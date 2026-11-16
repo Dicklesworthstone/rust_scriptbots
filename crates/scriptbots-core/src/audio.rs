@@ -1,10 +1,12 @@
-//! Pure, lock-free audio engine, frame mapper, and offline PCM renderer (`bd-16g.14.1`, `bd-16g.14.2`, `bd-16g.14.3`).
+//! Bounded audio engine, frame mapper, native output and offline PCM renderer (`bd-16g.14`).
 
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "audio")]
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 /// Maximum oneshot sounds triggered per tick.
 pub const MAX_ONESHOTS_PER_TICK: usize = 8;
@@ -14,7 +16,7 @@ pub const MAX_ONESHOTS_PER_TICK_F32: f32 = 8.0;
 pub const MAX_VOICES: usize = 32;
 /// Maximum spatial event coordinates stored per frame.
 pub const MAX_SPATIAL_EVENTS: usize = 16;
-/// Capacity of the lock-free simulation-to-audio non-blocking channel.
+/// Capacity of the non-blocking simulation-to-audio channel.
 pub const AUDIO_CHANNEL_CAPACITY: usize = 8;
 /// Default sample rate in Hz.
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
@@ -174,6 +176,25 @@ impl Default for LayerGains {
             bell: 0.6,
             thud: 0.6,
             transient: 0.7,
+        }
+    }
+}
+
+impl LayerGains {
+    const fn for_cue(self, kind: CueKind) -> f32 {
+        match kind {
+            CueKind::Bell => self.bell,
+            CueKind::Thud => self.thud,
+            CueKind::Transient => self.transient,
+        }
+    }
+
+    const fn bounded(self) -> Self {
+        Self {
+            drone: bounded_gain(self.drone),
+            bell: bounded_gain(self.bell),
+            thud: bounded_gain(self.thud),
+            transient: bounded_gain(self.transient),
         }
     }
 }
@@ -504,8 +525,11 @@ pub fn map_frame_bounded(
     let mut tokens = (prev.tokens + config.token_refill_rate).min(config.token_bucket_capacity);
 
     let mut plan = VoicePlan::default();
-    let total_triggers =
-        u64::from(frame.births) + u64::from(frame.deaths) + u64::from(frame.spike_hits);
+    // Muted layers must not consume tokens or starve other audible events.
+    let births = if config.layer_gains.bell > 0.0 { frame.births } else { 0 };
+    let deaths = if config.layer_gains.thud > 0.0 { frame.deaths } else { 0 };
+    let spikes = if config.layer_gains.transient > 0.0 { frame.spike_hits } else { 0 };
+    let total_triggers = u64::from(births) + u64::from(deaths) + u64::from(spikes);
 
     if total_triggers == 0 {
         next_params.tokens = tokens;
@@ -515,7 +539,10 @@ pub fn map_frame_bounded(
     let token_allowed = tokens.floor().max(0.0) as u64;
     let tick_allowed = config.max_oneshots_per_tick as u64;
     let voice_ceiling = MAX_VOICES.saturating_sub(active_voices) as u64;
-    let budget = tick_allowed.min(token_allowed).min(voice_ceiling);
+    let budget = tick_allowed
+        .min(token_allowed)
+        .min(voice_ceiling)
+        .min(MAX_ONESHOTS_PER_TICK as u64);
     let allowed = total_triggers.min(budget);
 
     plan.dropped = total_triggers.saturating_sub(allowed);
@@ -524,7 +551,7 @@ pub fn map_frame_bounded(
 
     // Generate bell oneshots for births
     let mut added = 0;
-    let births_to_add = u64::from(frame.births).min(allowed);
+    let births_to_add = u64::from(births).min(allowed);
     for _ in 0..births_to_add {
         if added >= allowed {
             break;
@@ -541,7 +568,7 @@ pub fn map_frame_bounded(
     }
 
     // Generate thud oneshots for deaths
-    let deaths_to_add = u64::from(frame.deaths).min(allowed.saturating_sub(added));
+    let deaths_to_add = u64::from(deaths).min(allowed.saturating_sub(added));
     for _ in 0..deaths_to_add {
         if added >= allowed {
             break;
@@ -558,16 +585,12 @@ pub fn map_frame_bounded(
     }
 
     // Generate transient oneshots for spike combat hits
-    let spikes_to_add = u64::from(frame.spike_hits).min(allowed.saturating_sub(added));
+    let spikes_to_add = u64::from(spikes).min(allowed.saturating_sub(added));
     for idx in 0..spikes_to_add {
         if added >= allowed {
             break;
         }
-        let pos = if (idx as usize) < frame.spike_position_count {
-            Some(frame.spike_positions[idx as usize])
-        } else {
-            None
-        };
+        let pos = frame.spike_positions().get(idx as usize).copied();
         let panning = pos.map_or(0.3, |p| (p.x / 1000.0).clamp(-1.0, 1.0));
         plan.push(OneShot {
             kind: CueKind::Transient,
@@ -639,25 +662,33 @@ impl Default for LimiterTelemetry {
     }
 }
 
-/// Create a non-blocking capacity-8 SPSC channel transport for simulation-to-audio frames.
+/// Create a non-blocking capacity-8 channel transport for simulation-to-audio frames.
 #[must_use]
 pub fn audio_channel() -> (AudioSender, AudioReceiver) {
     let (tx, rx) = std::sync::mpsc::sync_channel(AUDIO_CHANNEL_CAPACITY);
     let frames_dropped = Arc::new(AtomicU64::new(0));
+    let generation = Arc::new(AtomicU64::new(0));
     (
         AudioSender {
             tx,
             frames_dropped: Arc::clone(&frames_dropped),
+            generation: Arc::clone(&generation),
         },
-        AudioReceiver { rx, frames_dropped },
+        AudioReceiver {
+            rx,
+            frames_dropped,
+            generation,
+            reported_drops: AtomicU64::new(0),
+        },
     )
 }
 
 /// Simulation-side non-blocking audio frame sender.
 #[derive(Debug, Clone)]
 pub struct AudioSender {
-    tx: std::sync::mpsc::SyncSender<AudioFrame>,
+    tx: std::sync::mpsc::SyncSender<(u64, AudioFrame)>,
     frames_dropped: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
 }
 
 /// Failure condition when sending an `AudioFrame`.
@@ -669,13 +700,34 @@ pub enum AudioSendError {
     /// The receiver has disconnected; frame dropped.
     #[error("audio receiver disconnected; frame dropped")]
     Disconnected,
+    /// A frame contains non-finite continuous values or invalid position metadata.
+    #[error("audio frame contains invalid values")]
+    InvalidFrame,
 }
 
 impl AudioSender {
-    /// Non-blocking send: returns immediately. If the queue is full or disconnected,
-    /// increments `frames_dropped` and returns an error without blocking simulation.
+    /// Non-blocking send: invalid input, a full queue or disconnection increments
+    /// `frames_dropped` and returns an error without blocking simulation.
     pub fn try_send(&self, frame: AudioFrame) -> Result<(), AudioSendError> {
-        match self.tx.try_send(frame) {
+        if ![
+            frame.herbivore_share,
+            frame.mean_energy,
+            frame.mean_health,
+            frame.crowding,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
+            || frame.spike_position_count > MAX_SPATIAL_EVENTS
+            || frame
+                .spike_positions()
+                .iter()
+                .any(|position| !position.x.is_finite() || !position.y.is_finite())
+        {
+            self.frames_dropped.fetch_add(1, Ordering::Relaxed);
+            return Err(AudioSendError::InvalidFrame);
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        match self.tx.try_send((generation, frame)) {
             Ok(()) => Ok(()),
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.frames_dropped.fetch_add(1, Ordering::Relaxed);
@@ -698,24 +750,53 @@ impl AudioSender {
     pub fn frames_dropped(&self) -> u64 {
         self.frames_dropped.load(Ordering::Relaxed)
     }
+
+    /// Invalidate queued observations when the owner changes or playback is muted.
+    ///
+    /// This never waits for the consumer. New observations carry the new generation,
+    /// so a delayed callback cannot play cues belonging to a previous world.
+    pub fn reset(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// Audio-side receiver for simulation frames.
 pub struct AudioReceiver {
-    rx: std::sync::mpsc::Receiver<AudioFrame>,
+    rx: std::sync::mpsc::Receiver<(u64, AudioFrame)>,
     frames_dropped: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+    reported_drops: AtomicU64,
 }
 
 impl AudioReceiver {
     /// Try to receive a single frame without blocking.
     pub fn try_recv(&self) -> Result<AudioFrame, std::sync::mpsc::TryRecvError> {
-        self.rx.try_recv()
+        let mut remaining = AUDIO_CHANNEL_CAPACITY;
+        self.try_recv_with_budget(&mut remaining)
+            .map(|(_, frame)| frame)
     }
 
-    /// Drain all currently pending frames in the channel into a handler closure.
+    fn try_recv_with_budget(
+        &self,
+        remaining: &mut usize,
+    ) -> Result<(u64, AudioFrame), std::sync::mpsc::TryRecvError> {
+        // Bound work even when a producer continuously refills a reset queue.
+        while *remaining > 0 {
+            *remaining -= 1;
+            let (generation, frame) = self.rx.try_recv()?;
+            if generation == self.generation.load(Ordering::Acquire) {
+                return Ok((generation, frame));
+            }
+            self.frames_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    }
+
+    /// Drain up to one channel capacity, including stale input, into a handler.
     pub fn drain_all<F: FnMut(AudioFrame)>(&self, mut handler: F) -> usize {
         let mut count = 0;
-        while let Ok(frame) = self.rx.try_recv() {
+        let mut remaining = AUDIO_CHANNEL_CAPACITY;
+        while let Ok((_, frame)) = self.try_recv_with_budget(&mut remaining) {
             handler(frame);
             count += 1;
         }
@@ -728,10 +809,11 @@ impl AudioReceiver {
         self.frames_dropped.load(Ordering::Relaxed)
     }
 
-    /// Read and reset the dropped frame counter (e.g. for once-per-second reporting).
+    /// Read drops since the preceding report, preserving the lifetime total.
     #[must_use]
     pub fn take_frames_dropped(&self) -> u64 {
-        self.frames_dropped.swap(0, Ordering::Relaxed)
+        let total = self.frames_dropped.load(Ordering::Relaxed);
+        total.saturating_sub(self.reported_drops.swap(total, Ordering::Relaxed))
     }
 }
 
@@ -759,37 +841,6 @@ pub struct BufferAudioDevice {
 impl AudioDevice for BufferAudioDevice {
     fn write_samples(&mut self, samples: &[f32]) {
         self.buffer.extend_from_slice(samples);
-    }
-}
-
-/// Optional Kira audio backend device.
-#[cfg(feature = "audio")]
-pub struct KiraAudioDevice {
-    #[expect(
-        dead_code,
-        reason = "Kira audio manager held for active sound lifetime"
-    )]
-    manager: Option<kira::AudioManager<kira::DefaultBackend>>,
-}
-
-#[cfg(feature = "audio")]
-impl KiraAudioDevice {
-    /// Attempt to initialize the Kira audio manager device.
-    /// Returns `Err` if device initialization fails on headless or unprovisioned hosts.
-    pub fn new() -> Result<Self, String> {
-        let manager =
-            kira::AudioManager::<kira::DefaultBackend>::new(kira::AudioManagerSettings::default())
-                .map_err(|err| format!("{err:?}"))?;
-        Ok(Self {
-            manager: Some(manager),
-        })
-    }
-}
-
-#[cfg(feature = "audio")]
-impl AudioDevice for KiraAudioDevice {
-    fn write_samples(&mut self, _samples: &[f32]) {
-        // Kira static sounds or streaming can be fed here when the device is active.
     }
 }
 
@@ -823,7 +874,7 @@ pub struct Sonifier<D = NullAudioDevice> {
     device: D,
     params: AudioParams,
     active_voices: [Option<ActiveVoice>; MAX_VOICES],
-    sample_clock: u64,
+    drone_phase: f32,
     // Window-level telemetry accumulators
     total_samples_accumulated: u64,
     limiter_engaged_samples: u64,
@@ -833,6 +884,7 @@ pub struct Sonifier<D = NullAudioDevice> {
     one_shots_emitted: u64,
     one_shots_dropped: u64,
     latest_telemetry: LimiterTelemetry,
+    log_telemetry: bool,
 }
 
 impl Sonifier<NullAudioDevice> {
@@ -860,7 +912,7 @@ impl<D: AudioDevice> Sonifier<D> {
             device,
             params,
             active_voices: [None; MAX_VOICES],
-            sample_clock: 0,
+            drone_phase: 0.0,
             total_samples_accumulated: 0,
             limiter_engaged_samples: 0,
             sample_accumulator: 0.0,
@@ -869,6 +921,7 @@ impl<D: AudioDevice> Sonifier<D> {
             one_shots_emitted: 0,
             one_shots_dropped: 0,
             latest_telemetry: LimiterTelemetry::default(),
+            log_telemetry: true,
         }
     }
 
@@ -904,12 +957,30 @@ impl<D: AudioDevice> Sonifier<D> {
 
     /// Update master gain.
     pub const fn set_master_gain(&mut self, gain: f32) {
-        self.config.master_gain = gain.clamp(0.0, 1.0);
+        self.config.master_gain = bounded_gain(gain);
         self.params.master_gain = self.config.master_gain;
     }
 
-    /// Update per-layer gains.
-    pub const fn set_layer_gains(&mut self, layer_gains: LayerGains) {
+    /// Update per-layer gains, including already playing cues.
+    ///
+    /// A zero layer gain discards its active cues. Restoring the layer admits
+    /// future cues; it does not resurrect previously silenced events.
+    pub fn set_layer_gains(&mut self, layer_gains: LayerGains) {
+        let layer_gains = layer_gains.bounded();
+        if self.config.layer_gains == layer_gains {
+            return;
+        }
+        for slot in &mut self.active_voices {
+            if let Some(voice) = slot {
+                let previous = self.config.layer_gains.for_cue(voice.kind);
+                let next = layer_gains.for_cue(voice.kind);
+                if previous > 0.0 && next > 0.0 {
+                    voice.gain = (voice.gain / previous) * next;
+                } else {
+                    *slot = None;
+                }
+            }
+        }
         self.config.layer_gains = layer_gains;
         self.params.layer_gains = layer_gains;
     }
@@ -920,15 +991,39 @@ impl<D: AudioDevice> Sonifier<D> {
         self.active_voices.iter().filter(|v| v.is_some()).count()
     }
 
-    /// Process a single frame and synthesize `out.len()` PCM samples into `out`.
+    /// Forget the previous world's sound without replacing the device or transport.
+    pub fn reset_signal(&mut self) {
+        self.params = AudioParams {
+            master_gain: self.config.master_gain,
+            layer_gains: self.config.layer_gains,
+            is_muted: self.config.is_muted,
+            tokens: self.config.token_bucket_capacity,
+            drone_density: 0.0,
+            ..AudioParams::default()
+        };
+        self.active_voices.fill(None);
+        self.drone_phase = 0.0;
+        self.total_samples_accumulated = 0;
+        self.limiter_engaged_samples = 0;
+        self.sample_accumulator = 0.0;
+        self.peak_sample = 0.0;
+        self.max_attenuation_db = 0.0;
+        self.one_shots_emitted = 0;
+        self.one_shots_dropped = 0;
+        self.latest_telemetry = LimiterTelemetry::default();
+    }
+
+    /// Apply one completed scientific observation without advancing the audio clock.
+    ///
+    /// Device callbacks use this once per received frame, then render as many audio
+    /// samples as the device requests. Rendering another block never retriggers it.
     #[expect(
-        clippy::suboptimal_flops,
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "synthesis oscillators use standard f32 trigonometric phases"
     )]
-    pub fn step_frame(&mut self, frame: &AudioFrame, out: &mut [f32]) {
+    pub fn observe_frame(&mut self, frame: &AudioFrame) {
         let current_active = self.active_voice_count();
         let (next_params, plan) =
             map_frame_bounded(&self.params, frame, &self.config, current_active);
@@ -939,6 +1034,9 @@ impl<D: AudioDevice> Sonifier<D> {
 
         // Admit planned one-shots into active voice slots
         for shot in plan.one_shots() {
+            if shot.gain <= 0.0 {
+                continue;
+            }
             let base_freq = shot.kind.base_frequency_hz();
             let freq = base_freq * (shot.detune_cents / 1200.0).exp2();
             let total_samples =
@@ -963,6 +1061,15 @@ impl<D: AudioDevice> Sonifier<D> {
             }
         }
 
+    }
+
+    /// Render a device-sized block from the last observed parameters and active voices.
+    #[expect(
+        clippy::suboptimal_flops,
+        clippy::cast_precision_loss,
+        reason = "synthesis oscillators use standard f32 trigonometric phases"
+    )]
+    pub fn render_samples(&mut self, out: &mut [f32]) {
         // Instant bit-zero mute contract
         if self.config.is_muted || self.params.is_muted || self.config.master_gain <= 0.0 {
             out.fill(0.0);
@@ -973,15 +1080,16 @@ impl<D: AudioDevice> Sonifier<D> {
 
         let dt = 1.0 / self.config.sample_rate as f32;
         let drone_freq = 110.0 + self.params.dissonance * 20.0;
+        let drone_phase_step = std::f32::consts::TAU * drone_freq * dt;
 
         for out_sample in out.iter_mut() {
-            let t = self.sample_clock as f32 * dt;
-            self.sample_clock = self.sample_clock.wrapping_add(1);
-
-            let drone = (2.0 * std::f32::consts::PI * drone_freq * t).sin()
+            let drone = self.drone_phase.sin()
                 * 0.1
                 * self.params.drone_density
                 * self.config.layer_gains.drone;
+            // A bounded phase keeps long-running playback precise and changes
+            // frequency continuously when a new observation changes dissonance.
+            self.drone_phase = (self.drone_phase + drone_phase_step) % std::f32::consts::TAU;
 
             let mut voice_sum = 0.0_f32;
             for slot in &mut self.active_voices {
@@ -1021,6 +1129,12 @@ impl<D: AudioDevice> Sonifier<D> {
 
         self.device.write_samples(out);
         self.accumulate_telemetry(out, false);
+    }
+
+    /// Observe a completed tick and synthesize `out.len()` PCM samples into `out`.
+    pub fn step_frame(&mut self, frame: &AudioFrame, out: &mut [f32]) {
+        self.observe_frame(frame);
+        self.render_samples(out);
     }
 
     #[expect(
@@ -1070,6 +1184,7 @@ impl<D: AudioDevice> Sonifier<D> {
                 master_gain: self.config.master_gain,
             };
 
+            if self.log_telemetry {
             tracing::debug!(
                 target: "scriptbots::audio",
                 voices_active = self.latest_telemetry.voices_active,
@@ -1107,6 +1222,8 @@ impl<D: AudioDevice> Sonifier<D> {
                 );
             }
 
+            }
+
             // Reset reporting period accumulators
             self.total_samples_accumulated = 0;
             self.limiter_engaged_samples = 0;
@@ -1118,7 +1235,7 @@ impl<D: AudioDevice> Sonifier<D> {
         }
     }
 
-    /// Drain and process all pending frames from the receiver, returning number of frames processed.
+    /// Process at most one channel capacity of pending input, including stale frames.
     pub fn process_pending(&mut self, ticks_per_second: u64) -> usize {
         if ticks_per_second == 0 {
             return 0;
@@ -1128,11 +1245,318 @@ impl<D: AudioDevice> Sonifier<D> {
         let mut buffer = vec![0.0_f32; samples_per_tick];
         let mut processed = 0;
 
-        while let Ok(frame) = self.receiver.try_recv() {
+        let mut remaining = AUDIO_CHANNEL_CAPACITY;
+        while let Ok((_, frame)) = self.receiver.try_recv_with_budget(&mut remaining) {
             self.step_frame(&frame, &mut buffer);
             processed += 1;
         }
         processed
+    }
+}
+
+/// One optional native device playing the shared snapshot-driven synthesizer.
+///
+/// Construction is explicit and starts muted. Frontends own this object, submit
+/// bounded observations, and change presentation controls; the Kira callback owns
+/// synthesis and has no reference or callback into the scientific owner. Dropping
+/// this object stops the stream and closes the device.
+#[cfg(feature = "audio")]
+pub struct KiraSoundscape {
+    handle: SoundscapeHandle,
+    // Kira stops its backend when the manager is dropped.
+    manager: kira::AudioManager<kira::DefaultBackend>,
+}
+
+#[cfg(feature = "audio")]
+impl KiraSoundscape {
+    /// Open the default audio device once. Failure is returned to the frontend.
+    pub fn new(config: AudioConfig) -> Result<Self, String> {
+        let data = SoundscapeData::new(config)?;
+        let mut manager =
+            kira::AudioManager::<kira::DefaultBackend>::new(kira::AudioManagerSettings::default())
+                .map_err(|error| format!("could not open audio device: {error:?}"))?;
+        let handle = manager
+            .play(data)
+            .map_err(|error| format!("could not start soundscape: {error:?}"))?;
+        Ok(Self { handle, manager })
+    }
+
+    /// Admit one observation without waiting for the audio device.
+    ///
+    /// Admission does not promise playback: reset, mute and a stalled device may
+    /// discard queued observations. A full queue never delays the simulation.
+    pub fn try_send(&self, frame: AudioFrame) -> Result<(), AudioSendError> {
+        self.handle.sender.try_send(frame)
+    }
+
+    /// Retrieve a desktop backend error on the frontend thread.
+    ///
+    /// Callers can stop the soundscape and expose a persistent failure. Kira may
+    /// attempt device recovery before this error is observed. Its Web Audio
+    /// backend does not expose this error queue and returns `None` here.
+    pub fn take_error(&mut self) -> Option<String> {
+        let backend = self.manager.backend_mut();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            backend
+                .pop_error()
+                .map(|error| format!("audio device failed: {error}"))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = backend;
+            None
+        }
+    }
+
+    /// Mute at the next device callback and discard preceding cues and tails.
+    ///
+    /// Already submitted hardware buffers cannot be recalled. No new nonzero
+    /// samples are generated after the callback observes this control.
+    pub fn set_muted(&self, muted: bool) {
+        self.handle.set_muted(muted);
+    }
+
+    /// Set master gain; invalid numbers silence the output.
+    pub fn set_master_gain(&self, gain: f32) {
+        self.handle
+            .control
+            .master_gain
+            .store(bounded_gain(gain).to_bits(), Ordering::Release);
+    }
+
+    /// Set the shared mapper's drone, birth, death and combat gains.
+    pub fn set_layer_gains(&self, gains: LayerGains) {
+        for (destination, value) in self.handle.control.layer_gains.iter().zip([
+            gains.drone,
+            gains.bell,
+            gains.thud,
+            gains.transient,
+        ]) {
+            destination.store(bounded_gain(value).to_bits(), Ordering::Release);
+        }
+    }
+
+    /// Discard queued cues and synthesis state without reopening the device.
+    pub fn reset(&self) {
+        self.handle.sender.reset();
+    }
+
+    /// Retain the new owner's source seed and discard old input without reopening audio.
+    pub fn reset_with_seed(&self, seed: u64) {
+        self.handle.control.run_seed.store(seed, Ordering::Release);
+        self.reset();
+    }
+
+    /// Count observations dropped by the bounded transport.
+    #[must_use]
+    pub fn frames_dropped(&self) -> u64 {
+        self.handle.sender.frames_dropped()
+    }
+}
+
+const fn bounded_gain(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(feature = "audio")]
+struct SoundscapeControl {
+    muted: AtomicBool,
+    stopped: AtomicBool,
+    master_gain: AtomicU32,
+    layer_gains: [AtomicU32; 4],
+    run_seed: AtomicU64,
+}
+
+#[cfg(feature = "audio")]
+struct SoundscapeHandle {
+    sender: AudioSender,
+    control: Arc<SoundscapeControl>,
+}
+
+#[cfg(feature = "audio")]
+impl SoundscapeHandle {
+    fn set_muted(&self, muted: bool) {
+        if self.control.muted.swap(muted, Ordering::AcqRel) != muted {
+            self.sender.reset();
+        }
+    }
+}
+
+#[cfg(feature = "audio")]
+impl Drop for SoundscapeHandle {
+    fn drop(&mut self) {
+        self.control.stopped.store(true, Ordering::Release);
+        self.sender.reset();
+    }
+}
+
+#[cfg(feature = "audio")]
+struct SoundscapeData {
+    config: AudioConfig,
+    sender: AudioSender,
+    receiver: AudioReceiver,
+    control: Arc<SoundscapeControl>,
+}
+
+#[cfg(feature = "audio")]
+impl SoundscapeData {
+    fn new(mut config: AudioConfig) -> Result<Self, String> {
+        if config.sample_rate == 0
+            || !config.token_refill_rate.is_finite()
+            || config.token_refill_rate < 0.0
+            || !config.token_bucket_capacity.is_finite()
+            || config.token_bucket_capacity < 0.0
+        {
+            return Err("invalid soundscape sample rate or token budget".into());
+        }
+        config.is_muted = true;
+        config.master_gain = bounded_gain(config.master_gain);
+        config.layer_gains = config.layer_gains.bounded();
+        let gains = [
+            config.layer_gains.drone,
+            config.layer_gains.bell,
+            config.layer_gains.thud,
+            config.layer_gains.transient,
+        ];
+        let control = Arc::new(SoundscapeControl {
+            muted: AtomicBool::new(true),
+            stopped: AtomicBool::new(false),
+            master_gain: AtomicU32::new(config.master_gain.to_bits()),
+            layer_gains: gains.map(|gain| AtomicU32::new(bounded_gain(gain).to_bits())),
+            run_seed: AtomicU64::new(config.run_seed),
+        });
+        let (sender, receiver) = audio_channel();
+        Ok(Self {
+            config,
+            sender,
+            receiver,
+            control,
+        })
+    }
+}
+
+#[cfg(feature = "audio")]
+impl kira::sound::SoundData for SoundscapeData {
+    type Error = std::convert::Infallible;
+    type Handle = SoundscapeHandle;
+
+    fn into_sound(self) -> Result<(Box<dyn kira::sound::Sound>, Self::Handle), Self::Error> {
+        let mut sonifier = Sonifier::new(self.receiver, self.config);
+        sonifier.reset_signal();
+        // Subscribers may allocate or acquire logging locks. The real-time callback
+        // records counters but never invokes the configured tracing subscriber.
+        sonifier.log_telemetry = false;
+        let sound = KiraSoundStream {
+            sonifier,
+            control: Arc::clone(&self.control),
+            generation: 0,
+        };
+        Ok((
+            Box::new(sound),
+            SoundscapeHandle {
+                sender: self.sender,
+                control: self.control,
+            },
+        ))
+    }
+}
+
+#[cfg(feature = "audio")]
+struct KiraSoundStream {
+    sonifier: Sonifier,
+    control: Arc<SoundscapeControl>,
+    generation: u64,
+}
+
+#[cfg(feature = "audio")]
+impl kira::sound::Sound for KiraSoundStream {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a checked device sample period is rounded to an integral sample rate"
+    )]
+    fn process(&mut self, out: &mut [kira::Frame], dt: f64, _info: &kira::Info<'_>) {
+        out.fill(kira::Frame::ZERO);
+        if self.control.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let rate = dt.recip().round();
+        if !dt.is_finite() || dt <= 0.0 || !(1.0..=384_000.0).contains(&rate) {
+            self.sonifier.reset_signal();
+            return;
+        }
+        let generation = self.sonifier.receiver.generation.load(Ordering::Acquire);
+        if generation != self.generation || self.sonifier.config.sample_rate != rate as u32 {
+            self.sonifier.config.sample_rate = rate as u32;
+            self.sonifier.reset_signal();
+            self.generation = generation;
+        }
+        self.sonifier.config.run_seed = self.control.run_seed.load(Ordering::Acquire);
+        self.sonifier
+            .set_muted(self.control.muted.load(Ordering::Acquire));
+        self.sonifier.set_master_gain(f32::from_bits(
+            self.control.master_gain.load(Ordering::Acquire),
+        ));
+        let gains = self
+            .control
+            .layer_gains
+            .each_ref()
+            .map(|gain| f32::from_bits(gain.load(Ordering::Acquire)));
+        self.sonifier.set_layer_gains(LayerGains {
+            drone: gains[0],
+            bell: gains[1],
+            thud: gains[2],
+            transient: gains[3],
+        });
+        // A callback does at most the channel's declared capacity of input work.
+        // Rendering keeps its own sample clock; it never waits for a science tick.
+        let muted = self.sonifier.config.is_muted || self.sonifier.config.master_gain <= 0.0;
+        let mut remaining = AUDIO_CHANNEL_CAPACITY;
+        while let Ok((frame_generation, frame)) =
+            self.sonifier.receiver.try_recv_with_budget(&mut remaining)
+        {
+            if frame_generation != self.sonifier.receiver.generation.load(Ordering::Acquire) {
+                self.sonifier.receiver.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                self.sonifier.reset_signal();
+                return;
+            }
+            if frame_generation != self.generation {
+                self.sonifier.reset_signal();
+                self.sonifier.config.run_seed = self.control.run_seed.load(Ordering::Acquire);
+                self.generation = frame_generation;
+            }
+            if !muted {
+                self.sonifier.observe_frame(&frame);
+            }
+        }
+        if muted {
+            self.sonifier.reset_signal();
+            return;
+        }
+        // Fixed stack scratch, independent of the backend's requested block size.
+        let mut samples = [0.0_f32; 256];
+        for chunk in out.chunks_mut(samples.len()) {
+            if self.control.muted.load(Ordering::Acquire)
+                || self.control.stopped.load(Ordering::Acquire)
+                || self.sonifier.receiver.generation.load(Ordering::Acquire) != self.generation
+            {
+                self.sonifier.reset_signal();
+                break;
+            }
+            self.sonifier.render_samples(&mut samples[..chunk.len()]);
+            for (frame, &sample) in chunk.iter_mut().zip(&samples) {
+                *frame = kira::Frame::from_mono(sample);
+            }
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.control.stopped.load(Ordering::Acquire)
     }
 }
 
@@ -2618,55 +3042,201 @@ mod tests {
 
     #[cfg(feature = "audio")]
     #[test]
-    fn test_live_feature_on_e2e() {
+    fn native_callback_plays_real_samples_and_clears_muted_or_replaced_owners() {
+        use kira::sound::SoundData;
+
+        let (mut sound, handle) = SoundscapeData::new(AudioConfig::default())
+            .expect("valid live configuration")
+            .into_sound()
+            .expect("real Kira sound");
+        let info = kira::info::MockInfoBuilder::new().build();
+        let mut out = [kira::Frame::from_mono(1.0); 1_024];
+        let activity = AudioFrame {
+            population: 1_000,
+            births: 500,
+            deaths: 500,
+            spike_hits: 500,
+            ..AudioFrame::default()
+        };
+        handle.sender.try_send(activity).expect("bounded admission");
+        sound.process(&mut out, 1.0 / 44_100.0, &info);
+        assert!(out.iter().all(|frame| frame.left.to_bits() == 0 && frame.right.to_bits() == 0));
+
+        handle.set_muted(false);
+        handle.sender.try_send(activity).expect("fresh observed tick");
+        sound.process(&mut out, 1.0 / 44_100.0, &info);
+        assert!(out.iter().any(|frame| frame.left.abs() > 0.001));
+        assert!(out.iter().all(|frame| frame.left.is_finite()
+            && frame.left.abs() <= 1.0
+            && frame.right.to_bits() == frame.left.to_bits()));
+
+        handle.set_muted(true);
+        sound.process(&mut out, 1.0 / 44_100.0, &info);
+        assert!(out.iter().all(|frame| frame.left.to_bits() == 0));
+        handle.set_muted(false);
+        sound.process(&mut out, 1.0 / 44_100.0, &info);
+        assert!(out.iter().all(|frame| frame.left.to_bits() == 0), "old tails never resume");
+
+        handle.sender.try_send(activity).expect("old owner input");
+        handle.sender.reset();
+        handle.sender.try_send(AudioFrame::default()).expect("empty new owner");
+        sound.process(&mut out, 1.0 / 48_000.0, &info);
+        assert!(out.iter().all(|frame| frame.left.to_bits() == 0));
+        assert_eq!(handle.sender.frames_dropped(), 1);
+        assert!(!sound.finished());
+        drop(handle);
+        assert!(sound.finished());
+        out.fill(kira::Frame::from_mono(1.0));
+        sound.process(&mut out, 1.0 / 48_000.0, &info);
+        assert!(out.iter().all(|frame| frame.left.to_bits() == 0));
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn native_callback_handles_device_rate_changes_and_rejects_invalid_clocks() {
+        use kira::sound::SoundData;
+
+        let (mut sound, handle) = SoundscapeData::new(AudioConfig::default())
+            .expect("valid configuration")
+            .into_sound()
+            .expect("real callback");
+        let info = kira::info::MockInfoBuilder::new().build();
+        handle.set_muted(false);
+        let mut out = [kira::Frame::ZERO; 512];
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            handle.sender.try_send(AudioFrame {
+                births: 1,
+                ..AudioFrame::default()
+            }).expect("new birth");
+            sound.process(&mut out, 1.0 / rate, &info);
+            assert!(out.iter().any(|frame| frame.left.abs() > 0.001), "fresh cue survives rate change");
+        }
+        for dt in [0.0, -1.0, f64::NAN, f64::INFINITY, 1.0 / 500_000.0] {
+            out.fill(kira::Frame::from_mono(1.0));
+            sound.process(&mut out, dt, &info);
+            assert!(out.iter().all(|frame| frame.left.to_bits() == 0 && frame.right.to_bits() == 0));
+        }
+        assert!(SoundscapeData::new(AudioConfig { sample_rate: 0, ..AudioConfig::default() }).is_err());
+        assert_eq!(bounded_gain(f32::NAN).to_bits(), 0);
+    }
+
+    #[test]
+    fn transport_reset_preserves_lifetime_drop_counts_and_bounds_stale_drain() {
         let (sender, receiver) = audio_channel();
+        for tick in 0..3 {
+            sender.try_send(AudioFrame { tick, ..AudioFrame::default() }).expect("old owner");
+        }
+        sender.reset();
+        sender.try_send(AudioFrame { tick: 42, ..AudioFrame::default() }).expect("new owner");
+        let mut remaining = 2;
+        assert_eq!(receiver.try_recv_with_budget(&mut remaining), Err(std::sync::mpsc::TryRecvError::Empty));
+        assert_eq!(remaining, 0);
+        assert_eq!(receiver.try_recv().expect("current owner").tick, 42);
+        assert_eq!(receiver.take_frames_dropped(), 3);
+        assert_eq!(receiver.take_frames_dropped(), 0);
+        assert_eq!(sender.frames_dropped(), 3);
+        assert_eq!(receiver.frames_dropped(), 3);
+    }
+
+    #[test]
+    fn transport_rejects_invalid_frames_without_poisoning_future_input() {
+        let (sender, receiver) = audio_channel();
+        for frame in [
+            AudioFrame { mean_energy: f32::NAN, ..AudioFrame::default() },
+            AudioFrame { spike_position_count: MAX_SPATIAL_EVENTS + 1, ..AudioFrame::default() },
+        ] {
+            assert_eq!(sender.try_send(frame), Err(AudioSendError::InvalidFrame));
+        }
+        assert_eq!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        sender.try_send(AudioFrame::default()).expect("valid input survives");
+        assert!(receiver.try_recv().is_ok());
+        assert_eq!(sender.frames_dropped(), 2);
+    }
+
+    #[test]
+    fn callback_block_sizes_do_not_retrigger_observed_events() {
+        let (_, first_receiver) = audio_channel();
+        let (_, second_receiver) = audio_channel();
+        let mut first = Sonifier::new(first_receiver, AudioConfig::default());
+        let mut second = Sonifier::new(second_receiver, AudioConfig::default());
+        let frame = AudioFrame { population: 500, births: 3, ..AudioFrame::default() };
+        let mut single = [0.0; 2_048];
+        let mut split = [0.0; 2_048];
+        first.step_frame(&frame, &mut single);
+        second.observe_frame(&frame);
+        for chunk in split.chunks_mut(127) {
+            second.render_samples(chunk);
+        }
+        assert!(single.iter().zip(split).all(|(left, right)| left.to_bits() == right.to_bits()));
+        assert_eq!(first.one_shots_emitted, 3);
+        assert_eq!(second.one_shots_emitted, 3);
+        assert_eq!(second.active_voice_count(), 3);
+        second.reset_signal();
+        second.render_samples(&mut split);
+        assert!(split.iter().all(|sample| sample.to_bits() == 0));
+        assert_eq!(second.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn live_layer_gain_changes_affect_active_cues_without_resurrecting_them() {
+        let (_, receiver) = audio_channel();
+        let mut sonifier = Sonifier::new(receiver, AudioConfig::default());
+        let frame = AudioFrame { births: 1, ..AudioFrame::default() };
+        sonifier.observe_frame(&frame);
+        let original = sonifier.active_voices[0].expect("active bell");
+        sonifier.set_layer_gains(sonifier.config.layer_gains);
+        assert_eq!(sonifier.active_voices[0], Some(original));
+        sonifier.set_layer_gains(LayerGains { bell: 0.3, ..sonifier.config.layer_gains });
+        assert!((sonifier.active_voices[0].expect("quieter bell").gain - original.gain * 0.5).abs() < 1e-6);
+        sonifier.set_layer_gains(LayerGains { bell: 0.0, ..sonifier.config.layer_gains });
+        assert_eq!(sonifier.active_voice_count(), 0);
+        sonifier.observe_frame(&frame);
+        assert_eq!(sonifier.active_voice_count(), 0);
+        sonifier.set_layer_gains(LayerGains::default());
+        let mut out = [1.0; 128];
+        sonifier.render_samples(&mut out);
+        assert!(out.iter().all(|sample| sample.to_bits() == 0));
+        sonifier.observe_frame(&frame);
+        sonifier.render_samples(&mut out);
+        assert!(out.iter().any(|sample| sample.abs() > 0.001));
+    }
+
+    #[test]
+    fn oversized_cue_configuration_respects_fixed_voice_plan_capacity() {
         let config = AudioConfig {
-            sample_rate: 48_000,
+            max_oneshots_per_tick: 100,
+            token_bucket_capacity: 100.0,
+            token_refill_rate: 100.0,
             ..AudioConfig::default()
         };
-        // Either KiraAudioDevice initializes or gracefully returns an Err on headless hosts
-        match KiraAudioDevice::new() {
-            Ok(device) => {
-                let mut sonifier = Sonifier::with_device(receiver, config, device);
-                let mut total_processed = 0;
-                for tick in 0..120 {
-                    let frame = AudioFrame {
-                        tick,
-                        population: 100,
-                        births: (tick % 4) as u32,
-                        deaths: (tick % 6) as u32,
-                        spike_hits: (tick % 5) as u32,
-                        ..AudioFrame::default()
-                    };
-                    sender.send(frame).expect("send frame without world lock");
-                    total_processed += sonifier.process_pending(60);
-                }
-                assert_eq!(total_processed, 120);
-                assert_eq!(sonifier.telemetry().frames_dropped, 0);
-            }
-            Err(err) => {
-                tracing::info!(
-                    ?err,
-                    "Kira audio device not present on headless host, testing with NullAudioDevice"
-                );
-                let mut sonifier = Sonifier::new(receiver, config);
-                let mut total_processed = 0;
-                for tick in 0..120 {
-                    let frame = AudioFrame {
-                        tick,
-                        population: 100,
-                        births: (tick % 4) as u32,
-                        deaths: (tick % 6) as u32,
-                        spike_hits: (tick % 5) as u32,
-                        ..AudioFrame::default()
-                    };
-                    sender.send(frame).expect("send frame without world lock");
-                    total_processed += sonifier.process_pending(60);
-                }
-                assert_eq!(total_processed, 120);
-                assert_eq!(sonifier.telemetry().frames_dropped, 0);
-            }
-        }
+        let (_, plan) = map_frame(&AudioParams::default(), &AudioFrame {
+            spike_hits: 100,
+            spike_position_count: usize::MAX,
+            ..AudioFrame::default()
+        }, &config);
+        assert_eq!(plan.len(), MAX_ONESHOTS_PER_TICK);
+        assert_eq!(plan.dropped, 100 - MAX_ONESHOTS_PER_TICK as u64);
+    }
+
+    #[test]
+    fn muted_event_layers_do_not_starve_audible_combat() {
+        let config = AudioConfig {
+            layer_gains: LayerGains {
+                bell: 0.0,
+                thud: 0.0,
+                ..LayerGains::default()
+            },
+            ..AudioConfig::default()
+        };
+        let (_, plan) = map_frame(&AudioParams::default(), &AudioFrame {
+            births: 1_000,
+            deaths: 1_000,
+            spike_hits: 1,
+            ..AudioFrame::default()
+        }, &config);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.one_shots()[0].kind, CueKind::Transient);
+        assert_eq!(plan.dropped, 0, "explicitly muted cues are not overload drops");
     }
 
     #[test]
