@@ -2611,6 +2611,11 @@ const MAX_CATALOG_CHECKPOINTS: usize = 1_024;
 const MAX_CHECKPOINT_DISCOVERY_ENTRIES: usize = 16_384;
 const MAX_CHECKPOINT_DISCOVERY_BYTES: u64 = 256 * 1024 * 1024;
 
+// Admission limits for a saved remote canvas, not a total resident-memory guarantee.
+const MAX_CHECKPOINT_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CHECKPOINT_PREVIEW_GRID_CELLS: u64 = 262_144;
+const MAX_CHECKPOINT_PREVIEW_HISTORY: usize = 10_000;
+
 /// A completed file catalog entry, published only after the original writer
 /// acknowledges. Recovery exposes saved science for review/download; it does
 /// not adopt the original owner's requests, journal or persistence session.
@@ -2786,6 +2791,21 @@ fn read_checkpoint_catalog(
     directory: &Path,
     id: &str,
 ) -> Result<CheckpointMetadataDto, ControlError> {
+    let metadata = read_checkpoint_catalog_record(directory, id)?;
+    if metadata.byte_size > MAX_ARTIFACT_DOWNLOAD_BYTES as u64 {
+        return Err(checkpoint_catalog_error(
+            &directory.join(format!("{id}{CHECKPOINT_CATALOG_SUFFIX}")),
+            "unsupported, inconsistent or corrupt descriptor",
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Read the small committed descriptor before choosing a consumer's payload bound.
+fn read_checkpoint_catalog_record(
+    directory: &Path,
+    id: &str,
+) -> Result<CheckpointMetadataDto, ControlError> {
     let path = directory.join(format!("{id}{CHECKPOINT_CATALOG_SUFFIX}"));
     if !valid_checkpoint_catalog_id(id) {
         return Err(checkpoint_catalog_error(
@@ -2808,7 +2828,6 @@ fn read_checkpoint_catalog(
         || !id.ends_with(&format!("-t{}", metadata.tick))
         || metadata.schema != scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
         || metadata.byte_size == 0
-        || metadata.byte_size > MAX_ARTIFACT_DOWNLOAD_BYTES as u64
         || metadata
             .description
             .as_ref()
@@ -5951,13 +5970,164 @@ impl ControlHandle {
         self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)
     }
 
+    /// Project saved science for remote review with explicit resource admission bounds.
+    ///
+    /// Descriptor discovery is exact-ID and does not run the general catalog recovery:
+    /// a cold request must apply the 16 MiB source bound before decoding any payload.
+    /// The one verified payload read supplies both metadata validation and restoration.
+    pub(crate) fn checkpoint_canvas_bounded(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<(CheckpointMetadataDto, Arc<RenderSnapshot>), ControlError> {
+        let (metadata, checkpoint) = self.read_bounded_canvas_checkpoint(checkpoint_id)?;
+        let snapshot = self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?;
+        Ok((metadata, snapshot))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one retained-directory lease covers source discovery, verification and revalidation"
+    )]
+    fn read_bounded_canvas_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<(CheckpointMetadataDto, scriptbots_core::WorldCheckpointV1), ControlError> {
+        if checkpoint_id.len() > MAX_CHECKPOINT_BRANCH_ID_BYTES
+            || !valid_checkpoint_catalog_id(checkpoint_id)
+        {
+            return Err(ControlError::NotFound("checkpoint not found".into()));
+        }
+        let retention = self
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        if retention.directories.len() > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+            return Err(ControlError::CheckpointCapacity(
+                "checkpoint discovery directory budget exceeded".into(),
+            ));
+        }
+        if retention.requests.values().any(|request| {
+            !request.acknowledged && request.metadata.checkpoint_id == checkpoint_id
+        }) {
+            return Err(ControlError::NotFound(
+                "checkpoint completion is pending; retry its original capture request".into(),
+            ));
+        }
+        let find_directory = || {
+            let mut found = None;
+            for directory in retention.directories.keys() {
+                retention.verify_directory(directory)?;
+                let ready =
+                    directory.join(format!("{checkpoint_id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
+                match fs::symlink_metadata(&ready) {
+                    Ok(_) if found.is_some() => {
+                        return Err(ControlError::Conflict(format!(
+                            "checkpoint {checkpoint_id} appears in multiple retained directories"
+                        )));
+                    }
+                    Ok(_) => found = Some(directory.clone()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(checkpoint_catalog_error(&ready, error)),
+                }
+            }
+            found.ok_or_else(|| {
+                ControlError::NotFound(format!("checkpoint '{checkpoint_id}' not found"))
+            })
+        };
+        let directory = find_directory()?;
+        let metadata = read_checkpoint_catalog_record(&directory, checkpoint_id)?;
+        if metadata.byte_size > MAX_CHECKPOINT_PREVIEW_BYTES as u64
+            || metadata.agent_count > scriptbots_runtime::remote::REMOTE_MAX_AGENTS
+        {
+            return Err(ControlError::PayloadTooLarge(
+                "checkpoint preview exceeds its source-byte or agent admission bound".into(),
+            ));
+        }
+        let artifact = checkpoint_artifact_metadata(&metadata);
+        let validate_cached_identity = || {
+            let checkpoints = self
+                .data_services
+                .checkpoints
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            let artifacts = self
+                .data_services
+                .artifacts
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            match (checkpoints.get(checkpoint_id), artifacts.get(checkpoint_id)) {
+                (None, None) => Ok(()),
+                (Some(known), Some(retained))
+                    if known == &metadata
+                        && retained.directory == directory
+                        && retained.metadata == artifact =>
+                {
+                    Ok(())
+                }
+                _ => Err(ControlError::Conflict(format!(
+                    "checkpoint {checkpoint_id} has conflicting retained descriptors"
+                ))),
+            }
+        };
+        validate_cached_identity()?;
+        let path = directory.join(&artifact.relative_path);
+        let bytes = read_artifact_file_bounded(&path, MAX_CHECKPOINT_PREVIEW_BYTES)?;
+        if bytes.len() as u64 != metadata.byte_size
+            || compute_blake3(&bytes) != metadata.checksum_blake3
+            || compute_sha256(&bytes) != metadata.checksum_sha256
+        {
+            return Err(ControlError::InvalidPatch(
+                "artifact byte count or checksum changed".into(),
+            ));
+        }
+        let checkpoint = Self::decode_canvas_checkpoint(&metadata, &artifact, &bytes)?;
+        Self::validate_checkpoint_preview_config(checkpoint.config(), checkpoint.agent_count())?;
+        if find_directory()? != directory
+            || read_checkpoint_catalog_record(&directory, checkpoint_id)? != metadata
+        {
+            return Err(ControlError::Conflict(
+                "checkpoint descriptor changed during preview verification".into(),
+            ));
+        }
+        validate_cached_identity()?;
+        Ok((metadata, checkpoint))
+    }
+
+    fn validate_checkpoint_preview_config(
+        config: &ScriptBotsConfig,
+        agent_count: usize,
+    ) -> Result<(), ControlError> {
+        let (width, height) = config
+            .food_dimensions()
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        if agent_count > scriptbots_runtime::remote::REMOTE_MAX_AGENTS
+            || u64::from(width) * u64::from(height) > MAX_CHECKPOINT_PREVIEW_GRID_CELLS
+            || config.history_capacity > MAX_CHECKPOINT_PREVIEW_HISTORY
+            || config.narrative_capacity > MAX_CHECKPOINT_PREVIEW_HISTORY
+        {
+            return Err(ControlError::PayloadTooLarge(
+                "checkpoint preview exceeds its agent, grid or history admission bound".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn verified_canvas_checkpoint(
         &self,
         checkpoint_id: &str,
     ) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
         let metadata = self.get_checkpoint(checkpoint_id)?;
         let (artifact, bytes) = self.read_artifact_bytes(checkpoint_id)?;
-        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
+        Self::decode_canvas_checkpoint(&metadata, &artifact, &bytes)
+    }
+
+    fn decode_canvas_checkpoint(
+        metadata: &CheckpointMetadataDto,
+        artifact: &ArtifactMetadataDto,
+        bytes: &[u8],
+    ) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
+        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(bytes)
             .map_err(|error| ControlError::Serialization(error.to_string()))?;
         if metadata.schema != scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
             || metadata.tick != checkpoint.tick().0
@@ -14190,6 +14360,183 @@ pub(crate) mod tests {
                 Err(ControlError::InvalidPatch(_))
             ));
             assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        }
+    }
+
+    #[test]
+    fn bounded_checkpoint_canvas_verifies_cold_and_cached_sources_without_changing_owner() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 4, 64 * 1024 * 1024);
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let live = host.port.scientific_digest_v1().unwrap();
+        let publication = handle.read_snapshot().unwrap();
+        for cold in [false, true] {
+            if cold {
+                handle.data_services.checkpoints.lock().unwrap().clear();
+                handle.data_services.artifacts.lock().unwrap().clear();
+            }
+            let (metadata, frame) = handle
+                .checkpoint_canvas_bounded(&saved.checkpoint_id)
+                .unwrap();
+            assert_eq!(metadata, saved);
+            assert_eq!(frame.world.tick, saved.tick);
+            assert_eq!(frame.world.agents.len(), saved.agent_count);
+            assert!(frame.agent_visuals_complete());
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+        }
+        // An acknowledged marker cannot bypass a pending original writer request.
+        for request in handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests
+            .values_mut()
+        {
+            request.acknowledged = false;
+        }
+        assert!(matches!(
+            handle.checkpoint_canvas_bounded(&saved.checkpoint_id),
+            Err(ControlError::NotFound(reason)) if reason.contains("completion is pending")
+        ));
+        for request in handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests
+            .values_mut()
+        {
+            request.acknowledged = true;
+        }
+        let path = directory.join(format!("{}.bin", saved.checkpoint_id));
+        let preimage = fs::read(&path).unwrap();
+        fs::write(directory.join("preview-before-corruption.bin"), &preimage).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0xff])
+            .unwrap();
+        assert!(matches!(
+            handle.checkpoint_canvas_bounded(&saved.checkpoint_id),
+            Err(ControlError::InvalidPatch(_))
+        ));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+    }
+
+    #[test]
+    fn bounded_checkpoint_canvas_refuses_large_descriptors_before_payload_access() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 8, 64 * 1024 * 1024);
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        for case in 0..3 {
+            let mut metadata = saved.clone();
+            metadata.checkpoint_id = format!("ckpt-{:032x}-t{}", case + 1, saved.tick);
+            match case {
+                0 => metadata.byte_size = MAX_CHECKPOINT_PREVIEW_BYTES as u64 + 1,
+                1 => metadata.byte_size = MAX_ARTIFACT_DOWNLOAD_BYTES as u64 + 1,
+                2 => metadata.agent_count = scriptbots_runtime::remote::REMOTE_MAX_AGENTS + 1,
+                _ => unreachable!(),
+            }
+            write_checkpoint_catalog(&directory, &metadata).unwrap();
+            assert!(!directory.join(format!("{}.bin", metadata.checkpoint_id)).exists());
+            assert!(matches!(
+                handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
+                Err(ControlError::PayloadTooLarge(_))
+            ));
+        }
+        // A false small declaration cannot make an oversized physical file admissible.
+        let mut metadata = saved.clone();
+        metadata.checkpoint_id = format!("ckpt-{:032x}-t{}", 4, saved.tick);
+        metadata.byte_size = 1;
+        write_checkpoint_catalog(&directory, &metadata).unwrap();
+        fs::File::create(directory.join(format!("{}.bin", metadata.checkpoint_id)))
+            .unwrap()
+            .set_len(MAX_CHECKPOINT_PREVIEW_BYTES as u64 + 1)
+            .unwrap();
+        assert!(matches!(
+            handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
+            Err(ControlError::PayloadTooLarge(_))
+        ));
+        assert_eq!(host.port.scientific_digest_v1().unwrap().overall, saved.world_digest_v1);
+    }
+
+    #[test]
+    fn bounded_checkpoint_canvas_caps_decoded_histories_before_restoring() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 8, 64 * 1024 * 1024);
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let before = host.port.scientific_digest_v1().unwrap();
+        for narrative in [false, true] {
+            let mut config = ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 40,
+                world_height: 40,
+                food_cell_size: 10,
+                persistence_interval: 0,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..ScriptBotsConfig::default()
+            };
+            if narrative {
+                config.narrative_capacity = MAX_CHECKPOINT_PREVIEW_HISTORY + 1;
+            } else {
+                config.history_capacity = MAX_CHECKPOINT_PREVIEW_HISTORY + 1;
+            }
+            let checkpoint = WorldState::new(config).unwrap().checkpoint_v1().unwrap();
+            let bytes = checkpoint.encode().unwrap();
+            assert!(bytes.len() < MAX_CHECKPOINT_PREVIEW_BYTES);
+            let mut metadata = saved.clone();
+            metadata.checkpoint_id = format!("ckpt-{:032x}-t0", if narrative { 11 } else { 10 });
+            metadata.world_digest_v1 = checkpoint.source_digest().overall.clone();
+            metadata.byte_size = bytes.len() as u64;
+            metadata.checksum_blake3 = compute_blake3(&bytes);
+            metadata.checksum_sha256 = compute_sha256(&bytes);
+            write_checkpoint_catalog(&directory, &metadata).unwrap();
+            fs::write(directory.join(format!("{}.bin", metadata.checkpoint_id)), &bytes).unwrap();
+            assert!(matches!(
+                handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
+                Err(ControlError::PayloadTooLarge(reason)) if reason.contains("history")
+            ));
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn checkpoint_preview_grid_and_agent_admission_include_exact_boundaries() {
+        let config = ScriptBotsConfig {
+            world_width: 512,
+            world_height: 512,
+            food_cell_size: 1,
+            history_capacity: MAX_CHECKPOINT_PREVIEW_HISTORY,
+            narrative_capacity: MAX_CHECKPOINT_PREVIEW_HISTORY,
+            ..ScriptBotsConfig::default()
+        };
+        ControlHandle::validate_checkpoint_preview_config(
+            &config,
+            scriptbots_runtime::remote::REMOTE_MAX_AGENTS,
+        )
+        .unwrap();
+        let mut excessive_grid = config.clone();
+        excessive_grid.world_width = 513;
+        for (config, agents) in [
+            (&excessive_grid, 0),
+            (&config, scriptbots_runtime::remote::REMOTE_MAX_AGENTS + 1),
+        ] {
+            assert!(matches!(
+                ControlHandle::validate_checkpoint_preview_config(config, agents),
+                Err(ControlError::PayloadTooLarge(_))
+            ));
         }
     }
 
