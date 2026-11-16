@@ -151,7 +151,7 @@ const mockWasmModule = `
   export function restore_checkpoint(bytes) {
     if (![1, 9].includes(bytes.length) || bytes[0] !== 42) throw new Error("intentional checkpoint refusal");
     const tick = bytes.length === 1 ? 37 : Number(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(1, true));
-    return createHandle("checkpoint", "sbw1.continuation", tick);
+    return createHandle("checkpoint", "sbw1.continuation", tick, owners.checkpointPreset || "mlp");
   }
   export function decode_remote_frame_binary() { throw new Error("No remote frame in this lifecycle fixture"); }
 
@@ -159,6 +159,8 @@ const mockWasmModule = `
     const failure = owners.nextFailure;
     owners.nextFailure = null;
     if (failure === "create") throw new Error("intentional create failure");
+    const families = preset === "mixed" ? [...(owners.checkpointFamilies || ["assembly", "mlp", "dwraon"])]
+      : ["mlp", "dwraon", "assembly"].includes(preset) ? [preset] : [];
     const record = { id: owners.records.length + 1, kind, preset, seed: String(seed), population, tick: initialTick,
       freeCalls: 0, driveCalls: 0, frameCalls: 0, narrativeReads: 0, permalinkCalls: 0, elapsed: 0, speed: 1 };
     owners.records.push(record);
@@ -174,6 +176,7 @@ const mockWasmModule = `
       },
       permalinkOf() { check("permalink"); record.permalinkCalls += 1; return link; },
       brainPreset() { check("preset"); return preset; },
+      brainFamilies() { check("families"); return [...families]; },
       launchInfo: failure === "launch_missing" ? undefined : function () {
         check("launch");
         if (failure === "launch_schema") return { kind: "browser_launch", semantics: "saved_owner_continuation", shareable: true };
@@ -338,6 +341,62 @@ async function runOwnerLifecycleCases(page, context) {
     }
     observations.brainFamilies.push({ preset, owner: current.id, saveDisabled: disabled });
   }
+
+  // A continuation can carry several actual evaluator families without inventing
+  // a founder distribution. Its saved state remains runnable and saveable; only
+  // an explicit new-world choice permits reset.
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointPreset = "mixed";
+    window.__ownerTest.checkpointFamilies = ["assembly", "mlp", "dwraon"];
+  });
+  await replace("checkpoint");
+  const mixedState = await state();
+  const mixedOwner = activeOwner(mixedState);
+  const mixedControls = await page.evaluate(() => ({
+    resetDisabled: document.getElementById("reset-btn").disabled,
+    saveDisabled: document.getElementById("checkpoint-save").disabled,
+    browserSaveDisabled: document.getElementById("checkpoint-browser-save").disabled,
+    capability: document.getElementById("checkpoint-capability").textContent,
+    recipeKind: document.getElementById("launch-info").dataset.kind,
+  }));
+  if (mixedOwner.preset !== "mixed" || mixedState.preset !== "mixed" || mixedState.speed !== "0"
+      || !mixedControls.resetDisabled || mixedControls.saveDisabled || mixedControls.browserSaveDisabled
+      || !mixedControls.capability.includes("assembly + mlp + dwraon")
+      || mixedControls.recipeKind !== "checkpoint_continuation") {
+    throw new Error(`Mixed continuation was collapsed or could not continue: ${JSON.stringify({ mixedState, mixedControls })}`);
+  }
+  await page.evaluate(() => document.getElementById("reset-btn").dispatchEvent(new Event("click")));
+  await context.clock.runFor(32);
+  if (activeOwner(await state()).id !== mixedOwner.id) {
+    throw new Error("A reset without a new family discarded the mixed continuation");
+  }
+  await setSpeed(1);
+  await context.clock.runFor(96);
+  if (activeOwner(await state()).tick <= mixedOwner.tick) throw new Error("Mixed continuation did not resume");
+  await page.selectOption("#brain-preset", "assembly");
+  if (await page.isDisabled("#reset-btn")
+      || await page.getAttribute("#launch-info", "data-kind") !== "checkpoint_continuation") {
+    throw new Error("A family choice changed the live recipe or left reset unavailable");
+  }
+  await replace("reset");
+  const chosenOwner = activeOwner(await state());
+  if (chosenOwner.id === mixedOwner.id || chosenOwner.preset !== "assembly") {
+    throw new Error("An explicit family choice did not create the requested new world");
+  }
+  await page.evaluate(() => { window.__ownerTest.checkpointFamilies = ["mlp", "neuroflow"]; });
+  await replace("checkpoint");
+  if (activeOwner(await state()).id !== chosenOwner.id
+      || !await page.textContent("#checkpoint-status").then((text) => text.includes("brain-family roster"))) {
+    throw new Error("Unsupported mixed families replaced the active world");
+  }
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointPreset = null;
+    window.__ownerTest.checkpointFamilies = null;
+  });
+  await page.selectOption("#brain-preset", "mlp");
+  await replace("reset");
+  observations.mixedContinuation = { owner: mixedOwner.id, families: ["assembly", "mlp", "dwraon"],
+    resetRefused: true, explicitResetOwner: chosenOwner.id, unsupportedPreservedOwner: chosenOwner.id };
 
   // Keep reading the active owner after presentation faults, without flooding
   // the UI/log or creating a second scientific timer or RAF chain.

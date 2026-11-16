@@ -9,7 +9,7 @@ import { InspectionController, pickAgent, renderInspector, renderInspectorSource
 import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource } from "./genome.js";
 import { InterventionController, renderInterventions, validateInterventionAction } from "./interventions.js";
 import { NarrativeController, renderNarrative, renderNarrativeSource } from "./narrative.js";
-import { validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
+import { validateContinuationBrains, validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
 import { CheckpointLabController, renderCheckpointLab } from "./checkpoint-lab.js";
 import { ExperimentController } from "./experiments.js";
 import { readExperimentForm, renderExperimentLab, experimentObservationExport } from "./experiment-view.js";
@@ -56,6 +56,7 @@ const checkpointLoadInput = document.getElementById("checkpoint-load");
 const checkpointStatus = document.getElementById("checkpoint-status");
 const checkpointCapability = document.getElementById("checkpoint-capability");
 let activeBrainPreset = null;
+let activeBrainFamilies = [];
 let checkpointLoadPending = false;
 const browserSaveButton = document.getElementById("checkpoint-browser-save");
 const browserRestoreButton = document.getElementById("checkpoint-browser-restore");
@@ -619,8 +620,10 @@ populationSlider.addEventListener("input", () => {
   population = Number(populationSlider.value);
 });
 
+brainPresetSelect?.addEventListener("change", updateCheckpointControls);
+
 resetButton.addEventListener("click", () => {
-  if (remoteMode) return;
+  if (remoteMode || brainPresetSelect?.value === "mixed") return;
   if (permalinkStatus) {
     permalinkStatus.textContent = "";
   }
@@ -670,6 +673,7 @@ function updateCheckpointControls() {
   const supportsContinuation = activeBrainPreset !== "wander";
   const recoveryBusy = browserRecovery?.pending === true;
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
+  resetButton.disabled = remoteMode || brainPresetSelect?.value === "mixed";
   if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle || checkpointLoadPending || !supportsContinuation;
   if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending || recoveryBusy;
   const storageBusy = remoteMode || !browserContinuationStore || checkpointLoadPending || browserStorePending || recoveryBusy;
@@ -679,7 +683,9 @@ function updateCheckpointControls() {
     ? "These continuation controls apply to your local browser world. Return to Local Simulation to use them."
     : !supportsContinuation
       ? "This Wander world is a movement demo without inherited genomes or saved continuations. Choose MLP, DWRAON or Assembly, then Reset Simulation to start an evolving world."
-      : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
+      : activeBrainPreset === "mixed"
+        ? `This saved world retains ${activeBrainFamilies.join(" + ")} brain families, including any extinct family. Resume or save it to continue; choose a new-world preset before resetting.`
+        : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
   browserRecovery?.setAvailable(!remoteMode && !!simHandle && supportsContinuation && !document.hidden
     && !queuedReset && !checkpointLoadPending && !browserStorePending);
   renderRecoveryControls();
@@ -1262,6 +1268,7 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   const nextSpeed = continuation ? 0 : speedMultiplier;
   let frame;
   let brainPreset;
+  let brainFamilies = [];
   let launchInfo;
   try {
     // All fallible owner reads happen before the active world, clock, or UI is
@@ -1278,8 +1285,8 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
       seed: null, initial_population: null, brain_preset: null, recipe_version: null,
       reason: "This package did not record the original launch recipe for the saved owner.",
     } : null;
-    if (continuation && !["mlp", "dwraon", "assembly", "none"].includes(brainPreset)) {
-      throw new Error("Saved continuation has an unsupported brain family");
+    if (continuation) {
+      brainFamilies = validateContinuationBrains(brainPreset, next.brainFamilies?.() ?? null);
     }
     if (launchInfo?.shareable === false) {
       permalink = null;
@@ -1298,6 +1305,7 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   recoveryReadStatus = "";
   browserRecovery?.attach(next);
   activeBrainPreset = brainPreset;
+  activeBrainFamilies = brainFamilies;
   activeLaunchInfo = launchInfo;
   latestForkedLink = null;
   if (forkOutput) forkOutput.style.display = "none";
@@ -1612,6 +1620,7 @@ async function resetSimulation(populationOverride) {
   const defaults = default_init_options ? default_init_options() : {};
   const seed = Math.floor(Math.random() * 1_000_000);
   const preset = brainPresetSelect?.value || "mlp";
+  if (preset === "mixed") throw new Error("Choose a new-world brain preset before resetting this mixed continuation");
   const evolutionary = ["mlp", "dwraon", "assembly"].includes(preset);
   if (!evolutionary && !["wander", "none"].includes(preset)) throw new Error("Choose a supported brain family");
   const options = {

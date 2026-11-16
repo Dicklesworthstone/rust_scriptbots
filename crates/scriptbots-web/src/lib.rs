@@ -164,6 +164,8 @@ enum BrainPreset {
 }
 
 impl BrainPreset {
+    const ALL: [Self; 3] = [Self::Mlp, Self::Dwraon, Self::Assembly];
+
     const fn name(self) -> &'static str {
         match self {
             Self::Mlp => "mlp",
@@ -181,7 +183,7 @@ impl BrainPreset {
     }
 
     fn from_kind(kind: &str) -> Option<Self> {
-        [Self::Mlp, Self::Dwraon, Self::Assembly]
+        Self::ALL
             .into_iter()
             .find(|preset| preset.kind() == kind)
     }
@@ -206,6 +208,10 @@ struct SimSpec {
     snapshot_format: SnapshotFormat,
     seed_strategy: SeedStrategy,
     default_brain: Option<BrainPreset>,
+    // An imported multi-family owner has no recorded founder distribution.
+    // Keep its registry roster for continuation; only an explicit new-world
+    // preset can replace it with a fresh founder recipe.
+    continuation_brains: Vec<BrainPreset>,
     permalink: Option<Permalink>,
     launch: Option<launch::BrowserLaunch>,
     preserve_population_config: bool,
@@ -686,6 +692,7 @@ impl SimSpec {
             snapshot_format,
             seed_strategy,
             default_brain,
+            continuation_brains: Vec::new(),
             permalink: None,
             launch: None,
             preserve_population_config: false,
@@ -701,6 +708,7 @@ impl SimSpec {
             snapshot_format: SnapshotFormat::Json,
             seed_strategy: SeedStrategy::None,
             default_brain: None,
+            continuation_brains: Vec::new(),
             permalink: Some(permalink),
             launch: None,
             preserve_population_config: true,
@@ -772,17 +780,30 @@ impl Simulation {
         );
         let checkpoint = scriptbots_runtime::VolatileHostCheckpointV1::decode(bytes)?;
         let science = checkpoint.host_checkpoint().world_checkpoint();
+        launch::validate_config(science.config(), science.agent_count())
+            .map_err(anyhow::Error::msg)
+            .context("checkpoint exceeds browser world limits")?;
         let required = science.required_brain_registry();
+        ensure!(
+            required.entries.len() <= BrainPreset::ALL.len()
+                && required.next_key == u64::try_from(required.entries.len())?,
+            "checkpoint requires a brain registry layout unavailable in this browser"
+        );
         let mut registry = scriptbots_core::BrainRegistry::new();
-        let default_brain = match required.entries.as_slice() {
-            [] => None,
-            [entry] => {
-                let preset = BrainPreset::from_kind(&entry.kind)
-                    .context("checkpoint requires a brain registry unavailable in this browser")?;
-                preset.register(&mut registry)?;
-                Some(preset)
-            }
-            _ => anyhow::bail!("checkpoint requires a brain registry unavailable in this browser"),
+        let mut presets = Vec::with_capacity(required.entries.len());
+        for entry in &required.entries {
+            let preset = BrainPreset::from_kind(&entry.kind)
+                .context("checkpoint requires a brain registry unavailable in this browser")?;
+            let key = preset.register(&mut registry)?;
+            ensure!(
+                key == entry.key,
+                "checkpoint requires a brain registry layout unavailable in this browser"
+            );
+            presets.push(preset);
+        }
+        let default_brain = match presets.as_slice() {
+            [preset] => Some(*preset),
+            _ => None,
         };
         // The existing owner codec validates complete evaluator/registry identity;
         // browser import must never substitute newly randomized brains.
@@ -797,6 +818,9 @@ impl Simulation {
         );
         // This is an observed world configuration, not fresh-demo options.
         spec.preserve_population_config = true;
+        if presets.len() > 1 {
+            spec.continuation_brains = presets;
+        }
         let persistence = world.bind_persistence(Box::new(scriptbots_core::NullPersistence))?;
         let core = HostCore::restore_volatile_host_checkpoint_v1(
             &checkpoint,
@@ -827,6 +851,10 @@ impl Simulation {
     }
 
     fn new(mut spec: SimSpec) -> Result<Self> {
+        ensure!(
+            spec.continuation_brains.is_empty(),
+            "this mixed-family continuation has no recorded founder recipe; choose a new-world brain preset before resetting"
+        );
         let mut config = spec.config();
         // Resolve entropy before constructing the world so both its scientific
         // configuration and launch recipe record the same actual root seed.
@@ -1087,12 +1115,14 @@ impl SimHandle {
         self.inner.borrow_mut().checkpoint().map_err(js_error)
     }
 
-    /// Brain preset used when starting a new world from this handle's configuration.
+    /// New-world brain preset, or `mixed` for a continuation without a founder recipe.
     #[must_use]
     #[wasm_bindgen(js_name = brainPreset)]
     pub fn brain_preset_js(&self) -> String {
         let simulation = self.inner.borrow();
-        if let Some(preset) = simulation.spec.default_brain {
+        if !simulation.spec.continuation_brains.is_empty() {
+            "mixed"
+        } else if let Some(preset) = simulation.spec.default_brain {
             preset.name()
         } else if simulation.spec.seed_strategy == SeedStrategy::Wander {
             "wander"
@@ -1100,6 +1130,22 @@ impl SimHandle {
             "none"
         }
         .to_owned()
+    }
+
+    /// Versioned brain families retained by this owner, in registry key order.
+    /// Empty or extinct families remain present; unbound and Wander owners have none.
+    #[wasm_bindgen(js_name = brainFamilies)]
+    pub fn brain_families_js(&self) -> Result<JsValue, JsValue> {
+        let simulation = self.inner.borrow();
+        simulation
+            .spec
+            .default_brain
+            .iter()
+            .chain(simulation.spec.continuation_brains.iter())
+            .map(|preset| preset.name())
+            .collect::<Vec<_>>()
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
     }
 
     /// Read at most 64 canonical narrative records after an exact session-bound
@@ -1342,6 +1388,7 @@ impl SimHandle {
         }
         spec.permalink = None;
         spec.launch = None;
+        spec.continuation_brains.clear();
         // Construct before replacing the owner so adapter/configuration failures
         // cannot change the active world's reset recipe or evaluator family.
         *simulation = Simulation::new(spec).map_err(js_error)?;
@@ -2276,6 +2323,294 @@ mod tests {
                 original.core.scientific_digest_v1().unwrap(),
                 restored.core.scientific_digest_v1().unwrap()
             );
+        }
+    }
+
+    fn owner_for_checkpoint_test(world: WorldState, spec: SimSpec) -> Simulation {
+        let mut core = HostCore::new(
+            fresh_browser_session().unwrap(),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: false,
+                    speed_multiplier: 1.0,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        let controls = NullFrontend::new(core.local_port(), 1);
+        Simulation {
+            core,
+            controls,
+            spec,
+            now_nanos: 0,
+            environment_cache: RemoteEnvironmentCache::default(),
+            environment_js: None,
+        }
+    }
+
+    fn mixed_checkpoint_world(
+        presets: &[BrainPreset],
+        founders_per_family: usize,
+        dying: bool,
+    ) -> Simulation {
+        let mut spec = checkpoint_world(None, SeedStrategy::None).spec;
+        spec.initial_population = presets.len() * founders_per_family;
+        spec.base_config.food_intake_rate = 0.0;
+        spec.base_config.food_sharing_rate = 0.0;
+        spec.base_config.food_transfer_rate = 0.0;
+        spec.base_config.metabolism_drain = 0.0;
+        spec.base_config.movement_drain = 0.0;
+        spec.base_config.spike_damage = 0.0;
+        spec.base_config.spike_energy_cost = 0.0;
+        spec.base_config.temperature_discomfort_rate = 0.0;
+        spec.base_config.aging_health_decay_rate = 0.0;
+        spec.launch = None;
+        spec.continuation_brains = presets.to_vec();
+        let mut world = WorldState::new(spec.config()).unwrap();
+        for &preset in presets {
+            seed_agents(
+                &mut world,
+                founders_per_family,
+                SeedStrategy::None,
+                Some(preset),
+                &mut None,
+            )
+            .unwrap();
+        }
+        if dying {
+            let ids = world.agents().iter_handles().collect::<Vec<_>>();
+            for id in ids {
+                assert!(
+                    world
+                        .try_update_agent(id, |agent, runtime| {
+                            agent.health = 0.0;
+                            runtime.energy = 0.0;
+                        })
+                        .unwrap()
+                );
+            }
+        }
+        owner_for_checkpoint_test(world, spec)
+    }
+
+    fn assert_same_mixed_science(original: &Simulation, restored: &Simulation) {
+        assert_eq!(
+            original.core.scientific_digest_v1().unwrap(),
+            restored.core.scientific_digest_v1().unwrap()
+        );
+        let original = original.core.world();
+        let restored = restored.core.world();
+        assert_eq!(original.agent_count(), restored.agent_count());
+        for id in original.agents().iter_handles() {
+            let uid = original.agent_uid(id).unwrap();
+            let restored_id = restored
+                .agents()
+                .iter_handles()
+                .find(|candidate| restored.agent_uid(*candidate) == Some(uid))
+                .unwrap();
+            assert_eq!(
+                original.agent_runtime(id).unwrap().brain.registry_key(),
+                restored
+                    .agent_runtime(restored_id)
+                    .unwrap()
+                    .brain
+                    .registry_key()
+            );
+            assert_eq!(
+                original.agent_brain_genome(id).unwrap().payload(),
+                restored.agent_brain_genome(restored_id).unwrap().payload()
+            );
+            assert_eq!(
+                original
+                    .agent_brain_evaluator_state(id)
+                    .unwrap()
+                    .unwrap()
+                    .payload(),
+                restored
+                    .agent_brain_evaluator_state(restored_id)
+                    .unwrap()
+                    .unwrap()
+                    .payload()
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_checkpoint_continues_every_family_and_reexports_exact_science() {
+        for presets in [
+            vec![BrainPreset::Assembly, BrainPreset::Mlp],
+            vec![BrainPreset::Dwraon, BrainPreset::Assembly, BrainPreset::Mlp],
+        ] {
+            let mut original = mixed_checkpoint_world(&presets, 2, false);
+            original.tick(5).unwrap();
+            assert_eq!(original.core.world().agent_count(), presets.len() * 2);
+            let bytes = original.checkpoint().unwrap();
+            let decoded = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes).unwrap();
+            let required = decoded
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry();
+            let mut restored = Simulation::from_checkpoint(&bytes).unwrap();
+            assert_eq!(restored.spec.continuation_brains, presets);
+            assert_eq!(restored.spec.default_brain, None);
+            assert!(restored.spec.launch.is_none());
+            assert_same_mixed_science(&original, &restored);
+            for steps in [1, 3, 2] {
+                original.tick(steps).unwrap();
+                restored.tick(steps).unwrap();
+                assert_same_mixed_science(&original, &restored);
+                let continued = restored.checkpoint().unwrap();
+                let decoded =
+                    scriptbots_runtime::VolatileHostCheckpointV1::decode(&continued).unwrap();
+                assert_eq!(
+                    decoded
+                        .host_checkpoint()
+                        .world_checkpoint()
+                        .required_brain_registry(),
+                    required
+                );
+                restored = Simulation::from_checkpoint(&continued).unwrap();
+                assert_eq!(restored.spec.continuation_brains, presets);
+                assert_same_mixed_science(&original, &restored);
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_checkpoint_retains_empty_and_extinct_families() {
+        let presets = [BrainPreset::Assembly, BrainPreset::Mlp, BrainPreset::Dwraon];
+        for (founders, dying) in [(0, false), (2, true)] {
+            let mut original = mixed_checkpoint_world(&presets, founders, dying);
+            if dying {
+                original.tick(1).unwrap();
+            }
+            assert_eq!(original.core.world().agent_count(), 0);
+            let mut restored =
+                Simulation::from_checkpoint(&original.checkpoint().unwrap()).unwrap();
+            assert_eq!(restored.spec.continuation_brains, presets);
+            assert_same_mixed_science(&original, &restored);
+            original.tick(3).unwrap();
+            restored.tick(3).unwrap();
+            assert_same_mixed_science(&original, &restored);
+            let bytes = restored.checkpoint().unwrap();
+            let decoded = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes).unwrap();
+            assert_eq!(
+                decoded
+                    .host_checkpoint()
+                    .world_checkpoint()
+                    .required_brain_registry()
+                    .entries
+                    .len(),
+                presets.len()
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_checkpoint_requires_an_explicit_new_world_before_reset() {
+        let mut original =
+            mixed_checkpoint_world(&[BrainPreset::Dwraon, BrainPreset::Mlp], 2, false);
+        original.tick(3).unwrap();
+        let restored = Simulation::from_checkpoint(&original.checkpoint().unwrap()).unwrap();
+        let handle = SimHandle {
+            inner: Rc::new(RefCell::new(restored)),
+        };
+        assert_eq!(handle.brain_preset_js(), "mixed");
+        assert!(!handle.launch_info().shareable);
+        assert!(handle.permalink_string().is_err());
+        assert!(
+            handle
+                .fork_patch(&[("food_growth_rate".to_owned(), 0.1)])
+                .is_err()
+        );
+        let before = handle.inner.borrow_mut().checkpoint().unwrap();
+        for seed in [None, Some(41)] {
+            let error = handle.inner.borrow_mut().reset(seed).unwrap_err();
+            assert!(format!("{error:#}").contains("choose a new-world brain preset"));
+            assert_eq!(handle.inner.borrow_mut().checkpoint().unwrap(), before);
+        }
+        assert!(handle.register_brain_js("unknown").is_err());
+        assert_eq!(handle.inner.borrow_mut().checkpoint().unwrap(), before);
+        handle.register_brain_js("assembly").unwrap();
+        assert_eq!(handle.brain_preset_js(), "assembly");
+        assert!(handle.launch_info().shareable);
+        assert!(handle.permalink_string().is_ok());
+        let simulation = handle.inner.borrow();
+        assert!(simulation.spec.continuation_brains.is_empty());
+        assert_eq!(simulation.core.world_tick().0, 0);
+        assert_eq!(simulation.core.world().agent_count(), 4);
+        for id in simulation.core.world().agents().iter_handles() {
+            assert_eq!(
+                simulation.core.world().agent_runtime(id).unwrap().brain.kind(),
+                Some(BrainPreset::Assembly.kind())
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_checkpoint_refuses_unknown_aliases_and_registry_gaps() {
+        for defect in ["unknown", "wrong_adapter", "duplicate_label", "retired_key"] {
+            let spec = checkpoint_world(None, SeedStrategy::None).spec;
+            let mut world = WorldState::new(spec.config()).unwrap();
+            if defect == "retired_key" {
+                let key = BrainPreset::Assembly
+                    .register(world.brain_registry_mut().unwrap())
+                    .unwrap();
+                assert!(world.brain_registry_mut().unwrap().unregister(key));
+            }
+            seed_agents(
+                &mut world,
+                2,
+                SeedStrategy::None,
+                Some(BrainPreset::Mlp),
+                &mut None,
+            )
+            .unwrap();
+            let registry = world.brain_registry_mut().unwrap();
+            match defect {
+                "unknown" => {
+                    registry
+                        .register_family(
+                            "not-compiled-for-browser",
+                            Box::new(DwraonFamilyAdapter::default()),
+                        )
+                        .unwrap();
+                }
+                "wrong_adapter" => {
+                    registry
+                        .register_family(
+                            BrainPreset::Dwraon.kind(),
+                            Box::new(AssemblyFamilyAdapter::new().unwrap()),
+                        )
+                        .unwrap();
+                }
+                "duplicate_label" => {
+                    registry
+                        .register_family(
+                            BrainPreset::Mlp.kind(),
+                            Box::new(DwraonFamilyAdapter::default()),
+                        )
+                        .unwrap();
+                }
+                "retired_key" => {
+                    BrainPreset::Dwraon.register(registry).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let mut source = owner_for_checkpoint_test(world, spec);
+            source.tick(1).unwrap();
+            let before = source.core.scientific_digest_v1().unwrap();
+            let bytes = source.checkpoint().unwrap();
+            assert!(Simulation::from_checkpoint(&bytes).is_err(), "{defect}");
+            assert_eq!(source.core.scientific_digest_v1().unwrap(), before);
+            assert_eq!(source.checkpoint().unwrap(), bytes);
         }
     }
 

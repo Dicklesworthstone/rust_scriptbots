@@ -1,5 +1,23 @@
 // Browser launch recipes describe initial conditions. Saved-owner continuations
 // and legacy gallery references carry different, explicitly bounded metadata.
+export function validateContinuationBrains(preset, families = null) {
+  const supported = ["mlp", "dwraon", "assembly"];
+  // Older single-family packages did not expose the roster. Mixed continuations
+  // always require its complete observation; a label alone cannot admit them.
+  if (families === null && preset !== "mixed") {
+    families = supported.includes(preset) ? [preset] : [];
+  }
+  if (!Array.isArray(families) || families.length > supported.length
+      || families.some((family) => !supported.includes(family))
+      || new Set(families).size !== families.length
+      || (preset === "mixed" ? families.length < 2
+        : preset === "none" ? families.length !== 0
+          : !supported.includes(preset) || families.length !== 1 || families[0] !== preset)) {
+    throw new Error("Saved continuation has an unsupported or inconsistent brain-family roster");
+  }
+  return [...families];
+}
+
 export function validateLaunchInfo(info) {
   const kinds = { browser_launch: "initial_conditions_restart", gallery_reference: "gallery_configuration_restart",
     checkpoint_continuation: "saved_owner_continuation" };

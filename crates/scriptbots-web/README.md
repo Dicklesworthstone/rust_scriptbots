@@ -91,24 +91,37 @@ The crate exposes the following wasm-bindgen surface:
 - `SimHandle::reset(seed?: number)` — rebuilds the world. An explicit seed
   overrides the nested config for that reset; omitting it falls back to the
   original `config.rng_seed` (or entropy when the nested seed is also absent).
+  An imported mixed-family continuation has no recorded founder distribution,
+  so reset refuses until `registerBrain` explicitly chooses a new-world preset.
 - `SimHandle::registerBrain(kind: string)` — rebuilds the world with `"mlp"`,
   `"dwraon"`, `"assembly"`, `"wander"`, or `"none"`. Unknown or invalid presets
   leave the active owner intact.
 - `SimHandle::checkpoint() -> Uint8Array` — settles the current volatile journal
   boundary and exports the existing full owner checkpoint: science, evaluators,
   command history and cadence credit. It does not advance elapsed time. Legacy
-  wander evaluators are refused; MLP, DWRAON, Assembly and unbound worlds are
-  supported, including empty populations.
+  wander evaluators are refused; MLP, DWRAON, Assembly, mixtures of these three
+  families, and unbound worlds are supported, including empty populations.
+  Registered families remain part of the saved state after their last agent dies.
 - `restore_checkpoint(bytes: Uint8Array) -> SimHandle` — validates and restores a
   new owner, with a new command namespace and rebased elapsed clock. Failed
   imports preserve existing handles. Future science matches the saved state;
-  offline wall time adds no ticks. Reset starts a new world using the loaded
-  configuration, checkpoint population and saved brain family. Restoration uses
-  that family's exact registry and evaluator identity; unknown or mismatched
-  families are refused instead of being substituted.
+  offline wall time adds no ticks. Restoration retains every registered family
+  in its exact key order and restores its exact registry and evaluator identity.
+  Unsupported families, mismatched adapters, noncanonical registry key layouts,
+  and worlds outside browser resource limits are refused before owner replacement.
+  A single-family reset uses the loaded configuration, checkpoint population and
+  saved brain family. A mixed continuation requires an explicit new-world preset
+  before reset because the checkpoint does not record its founder distribution.
+  The demo displays the retained roster and keeps Reset disabled until a new
+  preset is selected. Selecting a preset leaves the live continuation intact;
+  pressing Reset then creates the requested fresh world.
 - `checkpoint_byte_limit() -> number` — the canonical owner codec's file bound,
   also checked before the demo reads a selected file.
-- `SimHandle::brainPreset() -> string` — the new-world brain preset for this handle.
+- `SimHandle::brainPreset() -> string` — the new-world brain preset for this handle,
+  or `"mixed"` for an imported mixed-family continuation without a founder recipe.
+- `SimHandle::brainFamilies() -> string[]` — the versioned family roster in registry
+  key order, including empty or extinct families. Unbound and Wander owners
+  return an empty array.
 - `SimHandle::launchInfo() -> JsValue` — describes the retained initial-world
   recipe, its exact decimal-string seed, founder count and brain preset. A loaded
   continuation has no original launch recipe and reports `shareable: false`.
