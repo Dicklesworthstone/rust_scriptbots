@@ -2,6 +2,51 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Mixed-family browser worlds and bounded journal writes (2026-11-16):**
+[Source committed and independently reviewed — Codex; scoped JavaScript checks
+passed; original acceptance remains open under `bd-ywtv` and `bd-50bg`]
+
+Three functional increments are published on main:
+
+- `eac2c9c` batches canonical domain-event projection inserts within the existing
+  1,024-binding budget (102 ten-field events per statement). Checked identities,
+  exact payload bytes, empty-boundary metadata, returned-row checks and transaction
+  rollback remain intact. No schema, database pin or foreign-key policy changed.
+- `4433f24` restores compatible volatile browser checkpoints with any supported
+  combination of MLP, DWRAON and Assembly families. Registry order, complete
+  adapter/genome/evaluator identity and empty or extinct families are retained.
+  Browser resource limits apply before executable restoration. Imported mixed
+  continuations require an explicit fresh-world choice before reset.
+- `9486777` creates opt-in mixed founder worlds in repeating MLP, DWRAON, Assembly
+  order, including zero-founder registries. A version 2 founder recipe preserves
+  this choice through sharing, forks and reset; existing version 1 bytes and
+  default seeding are preserved. Browser controls distinguish a fresh mixed
+  recipe from a saved continuation and refuse stale or incomplete packages before
+  replacing the active owner. Links retain their recorded seed; demo Reset
+  creates a new seed.
+
+Authored regressions cover real reproduction, checkpoint science and evaluator
+parity, recipe compatibility, browser replacement/refusal, canonical multi-chunk
+event readback, late conversion/SQL failures and original-archive retry.
+Independent source review corrected test diagnostics before publication.
+
+DSR on unchanged source `9486777` passed all **10 JavaScript recipe unit tests**.
+The formatter returned zero but printed eight diffs in the unchanged terminal
+`frankentui_shell.rs`; no web/storage diffs were emitted and no clean workspace
+format claim is made. Chromium was refused socket creation before any DOM
+assertion ran. The native `browser_mixed` probe hit its configured 300-second
+deadline after logging dependency acquisition; no Rust test pass was observed.
+Workspace checking, Clippy, storage Rust regressions, WASM execution and throughput
+qualification remain unpassed.
+
+[The validation record](docs/validation/2026-11-16-mixed-families/README.md)
+retains raw receipts, configurations and logs for the current checks and the two
+earlier failed attempts. Source inventories remained unchanged during the current
+checks. Progress comments were exported through `br`; original bead criteria,
+ownership and in-progress status remain unchanged. No browser durable-watermark,
+cross-target equivalence, measured speedup or broad bead closure is claimed.
+
+
 **Shared first-run Lab guide in terminal and GPUI (2026-11-15):**
 [Source implemented and independently reviewed — executable qualification remains open under `bd-2z0.10.4`]
 

@@ -1,0 +1,6 @@
+tools:
+  rust_scriptbots_candidate_dom:
+    repo: Dicklesworthstone/rust_scriptbots
+    local_path: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate
+    required_checks:
+      - SCRIPTBOTS_CHROMIUM_EXECUTABLE=/usr/lib/chromium/chromium node --test crates/scriptbots-web/web/tests/permalink_fork_dom.test.js

@@ -1,0 +1,71 @@
+# dsr quality check
+# argv: SCRIPTBOTS_CHROMIUM_EXECUTABLE=/usr/lib/chromium/chromium node --test crates/scriptbots-web/web/tests/permalink_fork_dom.test.js
+# cwd: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate
+# env: PATH=/workspace/scratch/59c449fc313c/tooling/bin:/workspace/scratch/59c449fc313c/tooling/cargo/bin:/home/agent/.codex/tmp/arg0-linux/codex-arg0wyO7Ne:/opt/codex/codex-path:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback
+# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs/rust_scriptbots_candidate_dom/20261115T212100-ZPmnVZN1
+# env: DSR_QUALITY_TIMEOUT=180
+# env: DSR_REPOS_FILE=/workspace/scratch/59c449fc313c/tooling/dsr-quality/repos-dom.yaml
+# env: DSR_CURRENT_CMD=quality
+# env: DSR_CURRENT_HOST=
+# env: DSR_RUN_ID=run-1794795654-2
+# env: CARGO_HOME=/workspace/scratch/59c449fc313c/tooling/cargo
+# env: RUSTUP_TOOLCHAIN=nightly-2026-08-31-x86_64-unknown-linux-gnu
+# env: RUSTUP_HOME=/workspace/scratch/59c449fc313c/tooling/rustup
+# env: DSR_CURRENT_TOOL=
+# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs
+# env: DSR_RUST_NATIVE_ENV_NAMES
+# started_monotonic_ms: 4758766
+# timeout_seconds: 180
+# ----
+FATAL: Test run failed: browserType.launch: Target page, context or browser has been closed
+Browser logs:
+
+<launching> /usr/lib/chromium/chromium --disable-field-trial-config --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-back-forward-cache --disable-breakpad --disable-client-side-phishing-detection --disable-component-extensions-with-background-pages --disable-component-update --no-default-browser-check --disable-default-apps --disable-dev-shm-usage --disable-edgeupdater --disable-extensions --disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,BoundaryEventDispatchTracksNodeRemoval,DestroyProfileOnBrowserClose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints,msForceBrowserSignIn,msEdgeUpdateLaunchServicesPreferredVersion --enable-features=CDPScreenshotNewSurface --allow-pre-commit-input --disable-hang-monitor --disable-ipc-flooding-protection --disable-popup-blocking --disable-prompt-on-repost --disable-renderer-backgrounding --disable-updater-scheduler --force-color-profile=srgb --metrics-recording-only --no-first-run --password-store=basic --use-mock-keychain --no-service-autorun --export-tagged-pdf --disable-search-engine-choice-screen --unsafely-disable-devtools-self-xss-warnings --edge-skip-compat-layer-relaunch --disable-infobars --disable-search-engine-choice-screen --disable-sync --enable-unsafe-swiftshader --headless --hide-scrollbars --mute-audio --blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4 --no-sandbox --user-data-dir=/tmp/playwright_chromiumdev_profile-xaIgOp --remote-debugging-pipe --no-startup-window
+<launched> pid=1540
+[pid=1540][err] [1540:1540:1115/212314.411137:FATAL:chrome/browser/process_singleton_posix.cc:297] Check failed: . socket() failed: Operation not permitted (1)
+[pid=1540][err] [1115/212314.421610:ERROR:third_party/crashpad/crashpad/util/linux/scoped_ptrace_attach.cc:27] ptrace: Operation not permitted (1)
+Call log:
+[2m  - <launching> /usr/lib/chromium/chromium --disable-field-trial-config --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-back-forward-cache --disable-breakpad --disable-client-side-phishing-detection --disable-component-extensions-with-background-pages --disable-component-update --no-default-browser-check --disable-default-apps --disable-dev-shm-usage --disable-edgeupdater --disable-extensions --disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,BoundaryEventDispatchTracksNodeRemoval,DestroyProfileOnBrowserClose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints,msForceBrowserSignIn,msEdgeUpdateLaunchServicesPreferredVersion --enable-features=CDPScreenshotNewSurface --allow-pre-commit-input --disable-hang-monitor --disable-ipc-flooding-protection --disable-popup-blocking --disable-prompt-on-repost --disable-renderer-backgrounding --disable-updater-scheduler --force-color-profile=srgb --metrics-recording-only --no-first-run --password-store=basic --use-mock-keychain --no-service-autorun --export-tagged-pdf --disable-search-engine-choice-screen --unsafely-disable-devtools-self-xss-warnings --edge-skip-compat-layer-relaunch --disable-infobars --disable-search-engine-choice-screen --disable-sync --enable-unsafe-swiftshader --headless --hide-scrollbars --mute-audio --blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4 --no-sandbox --user-data-dir=/tmp/playwright_chromiumdev_profile-xaIgOp --remote-debugging-pipe --no-startup-window[22m
+[2m  - <launched> pid=1540[22m
+[2m  - [pid=1540][err] [1540:1540:1115/212314.411137:FATAL:chrome/browser/process_singleton_posix.cc:297] Check failed: . socket() failed: Operation not permitted (1)[22m
+[2m  - [pid=1540][err] [1115/212314.421610:ERROR:third_party/crashpad/crashpad/util/linux/scoped_ptrace_attach.cc:27] ptrace: Operation not permitted (1)[22m
+[2m  - [pid=1540] <gracefully close start>[22m
+[2m  - [pid=1540] <kill>[22m
+[2m  - [pid=1540] <will force kill>[22m
+[2m  - [pid=1540] <process did exit: exitCode=null, signal=SIGABRT>[22m
+[2m  - [pid=1540] starting temporary directories cleanup[22m
+[2m  - [pid=1540] finished temporary directories cleanup[22m
+[2m  - [pid=1540] <gracefully close end>[22m
+
+    at runTests (/workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate/crates/scriptbots-web/web/tests/permalink_fork_dom.test.js:1078:34) {
+  log: [
+    '  - <launching> /usr/lib/chromium/chromium --disable-field-trial-config --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-back-forward-cache --disable-breakpad --disable-client-side-phishing-detection --disable-component-extensions-with-background-pages --disable-component-update --no-default-browser-check --disable-default-apps --disable-dev-shm-usage --disable-edgeupdater --disable-extensions --disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,BoundaryEventDispatchTracksNodeRemoval,DestroyProfileOnBrowserClose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints,msForceBrowserSignIn,msEdgeUpdateLaunchServicesPreferredVersion --enable-features=CDPScreenshotNewSurface --allow-pre-commit-input --disable-hang-monitor --disable-ipc-flooding-protection --disable-popup-blocking --disable-prompt-on-repost --disable-renderer-backgrounding --disable-updater-scheduler --force-color-profile=srgb --metrics-recording-only --no-first-run --password-store=basic --use-mock-keychain --no-service-autorun --export-tagged-pdf --disable-search-engine-choice-screen --unsafely-disable-devtools-self-xss-warnings --edge-skip-compat-layer-relaunch --disable-infobars --disable-search-engine-choice-screen --disable-sync --enable-unsafe-swiftshader --headless --hide-scrollbars --mute-audio --blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4 --no-sandbox --user-data-dir=/tmp/playwright_chromiumdev_profile-xaIgOp --remote-debugging-pipe --no-startup-window',
+    '  - <launched> pid=1540',
+    '  - [pid=1540][err] [1540:1540:1115/212314.411137:FATAL:chrome/browser/process_singleton_posix.cc:297] Check failed: . socket() failed: Operation not permitted (1)',
+    '  - [pid=1540][err] [1115/212314.421610:ERROR:third_party/crashpad/crashpad/util/linux/scoped_ptrace_attach.cc:27] ptrace: Operation not permitted (1)',
+    '  - [pid=1540] <gracefully close start>',
+    '  - [pid=1540] <kill>',
+    '  - [pid=1540] <will force kill>',
+    '  - [pid=1540] <process did exit: exitCode=null, signal=SIGABRT>',
+    '  - [pid=1540] starting temporary directories cleanup',
+    '  - [pid=1540] finished temporary directories cleanup',
+    '  - [pid=1540] <gracefully close end>'
+  ]
+}
+✖ crates/scriptbots-web/web/tests/permalink_fork_dom.test.js (3359.306312ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 3711.466519
+
+✖ failing tests:
+
+test at crates/scriptbots-web/web/tests/permalink_fork_dom.test.js:1:1
+✖ crates/scriptbots-web/web/tests/permalink_fork_dom.test.js (3359.306312ms)
+  'test failed'
+
+# exit_code: 1

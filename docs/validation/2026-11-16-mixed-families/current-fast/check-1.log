@@ -1,0 +1,39 @@
+# dsr quality check
+# argv: node --test crates/scriptbots-web/web/tests/recipes.test.mjs
+# cwd: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate
+# env: PATH=/workspace/scratch/59c449fc313c/tooling/bin:/workspace/scratch/59c449fc313c/tooling/cargo/bin:/home/agent/.codex/tmp/arg0-linux/codex-arg0wyO7Ne:/opt/codex/codex-path:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback
+# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs/rust_scriptbots_candidate_fast/20261115T211913-3G8NPIpq
+# env: DSR_QUALITY_TIMEOUT=180
+# env: DSR_REPOS_FILE=/workspace/scratch/59c449fc313c/tooling/dsr-quality/repos-candidate.yaml
+# env: DSR_CURRENT_CMD=quality
+# env: DSR_CURRENT_HOST=
+# env: DSR_RUN_ID=run-1794795551-2
+# env: CARGO_HOME=/workspace/scratch/59c449fc313c/tooling/cargo
+# env: RUSTUP_TOOLCHAIN=nightly-2026-08-31-x86_64-unknown-linux-gnu
+# env: RUSTUP_HOME=/workspace/scratch/59c449fc313c/tooling/rustup
+# env: DSR_CURRENT_TOOL=
+# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs
+# env: DSR_RUST_NATIVE_ENV_NAMES
+# started_monotonic_ms: 4636510
+# timeout_seconds: 180
+# ----
+✔ saved mixed worlds require every supported family in the observed registry order (5.87328ms)
+✔ mixed continuation admission refuses missing, foreign, duplicate or substituted families (1.784454ms)
+✔ browser recipes preserve exact full-width seeds and registered empty-world families (1.038367ms)
+✔ mixed founders require their explicit version two recipe (0.470303ms)
+✔ malformed metadata cannot round seeds or claim a different continuation contract (0.763474ms)
+✔ gallery references and saved owners retain their narrower recorded evidence (0.864257ms)
+✔ a usable owner with an oversized recipe keeps its known launch metadata (0.286021ms)
+✔ matching recorded inputs are displayed without promoting them to binary identity (0.867482ms)
+✔ unavailable identity clears earlier mismatch state and remains informational (0.595096ms)
+✔ legacy gallery references stay labelled and unknown status cannot leave a stale comparison (0.862561ms)
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 564.266757
+
+# exit_code: 0
