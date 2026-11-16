@@ -258,6 +258,33 @@ late responses, while the same endpoint/session can retain an uncertain retry.
 Closing the panel does not cancel a running server study; use **Cancel study**
 and observe its final status.
 
+Select a checkpoint and choose **Review saved world** to draw its saved agents
+and environment on the main canvas. A persistent banner identifies its checkpoint,
+tick and world digest, with **Return to live** available even after closing the Lab
+panel. The native server continues independently, and its stream and event timeline
+stay connected. Return to live presents the latest received live frame without
+pausing, stepping, replacing or restoring the live owner. A refused reconstruction
+leaves the current view intact; there is no automatic reconstruction retry.
+
+The saved view is read-only: live playback, creature and brain/genome inspection,
+interventions, new experiment/study requests and checkpoint saves are unavailable.
+The checkpoint contains a scientific state, not its original presentation history.
+Restored publication and environment revisions are newly reconstructed, and saved
+births/deaths and tick rate are shown as unavailable. **Save Frame as PNG** works
+with either renderer and names the checkpoint, saved tick and world digest. Changing
+views invalidates renderer caches and pending exports, so a later callback cannot
+label live pixels as a saved-world image.
+
+The preview GET is bound to the negotiated host session in both its query and
+`X-ScriptBots-Session` header. The browser verifies returned checkpoint metadata,
+checksums, session, exact tick, population and complete environment before admitting
+the reconstructed frame. Its 12 MiB response and 8 MiB binary-frame bounds are
+separate from checkpoint-file downloads; its 35-second fetch deadline accommodates
+the server's 30-second reconstruction deadline. Returning to live, changing source,
+disconnecting or hiding the panel aborts an in-flight preview and rejects late
+results. An already displayed saved view may remain visible offline, clearly marked
+as disconnected; connecting to another host clears it.
+
 Checkpoint and artifact lists are paginated. Only files published for the
 selected completed study are offered in its file list; a partial directory
 does not establish completion. Downloads are bounded and verified against the

@@ -2,22 +2,40 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
-**Saved-world inspection and registry portability (2026-11-15):**
-[Currently In Progress — Codex; native registry restoration and browser saved-world review]
+**Saved-world inspection and registry portability (2026-11-16):**
+[Source implemented and independently reviewed — Codex; executable qualification remains open]
 
-Continue the existing replay and browser product loop by restoring the exact recorded
-compiled brain registry, then exposing the native read-only saved-canvas path through
-a bounded session-bound browser endpoint and explicit Review / Return to live controls.
-Saved science, synthetic presentation state and the current live owner remain distinct.
-Original checkpoint, native and browser acceptance remains with the owning Beads.
+The saved-world product loop now has a native-to-browser review path:
 
-The local execution workspace disconnected after DSR refused native build admission
-for insufficient disk capacity. Source candidates are being independently reviewed
-and committed through GitHub; no compiler, formatter, test or live-browser result is
-inferred from those reviews. Author regressions for registry subsets, full adapter
-identity, corrupt sources, admission limits and stale browser requests. Executable
-qualification remains required when an execution environment is available.
+- `75e54a3` reconstructs the recorded compiled brain registry in its saved order,
+  including supported subsets and extinct families. Complete protocol and constructor
+  identities remain required. Canvas and montage replay no longer guess from today's
+  preset roster; managed study provenance still requires a true matching founder preset.
+- `fb1c648` adds `GET /api/v1/checkpoints/{checkpoint_id}/canvas?session_id=...`.
+  It verifies the retained descriptor, exact payload bytes and both checksums, restores
+  the saved scientific cut and checks its digest. The live owner is neither stepped nor
+  replaced. One reconstruction slot, a 30-second response deadline, 16 MiB source and
+  8 MiB binary-frame bounds, bounded populations, grids and history capacities provide
+  explicit admission limits; these are not a total resident-memory guarantee.
+- The browser exposes **Review saved world** and **Return to live**, keeps the live
+  stream and event timeline separate, and disables live mutations and UID inspection
+  while displaying saved science. It checks the source session, saved identity and
+  frame boundary, rejects stale results and invalidates presentation caches on view
+  changes. Saved PNGs identify the checkpoint, tick and digest. Original per-tick
+  activity and live tick rate are unavailable for a reconstructed scientific cut.
 
+Authored regressions cover registry portability and deterministic continuation,
+unchanged-owner canvas/reel replay, cold and cached sources, corrupt/oversized artifacts,
+admission boundaries, session and capacity refusals, browser cancellation and unchanged
+stream cursors. A real native/browser journey exercises review, both PNG renderers,
+incoming live frames and return to live. These new tests have **not run**.
+
+DSR refused native build admission for insufficient disk capacity, then the execution
+workspace disconnected. Independent source review found and corrected test/lifecycle
+issues, but establishes no compiler, formatter, Clippy, Rust, JavaScript or live-browser
+pass. Qualification must use DSR when execution is available. Original checkpoint,
+replay and browser Beads retain their acceptance criteria and statuses; none is closed
+by this source-only increment.
 **Mixed-family browser worlds and bounded journal writes (2026-11-16):**
 [Source committed and independently reviewed — Codex; scoped JavaScript checks
 passed; original acceptance remains open under `bd-ywtv` and `bd-50bg`]

@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   CHECKPOINT_LAB_PAGE_SIZE, MAX_LAB_ARTIFACT_BYTES, CheckpointLabController,
   renderCheckpointLab, validateLabArtifact, validateLabArtifactPage, validateLabBranchObservation, validateLabBranchPage, validateLabBranchStatus,
-  validateLabCheckpoint, validateLabCheckpointPage, validateLabIntervention,
+  validateLabCheckpoint, validateLabCheckpointPage, validateLabIntervention, validateCheckpointCanvas,
 } from "../checkpoint-lab.js";
 import { RemoteOwnerHttpError, RemoteStreamClient } from "../remote.js";
 import { MAX_STUDY_REPORT_BYTES } from "../study-report.js";
@@ -20,6 +20,20 @@ function checkpoint(changes = {}) {
   return { checkpoint_id: "ckpt-saved-t100", tick: 100, agent_count: 12, byte_size: 1024,
     world_digest_v1: WORLD_DIGEST, checksum_blake3: "b".repeat(64), checksum_sha256: "c".repeat(64),
     schema: "scriptbots.world-checkpoint.v1.3", created_at_utc: "1794000000", ...changes };
+}
+
+function savedCanvas(source = checkpoint()) {
+  return { schema: "scriptbots.checkpoint-canvas.v1", sourceSessionId: SESSION, checkpoint: source,
+    frame: { schema: "scriptbots.browser-frame.v1",
+      identity: { sessionId: SESSION, tick: String(source.tick), publicationRevision: "1",
+        scientificRevision: "0", controlRevision: "0", configRevision: "0" },
+      snapshot: { tick: source.tick, epoch: "0", world: { width: 100, height: 100 },
+        summary: { agentCount: source.agent_count, averageEnergy: 1, averageHealth: 1, births: 0, deaths: 0 },
+        agents: Array.from({ length: source.agent_count }, (_, index) => ({ uid: String(index + 1) })) },
+      environment: { width: 1, height: 1, sourceWidth: 1, sourceHeight: 1, cellSize: 100,
+        terrainRevision: "1", foodRevision: "1", hydrologyRevision: "0", foodMax: 1, hydrologyEnabled: false,
+        cells: [{ terrain: "Grass", elevation: 0, food: 1, waterDepth: 0 }] },
+      playback: { paused: true, speedMultiplier: 1 } } };
 }
 
 function page(items = [checkpoint()], changes = {}) {
@@ -66,7 +80,7 @@ function artifactPage(items = [artifact()], changes = {}) {
 
 async function harness({ listStudies, parseReport } = {}) {
   let time = 0, nextId = 0;
-  const queues = Object.fromEntries(["save", "launch", "status", "cancel", "artifacts", "download"].map((kind) => [kind, []]));
+  const queues = Object.fromEntries(["save", "review", "launch", "status", "cancel", "artifacts", "download"].map((kind) => [kind, []]));
   const services = Object.fromEntries(Object.keys(queues).map((kind) => [kind, (request, signal) => new Promise((resolve, reject) => {
     queues[kind].push({ request, signal, resolve, reject });
   })]));
@@ -88,6 +102,91 @@ async function launch(h, intervention = null) {
   await promise;
   return h.controller.branch;
 }
+
+test("saved canvas binds the exact host, metadata and reconstructed scientific cut", () => {
+  const request = { sessionId: SESSION, checkpoint: checkpoint() };
+  assert.equal(validateCheckpointCanvas(savedCanvas(), request).frame.identity.sessionId, SESSION);
+  for (const change of [
+    (value) => { value.sourceSessionId = "7"; },
+    (value) => { value.frame.identity.sessionId = Number(SESSION); },
+    (value) => { value.frame.identity.tick = "101"; },
+    (value) => { value.frame.snapshot.tick = 101; },
+    (value) => { value.frame.snapshot.summary.agentCount = 11; },
+    (value) => { value.frame.snapshot.agents.pop(); },
+    (value) => { value.frame.playback.paused = false; },
+    (value) => { value.frame.playback.speedMultiplier = 2; },
+    (value) => { value.frame.environment = null; },
+    (value) => { value.checkpoint.checksum_sha256 = "d".repeat(64); },
+    (value) => { value.checkpoint.checksum_blake3 = "d".repeat(64); },
+    (value) => { value.checkpoint.world_digest_v1 = "d".repeat(16); },
+  ]) {
+    const value = savedCanvas();
+    change(value);
+    assert.throws(() => validateCheckpointCanvas(value, request));
+  }
+});
+
+test("explicit saved-world review is immutable and read-only until return to live", async () => {
+  const h = await harness();
+  const pending = h.controller.reviewSelected();
+  assert.equal(h.controller.canvasPreview, null, "live presentation remains until reconstruction succeeds");
+  assert.equal(await h.controller.reviewSelected(), null, "one request owns the slot");
+  assert.deepEqual(h.queues.review[0].request, { sessionId: SESSION, checkpoint: checkpoint() });
+  h.queues.review[0].resolve(savedCanvas());
+  const preview = await pending;
+  assert.equal(h.controller.canvasPreview, preview);
+  assert.equal(Object.isFrozen(preview.frame.snapshot.agents), true);
+  assert.equal(h.controller.canSave, false);
+  assert.equal(h.controller.canLaunch, false);
+  assert.equal(await h.controller.save(), null);
+  assert.equal(await h.controller.launch({ branchName: "blocked", ticks: 120 }), null);
+  assert.equal(h.queues.save.length, 0);
+  assert.equal(h.queues.launch.length, 0);
+  const { panel, nodes } = labPanel();
+  renderCheckpointLab(panel, h.controller);
+  assert.equal(nodes.get("#lab-checkpoint-save").disabled, true);
+  assert.equal(nodes.get("#lab-checkpoint-review").disabled, false);
+  assert.equal(nodes.get("#lab-branch-launch").disabled, true);
+  h.controller.returnToLive();
+  assert.equal(h.controller.canvasPreview, null);
+  assert.equal(h.controller.canSave, true);
+  assert.equal(h.controller.canLaunch, true);
+  assert.equal(h.queues.review.length, 1);
+});
+
+test("return to live and source changes reject late reconstruction without freeing its slot early", async () => {
+  for (const cancel of [
+    (controller) => controller.returnToLive(),
+    (controller) => controller.observe(frame("7"), SOURCE),
+    (controller) => controller.setEnabled(false),
+  ]) {
+    const h = await harness();
+    const pending = h.controller.reviewSelected();
+    cancel(h.controller);
+    assert.equal(h.queues.review[0].signal.aborted, true);
+    assert.equal(h.controller.busy, true);
+    assert.equal(await h.controller.reviewSelected(), null);
+    h.queues.review[0].resolve(savedCanvas());
+    assert.equal(await pending, null);
+    assert.equal(h.controller.canvasPreview, null);
+    assert.equal(h.controller.busy, false);
+  }
+});
+
+test("a failed review retains the prior saved canvas and changing selection returns to live", async () => {
+  const h = await harness();
+  const pending = h.controller.reviewSelected();
+  h.queues.review[0].resolve(savedCanvas());
+  const prior = await pending;
+  const refused = h.controller.reviewSelected();
+  h.queues.review[1].reject(new Error("reconstruction busy"));
+  await refused;
+  assert.equal(h.controller.canvasPreview, prior);
+  assert.match(h.controller.notice, /reconstruction busy/);
+  h.controller.page = page([checkpoint(), checkpoint({ checkpoint_id: "ckpt-second" })]);
+  h.controller.select("ckpt-second");
+  assert.equal(h.controller.canvasPreview, null);
+});
 
 test("checkpoint selection requires exact metadata and complete bounded page cursors", () => {
   assert.equal(validateLabCheckpoint(checkpoint()).tick, 100);
@@ -713,6 +812,99 @@ test("Lab transport preserves reverse-proxy prefixes and exact server-checked se
     await assert.rejects(value.checkpointBranchStatus("../escape", { sessionId: SESSION }));
     await assert.rejects(value.launchCheckpointBranch({ ...branch, ticks: 10001 }));
     assert.equal(requests.length, count);
+  } finally { globalThis.fetch = previous; }
+});
+
+test("saved-world transport decodes an isolated bounded frame without moving live cursors", async () => {
+  const previous = globalThis.fetch, requests = [];
+  const preview = savedCanvas();
+  const wire = { schema: "scriptbots.remote-frame.v2", kind: "canvas", identity: preview.frame.identity,
+    payload: preview.frame.snapshot, environment: preview.frame.environment, playback: preview.frame.playback,
+    coalescedPublications: "0" };
+  const envelope = { schema: preview.schema, sourceSessionId: SESSION, checkpoint: preview.checkpoint, frameBase64: "U0JXUw==" };
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url), ...options });
+    return new Response(JSON.stringify(envelope));
+  };
+  try {
+    const value = client();
+    const live = { ...wire, identity: { ...wire.identity, tick: "120", publicationRevision: "100" },
+      payload: { ...wire.payload, tick: 120 } };
+    value.tracker.accept(live, () => true);
+    value.tracker.accept({ ...live, kind: "telemetry" }, () => true);
+    const cursor = structuredClone(value.resume);
+    const observed = [...value.tracker.observed];
+    let decodes = 0;
+    value.decodeFrame = (bytes) => { decodes += 1; assert.deepEqual([...bytes], [83, 66, 87, 83]); return wire; };
+    value.onFrame = () => { throw new Error("A saved frame must not enter the stream"); };
+    const result = await value.checkpointCanvas(checkpoint().checkpoint_id, { sessionId: SESSION, expected: checkpoint() });
+    assert.deepEqual(result, preview);
+    assert.equal(decodes, 1);
+    assert.deepEqual(value.resume, cursor);
+    assert.deepEqual([...value.tracker.observed], observed);
+    assert.equal(requests[0].method, "GET");
+    assert.equal(requests[0].url.pathname, "/nested/api/v1/checkpoints/ckpt-saved-t100/canvas");
+    assert.equal(requests[0].url.search, "?session_id=" + SESSION);
+    assert.equal(requests[0].headers["X-ScriptBots-Session"], SESSION);
+    assert.equal(requests[0].body, undefined);
+    assert.equal(requests[0].credentials, "omit");
+    assert.equal(requests[0].cache, "no-store");
+    await assert.rejects(value.checkpointCanvas("ckpt-different", { sessionId: SESSION, expected: checkpoint() }));
+    assert.equal(requests.length, 1);
+    envelope.checkpoint = checkpoint({ checksum_blake3: "d".repeat(64) });
+    await assert.rejects(value.checkpointCanvas(checkpoint().checkpoint_id, { sessionId: SESSION, expected: checkpoint() }), /selected checkpoint/);
+    assert.deepEqual(value.resume, cursor);
+  } finally { globalThis.fetch = previous; }
+});
+
+test("saved-world transport refuses malformed, oversized, incomplete and stale responses", async () => {
+  const previous = globalThis.fetch;
+  const preview = savedCanvas();
+  const wire = { schema: "scriptbots.remote-frame.v2", kind: "canvas", identity: preview.frame.identity,
+    payload: preview.frame.snapshot, environment: preview.frame.environment, playback: preview.frame.playback,
+    coalescedPublications: "0" };
+  let envelope = { schema: preview.schema, sourceSessionId: SESSION, checkpoint: preview.checkpoint, frameBase64: "U0JXUw==" };
+  globalThis.fetch = async () => new Response(JSON.stringify(envelope));
+  try {
+    const value = client();
+    let decodes = 0;
+    value.decodeFrame = () => { decodes += 1; return wire; };
+    for (const encoded of ["", "U0JXUw", "U0JXUw==\n", "U0JXUx==", "A".repeat(Math.ceil(8 * 1024 * 1024 / 3) * 4 + 4)]) {
+      envelope.frameBase64 = encoded;
+      await assert.rejects(value.checkpointCanvas(checkpoint().checkpoint_id, { sessionId: SESSION, expected: checkpoint() }));
+    }
+    assert.equal(decodes, 0, "invalid base64 and byte counts refuse before WASM");
+    envelope.frameBase64 = "U0JXUw==";
+    wire.coalescedPublications = "1";
+    await assert.rejects(value.checkpointCanvas(checkpoint().checkpoint_id, { sessionId: SESSION, expected: checkpoint() }), /complete reconstructed canvas/);
+    wire.coalescedPublications = "0";
+    wire.environment = null;
+    await assert.rejects(value.checkpointCanvas(checkpoint().checkpoint_id, { sessionId: SESSION, expected: checkpoint() }), /scientific cut/);
+    let respond;
+    globalThis.fetch = () => new Promise((resolve) => { respond = resolve; });
+    const pending = value.checkpointCanvas(checkpoint().checkpoint_id, { sessionId: SESSION, expected: checkpoint() });
+    const before = decodes;
+    value.generation += 1;
+    respond(new Response(JSON.stringify(envelope)));
+    await assert.rejects(pending, /connection changed/);
+    assert.equal(decodes, before);
+  } finally { globalThis.fetch = previous; }
+});
+
+test("saved-world response bounds use actual bytes even with a dishonest Content-Length", async () => {
+  const previous = globalThis.fetch;
+  let cancelled = false, decoded = false;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(12 * 1024 * 1024 + 1)); },
+    cancel() { cancelled = true; },
+  }), { headers: { "Content-Length": "1" } });
+  try {
+    const value = client();
+    value.decodeFrame = () => { decoded = true; };
+    await assert.rejects(value.checkpointCanvas(checkpoint().checkpoint_id,
+      { sessionId: SESSION, expected: checkpoint() }), /bound/);
+    assert.equal(cancelled, true);
+    assert.equal(decoded, false);
   } finally { globalThis.fetch = previous; }
 });
 

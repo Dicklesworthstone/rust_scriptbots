@@ -60,6 +60,23 @@
             cursor: crosshair;
         }
 
+        #checkpoint-view {
+            position: absolute;
+            left: 1rem;
+            right: 1rem;
+            bottom: 1rem;
+            z-index: 2;
+            max-width: 48rem;
+            padding: 0.85rem 1rem;
+            border: 1px solid #a78bfa;
+            border-radius: 0.5rem;
+            background: rgba(15, 23, 42, 0.96);
+            color: #ede9fe;
+        }
+
+        #checkpoint-view-status { margin: 0 0 0.65rem; font-size: 0.85rem; overflow-wrap: anywhere; }
+        #sim-container[data-view="checkpoint"] #sim-canvas { cursor: default; }
+
         #stats-panel {
             background: rgba(15, 23, 42, 0.95);
             border-left: 1px solid #1f2a44;
@@ -373,10 +390,14 @@
         <section id="sim-container">
             <canvas id="sim-canvas" width="1280" height="720" tabindex="0" aria-label="Simulation canvas. Click a creature to inspect it; Escape clears selection."></canvas>
             <div id="remote-overlay" role="status" hidden>Waiting for a remote canvas frame…</div>
+            <section id="checkpoint-view" aria-label="Saved-world review" hidden>
+                <p id="checkpoint-view-status" role="status" aria-live="polite"></p>
+                <button id="checkpoint-return-live" type="button">Return to live</button>
+            </section>
         </section>
         <aside id="stats-panel">
             <div class="controls">
-                <div class="chip">Live Metrics</div>
+                <div id="metrics-heading" class="chip">Live Metrics</div>
                 <dl>
                     <dt>FPS</dt>
                     <dd id="metric-fps">–</dd>
@@ -700,7 +721,11 @@
                     <button id="lab-checkpoint-next" type="button" disabled>Next page</button>
                 </div>
                 <p id="lab-checkpoint-detail">No source selected.</p>
-                <button id="lab-checkpoint-download" type="button" disabled>Download selected checkpoint</button>
+                <div class="inspector-actions">
+                    <button id="lab-checkpoint-review" type="button" disabled>Review saved world</button>
+                    <button id="lab-checkpoint-download" type="button" disabled>Download selected checkpoint</button>
+                </div>
+                <p>Review draws the saved agents and environment without changing the server. Return to live before controlling, inspecting or starting a study. Births, deaths and tick rate are unavailable for a saved state.</p>
                 <h3>2. Run a future from that state</h3>
                 <p>An unchanged future runs one trajectory. A treatment runs alongside an unchanged control from the same saved state. Both run independently of the live world.</p>
                 <form id="lab-branch-form">
