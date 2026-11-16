@@ -2,6 +2,34 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Live native soundscape integration (2026-11-16):**
+[Source implemented and independently reviewed — executable qualification remains open
+under `bd-16g.14` and `bd-2z0.14.1.11`]
+
+- Connected the existing bounded synthesis engine to a real Kira callback, replacing
+  the empty device sink. Input generations discard old owners and muted queues;
+  device-sized rendering does not retrigger observed ticks. Active layer controls,
+  finite-input validation, a bounded drone phase and actual device-rate handling are
+  implemented. Muted event layers no longer starve audible cues.
+- Added a shared immutable-snapshot projector. Canonical population metrics, configured
+  diet classification and exact completed-tick counts stay observational. Duplicate
+  publications do not replay events; missed ticks are counted without inventing cues.
+- Added explicit opt-in sound and mixer controls to GPUI and Bevy. World/Lab share one
+  device; pause, history, background and lifecycle gates mute or rebase it. Device
+  initialization and observed runtime failures have visible terminal status.
+- Authored production-callback, transport, mixer, real-owner projection and frontend
+  policy regressions. Independent review corrected stale-queue ordering, muted-layer
+  budget starvation, active-tail volume and frontend lifetime/error handling.
+
+DSR dependency probes stopped before compilation at the existing uncached pinned
+`xcb` Git dependency. A scoped dependency fetch and intermediate formatter execution
+completed, but repeated execution-workspace outages prevented the new tests and final
+compiler/Clippy/format qualification. The published source is independently reviewed;
+these observations do not constitute executable acceptance. Native output is currently
+mono, and physical-device journeys, spatial output, the original 10k performance budget
+and live/offline soundtrack equivalence remain unqualified. Original Bead criteria and
+statuses remain unchanged.
+
 **Saved-world inspection and registry portability (2026-11-16):**
 [Source implemented and independently reviewed — Codex; executable qualification remains open]
 

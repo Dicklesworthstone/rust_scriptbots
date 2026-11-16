@@ -69,10 +69,9 @@ use std::{
 };
 
 #[cfg(feature = "audio")]
-use kira::{
-    AudioManager, AudioManagerSettings, DefaultBackend, Frame,
-    sound::static_sound::{StaticSoundData, StaticSoundSettings},
-};
+use scriptbots_core::audio::{AudioConfig, AudioSendError, KiraSoundscape, LayerGains};
+#[cfg(feature = "audio")]
+use scriptbots_runtime::audio::SnapshotAudioProjector;
 
 use image::{Frame as ImageFrame, ImageBuffer, Rgba as ImgRgba};
 use tracing::{debug, error, info, warn};
@@ -2675,6 +2674,9 @@ struct GuiSession {
     timeline_cancelled: Arc<AtomicBool>,
     lab_submit: Option<LabWorkflowSubmit>,
     lab_guide: Arc<Mutex<LabGuide>>,
+    /// One explicit opt-in and one device for the application's two windows.
+    #[cfg(feature = "audio")]
+    audio: Arc<Mutex<AudioState>>,
 }
 
 impl GuiSession {
@@ -2714,6 +2716,8 @@ impl GuiSession {
             timeline_cancelled: Arc::new(AtomicBool::new(false)),
             lab_submit: None,
             lab_guide: Arc::new(Mutex::new(LabGuide::default())),
+            #[cfg(feature = "audio")]
+            audio: Arc::new(Mutex::new(AudioState::default())),
         }
     }
 
@@ -2730,6 +2734,10 @@ impl GuiSession {
         view.camera = Arc::clone(&self.world_camera);
         view.recent_commands = Arc::clone(&self.recent_commands);
         view.lab_guide = Arc::clone(&self.lab_guide);
+        #[cfg(feature = "audio")]
+        {
+            view.audio = Arc::clone(&self.audio);
+        }
         view.accessibility = Arc::clone(&self.accessibility);
         view.map_sandbox = Arc::clone(&self.map_sandbox);
         view.map_apply_submit = self.map_apply_submit.clone();
@@ -4710,7 +4718,7 @@ pub struct SimulationView {
     analytics_revision: Option<u64>,
     analytics_status: StorageUiStatus,
     #[cfg(feature = "audio")]
-    audio: Option<AudioState>,
+    audio: Arc<Mutex<AudioState>>,
     // When true, render a minimal canvas-focused layout (used in the dedicated world window).
     minimal_canvas_mode: bool,
     /// Active section in the companion Lab window. Keeping one section visible at a
@@ -4855,12 +4863,7 @@ impl SimulationView {
             analytics_revision: None,
             analytics_status: StorageUiStatus::default(),
             #[cfg(feature = "audio")]
-            audio: AudioState::new()
-                .map_err(|err| {
-                    error!(?err, "failed to initialize audio manager");
-                    err
-                })
-                .ok(),
+            audio: Arc::new(Mutex::new(AudioState::default())),
             minimal_canvas_mode: false,
             dashboard_tab: DashboardTab::default(),
             brain_history: std::collections::HashMap::new(),
@@ -10889,10 +10892,6 @@ impl SimulationView {
         }
 
         info!(open = self.settings_panel.open, "Settings panel toggled");
-        #[cfg(feature = "audio")]
-        if let Some(audio) = self.audio.as_mut() {
-            audio.play_toggle();
-        }
         cx.notify();
     }
 
@@ -11448,10 +11447,6 @@ impl SimulationView {
             self.settings_panel.collapsed_categories.push(category);
         }
 
-        #[cfg(feature = "audio")]
-        if let Some(audio) = self.audio.as_mut() {
-            audio.play_toggle();
-        }
         cx.notify();
     }
     fn toggle_narration(&mut self, cx: &mut Context<Self>) {
@@ -11467,10 +11462,6 @@ impl SimulationView {
             info!("Narration enabled");
         } else {
             info!("Narration disabled");
-        }
-        #[cfg(feature = "audio")]
-        if let Some(audio) = self.audio.as_mut() {
-            audio.play_toggle();
         }
         cx.notify();
     }
@@ -11488,10 +11479,6 @@ impl SimulationView {
             return;
         }
         info!(paused, "Simulation pause command enqueued");
-        #[cfg(feature = "audio")]
-        if let Some(audio) = self.audio.as_mut() {
-            audio.play_toggle();
-        }
         cx.notify();
     }
 
@@ -11511,10 +11498,6 @@ impl SimulationView {
         }
         self.controls.draw_agents = enabled;
         info!(draw_agents = enabled, "Agent rendering toggled");
-        #[cfg(feature = "audio")]
-        if let Some(audio) = self.audio.as_mut() {
-            audio.play_toggle();
-        }
         cx.notify();
     }
 
@@ -11524,10 +11507,6 @@ impl SimulationView {
         }
         self.controls.draw_food = enabled;
         info!(draw_food = enabled, "Food overlay toggled");
-        #[cfg(feature = "audio")]
-        if let Some(audio) = self.audio.as_mut() {
-            audio.play_toggle();
-        }
         cx.notify();
     }
 
@@ -11537,10 +11516,6 @@ impl SimulationView {
         }
         self.controls.agent_outline = enabled;
         info!(agent_outline = enabled, "Agent outline toggled");
-        #[cfg(feature = "audio")]
-        if let Some(audio) = self.audio.as_mut() {
-            audio.play_toggle();
-        }
         cx.notify();
     }
     fn adjust_simulation_speed(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -11556,10 +11531,6 @@ impl SimulationView {
             })
         {
             info!(speed, "Simulation speed command enqueued");
-            #[cfg(feature = "audio")]
-            if let Some(audio) = self.audio.as_mut() {
-                audio.play_toggle();
-            }
             cx.notify();
         }
     }
@@ -11657,10 +11628,6 @@ impl SimulationView {
                 .next();
             accessibility.request_palette(next);
         }
-        #[cfg(feature = "audio")]
-        if let Some(audio) = self.audio.as_mut() {
-            audio.play_toggle();
-        }
         cx.notify();
     }
 
@@ -11708,41 +11675,152 @@ impl SimulationView {
     }
 
     #[cfg(feature = "audio")]
-    fn update_audio(&mut self, snapshot: &HudSnapshot) {
-        let audio = match self.audio.as_mut() {
-            Some(audio) => audio,
-            None => return,
+    fn update_audio(&self, window_active: bool) {
+        // Read the immutable owner publication, never a historical HUD frame.
+        let snapshot = self.host.snapshot_hub().latest();
+        let mut audio = self
+            .audio
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        audio.observe(
+            &snapshot,
+            self.minimal_canvas_mode,
+            window_active,
+            self.playback.mode() == PlaybackMode::Live && !self.playback.displaying_history,
+        );
+    }
+
+    #[cfg(feature = "audio")]
+    fn toggle_audio(&self, window: &Window, cx: &mut Context<Self>) {
+        let snapshot = self.host.snapshot_hub().latest();
+        self.audio
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .toggle(snapshot.visual_seed);
+        self.update_audio(window.is_window_active());
+        cx.notify();
+    }
+
+    #[cfg(feature = "audio")]
+    fn adjust_audio_gain(
+        &self,
+        channel: AudioMixChannel,
+        delta: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.audio
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .adjust_gain(channel, delta);
+        self.update_audio(window.is_window_active());
+        cx.notify();
+    }
+
+    #[cfg(feature = "audio")]
+    fn render_audio_controls(&self, cx: &mut Context<Self>) -> Div {
+        let (enabled, muted, master_gain, layers, error, dropped, skipped) = {
+            let audio = self
+                .audio
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                audio.enabled,
+                audio.muted,
+                audio.master_gain,
+                audio.layer_gains,
+                audio.error.clone(),
+                audio.stream.as_ref().map_or(0, KiraSoundscape::frames_dropped),
+                audio.projector.skipped_ticks(),
+            )
         };
-
-        if self.playback.mode() != PlaybackMode::Live {
-            return;
-        }
-
-        if let Some(summary) = snapshot.summary.as_ref()
-            && summary.tick != audio.last_tick
-        {
-            if summary.births > audio.last_births {
-                audio.play_birth();
+        let button = |label: SharedString| {
+            div()
+                .cursor_pointer()
+                .rounded_md()
+                .border_1()
+                .border_color(chrome::border())
+                .bg(chrome::surface_raised())
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(label)
+        };
+        let toggle = button(
+            if error.is_some() {
+                "Audio unavailable"
+            } else if enabled {
+                "Mute soundscape"
+            } else {
+                "Enable soundscape"
             }
-            if summary.deaths > audio.last_deaths {
-                audio.play_death();
+            .into(),
+        )
+            .debug_selector(|| "audio-enable".to_owned())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.toggle_audio(window, cx);
+                }),
+            );
+        let rows = [
+            (AudioMixChannel::Master, "Master", master_gain),
+            (AudioMixChannel::Population, "Population", layers.drone),
+            (AudioMixChannel::Births, "Births", layers.bell),
+            (AudioMixChannel::Deaths, "Deaths", layers.thud),
+            (AudioMixChannel::Combat, "Combat", layers.transient),
+        ]
+        .into_iter()
+        .map(|(channel, label, gain)| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().flex_1().text_xs().child(label))
+                .child(button("−".into()).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                        this.adjust_audio_gain(channel, -0.1, window, cx);
+                    }),
+                ))
+                .child(div().w(px(42.0)).text_xs().child(format!("{:.0}%", gain * 100.0)))
+                .child(button("+".into()).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                        this.adjust_audio_gain(channel, 0.1, window, cx);
+                    }),
+                ))
+        });
+        let status = error.unwrap_or_else(|| {
+            if !enabled {
+                "Off. Enable to hear population, births, deaths, and combat.".to_owned()
+            } else if muted {
+                "Silent while paused, reviewing history, in the background, or at zero volume."
+                    .to_owned()
+            } else {
+                "Live soundscape shared by the World and Lab windows.".to_owned()
             }
-            audio.last_births = summary.births;
-            audio.last_deaths = summary.deaths;
-            audio.last_tick = summary.tick;
-        }
-
-        if let Some(frame) = snapshot.render_frame.as_ref() {
-            let spiked = frame
-                .agents
-                .iter()
-                .filter(|agent| agent.spike_victim)
-                .count();
-            if spiked > audio.last_spike_count {
-                audio.play_spike();
-            }
-            audio.last_spike_count = spiked;
-        }
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(chrome::border())
+            .bg(chrome::surface())
+            .px_3()
+            .py_2()
+            .child(div().text_sm().child("Soundscape"))
+            .child(toggle)
+            .child(div().text_xs().text_color(chrome::text_secondary()).child(status))
+            .children(rows)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(chrome::text_muted())
+                    .child(format!("Unheard ticks: {skipped} · Audio queue drops: {dropped}")),
+            )
     }
 
     fn render_inspector(&self, snapshot: &HudSnapshot, cx: &mut Context<Self>) -> Div {
@@ -14017,6 +14095,11 @@ impl SimulationView {
         let mut container = div().flex().flex_col().gap_4();
         let mut rendered_count = 0;
 
+        #[cfg(feature = "audio")]
+        {
+            container = container.child(self.render_audio_controls(cx));
+        }
+
         if self.minimal_canvas_mode {
             container = container
                 .child(self.render_debug_controls(cx))
@@ -16278,6 +16361,11 @@ impl Render for SimulationView {
         }
         if !self.world_raster_cleanup_registered {
             cx.on_release_in(window, |this, window, _| {
+                #[cfg(feature = "audio")]
+                this.audio
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retire_window(&this.host.snapshot_hub().latest(), this.minimal_canvas_mode);
                 if this.minimal_canvas_mode {
                     let mut accessibility = this
                         .accessibility
@@ -16296,6 +16384,13 @@ impl Render for SimulationView {
                 }
             })
             .detach();
+            #[cfg(feature = "audio")]
+            cx.observe_window_activation(window, |this, window, cx| {
+                // Background windows need not paint again for silence to take effect.
+                this.update_audio(window.is_window_active());
+                cx.notify();
+            })
+            .detach();
             self.world_raster_cleanup_registered = true;
         }
 
@@ -16306,6 +16401,9 @@ impl Render for SimulationView {
         self.poll_timeline_job(cx);
         self.poll_lab_workflows(cx);
         let snapshot = self.playback.snapshot_for_render(live_snapshot);
+
+        #[cfg(feature = "audio")]
+        self.update_audio(window.is_window_active());
 
         // Update per-agent brain output history from the current inspector focus
         self.update_brain_history(&snapshot);
@@ -16379,8 +16477,6 @@ impl Render for SimulationView {
             self.last_perf = perf_snapshot;
         }
 
-        #[cfg(feature = "audio")]
-        self.update_audio(&snapshot);
 
         // The perf readout is an Overview disclosure rather than a floating overlay.
         // It previously rendered only on frames where sample_count % 4 == 0; because
@@ -18552,63 +18648,230 @@ impl InputBindings {
 
 #[cfg(feature = "audio")]
 struct AudioState {
-    manager: AudioManager<DefaultBackend>,
-    birth_sound: StaticSoundData,
-    death_sound: StaticSoundData,
-    spike_sound: StaticSoundData,
-    toggle_sound: StaticSoundData,
-    last_births: usize,
-    last_deaths: usize,
-    last_spike_count: usize,
-    last_tick: u64,
+    stream: Option<KiraSoundscape>,
+    projector: SnapshotAudioProjector,
+    enabled: bool,
+    muted: bool,
+    master_gain: f32,
+    layer_gains: LayerGains,
+    error: Option<String>,
+    world_active: bool,
+    lab_active: bool,
+    world_live: bool,
+    lab_live: bool,
+}
+
+#[cfg(feature = "audio")]
+impl Default for AudioState {
+    fn default() -> Self {
+        let config = AudioConfig::default();
+        Self {
+            stream: None,
+            projector: SnapshotAudioProjector::default(),
+            enabled: false,
+            muted: true,
+            master_gain: config.master_gain,
+            layer_gains: config.layer_gains,
+            error: None,
+            world_active: false,
+            lab_active: false,
+            world_live: true,
+            lab_live: true,
+        }
+    }
+}
+
+#[cfg(feature = "audio")]
+#[derive(Clone, Copy)]
+enum AudioMixChannel {
+    Master,
+    Population,
+    Births,
+    Deaths,
+    Combat,
 }
 
 #[cfg(feature = "audio")]
 impl AudioState {
-    fn new() -> Result<Self, String> {
-        let manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
-            .map_err(|err| format!("{err:?}"))?;
-        let birth_sound = generate_tone(523.25, 0.18, 0.4);
-        let death_sound = generate_tone(196.0, 0.22, 0.45);
-        let spike_sound = generate_tone(880.0, 0.12, 0.35);
-        let toggle_sound = generate_tone(660.0, 0.10, 0.3);
-        Ok(Self {
-            manager,
-            birth_sound,
-            death_sound,
-            spike_sound,
-            toggle_sound,
-            last_births: 0,
-            last_deaths: 0,
-            last_spike_count: 0,
-            last_tick: u64::MAX,
-        })
+    fn toggle(&mut self, run_seed: u64) {
+        if self.error.is_some() {
+            return;
+        }
+        if self.enabled {
+            self.enabled = false;
+            self.muted = true;
+            if let Some(stream) = &self.stream {
+                stream.set_muted(true);
+            }
+            return;
+        }
+        if self.stream.is_none() {
+            // Opening a device is an explicit user action, never startup or paint work.
+            let config = AudioConfig {
+                master_gain: self.master_gain,
+                layer_gains: self.layer_gains,
+                run_seed,
+                is_muted: true,
+                ..AudioConfig::default()
+            };
+            match KiraSoundscape::new(config) {
+                Ok(stream) => self.stream = Some(stream),
+                Err(message) => {
+                    warn!(%message, "soundscape device unavailable");
+                    self.error = Some(format!("Audio unavailable: {message}. Restart to retry."));
+                    return;
+                }
+            }
+        }
+        self.error = None;
+        self.enabled = true;
     }
 
-    fn play(&mut self, sound: &StaticSoundData) {
-        if let Err(err) = self.manager.play(sound.clone()) {
-            error!(?err, "failed to play audio cue");
+    fn adjust_gain(&mut self, channel: AudioMixChannel, delta: f32) {
+        let gain = match channel {
+            AudioMixChannel::Master => &mut self.master_gain,
+            AudioMixChannel::Population => &mut self.layer_gains.drone,
+            AudioMixChannel::Births => &mut self.layer_gains.bell,
+            AudioMixChannel::Deaths => &mut self.layer_gains.thud,
+            AudioMixChannel::Combat => &mut self.layer_gains.transient,
+        };
+        // Quantize button increments so repeated decrements reach exact silence.
+        *gain = ((*gain + delta) * 10.0).round().clamp(0.0, 10.0) / 10.0;
+        if let Some(stream) = &self.stream {
+            stream.set_master_gain(self.master_gain);
+            stream.set_layer_gains(self.layer_gains);
         }
     }
 
-    fn play_toggle(&mut self) {
-        let sound = self.toggle_sound.clone();
-        self.play(&sound);
+    fn presentation_audible(&self) -> bool {
+        self.enabled
+            && (self.world_active || self.lab_active)
+            && self.world_live
+            && self.lab_live
+            && self.master_gain > 0.0
+            && (self.layer_gains.drone > 0.0
+                || self.layer_gains.bell > 0.0
+                || self.layer_gains.thud > 0.0
+                || self.layer_gains.transient > 0.0)
     }
 
-    fn play_birth(&mut self) {
-        let sound = self.birth_sound.clone();
-        self.play(&sound);
+    fn observe(
+        &mut self,
+        snapshot: &RenderSnapshot,
+        world_window: bool,
+        active: bool,
+        live: bool,
+    ) {
+        if world_window {
+            self.world_active = active;
+            self.world_live = live;
+        } else {
+            self.lab_active = active;
+            self.lab_live = live;
+        }
+        if let Some(message) = self.stream.as_mut().and_then(KiraSoundscape::take_error) {
+            warn!(%message, "soundscape backend stopped");
+            self.shutdown();
+            self.error = Some(format!("Audio device failed: {message}. Restart to retry."));
+        }
+        let audible = self.presentation_audible();
+        let update = self.projector.observe(snapshot, audible);
+        self.muted = update.muted;
+        let failure = self.stream.as_ref().and_then(|stream| {
+            if update.reset {
+                stream.reset_with_seed(snapshot.visual_seed);
+            }
+            stream.set_muted(update.muted);
+            update.frame.and_then(|frame| match stream.try_send(frame) {
+                Ok(()) | Err(AudioSendError::Full) => None,
+                Err(AudioSendError::Disconnected) => {
+                    Some("Audio device disconnected. Restart to retry.")
+                }
+                Err(AudioSendError::InvalidFrame) => {
+                    Some("Audio received invalid snapshot values. Restart to retry.")
+                }
+            })
+        });
+        if let Some(message) = failure {
+            warn!(%message, "soundscape stopped");
+            self.shutdown();
+            self.error = Some(message.to_owned());
+            let _ = self.projector.observe(snapshot, false);
+        }
     }
 
-    fn play_death(&mut self) {
-        let sound = self.death_sound.clone();
-        self.play(&sound);
+    fn shutdown(&mut self) {
+        self.enabled = false;
+        self.muted = true;
+        if let Some(stream) = self.stream.take() {
+            stream.set_muted(true);
+        }
     }
 
-    fn play_spike(&mut self) {
-        let sound = self.spike_sound.clone();
-        self.play(&sound);
+    fn retire_window(&mut self, snapshot: &RenderSnapshot, world_window: bool) {
+        // A closed window contributes neither focus nor a historical-view mute.
+        // The surviving window retains the user's opt-in and the shared device.
+        self.observe(snapshot, world_window, false, true);
+    }
+}
+
+#[cfg(all(test, feature = "audio"))]
+mod soundscape_tests {
+    use super::*;
+    use scriptbots_runtime::{HostCore, HostCoreOptions, HostSessionId, PlaybackSnapshot};
+
+    #[test]
+    fn shared_soundscape_defaults_off_and_respects_both_windows_and_zero_gain() {
+        let owner = HostCore::new(
+            HostSessionId::new(991),
+            WorldState::new(ScriptBotsConfig::default()).expect("real world"),
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: false,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("real owner");
+        let snapshot = owner.latest_snapshot();
+        let mut audio = AudioState::default();
+        audio.observe(&snapshot, true, true, true);
+        assert!(!audio.enabled && audio.muted && audio.stream.is_none());
+
+        // Exercise opt-in policy without requiring a physical test audio device.
+        audio.enabled = true;
+        audio.observe(&snapshot, true, true, true);
+        assert!(!audio.muted);
+        audio.observe(&snapshot, false, false, true);
+        assert!(!audio.muted, "an inactive Lab must not silence the active World");
+        audio.observe(&snapshot, true, false, true);
+        assert!(audio.muted, "both windows in background are silent");
+        audio.observe(&snapshot, false, true, true);
+        assert!(!audio.muted, "the active Lab shares the same live soundscape");
+        audio.observe(&snapshot, true, false, false);
+        assert!(audio.muted, "World history stays silent while Lab is active");
+        audio.retire_window(&snapshot, true);
+        assert!(audio.enabled && !audio.muted, "closing historical World releases its mute for Lab");
+
+        for _ in 0..10 {
+            audio.adjust_gain(AudioMixChannel::Master, -0.1);
+        }
+        audio.observe(&snapshot, false, true, true);
+        assert!(audio.muted);
+        assert_eq!(audio.master_gain.to_bits(), 0.0_f32.to_bits());
+        audio.adjust_gain(AudioMixChannel::Master, 0.1);
+        audio.observe(&snapshot, false, true, true);
+        assert!(!audio.muted);
+        audio.layer_gains = LayerGains {
+            drone: 0.0,
+            bell: 0.0,
+            thud: 0.0,
+            transient: 0.0,
+        };
+        audio.observe(&snapshot, false, true, true);
+        assert!(audio.muted, "a zeroed mixer clears pending cues before restoring gain");
+        assert!(audio.stream.is_none(), "policy observations never open devices");
     }
 }
 
@@ -19107,26 +19370,6 @@ fn scale_rgb(color: Rgba, factor: f32) -> Rgba {
     }
 }
 
-#[cfg(feature = "audio")]
-const AUDIO_SAMPLE_RATE: u32 = 44_100;
-
-#[cfg(feature = "audio")]
-fn generate_tone(frequency: f32, duration: f32, amplitude: f32) -> StaticSoundData {
-    let total_samples = (duration * AUDIO_SAMPLE_RATE as f32).max(1.0) as usize;
-    let mut frames = Vec::with_capacity(total_samples);
-    for i in 0..total_samples {
-        let t = i as f32 / AUDIO_SAMPLE_RATE as f32;
-        let envelope = (1.0 - t / duration).clamp(0.0, 1.0);
-        let sample = (2.0 * PI * frequency * t).sin() * amplitude * envelope;
-        frames.push(Frame::from_mono(sample));
-    }
-    StaticSoundData {
-        sample_rate: AUDIO_SAMPLE_RATE,
-        frames: frames.into(),
-        settings: StaticSoundSettings::default(),
-        slice: None,
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RenderDetail {

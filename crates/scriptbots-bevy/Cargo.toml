@@ -3,6 +3,11 @@ name = "scriptbots-bevy"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# The device is still opened only after the user enables Sound in Display settings.
+audio = ["scriptbots-core/audio"]
+
 [dependencies]
 anyhow = { workspace = true }
 # bevy 0.17.3's default features, verbatim, with zstd_rust swapped for zstd_c. The

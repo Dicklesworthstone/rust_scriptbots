@@ -545,12 +545,13 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - `ml` → enable `scriptbots-brain-ml`
   - `brain-ft` → propagate the non-default pinned Frankentorch dependencies and code-first `FtBrain` family through `scriptbots-brain-ml`
   - `neuro` → enable `scriptbots-brain-neuro`
+  - `audio` → enable the shared native soundscape for a selected `gui` or `bevy_render` frontend; this flag does not select a frontend or open a device by itself
   - `fast-alloc` → enable mimalloc as the global allocator for improved multithreaded performance
   - Example: `cargo run -p scriptbots-app --features neuro`
   - Frankentorch compile, determinism, and benchmark acceptance is DSR-only through the pinned `rust_scriptbots` profile; GitHub Actions and direct Cargo invocations are not acceptance evidence.
   - Note: default features enable `ml`, `neuro`, and `fast-alloc`. To disable defaults, use `--no-default-features` and opt-in explicitly.
-- **`scriptbots-render`**:
-  - `audio` → enable Kira-driven audio in the UI layer
+- **`scriptbots-render` and `scriptbots-bevy`**:
+  - `audio` → enable the shared Kira soundscape, initially off until the user enables it
 - **`scriptbots-index`**: the uniform-grid backend is unconditional; there are no backend-selection feature flags.
 - **`scriptbots-brain-ml`**:
   - `candle` enables real tensor forward/batch inference, without production heritable-family registration.
@@ -1315,8 +1316,51 @@ Simulation controls and retained-history playback are separate. The unmodified `
 - Persistence safety: a spawn shortcut is refused after the current tick is admitted under the selected storage guarantee; advance to the next open tick boundary before spawning. An unresolved admission is reported separately and must be resolved by retrying the exact retained batch before either the world or an external arrival can advance. Both typed reasons are logged without consuming simulation RNG.
 
 ### Audio system
-- Optional `kira`-backed mixer (feature `audio`) with event-driven cues (births, deaths, spikes) and accessibility toggles.
-- Channels planned for ambience/effects; platform caveats apply on Linux/WSL2. Audio is disabled in wasm; use Web Audio API from JS if needed.
+
+The native soundscape connects completed simulation snapshots to a real Kira audio
+callback. Population drives a continuous drone; births, deaths and combat drive
+bounded bell, thud and transient cues. The soundscape is optional at build time and
+starts **off** in both native frontends.
+
+Select one of these application feature sets in the DSR build profile, then launch
+the resulting application with the indicated mode:
+
+| Frontend | Application features | Launch mode | Enable and mix |
+|---|---|---|---|
+| GPUI | `gui,audio` | `--mode gui` | Settings → Soundscape → Enable soundscape; master and four layer gain controls |
+| Bevy | `bevy_render,audio` | `--mode bevy` | Display settings → Sound, or F9; master volume and layer buttons cycling full, half and off |
+
+World and Lab share one GPUI device and projector. Bevy keeps its unrelated default
+audio plugin disabled, so enabling this feature does not create an eager second
+device. Merely starting the application, painting a window or updating controls
+while sound is off does not open audio.
+
+Audio reads immutable owner publications and never advances science or accesses
+storage. Repeated control publications do not repeat events; adjacent ticks with
+equal event counts remain distinct observations. A latest-value subscriber may miss
+ticks, and the controls show skipped ticks and transport drops without reconstructing
+unobserved cues. The input queue holds eight frames, each observation admits at most
+eight one-shots, and the synthesizer caps concurrent voices at 32.
+
+Pause, frozen playback speed, unhealthy owners and saved-world review silence the
+soundscape. Background playback is muted by default; Bevy also exposes an explicit
+background preference. Resuming or changing owners starts with current ambience and
+discards old event tails. Master and layer controls apply to active output; muted
+event layers cannot consume the cue budget of audible layers.
+
+A frontend attempts device initialization once after explicit opt-in. Initialization
+failure, a reported native backend error, invalid snapshot values or a disconnected
+consumer disables sound with a persistent reason and restart instruction. Kira may
+attempt internal device recovery before its backend reports an error to the frontend.
+
+Current native output is mono, duplicated to the device's stereo frames. Spatial
+positioning and the original 10k-agent performance acceptance remain open under
+`bd-16g.14` and `bd-2z0.14.1.11`. Canonical offline soundtrack export remains a separate
+fixed-point rendering path; live callbacks are not claimed to reproduce its PCM bytes.
+The new callback, projector and frontend regressions are authored but have not run:
+DSR dependency checks and repeated workspace outages blocked executable qualification.
+No physical-device, native-journey or performance pass is claimed. The browser frontend
+does not enable this native audio feature.
 
 ### Terminal mode
 The interactive frontend runs FrankenTUI's `Program` and retains Ratatui widgets; headless mode uses its buffer adapter. Automatic selection chooses terminal mode only before launch; an explicit GPUI/Bevy request or a native window launch failure is surfaced rather than silently changing products.

@@ -11316,7 +11316,6 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
- "kira",
  "naga 27.0.3",
  "pollster 0.4.0",
  "postcard",
