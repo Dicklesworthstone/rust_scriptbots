@@ -1381,8 +1381,16 @@ struct SoundscapeHandle {
 #[cfg(feature = "audio")]
 impl SoundscapeHandle {
     fn set_muted(&self, muted: bool) {
-        if self.control.muted.swap(muted, Ordering::AcqRel) != muted {
+        if muted {
+            // Silence first, then invalidate input already queued by the producer.
+            if !self.control.muted.swap(true, Ordering::AcqRel) {
+                self.sender.reset();
+            }
+        } else if self.control.muted.load(Ordering::Acquire) {
+            // Publish the new input generation before making it audible. Otherwise
+            // a callback between these operations could replay muted-generation input.
             self.sender.reset();
+            self.control.muted.store(false, Ordering::Release);
         }
     }
 }
