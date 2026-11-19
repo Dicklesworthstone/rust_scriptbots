@@ -565,6 +565,14 @@ pub(super) fn setup_panel(commands: &mut Commands, font: Handle<Font>) {
     });
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct LabInput<'w, 's> {
+    keys: Res<'w, ButtonInput<KeyCode>>,
+    open: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<OpenLabButton>)>,
+    rows: Query<'w, 's, (&'static LabRow, &'static Interaction), Changed<Interaction>>,
+    banners: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<LabReviewBanner>)>,
+}
+
 /// Handle intent before ordinary world controls and consume results without
 /// waiting. Escape stays captured for the whole frame when closing the modal.
 pub(super) fn update(
@@ -572,13 +580,16 @@ pub(super) fn update(
     mut presentation: ResMut<LabPresentation>,
     mut state: ResMut<SnapshotState>,
     mut motion: ResMut<AgentMotionSettings>,
-    keys: Res<ButtonInput<KeyCode>>,
-    open: Query<&Interaction, (Changed<Interaction>, With<OpenLabButton>)>,
-    rows: Query<(&LabRow, &Interaction), Changed<Interaction>>,
-    banners: Query<&Interaction, (Changed<Interaction>, With<LabReviewBanner>)>,
+    input: LabInput,
     ui: Option<Res<LabUi>>,
     mut rig: ResMut<CameraRig>,
 ) {
+    let LabInput {
+        keys,
+        open,
+        rows,
+        banners,
+    } = input;
     presentation.keyboard_captured = false;
     if presentation.source_changed {
         model.reset_observations();
@@ -1953,13 +1964,23 @@ fn retained_focus(previous: &[PanelRow], next: &[PanelRow], focus: Option<usize>
         .position(|row| row.enabled && row.action.as_ref() == Some(action))
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct LabPanelInput<'w, 's> {
+    roots: Query<'w, 's, Entity, With<LabPanelRoot>>,
+    banners: Query<'w, 's, Entity, With<LabReviewBanner>>,
+    headings: Query<'w, 's, Entity, With<LabWorldHeading>>,
+    wheels: MessageReader<'w, 's, MouseWheel>,
+    keys: Res<'w, ButtonInput<KeyCode>>,
+    bodies: Query<'w, 's, (&'static ComputedNode, &'static mut ScrollPosition), With<LabPanelBody>>,
+    sizes: Query<'w, 's, &'static ComputedNode, With<LabRow>>,
+}
+
 /// Update the fixed widget pool. Stable observations do not mark text changed.
 pub(super) fn refresh_panel(
     model: NonSend<LabWorkflows>,
     mut presentation: ResMut<LabPresentation>,
     ui: Option<ResMut<LabUi>>,
     mut nodes: Query<&mut Node>,
-    roots: Query<Entity, With<LabPanelRoot>>,
     mut rows: Query<(
         &mut LabRow,
         &Interaction,
@@ -1967,13 +1988,17 @@ pub(super) fn refresh_panel(
         &mut BorderColor,
     )>,
     mut texts: Query<&mut Text>,
-    banners: Query<Entity, With<LabReviewBanner>>,
-    headings: Query<Entity, With<LabWorldHeading>>,
-    mut wheels: MessageReader<MouseWheel>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut bodies: Query<(&ComputedNode, &mut ScrollPosition), With<LabPanelBody>>,
-    sizes: Query<&ComputedNode, With<LabRow>>,
+    input: LabPanelInput,
 ) {
+    let LabPanelInput {
+        roots,
+        banners,
+        headings,
+        mut wheels,
+        keys,
+        mut bodies,
+        sizes,
+    } = input;
     let Some(mut ui) = ui else {
         return;
     };
@@ -3748,7 +3773,7 @@ mod tests {
                 }
                 LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
                     assert_eq!(branch_id, report.branch_id);
-                    LabWorkflowResponse::CheckpointBranchReport(report.clone())
+                    LabWorkflowResponse::CheckpointBranchReport(Box::new(report.clone()))
                 }
                 other => panic!("unexpected native study request: {other:?}"),
             })

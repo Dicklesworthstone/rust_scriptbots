@@ -1023,13 +1023,13 @@ mod tests {
         reason = "one ready-wire fixture: full locus and delta pages plus large exact provenance"
     )]
     fn genome_ready_wire_keeps_flat_complete_pages_and_exact_large_provenance() {
+        const LARGE_SCALAR: f64 = 1.234_567_890_123_456_7e250;
         let identity = u64::MAX.to_string();
         let revisions = InspectionRevisions {
             scientific: identity.clone(),
             control: identity.clone(),
             config: identity.clone(),
         };
-        const LARGE_SCALAR: f64 = 1.234_567_890_123_456_7e250;
         let locus_at = |index: usize| Locus::NodeWeightWide {
             node: u32::MAX - u32::try_from(index).unwrap(),
             conn: u32::MAX,
@@ -1189,6 +1189,8 @@ mod tests {
         let digest = owner.scientific_digest_v1().unwrap();
         let publication = owner.latest_snapshot();
         let mut detail = owner.inspect_agent_basic(uid).unwrap().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&detail.publication, &publication));
+        assert!(detail.source.matches_snapshot(&detail.publication));
         assert!(detail.source.matches_snapshot(&publication));
         assert_eq!(detail.epoch, publication.world.epoch);
         assert!(detail.sensor_attribution.is_none());

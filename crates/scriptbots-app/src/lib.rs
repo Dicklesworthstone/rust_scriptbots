@@ -4153,8 +4153,9 @@ pub mod renderer {
                         .map(project_lab_checkpoint_branch)
                         .map(LabWorkflowResponse::CheckpointBranch),
                     LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
-                        read_lab_checkpoint_branch_report(&control, &branch_id)
-                            .map(LabWorkflowResponse::CheckpointBranchReport)
+                        read_lab_checkpoint_branch_report(&control, &branch_id).map(|report| {
+                            LabWorkflowResponse::CheckpointBranchReport(Box::new(report))
+                        })
                     }
                     LabWorkflowRequest::ExperimentCapabilities => {
                         Ok(LabWorkflowResponse::ExperimentCapabilities(

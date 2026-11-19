@@ -6808,6 +6808,7 @@ impl SimulationView {
                 || Some(sample.detail.agent_id) != focused
                 || !sample.source.matches(
                     published.session_id,
+                    published.revision,
                     published.world.epoch,
                     uid,
                     published.world.tick,
@@ -6834,6 +6835,7 @@ impl SimulationView {
                 {
                     if sample.source.matches(
                         published.session_id,
+                        published.revision,
                         published.world.epoch,
                         uid,
                         published.world.tick,
@@ -6842,7 +6844,8 @@ impl SimulationView {
                     } else if sample.source.session == published.session_id
                         && sample.source.epoch == published.world.epoch
                         && Some(sample.source.uid) == uid
-                        && sample.source.tick > published.world.tick
+                        && (sample.source.tick > published.world.tick
+                            || sample.source.revision > published.revision)
                         && job
                             .ready_since
                             .is_none_or(|since| since.elapsed() < Duration::from_millis(500))
@@ -6900,14 +6903,10 @@ impl SimulationView {
                             Instant::now() + Duration::from_millis(500),
                         )
                         .ok()??;
-                    let latest = host.snapshot_hub().latest();
-                    let publication = if owner_detail.source.matches_snapshot(&requested) {
-                        &requested
-                    } else if owner_detail.source.matches_snapshot(&latest) {
-                        &latest
-                    } else {
+                    let publication = Arc::clone(&owner_detail.publication);
+                    if !owner_detail.source.matches_snapshot(&publication) {
                         return None;
-                    };
+                    }
                     if publication.session_id != requested.session_id
                         || publication.world.epoch != requested.world.epoch
                     {
@@ -6930,7 +6929,7 @@ impl SimulationView {
                         tick: publication.world.tick,
                     };
                     let detail = AgentInspectorDetails::from_snapshot(
-                        publication,
+                        &publication,
                         agent_id,
                         owner_detail.clone(),
                         None,
@@ -6947,7 +6946,7 @@ impl SimulationView {
                     .ok()?;
                     inspector.focused_agent = Some(agent_id);
                     let (_, brain, _) = InspectorSnapshot::from_snapshot(
-                        publication,
+                        &publication,
                         &host,
                         &inspector,
                         selection_projection.as_deref(),
@@ -6956,7 +6955,7 @@ impl SimulationView {
                         false,
                     );
                     let detail = AgentInspectorDetails::from_snapshot(
-                        publication,
+                        &publication,
                         agent_id,
                         owner_detail,
                         brain.clone(),
@@ -7003,6 +7002,7 @@ impl SimulationView {
                 detail.selected_eye != selected_eye
                     || !source.matches(
                         published.session_id,
+                        published.revision,
                         published.world.epoch,
                         focused,
                         published.world.tick,
@@ -7032,6 +7032,7 @@ impl SimulationView {
                 {
                     if source.matches(
                         published.session_id,
+                        published.revision,
                         published.world.epoch,
                         focused,
                         published.world.tick,
@@ -7040,7 +7041,8 @@ impl SimulationView {
                     } else if source.session == published.session_id
                         && source.epoch == published.world.epoch
                         && Some(source.uid) == focused
-                        && source.tick > published.world.tick
+                        && (source.tick > published.world.tick
+                            || source.revision > published.revision)
                         && job
                             .ready_since
                             .is_none_or(|since| since.elapsed() < Duration::from_millis(500))
@@ -7077,18 +7079,17 @@ impl SimulationView {
                     .map_err(|error| error.to_string())
                     .map(|detail| {
                         let detail = detail?;
-                        let latest = host.snapshot_hub().latest();
-                        let source = if detail.source.matches_snapshot(&requested) {
-                            &requested
-                        } else if detail.source.matches_snapshot(&latest) {
-                            &latest
-                        } else {
+                        let source = Arc::clone(&detail.publication);
+                        if !detail.source.matches_snapshot(&source)
+                            || source.session_id != requested.session_id
+                            || source.world.epoch != requested.world.epoch
+                        {
                             return None;
-                        };
+                        }
                         let agent = source.world.agents.iter().find(|agent| agent.uid == uid)?;
                         let id = AgentId::from(slotmap::KeyData::from_ffi(agent.id));
                         let detail = AgentInspectorDetails::from_snapshot(
-                            source,
+                            &source,
                             id,
                             detail,
                             None,
@@ -11786,9 +11787,10 @@ impl SimulationView {
             (matches!(self.playback.mode(), PlaybackMode::Live)
                 && inspector.focus_id == Some(sample.detail.agent_id)
                 && inspector.selected_eye == sample.selected_eye
-                && snapshot.publication.is_some_and(|(session, _)| {
+                && snapshot.publication.is_some_and(|(session, revision)| {
                     sample.source.matches(
                         session,
+                        revision,
                         snapshot.epoch,
                         Some(sample.source.uid),
                         snapshot.tick,
@@ -18753,11 +18755,16 @@ impl WorldHudSampleSource {
     fn matches(
         self,
         session: scriptbots_runtime::HostSessionId,
+        revision: scriptbots_runtime::SnapshotRevision,
         epoch: u64,
         uid: Option<AgentUid>,
         tick: u64,
     ) -> bool {
-        self.session == session && self.epoch == epoch && Some(self.uid) == uid && self.tick <= tick
+        self.session == session
+            && self.epoch == epoch
+            && Some(self.uid) == uid
+            && self.revision <= revision
+            && self.tick <= tick
     }
 }
 
@@ -18822,7 +18829,10 @@ impl AgentInspectorDetails {
             .agents
             .iter()
             .find(|agent| agent.id == agent_id.raw())?;
-        if detail.uid != agent.uid || !detail.source.matches_snapshot(snapshot) {
+        if detail.uid != agent.uid
+            || detail.epoch != snapshot.world.epoch
+            || !detail.source.matches_snapshot(snapshot)
+        {
             return None;
         }
         let (
@@ -34123,25 +34133,37 @@ mod command_characterization_tests {
             uid: creature,
             tick: 100,
         };
+        let revision = scriptbots_runtime::SnapshotRevision::new(3);
         assert!(
-            sample.matches(session, 3, Some(creature), 101),
+            sample.matches(session, revision, 3, Some(creature), 101),
             "a recent sample may remain visible while a new one is pending"
         );
         assert!(
-            !sample.matches(session, 4, Some(creature), 101),
+            !sample.matches(session, revision, 4, Some(creature), 101),
             "epoch change must invalidate a retained sample"
         );
         assert!(!sample.matches(
             scriptbots_runtime::HostSessionId::new(8),
+            revision,
             3,
             Some(creature),
             101
         ));
-        assert!(!sample.matches(session, 3, Some(AgentUid(43)), 101));
-        assert!(!sample.matches(session, 3, None, 101));
+        assert!(!sample.matches(session, revision, 3, Some(AgentUid(43)), 101));
+        assert!(!sample.matches(session, revision, 3, None, 101));
         assert!(
-            !sample.matches(session, 3, Some(creature), 99),
+            !sample.matches(session, revision, 3, Some(creature), 99),
             "a sample from the future cannot be shown after a rewind"
+        );
+        assert!(
+            !sample.matches(
+                session,
+                scriptbots_runtime::SnapshotRevision::new(2),
+                3,
+                Some(creature),
+                100
+            ),
+            "a later publication at the same tick is not yet visible"
         );
     }
 
@@ -34173,6 +34195,13 @@ mod command_characterization_tests {
             .unwrap()
             .uid;
         let owner_detail = host.port.inspect_agent(first_uid, 0).unwrap().unwrap();
+        let mut wrong_epoch = owner_detail.clone();
+        wrong_epoch.epoch = published.world.epoch + 1;
+        assert!(
+            AgentInspectorDetails::from_snapshot(&published, first, wrong_epoch, None, None)
+                .is_none(),
+            "owner detail from another epoch must not be paired with this frame"
+        );
         let detail =
             AgentInspectorDetails::from_snapshot(&published, first, owner_detail, None, None)
                 .unwrap();
@@ -34280,6 +34309,38 @@ mod command_characterization_tests {
                 .is_none(),
             "a different publication must not enrich recorded history"
         );
+
+        // A newer publication at the same tick must wait until it is shown.
+        let (_sender, result) = std::sync::mpsc::sync_channel(1);
+        let next_revision = scriptbots_runtime::SnapshotRevision::new(source.revision.get() + 1);
+        canvas.world_hud_job = Some(WorldHudJob {
+            session: source.session,
+            epoch: source.epoch,
+            uid: first_uid,
+            selected_eye: None,
+            result,
+            ready: Some((
+                WorldHudSampleSource {
+                    revision: next_revision,
+                    ..source
+                },
+                detail.clone(),
+            )),
+            ready_since: None,
+        });
+        canvas.world_hud_detail_cache = None;
+        canvas.world_hud_last_request = Some(Instant::now());
+        canvas.poll_world_hud_detail(&published, Some(first_uid), None);
+        assert!(canvas.world_hud_detail_cache.is_none());
+        assert!(canvas.world_hud_job.as_ref().unwrap().ready.is_some());
+        let mut caught_up = published.as_ref().clone();
+        caught_up.revision = next_revision;
+        canvas.poll_world_hud_detail(&Arc::new(caught_up), Some(first_uid), None);
+        assert_eq!(
+            canvas.world_hud_detail_cache.as_ref().unwrap().0.revision,
+            next_revision
+        );
+        canvas.world_hud_detail_cache = None;
 
         // A future sample can wait for publication, but cannot block new
         // requests indefinitely after a rewind or a lost publication.
@@ -37740,6 +37801,52 @@ mod command_characterization_tests {
         assert!(
             view.lab_inspection_cache.is_none(),
             "old creature detail must be discarded"
+        );
+
+        select(first);
+        let published = host.snapshot();
+        let owner_detail = host.port.inspect_agent(uid, 0).unwrap().unwrap();
+        let detail =
+            AgentInspectorDetails::from_snapshot(&published, first, owner_detail, None, None)
+                .unwrap();
+        let next_revision = scriptbots_runtime::SnapshotRevision::new(published.revision.get() + 1);
+        let source = WorldHudSampleSource {
+            session: published.session_id,
+            revision: next_revision,
+            epoch: published.world.epoch,
+            uid,
+            tick: published.world.tick,
+        };
+        let (_sender, result) = std::sync::mpsc::sync_channel(1);
+        view.lab_inspection_job = Some(LabInspectionJob {
+            session: source.session,
+            epoch: source.epoch,
+            uid,
+            selected_eye: None,
+            result,
+            ready: Some(LabInspectionSample {
+                source,
+                selected_eye: None,
+                detail,
+                brain: None,
+            }),
+            ready_since: None,
+        });
+        view.lab_inspection_last_request = Some(Instant::now());
+        let inspector = InspectorState {
+            focused_agent: Some(first),
+            ..Default::default()
+        };
+        let summary = InspectorSnapshot::default();
+        view.poll_lab_inspection(&published, &inspector, None, &summary);
+        assert!(view.lab_inspection_cache.is_none());
+        assert!(view.lab_inspection_job.as_ref().unwrap().ready.is_some());
+        let mut caught_up = published.as_ref().clone();
+        caught_up.revision = next_revision;
+        view.poll_lab_inspection(&Arc::new(caught_up), &inspector, None, &summary);
+        assert_eq!(
+            view.lab_inspection_cache.as_ref().unwrap().source.revision,
+            next_revision
         );
     }
 

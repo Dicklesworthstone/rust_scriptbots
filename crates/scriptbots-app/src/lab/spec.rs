@@ -2007,21 +2007,21 @@ mod tests {
         );
     }
 
+    fn assert_invalid_brain_family(requested: &str) {
+        let mut proposed = spec();
+        proposed.brain_families = vec![requested.to_owned()];
+        let errors = validate_spec(&proposed, OPERATOR_BUDGET).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidBrainFamily { name, .. } if name == requested
+        )));
+    }
+
     #[test]
     fn brain_family_validation_uses_the_compiled_runner_catalog() {
-        for requested in [
-            "imaginary",
-            #[cfg(not(feature = "neuro"))]
-            "neuroflow",
-        ] {
-            let mut proposed = spec();
-            proposed.brain_families = vec![requested.to_owned()];
-            let errors = validate_spec(&proposed, OPERATOR_BUDGET).unwrap_err();
-            assert!(errors.iter().any(|error| matches!(
-                error,
-                SpecError::InvalidBrainFamily { name, .. } if name == requested
-            )));
-        }
+        assert_invalid_brain_family("imaginary");
+        #[cfg(not(feature = "neuro"))]
+        assert_invalid_brain_family("neuroflow");
         for &family in EXPERIMENT_BRAIN_FAMILIES {
             let mut proposed = spec();
             proposed.brain_families = vec![family.to_owned()];

@@ -1571,6 +1571,7 @@ fn add_capture_scene_systems(app: &mut App) {
         Update,
         (
             sync_world,
+            crate::sync_far_terrain_color,
             crate::apply_daynight_lighting,
             crate::apply_tier_to_fog,
             crate::conform_selection_ring,
@@ -2344,6 +2345,120 @@ mod tests {
         assert!(
             matches!(cameras.single(world).unwrap().clear_color, ClearColorConfig::Custom(color) if color != crate::terrain_sky_color())
         );
+    }
+
+    #[test]
+    fn capture_synchronizes_far_terrain_color_and_respects_palette() {
+        let mut app = corruption_app(false);
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.terrain_height.daylight = 1.0;
+        }
+        app.update();
+        let canonical_pixels = |snapshot: &WorldSnapshot| {
+            crate::far_terrain_color_image(&snapshot.terrain_height)
+                .expect("supported terrain image")
+                .data
+                .expect("terrain image pixels")
+        };
+        let check_materials = |app: &App, enabled: bool| {
+            let world = app.world();
+            let registry = world.resource::<TerrainChunkRegistry>();
+            let materials = world.resource::<Assets<crate::TerrainMaterial>>();
+            let images = world.resource::<Assets<Image>>();
+            let snapshot = world.resource::<SnapshotState>().latest.as_ref().unwrap();
+            let expected = enabled.then(|| {
+                crate::far_terrain_color_image(&snapshot.terrain_height)
+                    .expect("supported terrain image")
+            });
+            assert!(!registry.chunks.is_empty());
+            for chunk in registry.chunks.values() {
+                let extension = &materials.get(&chunk.material).unwrap().extension;
+                assert_eq!(
+                    extension.far_color_mapping.w,
+                    if enabled { 1.0 } else { 0.0 }
+                );
+                if enabled {
+                    let image = extension
+                        .far_color
+                        .as_ref()
+                        .expect("filtered terrain image");
+                    let image = images.get(image).expect("bound image exists");
+                    assert_eq!(image.data, expected.as_ref().unwrap().data);
+                    assert_eq!(
+                        extension.far_color_mapping.truncate(),
+                        Vec3::new(
+                            snapshot.world_size.x * 0.5,
+                            snapshot.world_size.y * 0.5,
+                            snapshot.terrain_height.cell_size.max(1) as f32,
+                        )
+                    );
+                }
+            }
+        };
+
+        check_materials(&app, true);
+        let daylight_pixels = canonical_pixels(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap(),
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.terrain_height.daylight = scriptbots_core::visual::DAYLIGHT_NIGHT_FLOOR;
+        }
+        app.update();
+        check_materials(&app, true);
+        let night_pixels = canonical_pixels(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap(),
+        );
+        assert_ne!(
+            daylight_pixels, night_pixels,
+            "daylight must change this fixture"
+        );
+        app.world_mut().resource_mut::<AccessibilityState>().cycle();
+        app.update();
+        check_materials(&app, false);
+        for _ in 0..4 {
+            app.world_mut().resource_mut::<AccessibilityState>().cycle();
+        }
+        app.update();
+        check_materials(&app, true);
+
+        let mut snapshot = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .clone()
+            .unwrap();
+        snapshot.revision += 1;
+        snapshot
+            .terrain_height
+            .kinds
+            .fill(scriptbots_core::TerrainKind::DeepWater);
+        snapshot.terrain_height.water_depth.fill(4.0);
+        assert_ne!(
+            night_pixels,
+            canonical_pixels(&snapshot),
+            "the next capture must exercise a different terrain image"
+        );
+        reset_capture_scene(app.world_mut());
+        app.world_mut()
+            .run_system_once(setup_capture_resources)
+            .unwrap();
+        app.world_mut().resource_mut::<SnapshotState>().latest = Some(snapshot);
+        app.update();
+        check_materials(&app, true);
     }
 
     #[test]

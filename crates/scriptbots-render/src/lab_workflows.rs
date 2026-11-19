@@ -1725,7 +1725,7 @@ mod tests {
                     let retained = retained_study.lock().unwrap();
                     let (_, report) = retained.as_ref().unwrap();
                     assert_eq!(branch_id, report.branch_id);
-                    LabWorkflowResponse::CheckpointBranchReport(report.clone())
+                    LabWorkflowResponse::CheckpointBranchReport(Box::new(report.clone()))
                 }
                 other => panic!("unexpected checkpoint-study request: {other:?}"),
             })

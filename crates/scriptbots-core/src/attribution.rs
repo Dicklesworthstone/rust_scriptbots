@@ -671,7 +671,7 @@ mod tests {
                 AttributionMethod::Unavailable(AttributionUnavailable::WorkLimitExceeded),
                 "{name}"
             );
-            assert!(explanation.inputs.is_empty());
+            assert_eq!(explanation.inputs, [] as [InputAttribution; 0]);
             assert_eq!(activity, before);
         }
     }

@@ -38737,7 +38737,7 @@ mod tests {
         for seed in 0..12 {
             let mut agent = sample_agent(seed);
             agent.health = 2.0;
-            world.spawn_agent(agent.clone());
+            world.spawn_agent(agent);
             control.spawn_agent(agent);
         }
         for tick in 1..=160 {
@@ -38781,9 +38781,8 @@ mod tests {
             }
             if let Some((history_capacity, narrative_capacity, narrative_interval)) = match tick {
                 113 => Some((3, 0, 0)),
-                114 => Some((32, 8, 8)),
+                114 | 145 => Some((32, 8, 8)),
                 137 => Some((8, 1, 0)),
-                145 => Some((32, 8, 8)),
                 _ => None,
             } {
                 let mut next = world.config().clone();
@@ -38796,7 +38795,7 @@ mod tests {
                 for seed in 100..112 {
                     let mut agent = sample_agent(seed);
                     agent.health = 2.0;
-                    world.try_inject_agent(agent.clone()).unwrap();
+                    world.try_inject_agent(agent).unwrap();
                     control.try_inject_agent(agent).unwrap();
                 }
             }
@@ -43021,8 +43020,11 @@ mod tests {
             BrainInspectionLimits::tightened(1, 32, 3, 2, 1024, 32),
         )
         .expect("tighter layer bound");
-        assert!(dropped_layer.activations.layers.is_empty());
-        assert!(dropped_layer.activations.connections.is_empty());
+        assert_eq!(dropped_layer.activations.layers, [] as [ActivationLayer; 0]);
+        assert_eq!(
+            dropped_layer.activations.connections,
+            [] as [ActivationEdge; 0]
+        );
         assert!(dropped_layer.activations.truncated);
     }
 

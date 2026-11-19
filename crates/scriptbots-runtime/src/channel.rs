@@ -308,6 +308,9 @@ impl From<&scriptbots_core::AgentRuntime> for AgentPhysiologyData {
 pub struct AgentInspectorData {
     /// Source revisions for rejecting a detail paired with an older rendered frame.
     pub source: BrainProjectionSource,
+    /// Immutable publication observed by the owner when it captured this detail.
+    /// Retaining it lets a client validate the response even if the hub advances.
+    pub publication: Arc<RenderSnapshot>,
     /// Evolution epoch captured at the inspected owner boundary.
     pub epoch: u64,
     /// Stable subject identity, independent of slot reuse.

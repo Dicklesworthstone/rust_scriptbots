@@ -2873,7 +2873,7 @@ mod tests {
         let mut cut = valid.clone();
         cut.owners.swap(0, 1);
         invalid.push(cut);
-        let mut cut = valid.clone();
+        let mut cut = valid;
         cut.metadata.edges.push((IslandId(0), IslandId(999)));
         invalid.push(cut);
         for cut in invalid {
@@ -2914,7 +2914,7 @@ mod tests {
         let mut trailing = bytes;
         let end = trailing.len() - blake3::OUT_LEN;
         trailing.insert(end, 0);
-        let hash = blake3::hash(&trailing[..end + 1]);
+        let hash = blake3::hash(&trailing[..=end]);
         trailing[end + 1..].copy_from_slice(hash.as_bytes());
         assert!(ArchipelagoCheckpointV1::decode(&trailing).is_err());
     }

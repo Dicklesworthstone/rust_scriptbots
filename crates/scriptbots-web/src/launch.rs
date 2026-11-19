@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{BrainPreset, DiffRow, SeedStrategy, SimSpec, SnapshotFormat};
 
-pub(super) const PREFIX: &str = "sbb1.";
-pub(super) const MAX_PAYLOAD_BYTES: usize = 65_536;
+pub const PREFIX: &str = "sbb1.";
+pub const MAX_PAYLOAD_BYTES: usize = 65_536;
 const MAX_LINK_BYTES: usize = PREFIX.len() + MAX_PAYLOAD_BYTES.div_ceil(3) * 4 + 17;
 const MAX_FOUNDERS: usize = 50_000;
 const MAX_GRID_CELLS: u64 = 262_144;
@@ -57,7 +57,7 @@ struct SourceInput {
 /// Recorded inputs, not an attestation or proof of cross-build determinism.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct BrowserBuildInputs {
+pub struct BrowserBuildInputs {
     pub(super) source_fingerprint: Option<String>,
     source_inventory: Vec<SourceInput>,
     pub(super) lockfile_fingerprint: Option<String>,
@@ -186,7 +186,7 @@ pub struct LaunchInfo {
 /// not a replacement for the configuration or executable state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct BrowserLaunch {
+pub struct BrowserLaunch {
     schema_version: u16,
     founder_recipe_version: u16,
     pub(super) config: ScriptBotsConfig,
@@ -301,8 +301,8 @@ impl BrowserLaunch {
             if scriptbots_core::knob_range(&row.knob).is_none()
                 || !row.this_value.is_finite()
                 || !row.parent_value.is_finite()
-                || !super::extract_json_number(&config, &row.knob)
-                    .is_some_and(|value| value.to_bits() == row.this_value.to_bits())
+                || super::extract_json_number(&config, &row.knob)
+                    .is_none_or(|value| value.to_bits() != row.this_value.to_bits())
             {
                 return Err(format!(
                     "browser launch diff disagrees with config at '{}'",
@@ -400,7 +400,7 @@ impl BrowserLaunch {
     }
 }
 
-pub(super) fn validate_config(config: &ScriptBotsConfig, founders: usize) -> Result<(), String> {
+pub fn validate_config(config: &ScriptBotsConfig, founders: usize) -> Result<(), String> {
     if founders > MAX_FOUNDERS
         || config.population_minimum > MAX_FOUNDERS
         || u64::from(config.population_spawn_count) > MAX_FOUNDERS as u64
@@ -434,10 +434,7 @@ pub(super) fn validate_config(config: &ScriptBotsConfig, founders: usize) -> Res
     Ok(())
 }
 
-pub(super) fn validate_patch(
-    config: &serde_json::Value,
-    patch: &[(String, f64)],
-) -> Result<(), String> {
+pub fn validate_patch(config: &serde_json::Value, patch: &[(String, f64)]) -> Result<(), String> {
     if patch.len() > MAX_CHANGES {
         return Err(format!(
             "a browser restart accepts at most {MAX_CHANGES} knob assignments"
@@ -489,6 +486,8 @@ fn payload_fingerprint(bytes: &[u8]) -> u64 {
 }
 
 fn encode_payload(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
     let mut text = String::with_capacity(PREFIX.len() + bytes.len().div_ceil(3) * 4 + 17);
     text.push_str(PREFIX);
     for chunk in bytes.chunks(3) {
@@ -506,7 +505,6 @@ fn encode_payload(bytes: &[u8]) -> String {
             text.push(char::from(ALPHABET[usize::from(c & 63)]));
         }
     }
-    use std::fmt::Write as _;
     let _ = write!(text, ".{:016x}", payload_fingerprint(bytes));
     text
 }
@@ -600,6 +598,21 @@ mod tests {
             left.inner.borrow().core.world().world_digest_v1().unwrap(),
             right.inner.borrow().core.world().world_digest_v1().unwrap()
         );
+    }
+
+    fn assert_invalid_browser_forks(original: &SimHandle) {
+        for patch in [
+            vec![("population_minimum".to_owned(), 3.5)],
+            vec![("food_growth_rate".to_owned(), f64::NAN)],
+            vec![("missing".to_owned(), 1.0)],
+            vec![("world_width".to_owned(), 241.0)],
+            vec![
+                ("food_growth_rate".to_owned(), 0.1),
+                ("food_growth_rate".to_owned(), 0.2),
+            ],
+        ] {
+            assert!(original.fork_patch(&patch).is_err());
+        }
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -796,19 +809,8 @@ mod tests {
                 f64::from(root.config.food_growth_rate),
             )])
             .unwrap();
-        assert!(restored_baseline.changes.is_empty());
-        for patch in [
-            vec![("population_minimum".to_owned(), 3.5)],
-            vec![("food_growth_rate".to_owned(), f64::NAN)],
-            vec![("missing".to_owned(), 1.0)],
-            vec![("world_width".to_owned(), 241.0)],
-            vec![
-                ("food_growth_rate".to_owned(), 0.1),
-                ("food_growth_rate".to_owned(), 0.2),
-            ],
-        ] {
-            assert!(original.fork_patch(&patch).is_err());
-        }
+        assert_eq!(restored_baseline.changes, [] as [DiffRow; 0]);
+        assert_invalid_browser_forks(&original);
         assert_eq!(
             original
                 .inner
@@ -874,7 +876,7 @@ mod tests {
                 ),
             ])
             .unwrap();
-        assert!(restored.changes.is_empty());
+        assert_eq!(restored.changes, [] as [DiffRow; 0]);
         assert_eq!(restored.config, root.config);
         let mut understated = changed;
         understated.changes[0].this_value = 0.2;
@@ -1135,7 +1137,7 @@ mod tests {
             |inputs: &mut BrowserBuildInputs| inputs.rustflags = Some("different-flags".to_owned()),
             |inputs: &mut BrowserBuildInputs| inputs.compiler = Some("another compiler".to_owned()),
             |inputs: &mut BrowserBuildInputs| {
-                inputs.source_inventory[0].fingerprint = "fnv1a64:0000000000000000".to_owned()
+                inputs.source_inventory[0].fingerprint = "fnv1a64:0000000000000000".to_owned();
             },
         ];
         for mutate in mutations {

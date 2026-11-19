@@ -276,17 +276,17 @@ impl ParticleScene {
             return Ok(false);
         }
         validate_boundary(snapshot)?;
-        if same_source && self.last_tick == Some(snapshot.tick) {
-            if self.last_ordinal.is_some_and(|ordinal| {
+        if same_source
+            && self.last_tick == Some(snapshot.tick)
+            && (self.last_ordinal.is_some_and(|ordinal| {
                 snapshot
                     .visual
                     .events
                     .last()
                     .is_none_or(|event| event.ordinal < ordinal)
-            }) || snapshot.visual.dropped < self.observed_producer_drops
-            {
-                return Err("visual-event prefix regressed within one completed boundary");
-            }
+            }) || snapshot.visual.dropped < self.observed_producer_drops)
+        {
+            return Err("visual-event prefix regressed within one completed boundary");
         }
 
         let mut changed = false;
@@ -1168,9 +1168,9 @@ mod tests {
         let mut bytes = Vec::new();
         row.append_bytes(&mut bytes);
         assert_eq!(bytes.len(), ROW_BYTES);
-        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
-                f32::from_le_bytes(chunk.try_into().unwrap()),
+                f32::from_le_bytes(*chunk),
                 f32::from(u16::try_from(index).unwrap())
             );
         }

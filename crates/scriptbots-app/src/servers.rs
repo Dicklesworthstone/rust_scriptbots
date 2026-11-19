@@ -2886,10 +2886,10 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                         debug!(connection_id, "remote stream closed after failed or timed-out write");
                         break;
                     }
-                    if let Some(reason) = cadence.observe(started.elapsed()) {
-                        if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await {
-                            break;
-                        }
+                    if let Some(reason) = cadence.observe(started.elapsed())
+                        && !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await
+                    {
+                        break;
                     }
                 }
             }
@@ -2925,8 +2925,10 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                                     // with the previous page. Credit itself must wake
                                     // projection even when the owner stays paused.
                                     schedule.request();
-                                    if let Some(reason) = cadence.observe(elapsed) {
-                                        if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await { break; }
+                                    if let Some(reason) = cadence.observe(elapsed)
+                                        && !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await
+                                    {
+                                        break;
                                     }
                                 }
                                 Err(error) => {

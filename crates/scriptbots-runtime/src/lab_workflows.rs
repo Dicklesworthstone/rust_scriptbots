@@ -1204,7 +1204,7 @@ pub enum LabWorkflowResponse {
     /// Managed study observation after read or cancellation.
     CheckpointBranch(LabCheckpointBranch),
     /// Verified report for the selected completed study.
-    CheckpointBranchReport(LabBranchReport),
+    CheckpointBranchReport(Box<LabBranchReport>),
     /// Verified event target and its retained checkpoint provenance.
     EventFrame(LabEventReview),
 }
@@ -1482,7 +1482,7 @@ fn branch_is_bounded(branch: &LabCheckpointBranch) -> bool {
         && branch
             .target_tick
             .checked_sub(branch.source_tick)
-            .is_some_and(|ticks| ticks > 0 && ticks <= u64::from(u32::MAX))
+            .is_some_and(|ticks| ticks > 0 && u32::try_from(ticks).is_ok())
         && lowercase_hex_is_valid(&branch.world_digest, std::mem::size_of::<u64>() * 2)
         && branch
             .artifact_id
@@ -1790,7 +1790,7 @@ impl LabWorkflows {
 
     /// Take one accepted event frame after polling the bounded worker.
     /// Any intervening selection, source or panel change clears this result.
-    pub fn take_event_review(&mut self) -> Option<LabEventReview> {
+    pub const fn take_event_review(&mut self) -> Option<LabEventReview> {
         self.event_review.take()
     }
 
@@ -2647,27 +2647,9 @@ impl LabWorkflows {
                 true
             }
             (
-                LabWorkflowRequest::Compare {
-                    experiment_id,
-                    baseline_variant,
-                    challenger_variant,
-                    metric,
-                },
+                request @ LabWorkflowRequest::Compare { .. },
                 LabWorkflowResponse::Comparison(comparison),
-            ) if self.comparison_request().as_ref() == Some(request)
-                && comparison.experiment_id == *experiment_id
-                && comparison.baseline_variant == *baseline_variant
-                && comparison.challenger_variant == *challenger_variant
-                && comparison.metric == *metric
-                && self
-                    .batch
-                    .as_ref()
-                    .is_some_and(|batch| comparison_matches_batch(&comparison, batch))
-                && comparison_is_bounded(&comparison) =>
-            {
-                self.comparison = Some(comparison);
-                true
-            }
+            ) => self.accept_comparison(request, comparison),
             (
                 LabWorkflowRequest::ListCheckpoints { cursor },
                 LabWorkflowResponse::Checkpoints(page),
@@ -2714,6 +2696,57 @@ impl LabWorkflows {
                 self.event_review = Some(review);
                 return None;
             }
+            (
+                request @ (LabWorkflowRequest::BranchCapabilities
+                | LabWorkflowRequest::ListCheckpointBranches { .. }
+                | LabWorkflowRequest::GetCheckpointBranch { .. }
+                | LabWorkflowRequest::CancelCheckpointBranch { .. }
+                | LabWorkflowRequest::GetCheckpointBranchReport { .. }),
+                response,
+            ) => self.accept_branch_response(request, response),
+            _ => false,
+        };
+        self.finish_response(request, accepted);
+        None
+    }
+
+    fn accept_comparison(
+        &mut self,
+        request: &LabWorkflowRequest,
+        comparison: LabComparison,
+    ) -> bool {
+        let LabWorkflowRequest::Compare {
+            experiment_id,
+            baseline_variant,
+            challenger_variant,
+            metric,
+        } = request
+        else {
+            return false;
+        };
+        if self.comparison_request().as_ref() != Some(request)
+            || comparison.experiment_id != *experiment_id
+            || comparison.baseline_variant != *baseline_variant
+            || comparison.challenger_variant != *challenger_variant
+            || comparison.metric != *metric
+            || !self
+                .batch
+                .as_ref()
+                .is_some_and(|batch| comparison_matches_batch(&comparison, batch))
+            || !comparison_is_bounded(&comparison)
+        {
+            return false;
+        }
+        self.comparison = Some(comparison);
+        true
+    }
+
+    fn accept_branch_response(
+        &mut self,
+        request: &LabWorkflowRequest,
+        response: LabWorkflowResponse,
+    ) -> bool {
+        match (request, response) {
             (LabWorkflowRequest::BranchCapabilities, LabWorkflowResponse::BranchCapabilities(capabilities))
                 if self.panel == LabPanel::Checkpoints
                     && self.checkpoint_view == LabCheckpointView::BranchComposer
@@ -2751,11 +2784,14 @@ impl LabWorkflows {
                                 && report.source_byte_size == creation.draft.checkpoint.byte_size
                                 && report.control.baseline_population == creation.draft.checkpoint.agent_count
                         }) => {
-                self.branch_report = Some(report);
+                self.branch_report = Some(*report);
                 true
             }
             _ => false,
-        };
+        }
+    }
+
+    fn finish_response(&mut self, request: &LabWorkflowRequest, accepted: bool) {
         if !accepted && matches!(request, LabWorkflowRequest::ExperimentCapabilities) {
             self.experiment_capabilities = None;
         }
@@ -2794,7 +2830,6 @@ impl LabWorkflows {
         if accepted && matches!(request, LabWorkflowRequest::BranchCapabilities) {
             self.note_prior_branch_creation();
         }
-        None
     }
 
     fn accept_experiment_page(&mut self, cursor: Option<&str>, page: LabExperimentPage) -> bool {
@@ -3148,205 +3183,172 @@ impl LabWorkflows {
         self.set_notice(message);
     }
 
+    fn back_to_checkpoints(&mut self) {
+        self.invalidate();
+        self.checkpoint_view = LabCheckpointView::SavedCuts;
+        self.selected_branch = None;
+        self.branch = None;
+        self.branch_report = None;
+        self.set_notice("Returned to saved checkpoints. Admitted studies continue independently; an unconfirmed request keeps its exact retry identity.");
+    }
+
+    fn checkpoint_branches_page(&mut self, cursor: Option<String>) {
+        if self.panel != LabPanel::Checkpoints
+            || cursor
+                .as_ref()
+                .is_some_and(|value| value.parse::<usize>().is_err())
+        {
+            self.set_notice("Open Checkpoints and use an observed study page cursor.");
+            return;
+        }
+        self.invalidate();
+        self.checkpoint_view = LabCheckpointView::BranchCatalog;
+        self.branch_cursor = cursor;
+        self.checkpoint_branches = None;
+        self.selected_branch = None;
+        self.branch = None;
+        self.branch_report = None;
+        if !self.is_busy() {
+            self.start(LabWorkflowRequest::ListCheckpointBranches {
+                cursor: self.branch_cursor.clone(),
+            });
+        }
+    }
+
+    fn abandon_checkpoint_branch_request(&mut self) {
+        if !self.can_abandon_branch_request() {
+            self.set_notice(
+                "Only an unconfirmed study whose worker has finished can be abandoned locally.",
+            );
+            return;
+        }
+        if let Some(creation) = self.latest_branch_creation.take() {
+            self.invalidate();
+            self.set_notice(format!(
+                "Forgot local study retry identity {}. Its study may already exist; inspect retained studies before submitting another request. This does not cancel admitted work.",
+                creation.request_id,
+            ));
+        }
+    }
+
+    fn cancel_checkpoint_branch(&mut self) {
+        if self.can_cancel_checkpoint_branch() {
+            if let Some(branch_id) = self.selected_branch.clone() {
+                self.branch_report = None;
+                self.start(LabWorkflowRequest::CancelCheckpointBranch { branch_id });
+            }
+        } else {
+            self.set_notice(
+                "Cancellation requires a selected running study and a free worker slot.",
+            );
+        }
+    }
+
+    fn read_checkpoint_branch_report(&mut self) {
+        if self.can_read_branch_report() {
+            if let Some(branch_id) = self.selected_branch.clone() {
+                self.branch_report = None;
+                self.start(LabWorkflowRequest::GetCheckpointBranchReport { branch_id });
+            }
+        } else {
+            self.set_notice("Read results after the selected study has a completed receipt and a verified report identity.");
+        }
+    }
+
+    fn new_experiment(&mut self) {
+        if self.panel != LabPanel::Experiments {
+            self.set_notice("Open the Experiments panel before creating a batch.");
+            return;
+        }
+        self.invalidate();
+        self.composing_experiment = true;
+        if let Some(creation) = &self.latest_experiment_creation
+            && !matches!(creation.state, LabExperimentCreationState::Created { .. })
+        {
+            self.experiment_draft = creation.draft.clone();
+        }
+        self.experiment_capabilities = None;
+        self.comparison = None;
+        if !self.is_busy() {
+            self.start(LabWorkflowRequest::ExperimentCapabilities);
+        }
+    }
+
+    fn set_draft_family(&mut self, family: String, baseline: bool) {
+        if !self.allow_draft_edit() {
+            return;
+        }
+        if self.experiment_draft.treatment.is_some() && !baseline {
+            self.set_notice("Ecological treatment arms share the baseline brain family; changing a second factor is refused.");
+            return;
+        }
+        if !self
+            .experiment_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.families.contains(&family))
+        {
+            self.set_notice("This brain family was not offered by the current runner.");
+            return;
+        }
+        if baseline {
+            self.experiment_draft.baseline_family.clone_from(&family);
+            if self.experiment_draft.treatment.is_some() {
+                self.experiment_draft.challenger_family = family;
+            }
+        } else {
+            self.experiment_draft.challenger_family = family;
+        }
+        self.report_draft_validation();
+    }
+
+    fn abandon_experiment_request(&mut self) {
+        if !self.can_abandon_experiment_request() {
+            self.set_notice(
+                "Only an unconfirmed creation whose worker has finished can be abandoned locally.",
+            );
+            return;
+        }
+        if let Some(creation) = self.latest_experiment_creation.take() {
+            self.invalidate();
+            self.set_notice(format!(
+                "Forgot local retry identity {}. Its experiment may already exist; inspect the catalog before submitting another batch.",
+                creation.request_id,
+            ));
+        }
+    }
+
     /// Apply one native UI intent, preserving request identity and bounded state.
     pub fn dispatch(&mut self, action: LabAction) {
         match action {
             LabAction::NewCheckpointBranch => self.open_branch_composer(),
-            LabAction::BackToCheckpoints => {
-                self.invalidate();
-                self.checkpoint_view = LabCheckpointView::SavedCuts;
-                self.selected_branch = None;
-                self.branch = None;
-                self.branch_report = None;
-                self.set_notice("Returned to saved checkpoints. Admitted studies continue independently; an unconfirmed request keeps its exact retry identity.");
-            }
-            LabAction::CheckpointBranchesPage(cursor) => {
-                if self.panel != LabPanel::Checkpoints
-                    || cursor
-                        .as_ref()
-                        .is_some_and(|value| value.parse::<usize>().is_err())
-                {
-                    self.set_notice("Open Checkpoints and use an observed study page cursor.");
-                    return;
-                }
-                self.invalidate();
-                self.checkpoint_view = LabCheckpointView::BranchCatalog;
-                self.branch_cursor = cursor;
-                self.checkpoint_branches = None;
-                self.selected_branch = None;
-                self.branch = None;
-                self.branch_report = None;
-                if !self.is_busy() {
-                    self.start(LabWorkflowRequest::ListCheckpointBranches {
-                        cursor: self.branch_cursor.clone(),
-                    });
-                }
-            }
+            LabAction::BackToCheckpoints => self.back_to_checkpoints(),
+            LabAction::CheckpointBranchesPage(cursor) => self.checkpoint_branches_page(cursor),
             LabAction::SelectCheckpointBranch(id) => self.select_checkpoint_branch(id),
-            LabAction::BranchTreatment(treatment) => {
-                if self.allow_branch_draft_edit() {
-                    if let Some(draft) = &mut self.branch_draft {
-                        draft.treatment = treatment;
-                    }
-                    self.report_branch_draft_validation();
-                }
-            }
-            LabAction::BranchTicks(ticks) => {
-                if self.allow_branch_draft_edit() {
-                    if let Some(draft) = &mut self.branch_draft {
-                        draft.ticks = ticks;
-                    }
-                    self.report_branch_draft_validation();
-                }
-            }
+            action @ (LabAction::BranchTreatment(_)
+            | LabAction::BranchTicks(_)
+            | LabAction::TreatmentPercent(_)
+            | LabAction::TreatmentTick(_)
+            | LabAction::FirstSeed(_)
+            | LabAction::SeedCount(_)
+            | LabAction::TicksPerRun(_)) => self.edit_draft(&action),
             LabAction::CreateCheckpointBranch => self.create_checkpoint_branch(),
-            LabAction::AbandonCheckpointBranchRequest => {
-                if !self.can_abandon_branch_request() {
-                    self.set_notice("Only an unconfirmed study whose worker has finished can be abandoned locally.");
-                    return;
-                }
-                if let Some(creation) = self.latest_branch_creation.take() {
-                    self.invalidate();
-                    self.set_notice(format!(
-                        "Forgot local study retry identity {}. Its study may already exist; inspect retained studies before submitting another request. This does not cancel admitted work.",
-                        creation.request_id,
-                    ));
-                }
-            }
-            LabAction::CancelCheckpointBranch => {
-                if self.can_cancel_checkpoint_branch() {
-                    if let Some(branch_id) = self.selected_branch.clone() {
-                        self.branch_report = None;
-                        self.start(LabWorkflowRequest::CancelCheckpointBranch { branch_id });
-                    }
-                } else {
-                    self.set_notice(
-                        "Cancellation requires a selected running study and a free worker slot.",
-                    );
-                }
-            }
-            LabAction::ReadCheckpointBranchReport => {
-                if self.can_read_branch_report() {
-                    if let Some(branch_id) = self.selected_branch.clone() {
-                        self.branch_report = None;
-                        self.start(LabWorkflowRequest::GetCheckpointBranchReport { branch_id });
-                    }
-                } else {
-                    self.set_notice("Read results after the selected study has a completed receipt and a verified report identity.");
-                }
-            }
-            LabAction::NewExperiment => {
-                if self.panel != LabPanel::Experiments {
-                    self.set_notice("Open the Experiments panel before creating a batch.");
-                    return;
-                }
-                self.invalidate();
-                self.composing_experiment = true;
-                if let Some(creation) = &self.latest_experiment_creation
-                    && !matches!(creation.state, LabExperimentCreationState::Created { .. })
-                {
-                    self.experiment_draft = creation.draft.clone();
-                }
-                self.experiment_capabilities = None;
-                self.comparison = None;
-                if !self.is_busy() {
-                    self.start(LabWorkflowRequest::ExperimentCapabilities);
-                }
-            }
+            LabAction::AbandonCheckpointBranchRequest => self.abandon_checkpoint_branch_request(),
+            LabAction::CancelCheckpointBranch => self.cancel_checkpoint_branch(),
+            LabAction::ReadCheckpointBranchReport => self.read_checkpoint_branch_report(),
+            LabAction::NewExperiment => self.new_experiment(),
             LabAction::ExperimentDesign(design) => self.set_experiment_design(design),
             LabAction::TreatmentParameter(parameter) => self.set_treatment_parameter(parameter),
-            LabAction::TreatmentPercent(percent) => {
-                if self.allow_draft_edit()
-                    && let Some(treatment) = &mut self.experiment_draft.treatment
-                {
-                    treatment.scale_percent = percent;
-                    self.report_draft_validation();
-                }
-            }
-            LabAction::TreatmentTick(tick) => {
-                if self.allow_draft_edit()
-                    && let Some(treatment) = &mut self.experiment_draft.treatment
-                {
-                    treatment.at_tick = tick;
-                    self.report_draft_validation();
-                }
-            }
-            LabAction::DraftBaseline(ref family) | LabAction::DraftChallenger(ref family) => {
-                if !self.allow_draft_edit() {
-                    return;
-                }
-                if self.experiment_draft.treatment.is_some()
-                    && matches!(&action, LabAction::DraftChallenger(_))
-                {
-                    self.set_notice("Ecological treatment arms share the baseline brain family; changing a second factor is refused.");
-                    return;
-                }
-                if !self
-                    .experiment_capabilities
-                    .as_ref()
-                    .is_some_and(|capabilities| capabilities.families.contains(family))
-                {
-                    self.set_notice("This brain family was not offered by the current runner.");
-                    return;
-                }
-                if matches!(&action, LabAction::DraftBaseline(_)) {
-                    self.experiment_draft.baseline_family = family.clone();
-                    if self.experiment_draft.treatment.is_some() {
-                        self.experiment_draft.challenger_family = family.clone();
-                    }
-                } else {
-                    self.experiment_draft.challenger_family = family.clone();
-                }
-                self.report_draft_validation();
-            }
-            LabAction::FirstSeed(seed) => {
-                if self.allow_draft_edit() {
-                    self.experiment_draft.first_seed = seed;
-                    self.report_draft_validation();
-                }
-            }
-            LabAction::SeedCount(count) => {
-                if self.allow_draft_edit() {
-                    self.experiment_draft.seed_count = count;
-                    self.report_draft_validation();
-                }
-            }
-            LabAction::TicksPerRun(ticks) => {
-                if self.allow_draft_edit() {
-                    self.experiment_draft.ticks_per_run = ticks;
-                    self.report_draft_validation();
-                }
-            }
+            LabAction::DraftBaseline(family) => self.set_draft_family(family, true),
+            LabAction::DraftChallenger(family) => self.set_draft_family(family, false),
             LabAction::CreateExperiment => self.create_experiment(),
-            LabAction::AbandonExperimentRequest => {
-                if !self.can_abandon_experiment_request() {
-                    self.set_notice("Only an unconfirmed creation whose worker has finished can be abandoned locally.");
-                    return;
-                }
-                if let Some(creation) = self.latest_experiment_creation.take() {
-                    self.invalidate();
-                    self.set_notice(format!(
-                        "Forgot local retry identity {}. Its experiment may already exist; inspect the catalog before submitting another batch.",
-                        creation.request_id,
-                    ));
-                }
-            }
+            LabAction::AbandonExperimentRequest => self.abandon_experiment_request(),
             LabAction::ReturnLive => self.invalidate(),
             LabAction::CancelRequest => {
                 self.invalidate();
                 self.set_notice("Result cancelled. The worker remains occupied until it finishes; submitted actions may still complete. Unconfirmed saves and admissions retain their retry identity.");
             }
             LabAction::SelectExperiment(id) => self.select_experiment(id),
-            LabAction::AllExperiments | LabAction::BackToExperiments => {
-                self.invalidate();
-                self.composing_experiment = false;
-                self.selected_experiment = None;
-                self.batch = None;
-                self.comparison = None;
-                self.experiments = None;
-                self.experiment_cursor = None;
-                self.set_notice("Returned to the experiment catalog. Any admitted experiment continues independently.");
-            }
+            LabAction::AllExperiments | LabAction::BackToExperiments => self.back_to_experiments(),
             LabAction::ExperimentsPage(cursor) => {
                 self.invalidate();
                 self.experiment_cursor = cursor;
@@ -3359,47 +3361,10 @@ impl LabWorkflows {
                 self.checkpoints = None;
                 self.selected_checkpoint = None;
             }
-            LabAction::SelectCheckpoint(id) => {
-                if self
-                    .checkpoints
-                    .as_ref()
-                    .is_some_and(|page| page.items.iter().any(|row| row.checkpoint_id == id))
-                    || self
-                        .saved_checkpoint_metadata()
-                        .is_some_and(|row| row.checkpoint_id == id)
-                {
-                    self.invalidate();
-                    self.selected_checkpoint = Some(id);
-                }
-            }
-            LabAction::Baseline(ref id) | LabAction::Challenger(ref id) => {
-                let baseline = matches!(&action, LabAction::Baseline(_));
-                if self
-                    .batch
-                    .as_ref()
-                    .is_some_and(|batch| batch.variants.iter().any(|row| &row.variant_id == id))
-                {
-                    self.invalidate();
-                    if baseline {
-                        self.baseline = Some(id.clone());
-                    } else {
-                        self.challenger = Some(id.clone());
-                    }
-                    self.comparison = None;
-                }
-            }
-            LabAction::Metric(metric) => {
-                if self.metric != metric {
-                    self.invalidate();
-                    self.metric = metric;
-                    self.comparison = None;
-                    self.set_notice(format!(
-                        "Selected {} ({}). Request a comparison for this endpoint.",
-                        metric.label(),
-                        metric.unit(),
-                    ));
-                }
-            }
+            LabAction::SelectCheckpoint(id) => self.select_checkpoint(id),
+            LabAction::Baseline(id) => self.select_variant(id, true),
+            LabAction::Challenger(id) => self.select_variant(id, false),
+            LabAction::Metric(metric) => self.select_metric(metric),
             LabAction::VariantsPage(offset) => {
                 let maximum = self.batch.as_ref().map_or(0, |batch| {
                     batch.variants.len().saturating_sub(1) / VARIANTS_PER_PAGE * VARIANTS_PER_PAGE
@@ -3429,26 +3394,140 @@ impl LabWorkflows {
                     });
                 }
             }
-            LabAction::ReviewEvent(event) => {
-                if self.panel == LabPanel::Narrative
-                    && self.session == Some(event.session_id)
-                    && self
-                        .selected_event
-                        .as_ref()
-                        .is_some_and(|selected| selected.identity == event)
-                {
-                    self.event_review = None;
-                    self.start(LabWorkflowRequest::ReviewEvent { event });
-                } else {
-                    self.set_notice("Select the same retained event in the current owner's timeline before reviewing it.");
-                }
-            }
+            LabAction::ReviewEvent(event) => self.review_event(event),
             LabAction::CreateCheckpoint => self.create_checkpoint(),
             LabAction::Refresh => {
                 if let Some(request) = self.refresh_request() {
                     self.start(request);
                 }
             }
+        }
+    }
+
+    fn edit_draft(&mut self, action: &LabAction) {
+        match action {
+            LabAction::BranchTreatment(treatment) => {
+                if self.allow_branch_draft_edit() {
+                    if let Some(draft) = &mut self.branch_draft {
+                        draft.treatment = *treatment;
+                    }
+                    self.report_branch_draft_validation();
+                }
+            }
+            LabAction::BranchTicks(ticks) => {
+                if self.allow_branch_draft_edit() {
+                    if let Some(draft) = &mut self.branch_draft {
+                        draft.ticks = *ticks;
+                    }
+                    self.report_branch_draft_validation();
+                }
+            }
+            LabAction::TreatmentPercent(percent) => {
+                if self.allow_draft_edit()
+                    && let Some(treatment) = &mut self.experiment_draft.treatment
+                {
+                    treatment.scale_percent = *percent;
+                    self.report_draft_validation();
+                }
+            }
+            LabAction::TreatmentTick(tick) => {
+                if self.allow_draft_edit()
+                    && let Some(treatment) = &mut self.experiment_draft.treatment
+                {
+                    treatment.at_tick = *tick;
+                    self.report_draft_validation();
+                }
+            }
+            LabAction::FirstSeed(seed) => {
+                if self.allow_draft_edit() {
+                    self.experiment_draft.first_seed = *seed;
+                    self.report_draft_validation();
+                }
+            }
+            LabAction::SeedCount(count) => {
+                if self.allow_draft_edit() {
+                    self.experiment_draft.seed_count = *count;
+                    self.report_draft_validation();
+                }
+            }
+            LabAction::TicksPerRun(ticks) => {
+                if self.allow_draft_edit() {
+                    self.experiment_draft.ticks_per_run = *ticks;
+                    self.report_draft_validation();
+                }
+            }
+            _ => unreachable!("only draft edits are routed to this handler"),
+        }
+    }
+
+    fn back_to_experiments(&mut self) {
+        self.invalidate();
+        self.composing_experiment = false;
+        self.selected_experiment = None;
+        self.batch = None;
+        self.comparison = None;
+        self.experiments = None;
+        self.experiment_cursor = None;
+        self.set_notice(
+            "Returned to the experiment catalog. Any admitted experiment continues independently.",
+        );
+    }
+
+    fn select_checkpoint(&mut self, id: String) {
+        if self
+            .checkpoints
+            .as_ref()
+            .is_some_and(|page| page.items.iter().any(|row| row.checkpoint_id == id))
+            || self
+                .saved_checkpoint_metadata()
+                .is_some_and(|row| row.checkpoint_id == id)
+        {
+            self.invalidate();
+            self.selected_checkpoint = Some(id);
+        }
+    }
+
+    fn select_variant(&mut self, id: String, baseline: bool) {
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|batch| batch.variants.iter().any(|row| row.variant_id == id))
+        {
+            self.invalidate();
+            if baseline {
+                self.baseline = Some(id);
+            } else {
+                self.challenger = Some(id);
+            }
+            self.comparison = None;
+        }
+    }
+
+    fn select_metric(&mut self, metric: LabMetric) {
+        if self.metric != metric {
+            self.invalidate();
+            self.metric = metric;
+            self.comparison = None;
+            self.set_notice(format!(
+                "Selected {} ({}). Request a comparison for this endpoint.",
+                metric.label(),
+                metric.unit(),
+            ));
+        }
+    }
+
+    fn review_event(&mut self, event: LabEventIdentity) {
+        if self.panel == LabPanel::Narrative
+            && self.session == Some(event.session_id)
+            && self
+                .selected_event
+                .as_ref()
+                .is_some_and(|selected| selected.identity == event)
+        {
+            self.event_review = None;
+            self.start(LabWorkflowRequest::ReviewEvent { event });
+        } else {
+            self.set_notice("Select the same retained event in the current owner's timeline before reviewing it.");
         }
     }
 
@@ -3926,7 +4005,7 @@ mod tests {
                 command_applied_tick: receipt.source_tick,
                 details: "Ground-food digest first differed at the completed boundary.".into(),
             }),
-            ..control.clone()
+            ..control
         };
         LabBranchReport {
             branch_id: receipt.branch_id,
@@ -3956,7 +4035,7 @@ mod tests {
             assert!(chosen.validate(&capabilities).is_ok());
             assert_eq!(chosen.checkpoint, draft.checkpoint);
             assert!(branch_identifier_is_valid(treatment.key()));
-            assert!(!treatment.description().is_empty());
+            assert_ne!(treatment.description(), "");
             assert_eq!(
                 treatment.branch_count(),
                 if treatment == LabBranchTreatment::Unchanged {
@@ -4201,7 +4280,7 @@ mod tests {
                         .unwrap()
                         .draft
                         .checkpoint
-                        .byte_size += 1
+                        .byte_size += 1;
                 }
                 _ => unreachable!(),
             }
@@ -4235,7 +4314,13 @@ mod tests {
         let mut state = LabWorkflows {
             submit: Some(Arc::new(move |request| {
                 calls.lock().unwrap().push(request.clone());
-                let mut status = service_status.lock().unwrap();
+                let status = {
+                    let mut status = service_status.lock().unwrap();
+                    if matches!(request, LabWorkflowRequest::CancelCheckpointBranch { .. }) {
+                        *status = "cancelling".into();
+                    }
+                    status.clone()
+                };
                 match request {
                     LabWorkflowRequest::ListCheckpointBranches { .. } => Ok(
                         LabWorkflowResponse::CheckpointBranches(LabCheckpointBranchPage {
@@ -4245,14 +4330,8 @@ mod tests {
                             next_cursor: None,
                         }),
                     ),
-                    LabWorkflowRequest::GetCheckpointBranch { .. } => {
-                        Ok(LabWorkflowResponse::CheckpointBranch(branch_test_receipt(
-                            &branch_test_draft(),
-                            &status,
-                        )))
-                    }
-                    LabWorkflowRequest::CancelCheckpointBranch { .. } => {
-                        *status = "cancelling".into();
+                    LabWorkflowRequest::GetCheckpointBranch { .. }
+                    | LabWorkflowRequest::CancelCheckpointBranch { .. } => {
                         Ok(LabWorkflowResponse::CheckpointBranch(branch_test_receipt(
                             &branch_test_draft(),
                             &status,
@@ -4374,7 +4453,7 @@ mod tests {
                 11 => changed.treatment.as_mut().unwrap().average_health = None,
                 12 => changed.treatment.as_mut().unwrap().recovery_ratio = Some(2.0),
                 13 => {
-                    changed.treatment.as_mut().unwrap().extinction_tick = Some(changed.source_tick)
+                    changed.treatment.as_mut().unwrap().extinction_tick = Some(changed.source_tick);
                 }
                 14 => {
                     changed
@@ -4384,7 +4463,7 @@ mod tests {
                         .first_divergence
                         .as_mut()
                         .unwrap()
-                        .tick = changed.source_tick
+                        .tick = changed.source_tick;
                 }
                 15 => {
                     changed
@@ -4394,7 +4473,7 @@ mod tests {
                         .first_divergence
                         .as_mut()
                         .unwrap()
-                        .branch_digest = "d".repeat(16)
+                        .branch_digest = "d".repeat(16);
                 }
                 16 => {
                     changed
@@ -4404,7 +4483,7 @@ mod tests {
                         .first_divergence
                         .as_mut()
                         .unwrap()
-                        .details = "x".repeat(2049)
+                        .details = "x".repeat(2049);
                 }
                 17 => changed.treatment.as_mut().unwrap().first_divergence = None,
                 _ => unreachable!(),
@@ -4414,14 +4493,19 @@ mod tests {
                 LabWorkflowRequest::GetCheckpointBranchReport {
                     branch_id: receipt.branch_id.clone(),
                 },
-                LabWorkflowResponse::CheckpointBranchReport(changed),
+                LabWorkflowResponse::CheckpointBranchReport(Box::new(changed)),
             );
             assert!(
                 state.branch_report.is_none(),
                 "malformed report {mismatch} must clear the previous preview"
             );
         }
+    }
 
+    #[test]
+    fn saved_study_reports_preserve_historical_and_empty_population_evidence() {
+        let receipt = branch_test_receipt(&branch_test_draft(), "completed");
+        let report = branch_test_report();
         let mut historical = report.clone();
         let divergence = historical
             .treatment
@@ -4538,9 +4622,9 @@ mod tests {
             }
             assert!(state.is_busy());
             assert!(
-                send.send(Ok(LabWorkflowResponse::CheckpointBranchReport(
+                send.send(Ok(LabWorkflowResponse::CheckpointBranchReport(Box::new(
                     branch_test_report()
-                )))
+                ))))
                 .is_ok()
             );
             assert!(state.poll().is_none());
@@ -4724,7 +4808,7 @@ mod tests {
     #[test]
     fn ecological_treatment_uses_canonical_values_and_refuses_confounded_or_unobserved_changes() {
         let capabilities = composer_test_capabilities();
-        let mut treatment = LabExperimentTreatment {
+        let treatment = LabExperimentTreatment {
             parameter: LabExperimentParameter::FoodGrowth,
             baseline_value: capabilities.treatment_parameters[0].baseline_value,
             scale_percent: 150,
@@ -4769,9 +4853,23 @@ mod tests {
             draft.validate(&capabilities).is_err(),
             "identical families need an explicit treatment design"
         );
+    }
 
-        treatment.scale_percent = 100;
-        draft.treatment = Some(treatment);
+    #[test]
+    fn ecological_treatment_checks_value_limits_and_exact_baseline() {
+        let capabilities = composer_test_capabilities();
+        let mut treatment = LabExperimentTreatment {
+            parameter: LabExperimentParameter::FoodGrowth,
+            baseline_value: capabilities.treatment_parameters[0].baseline_value,
+            scale_percent: 100,
+            at_tick: 99,
+        };
+        let mut draft = LabExperimentDraft {
+            baseline_family: "mlp.baseline".into(),
+            challenger_family: "mlp.baseline".into(),
+            treatment: Some(treatment),
+            ..LabExperimentDraft::default()
+        };
         draft.validate(&capabilities).unwrap();
         assert_eq!(
             treatment.value().unwrap().to_bits(),

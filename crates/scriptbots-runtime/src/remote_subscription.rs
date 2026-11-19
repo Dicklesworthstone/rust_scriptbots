@@ -1146,7 +1146,9 @@ mod tests {
             None
         );
 
-        let near_limit = Duration::MAX - Duration::from_secs(1);
+        let near_limit = Duration::MAX
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second is within the maximum duration");
         window.mark_sent(&canvas, near_limit).unwrap();
         assert_eq!(
             window.acknowledgement_timeout_remaining(Duration::MAX),

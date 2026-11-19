@@ -4538,6 +4538,7 @@ impl HostCore {
                 inspected_host: self.revisions,
                 inspected_tick: self.world.tick(),
             },
+            publication: latest,
             epoch: self.world.epoch(),
             uid,
             health: body.health,

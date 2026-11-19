@@ -1065,7 +1065,7 @@ impl InitOptions {
         // existing meaning for callers and the named native/WASM parity cases.
         let default_brain = self
             .default_brain
-            .or(self.seed_strategy.is_none().then_some(BrainPreset::Mlp));
+            .or_else(|| self.seed_strategy.is_none().then_some(BrainPreset::Mlp));
 
         SimSpec::new(
             config,
@@ -1288,15 +1288,10 @@ impl SimHandle {
     ) -> Result<JsValue, JsValue> {
         let uid = scriptbots_runtime::inspector::parse_agent_uid(uid)
             .ok_or_else(|| js_error("creature UID must be a canonical u64 decimal string"))?;
-        for offset in [locus_offset, delta_offset] {
-            if !offset.is_finite() || offset.fract() != 0.0 || !(0.0..=65536.0).contains(&offset) {
-                return Err(js_error(
-                    "genome page offsets must be bounded nonnegative integers",
-                ));
-            }
-        }
-        let locus_offset = locus_offset as usize;
-        let delta_offset = delta_offset as usize;
+        let invalid_offset =
+            || js_error("genome page offsets must be bounded nonnegative integers");
+        let locus_offset = bounded_genome_page_offset(locus_offset).ok_or_else(invalid_offset)?;
+        let delta_offset = bounded_genome_page_offset(delta_offset).ok_or_else(invalid_offset)?;
         scriptbots_runtime::inspector::validate_genome_page_offsets(locus_offset, delta_offset)
             .map_err(js_error)?;
         self.inner
@@ -1546,6 +1541,21 @@ fn seed_agents(
     }
 
     Ok(())
+}
+
+/// Convert a bounded, integral browser offset without saturating float casts.
+fn bounded_genome_page_offset(offset: f64) -> Option<usize> {
+    let maximum =
+        f64::from(u32::try_from(scriptbots_runtime::inspector::MAX_GENOME_SOURCE_LOCI).ok()?);
+    if !offset.is_finite() || offset.fract() != 0.0 || !(0.0..=maximum).contains(&offset) {
+        return None;
+    }
+    // Rust's unsigned parser does not accept "-0", but both signs of zero are
+    // valid input. Every other admitted value has an exact decimal integer form.
+    if offset == 0.0 {
+        return Some(0);
+    }
+    offset.to_string().parse().ok()
 }
 
 fn normalize_seed(seed: Option<f64>) -> Result<Option<u64>> {
@@ -2440,7 +2450,7 @@ mod tests {
                 .applied_interventions
                 .is_empty()
         );
-        assert!(first.core.world().active_effects().is_empty());
+        assert_eq!(first.core.world().active_effects(), []);
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -2595,6 +2605,37 @@ mod tests {
             2.0
         );
         assert_eq!(restored.core.scientific_digest_v1().unwrap(), digest);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn genome_page_offsets_convert_exactly_and_reject_invalid_inputs() {
+        let maximum = u32::try_from(scriptbots_runtime::inspector::MAX_GENOME_SOURCE_LOCI)
+            .expect("genome page bound fits u32");
+        for value in 0..=maximum {
+            assert_eq!(
+                bounded_genome_page_offset(f64::from(value)),
+                Some(usize::try_from(value).expect("genome page bound fits usize")),
+                "offset {value}"
+            );
+        }
+        assert_eq!(bounded_genome_page_offset(-0.0), Some(0));
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            -f64::EPSILON,
+            0.5,
+            65_535.5,
+            f64::from(maximum) + 1.0,
+        ] {
+            assert_eq!(
+                bounded_genome_page_offset(invalid),
+                None,
+                "offset {invalid}"
+            );
+        }
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -3361,8 +3402,14 @@ mod tests {
             else {
                 panic!("real MLP activity must be available");
             };
-            assert!(!activations.layers.is_empty());
-            assert!(!activations.connections.is_empty());
+            assert_ne!(
+                activations.layers,
+                [] as [scriptbots_core::ActivationLayer; 0]
+            );
+            assert_ne!(
+                activations.connections,
+                [] as [scriptbots_core::ActivationEdge; 0]
+            );
             assert_eq!(outputs.len(), scriptbots_core::OUTPUT_SIZE);
             assert_eq!(
                 build.retained_values,
@@ -5012,7 +5059,10 @@ mod narrative_tests {
             )))
             .unwrap();
         simulation.tick(8).unwrap();
-        assert!(simulation.snapshot().agents.is_empty());
+        assert_eq!(
+            simulation.snapshot().agents,
+            [] as [scriptbots_core::DynamicAgentSnapshot; 0]
+        );
         simulation.set_speed(0.0).unwrap();
         let before_bytes = simulation.checkpoint().unwrap();
         let before_digest = simulation.core.scientific_digest_v1().unwrap();
@@ -5035,7 +5085,10 @@ mod narrative_tests {
         assert_eq!(frame, repeated);
         let cursor = page.latest_event.to_string();
         let empty = browser_narrative_page(&snapshot, &cursor, &session).unwrap();
-        assert!(events(&empty).events.is_empty());
+        assert_eq!(
+            events(&empty).events,
+            [] as [scriptbots_runtime::remote::RemoteSequencedEvent; 0]
+        );
         assert_eq!(events(&empty).after_event, page.latest_event);
         assert_eq!(
             simulation.core.scientific_digest_v1().unwrap(),

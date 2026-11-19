@@ -1656,8 +1656,12 @@ fn smooth_agent_poses(
             }
         }
         display.previous_target = *target;
-        transform.translation = display.translation;
-        transform.rotation = display.rotation;
+        // Avoid propagating unchanged transforms through every creature part
+        // while a paused scene or an interpolated pose is stationary.
+        if transform.translation != display.translation || transform.rotation != display.rotation {
+            transform.translation = display.translation;
+            transform.rotation = display.rotation;
+        }
     }
 }
 
@@ -1726,7 +1730,7 @@ fn displayed_follow_target(
     let selected = selected.map(|(min, max)| (min + max) * 0.5);
     match mode {
         FollowMode::Off => None,
-        FollowMode::Selected => selected.or(first),
+        FollowMode::Selected => selected,
         FollowMode::Oldest => oldest.map(|(_, position)| position).or(selected).or(first),
     }
 }
@@ -1818,7 +1822,9 @@ fn smooth_spike_poses(
                 tick: target.tick,
             });
         }
-        *transform = sampled;
+        if *transform != sampled {
+            *transform = sampled;
+        }
     }
 }
 
@@ -1848,9 +1854,12 @@ fn animate_idle_bodies(
         // Always start from the snapshot base: repeated paints cannot compound
         // the deformation. Pause and reduced motion restore the exact base at
         // once, so paused inspection does not depend on elapsed render time.
-        *transform = target.transform;
+        let mut desired = target.transform;
         if enabled {
-            transform.scale *= 1.0 + BODY_IDLE_AMPLITUDE * (phase + target.phase).sin();
+            desired.scale *= 1.0 + BODY_IDLE_AMPLITUDE * (phase + target.phase).sin();
+        }
+        if *transform != desired {
+            *transform = desired;
         }
     }
 }
@@ -3737,6 +3746,16 @@ struct CreatureTraitMarker(usize);
 #[derive(Component)]
 struct CreatureTraitReading(usize);
 
+/// Inherited mutation parameters from the same owner sample as the trait panel.
+#[derive(Component, Clone, Copy)]
+enum CreatureMutationMetric {
+    Gate,
+    Scale,
+}
+
+#[derive(Component)]
+struct CreatureMutationReading(CreatureMutationMetric);
+
 #[derive(Component)]
 struct CreatureOwnerStatus;
 
@@ -3755,6 +3774,12 @@ struct CreatureParentIndicator(usize);
 
 fn creature_trait_position(value: f32) -> Option<f32> {
     (value.is_finite() && value >= 0.0).then(|| value / (1.0 + value))
+}
+
+/// A nonnegative value equals the center when it equals the supplied reference.
+fn creature_mutation_position(value: f32, reference: f32) -> Option<f32> {
+    (value.is_finite() && value >= 0.0 && reference.is_finite() && reference > 0.0)
+        .then(|| (f64::from(value) / (f64::from(value) + f64::from(reference))) as f32)
 }
 
 #[derive(Clone, Copy)]
@@ -3984,6 +4009,7 @@ struct HudDiagnosticsPageControls;
 
 fn handle_follow_menu(
     (mut menu, rig): (ResMut<HudFollowMenu>, Res<CameraRig>),
+    state: Option<Res<SnapshotState>>,
     changed: Query<&Interaction, (Changed<Interaction>, With<HudFollowMenuButton>)>,
     selections: Query<&Interaction, (Changed<Interaction>, With<FollowButton>)>,
     clear: Query<&Interaction, (Changed<Interaction>, With<ClearSelectionButton>)>,
@@ -4026,7 +4052,16 @@ fn handle_follow_menu(
         }
     }
     for mut text in &mut labels {
-        set_hud_text_if_changed(&mut text, format!("Follow: {}", rig.follow_mode.label()));
+        let label = if rig.follow_mode == FollowMode::Selected
+            && state
+                .as_ref()
+                .is_none_or(|state| state.selection_center.is_none())
+        {
+            "Follow: Awaiting selection".to_owned()
+        } else {
+            format!("Follow: {}", rig.follow_mode.label())
+        };
+        set_hud_text_if_changed(&mut text, label);
     }
 }
 
@@ -4080,11 +4115,18 @@ fn hud_diagnostic_node() -> Node {
 /// its own message reader and ignores wheel events captured by a HUD node.
 fn scroll_hud_panel(
     mut wheels: MessageReader<MouseWheel>,
+    lab: Option<Res<lab_workflows::LabPresentation>>,
     mut panels: Query<
         (&RelativeCursorPosition, &ComputedNode, &mut ScrollPosition),
         With<HudScenePanel>,
     >,
 ) {
+    // The modal receives wheel input independently; do not scroll the
+    // geometrically underlying dashboard or replay the gesture after close.
+    if !lab_workflows::camera_controls_allowed(lab) {
+        wheels.clear();
+        return;
+    }
     let scroll_pixels: f32 = wheels
         .read()
         .filter(|wheel| wheel.y.is_finite())
@@ -4228,6 +4270,64 @@ mod hud_diagnostics_tests {
             app.world().resource::<CameraRig>().distance,
             original_distance
         );
+    }
+
+    #[test]
+    fn lab_modal_consumes_dashboard_wheel_without_replaying_it_on_close() {
+        let mut app = App::new();
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::F8);
+        app.insert_resource(keys)
+            .init_resource::<lab_workflows::LabPresentation>()
+            .insert_resource(AgentMotionSettings { enabled: true })
+            .init_resource::<SnapshotState>()
+            .init_resource::<CameraRig>()
+            .init_resource::<Messages<MouseWheel>>()
+            .insert_non_send_resource(lab_workflows::consumer(None))
+            .add_systems(Update, (lab_workflows::update, scroll_hud_panel).chain());
+        let panel = app
+            .world_mut()
+            .spawn((
+                ComputedNode {
+                    size: Vec2::new(400.0, 300.0),
+                    content_size: Vec2::new(400.0, 700.0),
+                    inverse_scale_factor: 1.0,
+                    ..default()
+                },
+                RelativeCursorPosition {
+                    cursor_over: true,
+                    normalized: Some(Vec2::ZERO),
+                },
+                ScrollPosition::default(),
+                HudScenePanel,
+            ))
+            .id();
+        let send_wheel = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<Messages<MouseWheel>>()
+                .write(MouseWheel {
+                    unit: MouseScrollUnit::Line,
+                    x: 0.0,
+                    y: -1.0,
+                    window: Entity::PLACEHOLDER,
+                });
+            app.update();
+        };
+
+        send_wheel(&mut app);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.reset_all();
+            keys.press(KeyCode::Escape);
+        }
+        send_wheel(&mut app);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 0.0);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+        send_wheel(&mut app);
+        assert_eq!(app.world().get::<ScrollPosition>(panel).unwrap().0.y, 40.0);
     }
 
     #[test]
@@ -6392,13 +6492,15 @@ fn setup_scene(
                     .id();
                 card.spawn((
                     Text::new("OWNER SAMPLE  ·  WAITING"),
-                    ui_font(9.0),
+                    ui_font(11.0),
                     TextColor(Color::srgb(0.65, 0.80, 0.71)),
                     CreatureOwnerStatus,
                 ));
                 card.spawn(Node {
                     flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
                     column_gap: Val::Px(6.0),
+                    row_gap: Val::Px(4.0),
                     ..default()
                 })
                 .with_children(|row| {
@@ -6408,8 +6510,9 @@ fn setup_scene(
                         ("KNOWN PARENTS", CreatureLifeReading::Parents),
                     ] {
                         row.spawn(Node {
+                            min_width: Val::Px(0.0),
                             flex_grow: 1.0,
-                            flex_basis: Val::Px(0.0),
+                            flex_basis: Val::Px(105.0),
                             flex_direction: FlexDirection::Column,
                             row_gap: Val::Px(1.0),
                             ..default()
@@ -6417,7 +6520,7 @@ fn setup_scene(
                         .with_children(|cell| {
                             cell.spawn((
                                 Text::new(name),
-                                ui_font(9.0),
+                                ui_font(11.0),
                                 TextColor(Color::srgb(0.65, 0.80, 0.71)),
                             ));
                             cell.spawn(Node {
@@ -6487,7 +6590,7 @@ fn setup_scene(
                             &mut card_energy,
                             Some(CreatureVitalBar::Energy),
                         ),
-                        ("AGE", &mut card_age, None),
+                        ("AGE CYCLES", &mut card_age, None),
                         ("GEN", &mut card_generation, None),
                     ] {
                         row.spawn((
@@ -6550,12 +6653,16 @@ fn setup_scene(
                 });
                 card.spawn(Node {
                     flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
                     column_gap: Val::Px(10.0),
+                    row_gap: Val::Px(4.0),
                     align_items: AlignItems::Center,
                     ..default()
                 })
                 .with_children(|row| {
                     row.spawn(Node {
+                        min_width: Val::Px(0.0),
+                        max_width: Val::Percent(100.0),
                         flex_direction: FlexDirection::Column,
                         row_gap: Val::Px(3.0),
                         ..default()
@@ -6569,6 +6676,7 @@ fn setup_scene(
                         map.spawn((
                             Node {
                                 width: Val::Px(105.0),
+                                max_width: Val::Percent(100.0),
                                 height: Val::Px(48.0),
                                 border: UiRect::all(Val::Px(1.0)),
                                 ..default()
@@ -6615,6 +6723,7 @@ fn setup_scene(
                             Node {
                                 display: Display::None,
                                 width: Val::Px(105.0),
+                                max_width: Val::Percent(100.0),
                                 height: Val::Px(48.0),
                                 align_items: AlignItems::Center,
                                 justify_content: JustifyContent::Center,
@@ -6633,8 +6742,9 @@ fn setup_scene(
                         });
                     });
                     row.spawn(Node {
+                        min_width: Val::Px(0.0),
                         flex_grow: 1.0,
-                        flex_basis: Val::Px(0.0),
+                        flex_basis: Val::Px(150.0),
                         flex_direction: FlexDirection::Column,
                         row_gap: Val::Px(3.0),
                         ..default()
@@ -6663,7 +6773,8 @@ fn setup_scene(
                                         ui_font(10.0),
                                         TextColor(Color::srgb(0.80, 0.89, 0.83)),
                                         Node {
-                                            width: Val::Px(150.0),
+                                            width: Val::Px(100.0),
+                                            max_width: Val::Percent(70.0),
                                             ..default()
                                         },
                                         CreatureBodyMetricLabel(metric),
@@ -6672,6 +6783,7 @@ fn setup_scene(
                                         .spawn((
                                             Node {
                                                 flex_grow: 1.0,
+                                                min_width: Val::Px(16.0),
                                                 height: Val::Px(7.0),
                                                 ..default()
                                             },
@@ -6696,14 +6808,17 @@ fn setup_scene(
                 });
                 card.spawn(Node {
                     flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
                     column_gap: Val::Px(10.0),
+                    row_gap: Val::Px(4.0),
                     ..default()
                 })
                 .with_children(|row| {
                     for drive in [CreatureDrive::Left, CreatureDrive::Right] {
                         row.spawn(Node {
+                            min_width: Val::Px(0.0),
                             flex_grow: 1.0,
-                            flex_basis: Val::Px(0.0),
+                            flex_basis: Val::Px(140.0),
                             flex_direction: FlexDirection::Column,
                             row_gap: Val::Px(3.0),
                             ..default()
@@ -6711,7 +6826,7 @@ fn setup_scene(
                         .with_children(|column| {
                             column.spawn((
                                 Text::default(),
-                                ui_font(10.0),
+                                ui_font(11.0),
                                 TextColor(Color::srgb(0.80, 0.89, 0.83)),
                                 CreatureDriveLabel(drive),
                             ));
@@ -6744,14 +6859,17 @@ fn setup_scene(
                 });
                 card.spawn(Node {
                     flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
                     column_gap: Val::Px(10.0),
+                    row_gap: Val::Px(4.0),
                     ..default()
                 })
                 .with_children(|row| {
                     for preference in [CreaturePreference::Diet, CreaturePreference::Temperature] {
                         row.spawn(Node {
+                            min_width: Val::Px(0.0),
                             flex_grow: 1.0,
-                            flex_basis: Val::Px(0.0),
+                            flex_basis: Val::Px(140.0),
                             flex_direction: FlexDirection::Column,
                             row_gap: Val::Px(3.0),
                             ..default()
@@ -6759,7 +6877,7 @@ fn setup_scene(
                         .with_children(|scale| {
                             scale.spawn((
                                 Text::default(),
-                                ui_font(10.0),
+                                ui_font(11.0),
                                 TextColor(Color::srgb(0.80, 0.89, 0.83)),
                                 CreaturePreferenceLabel(preference),
                             ));
@@ -6821,12 +6939,14 @@ fn setup_scene(
                 });
                 card.spawn((
                     Text::new("TRAITS  ·  1× CENTER  ·  NONLINEAR"),
-                    ui_font(9.0),
+                    ui_font(11.0),
                     TextColor(Color::srgb(0.65, 0.80, 0.71)),
                 ));
                 card.spawn(Node {
                     flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
                     column_gap: Val::Px(5.0),
+                    row_gap: Val::Px(4.0),
                     ..default()
                 })
                 .with_children(|row| {
@@ -6835,6 +6955,7 @@ fn setup_scene(
                         .enumerate()
                     {
                         row.spawn(Node {
+                            min_width: Val::Px(55.0),
                             flex_grow: 1.0,
                             flex_basis: Val::Px(0.0),
                             flex_direction: FlexDirection::Column,
@@ -6844,7 +6965,7 @@ fn setup_scene(
                         .with_children(|cell| {
                             cell.spawn((
                                 Text::new(name),
-                                ui_font(9.0),
+                                ui_font(11.0),
                                 TextColor(Color::srgb(0.65, 0.80, 0.71)),
                             ));
                             cell.spawn((
@@ -6891,10 +7012,82 @@ fn setup_scene(
                         });
                     }
                 });
+                card.spawn((
+                    Text::new("INHERITED MUTATION  ·  DEFAULT AT CENTER  ·  NONLINEAR"),
+                    ui_font(11.0),
+                    TextColor(Color::srgb(0.65, 0.80, 0.71)),
+                ));
                 card.spawn(Node {
                     flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    column_gap: Val::Px(10.0),
+                    row_gap: Val::Px(4.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for (name, metric) in [
+                        ("GATE", CreatureMutationMetric::Gate),
+                        ("SCALE", CreatureMutationMetric::Scale),
+                    ] {
+                        row.spawn(Node {
+                            min_width: Val::Px(0.0),
+                            flex_grow: 1.0,
+                            flex_basis: Val::Px(140.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(3.0),
+                            ..default()
+                        })
+                        .with_children(|cell| {
+                            cell.spawn((
+                                Text::new(format!("{name}  --")),
+                                ui_font(11.0),
+                                TextColor(Color::srgb(0.80, 0.89, 0.83)),
+                                CreatureMutationReading(metric),
+                            ));
+                            cell.spawn((
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    height: Val::Px(4.0),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.22, 0.34, 0.29)),
+                                BorderRadius::all(Val::Px(2.0)),
+                            ))
+                            .with_children(|track| {
+                                track.spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        left: Val::Percent(50.0),
+                                        width: Val::Px(1.0),
+                                        height: Val::Percent(100.0),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.67, 0.76, 0.70)),
+                                ));
+                                track.spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        display: Display::None,
+                                        width: Val::Px(5.0),
+                                        height: Val::Px(8.0),
+                                        top: Val::Px(-2.0),
+                                        margin: UiRect::left(Val::Px(-2.5)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.97, 0.73, 0.34)),
+                                    BorderRadius::all(Val::Px(2.0)),
+                                    metric,
+                                ));
+                            });
+                        });
+                    }
+                });
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
                     align_items: AlignItems::Center,
                     column_gap: Val::Px(6.0),
+                    row_gap: Val::Px(4.0),
                     ..default()
                 })
                 .with_children(|row| {
@@ -6906,7 +7099,7 @@ fn setup_scene(
                     .with_children(|legend| {
                         legend.spawn((
                             Text::new("EYES  ↑ FWD"),
-                            ui_font(9.0),
+                            ui_font(10.5),
                             TextColor(Color::srgb(0.65, 0.80, 0.71)),
                         ));
                         for (color, label) in [
@@ -6932,14 +7125,14 @@ fn setup_scene(
                                     ));
                                     line.spawn((
                                         Text::new(label),
-                                        ui_font(9.0),
+                                        ui_font(10.5),
                                         TextColor(Color::srgb(0.65, 0.80, 0.71)),
                                     ));
                                 });
                         }
                         legend.spawn((
                             Text::new("COLOR / DENSITY"),
-                            ui_font(9.0),
+                            ui_font(10.5),
                             TextColor(Color::srgb(0.65, 0.80, 0.71)),
                         ));
                     });
@@ -6948,7 +7141,7 @@ fn setup_scene(
                             Node {
                                 flex_grow: 1.0,
                                 flex_basis: Val::Px(0.0),
-                                min_width: Val::Px(0.0),
+                                min_width: Val::Px(58.0),
                                 flex_direction: FlexDirection::Column,
                                 align_items: AlignItems::Center,
                                 justify_content: JustifyContent::Center,
@@ -6970,7 +7163,7 @@ fn setup_scene(
                             .with_children(|cell| {
                                 cell.spawn((
                                     Text::new(format!("E{}", eye + 1)),
-                                    ui_font(10.0),
+                                    ui_font(11.0),
                                     TextColor(Color::srgb(0.80, 0.89, 0.83)),
                                 ));
                                 cell.spawn((
@@ -9225,6 +9418,8 @@ struct CreatureCardData<'w, 's> {
     preference_labels: Query<'w, 's, (Entity, &'static CreaturePreferenceLabel)>,
     trait_markers: Query<'w, 's, (Entity, &'static CreatureTraitMarker)>,
     trait_readings: Query<'w, 's, (Entity, &'static CreatureTraitReading)>,
+    mutation_markers: Query<'w, 's, (Entity, &'static CreatureMutationMetric)>,
+    mutation_readings: Query<'w, 's, (Entity, &'static CreatureMutationReading)>,
     owner_statuses: Query<'w, 's, Entity, With<CreatureOwnerStatus>>,
     life_readings: Query<'w, 's, (Entity, &'static CreatureLifeReading)>,
     food_delta_indicators: Query<'w, 's, Entity, With<CreatureFoodDeltaIndicator>>,
@@ -9267,6 +9462,8 @@ fn update_creature_card(
         preference_labels,
         trait_markers,
         trait_readings,
+        mutation_markers,
+        mutation_readings,
         owner_statuses,
         life_readings,
         food_delta_indicators,
@@ -9629,6 +9826,55 @@ fn update_creature_card(
             ]
         });
     let life = sample.and_then(|sample| sample.life_summary);
+    let mutation_value = |metric: CreatureMutationMetric| {
+        let rates = life?.mutation_rates;
+        let defaults = scriptbots_core::MutationRates::default();
+        Some(match metric {
+            CreatureMutationMetric::Gate => (rates.primary, defaults.primary),
+            CreatureMutationMetric::Scale => (rates.secondary, defaults.secondary),
+        })
+    };
+    for (entity, metric) in &mutation_markers {
+        let position = mutation_value(*metric)
+            .and_then(|(value, reference)| creature_mutation_position(value, reference));
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if position.is_some() {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if let Some(position) = position {
+                let left = Val::Percent(position * 100.0);
+                if node.left != left {
+                    node.left = left;
+                }
+            }
+        }
+    }
+    for (entity, reading) in &mutation_readings {
+        let name = match reading.0 {
+            CreatureMutationMetric::Gate => "GATE",
+            CreatureMutationMetric::Scale => "SCALE",
+        };
+        let value = mutation_value(reading.0)
+            .filter(|(value, reference)| creature_mutation_position(*value, *reference).is_some())
+            .map_or_else(
+                || "--".to_owned(),
+                |(value, _)| {
+                    if value != 0.0 && !(0.0001..10_000.0).contains(&value) {
+                        format!("{value:.3e}")
+                    } else {
+                        format!("{value:.4}")
+                    }
+                },
+            );
+        if let Ok(mut text) = texts.get_mut(entity) {
+            set_hud_text_if_changed(&mut text, format!("{name}  {value}"));
+        }
+    }
     for (entity, metric) in &life_readings {
         let value = match (life, metric) {
             (Some(life), CreatureLifeReading::FoodDelta) if life.food_delta.is_finite() => {
@@ -9995,14 +10241,7 @@ fn update_creature_card(
         (card.context, context),
         (card.health, format!("{:.2}", agent.health)),
         (card.energy, format!("{:.2}", agent.energy)),
-        (
-            card.age,
-            format!(
-                "{} step{}",
-                agent.age,
-                if agent.age == 1 { "" } else { "s" }
-            ),
-        ),
+        (card.age, format!("{}", agent.age)),
         (card.generation, format!("{}", agent.generation)),
         (card.signal_status, signal_status),
         (card.brain_status, brain_status),
@@ -13000,6 +13239,7 @@ mod adaptive_governor_tests {
             .insert_resource(auto_launch(RenderQuality::High))
             .init_resource::<HudFollowMenu>()
             .init_resource::<CameraRig>()
+            .init_resource::<SnapshotState>()
             .add_systems(Startup, setup_scene)
             .add_systems(Update, handle_follow_menu);
         app.update();
@@ -13070,6 +13310,20 @@ mod adaptive_governor_tests {
             Display::None
         );
         assert!(!app.world().resource::<HudFollowMenu>().0);
+        app.world_mut().resource_mut::<CameraRig>().follow_mode = FollowMode::Selected;
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(label).unwrap().0,
+            "Follow: Awaiting selection"
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .selection_center = Some(Vec2::ONE);
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(label).unwrap().0,
+            "Follow: Selected"
+        );
         app.world_mut().resource_mut::<CameraRig>().follow_mode = FollowMode::Oldest;
         app.update();
         assert_eq!(app.world().get::<Text>(label).unwrap().0, "Follow: Oldest");
@@ -15179,6 +15433,7 @@ struct CreatureLifeSummary {
     reproduction_counter: f32,
     parents: [Option<AgentUid>; 2],
     hybrid: bool,
+    mutation_rates: scriptbots_core::MutationRates,
 }
 
 impl From<&scriptbots_runtime::channel::AgentInspectorData> for CreatureLifeSummary {
@@ -15188,6 +15443,7 @@ impl From<&scriptbots_runtime::channel::AgentInspectorData> for CreatureLifeSumm
             reproduction_counter: detail.life.reproduction_counter,
             parents: detail.life.lineage,
             hybrid: detail.life.hybrid,
+            mutation_rates: detail.mutation_rates,
         }
     }
 }
@@ -15289,12 +15545,14 @@ struct OwnerInspectorJob {
     worker: thread::JoinHandle<()>,
 }
 
-/// Render-thread controller: no owner wait and at most one request/response retained.
-/// The owner read has a deadline; renderer shutdown reaps the sole worker.
+/// Render-thread controller: no owner wait, one request, one visible sample,
+/// and at most one newer sample awaiting its matching frame. The owner read
+/// has a deadline; renderer shutdown reaps the sole worker.
 struct OwnerInspector {
     host: ChannelHostPort,
     job: Option<OwnerInspectorJob>,
     sample: Option<OwnerInspectorSample>,
+    pending_sample: Option<OwnerInspectorSample>,
     last_request: Option<Instant>,
     last_attempt: Option<InspectorTarget>,
     last_attempt_offset: usize,
@@ -15309,6 +15567,7 @@ impl OwnerInspector {
             host,
             job: None,
             sample: None,
+            pending_sample: None,
             last_request: None,
             last_attempt: None,
             last_attempt_offset: 0,
@@ -15323,6 +15582,7 @@ impl OwnerInspector {
             .sample
             .as_ref()
             .map(|sample| sample.target)
+            .or_else(|| self.pending_sample.as_ref().map(|sample| sample.target))
             .or_else(|| self.job.as_ref().map(|job| job.target))
             .or(self.last_attempt);
         if previous.is_some_and(|old| target.is_none_or(|new| !old.same_subject(new))) {
@@ -15337,6 +15597,27 @@ impl OwnerInspector {
         {
             self.sample = None;
             self.last_failure = None;
+        }
+        if self.pending_sample.as_ref().is_some_and(|sample| {
+            target.is_none_or(|current| !sample.target.same_subject(current))
+                || sample.genome_paging.map_or(0, |paging| paging.page_offset) != self.genome_offset
+        }) {
+            self.pending_sample = None;
+            // A later return to the discarded slice must be able to request
+            // it again even when the presented publication has not advanced.
+            self.last_attempt = None;
+            self.last_request = None;
+        }
+        if self
+            .pending_sample
+            .as_ref()
+            .is_some_and(|sample| target.is_some_and(|current| sample.target.visible_at(current)))
+        {
+            let sample = self
+                .pending_sample
+                .take()
+                .expect("visible pending sample exists");
+            self.install_visible_sample(sample);
         }
         // Never join a running worker from an Update system. A completed thread
         // can be reaped without waiting for owner work or channel admission.
@@ -15358,12 +15639,19 @@ impl OwnerInspector {
                             self.genome_offset = 0;
                             self.last_attempt_offset = 0;
                         }
-                        self.sample = Some(sample);
+                        if target.is_some_and(|current| sample.target.visible_at(current)) {
+                            self.install_visible_sample(sample);
+                        } else {
+                            // Keep the last presented sample until this
+                            // response's publication is actually on screen.
+                            self.pending_sample = Some(sample);
+                        }
                         self.last_failure = None;
                         self.status = "waiting for detail matching this frame".into();
                     }
                     (Ok(()), Ok(Ok(_))) => {
                         self.sample = None;
+                        self.pending_sample = None;
                         self.last_failure = None;
                         self.status = "unavailable: subject no longer exists (I to retry)".into();
                     }
@@ -15388,9 +15676,11 @@ impl OwnerInspector {
             return;
         };
         if self.job.is_some()
+            || self.pending_sample.is_some()
             || (self.last_attempt == Some(target) && self.last_attempt_offset == self.genome_offset)
             || self.sample.as_ref().is_some_and(|sample| {
-                sample.target == target
+                self.last_failure.is_none()
+                    && sample.target == target
                     && sample.genome_paging.map_or(0, |paging| paging.page_offset)
                         == self.genome_offset
             })
@@ -15432,6 +15722,16 @@ impl OwnerInspector {
                     "could not start inspection: {error}"
                 )));
             }
+        }
+    }
+
+    fn install_visible_sample(&mut self, sample: OwnerInspectorSample) {
+        if self
+            .sample
+            .as_ref()
+            .is_none_or(|old| old.target.visible_at(sample.target))
+        {
+            self.sample = Some(sample);
         }
     }
 
@@ -15555,8 +15855,7 @@ fn capture_owner_inspector_at(
     else {
         return Ok(None);
     };
-    let latest = host.snapshot_hub().latest();
-    let captured = inspector_target_for_detail(&detail, target, &latest)?;
+    let captured = inspector_target_for_detail(&detail, target)?;
     let (pages, sections) = owner_inspector_pages(&detail);
     let genome_paging = detail.genome_browser.as_ref().map(|genome| genome.paging);
     if genome_paging.is_some_and(|paging| paging.page_offset != genome_offset) {
@@ -15582,15 +15881,19 @@ fn capture_owner_inspector_at(
 fn inspector_target_for_detail(
     detail: &scriptbots_runtime::channel::AgentInspectorData,
     target: InspectorTarget,
-    latest: &RenderSnapshot,
 ) -> std::result::Result<InspectorTarget, String> {
+    if detail.epoch != target.epoch {
+        return Err("owner detail subject or source changed".into());
+    }
     // A response must correspond to an actual immutable owner publication.
-    // The owner may advance between submission and completion, so also accept
-    // its independently read latest publication, never a fabricated revision.
+    // The owner retains its publication with the response so a later hub
+    // update cannot make an intermediate, valid response unverifiable.
     let epoch = if detail.source == target.source {
         target.epoch
-    } else if detail.source.matches_snapshot(latest) {
-        latest.world.epoch
+    } else if detail.source.matches_snapshot(&detail.publication)
+        && detail.epoch == detail.publication.world.epoch
+    {
+        detail.publication.world.epoch
     } else {
         return Err("owner detail did not match a published frame".into());
     };
@@ -16017,7 +16320,9 @@ fn handle_inspector_page(
         if let Some(mut inspector) = inspector
             && (inspector.sample.is_none() || inspector.last_failure.is_some())
         {
+            inspector.pending_sample = None;
             inspector.last_attempt = None;
+            inspector.last_request = None;
             inspector.status = "retry queued".into();
         }
     }
@@ -16782,6 +17087,53 @@ mod owner_inspector_tests {
         owner.serve();
     }
 
+    #[test]
+    fn discarded_future_genome_slice_can_be_requested_again_on_a_paused_frame() {
+        use scriptbots_core::genome_browser::BrowserPagingMeta;
+
+        let mut owner = TestOwner::new();
+        let frame = owner.frame();
+        let target = InspectorTarget::from_frame(&frame).unwrap();
+        let mut future = target;
+        future.source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(target.source.published_snapshot.get() + 1);
+        let sample = |target, offset| OwnerInspectorSample {
+            target,
+            sensors: [0.0; scriptbots_core::INPUT_SIZE],
+            outputs: [0.0; scriptbots_core::OUTPUT_SIZE],
+            trait_modifiers: None,
+            life_summary: None,
+            pages: vec!["Genome".into()],
+            sections: InspectorSectionStarts::default(),
+            genome_paging: Some(BrowserPagingMeta {
+                page_offset: offset,
+                page_limit: 20,
+                total_nodes: 45,
+                total_loci: 200,
+                is_truncated: true,
+            }),
+            genome_deltas: vec![],
+        };
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = Some(sample(target, 0));
+        inspector.pending_sample = Some(sample(future, 20));
+        inspector.last_attempt = Some(target);
+        inspector.last_attempt_offset = 20;
+        let now = Instant::now();
+        inspector.last_request = Some(now);
+        owner.serve();
+
+        // Returning to the visible first slice discards the staged second.
+        inspector.poll(Some(target), now);
+        assert!(inspector.pending_sample.is_none());
+        assert!(inspector.last_attempt.is_none());
+        assert!(inspector.job.is_none());
+        // The same publication can now request the second slice again.
+        inspector.genome_offset = 20;
+        inspector.poll(Some(target), now);
+        assert!(inspector.job.is_some());
+    }
+
     struct TestOwner {
         port: ChannelHostPort,
         start: Option<mpsc::SyncSender<()>>,
@@ -17541,6 +17893,28 @@ mod owner_inspector_tests {
             .world_mut()
             .spawn((Text::default(), CreatureTraitReading(0)))
             .id();
+        let mutation_marker = app
+            .world_mut()
+            .spawn((Node::default(), CreatureMutationMetric::Gate))
+            .id();
+        let mutation_reading = app
+            .world_mut()
+            .spawn((
+                Text::default(),
+                CreatureMutationReading(CreatureMutationMetric::Gate),
+            ))
+            .id();
+        let mutation_scale_marker = app
+            .world_mut()
+            .spawn((Node::default(), CreatureMutationMetric::Scale))
+            .id();
+        let mutation_scale_reading = app
+            .world_mut()
+            .spawn((
+                Text::default(),
+                CreatureMutationReading(CreatureMutationMetric::Scale),
+            ))
+            .id();
         let trait_status = app
             .world_mut()
             .spawn((Text::default(), CreatureOwnerStatus))
@@ -17678,6 +18052,106 @@ mod owner_inspector_tests {
             .eye_fov[0] = std::f32::consts::FRAC_PI_2;
         app.update();
         assert_eq!(app.world().get::<Text>(food_reading).unwrap().0, "-0.120");
+        // A newer owner response must not blank the signal bar while the
+        // currently displayed frame is still at the previous publication.
+        let original_width = app.world().get::<Node>(food_bar).unwrap().width;
+        let mut future = target;
+        future.source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(target.source.published_snapshot.get() + 1);
+        future.source.inspected_tick = scriptbots_core::Tick(target.source.inspected_tick.0 + 1);
+        future.source.inspected_host.scientific = scriptbots_runtime::ScientificRevision::new(
+            target.source.inspected_host.scientific.get() + 1,
+        );
+        future.source.published_host = future.source.inspected_host;
+        let mut response = capture_owner_inspector(&owner.port, target)
+            .unwrap()
+            .unwrap();
+        response.target = future;
+        response.sensors[4] = 0.9;
+        let (send, result) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || send.send(Ok(Some(response))).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let now = Instant::now();
+        {
+            let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            inspector.job = Some(OwnerInspectorJob {
+                target,
+                genome_offset: 0,
+                result,
+                worker,
+            });
+            inspector.last_request = Some(now);
+            inspector.poll(Some(target), now);
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(food_bar).unwrap().width,
+            original_width
+        );
+        assert!(
+            !app.world()
+                .get::<Text>(signal_status)
+                .unwrap()
+                .0
+                .contains("WAITING")
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .owner_source = Some((future.source, future.epoch));
+        app.world_mut()
+            .non_send_resource_mut::<OwnerInspector>()
+            .poll(Some(future), now);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(food_bar).unwrap().width,
+            Val::Percent(90.0)
+        );
+
+        // Restore the real owner sample for the remaining dashboard checks.
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .owner_source = Some((target.source, target.epoch));
+        app.world_mut()
+            .non_send_resource_mut::<OwnerInspector>()
+            .sample = capture_owner_inspector(&owner.port, target).unwrap();
+        {
+            let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
+            inspector
+                .sample
+                .as_mut()
+                .unwrap()
+                .life_summary
+                .as_mut()
+                .unwrap()
+                .mutation_rates = scriptbots_core::MutationRates::default();
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(mutation_marker).unwrap().left,
+            Val::Percent(50.0)
+        );
+        assert_eq!(
+            app.world().get::<Text>(mutation_reading).unwrap().0,
+            "GATE  0.0030"
+        );
+        assert_eq!(
+            app.world().get::<Node>(mutation_scale_marker).unwrap().left,
+            Val::Percent(50.0)
+        );
+        assert_eq!(
+            app.world().get::<Text>(mutation_scale_reading).unwrap().0,
+            "SCALE  0.0500"
+        );
         assert_eq!(
             app.world().get::<Text>(reproduction_reading).unwrap().0,
             "0.375"
@@ -17735,6 +18209,8 @@ mod owner_inspector_tests {
                 .unwrap();
             life.food_delta = f32::NAN;
             life.reproduction_counter = f32::INFINITY;
+            life.mutation_rates.primary = f32::NAN;
+            life.mutation_rates.secondary = 0.0;
         }
         app.update();
         assert_eq!(app.world().get::<Text>(food_reading).unwrap().0, "--");
@@ -17745,6 +18221,22 @@ mod owner_inspector_tests {
         assert_eq!(
             app.world().get::<Node>(food_indicator).unwrap().display,
             Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(mutation_marker).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Text>(mutation_reading).unwrap().0,
+            "GATE  --"
+        );
+        assert_eq!(
+            app.world().get::<Node>(mutation_scale_marker).unwrap().left,
+            Val::Percent(0.0)
+        );
+        assert_eq!(
+            app.world().get::<Text>(mutation_scale_reading).unwrap().0,
+            "SCALE  0.0000"
         );
         {
             let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
@@ -17791,6 +18283,8 @@ mod owner_inspector_tests {
             let mut inspector = app.world_mut().non_send_resource_mut::<OwnerInspector>();
             let sample = inspector.sample.as_mut().unwrap();
             sample.trait_modifiers.as_mut().unwrap().smell = 0.5;
+            sample.life_summary.as_mut().unwrap().mutation_rates.primary =
+                scriptbots_core::MutationRates::default().primary;
             sample.target.uid = AgentUid(target.uid.0 + 1);
         }
         app.update();
@@ -17800,6 +18294,14 @@ mod owner_inspector_tests {
         );
         assert_eq!(app.world().get::<Text>(trait_reading).unwrap().0, "--");
         assert_eq!(app.world().get::<Text>(parents_reading).unwrap().0, "--");
+        assert_eq!(
+            app.world().get::<Text>(mutation_reading).unwrap().0,
+            "GATE  --"
+        );
+        assert_eq!(
+            app.world().get::<Node>(mutation_marker).unwrap().display,
+            Display::None
+        );
         for entity in [food_track, boost_track] {
             assert_eq!(
                 *app.world().get::<BorderColor>(entity).unwrap(),
@@ -18375,6 +18877,22 @@ mod owner_inspector_tests {
     }
 
     #[test]
+    fn mutation_scale_uses_the_actual_reference_and_rejects_invalid_values() {
+        let reference = scriptbots_core::MutationRates::default().primary;
+        assert_eq!(creature_mutation_position(0.0, reference), Some(0.0));
+        assert_eq!(creature_mutation_position(reference, reference), Some(0.5));
+        assert!(creature_mutation_position(reference * 2.0, reference).unwrap() > 0.5);
+        assert!(
+            creature_mutation_position(f32::MAX, reference)
+                .unwrap()
+                .is_finite()
+        );
+        assert_eq!(creature_mutation_position(f32::NAN, reference), None);
+        assert_eq!(creature_mutation_position(-1.0, reference), None);
+        assert_eq!(creature_mutation_position(reference, 0.0), None);
+    }
+
+    #[test]
     fn creature_card_motion_follows_selected_snapshot_without_owner_detail() {
         let owner = TestOwner::new();
         let mut frame = owner.frame();
@@ -18388,6 +18906,7 @@ mod owner_inspector_tests {
         agent.spike_length = 7.5;
         agent.boost = 1.0;
         agent.spiked = true;
+        agent.age = 33;
         agent.position = frame.world_size * Vec2::new(0.25, 0.75);
 
         let mut app = App::new();
@@ -18413,6 +18932,7 @@ mod owner_inspector_tests {
             page_body: label(),
         };
         let context = card.context;
+        let age = card.age;
         let status = card.page_status;
         let left_bar = app
             .world_mut()
@@ -18450,6 +18970,7 @@ mod owner_inspector_tests {
         app.update();
         let text = &app.world().get::<Text>(context).unwrap().0;
         assert!(text.contains("speed 5.00/tick"));
+        assert_eq!(app.world().get::<Text>(age).unwrap().0, "33");
         let marker = app.world().get::<Node>(map_position).unwrap();
         assert_eq!(
             (marker.left, marker.top),
@@ -18952,6 +19473,68 @@ mod owner_inspector_tests {
     }
 
     #[test]
+    fn future_owner_response_keeps_the_visible_sample_until_the_frame_catches_up() {
+        let owner = TestOwner::new();
+        let mut frame = owner.frame();
+        let current = InspectorTarget::from_frame(&frame).unwrap();
+        let mut future = current;
+        future.source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(current.source.published_snapshot.get() + 1);
+        future.source.inspected_tick = scriptbots_core::Tick(current.source.inspected_tick.0 + 1);
+        future.source.inspected_host.scientific = scriptbots_runtime::ScientificRevision::new(
+            current.source.inspected_host.scientific.get() + 1,
+        );
+        future.source.published_host = future.source.inspected_host;
+        let sample = |target, text: &str| OwnerInspectorSample {
+            target,
+            sensors: [0.0; scriptbots_core::INPUT_SIZE],
+            outputs: [0.0; scriptbots_core::OUTPUT_SIZE],
+            trait_modifiers: None,
+            life_summary: None,
+            pages: vec![format!("Life\n{text}")],
+            sections: InspectorSectionStarts::default(),
+            genome_paging: None,
+            genome_deltas: vec![],
+        };
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = Some(sample(current, "visible"));
+        let response = sample(future, "future");
+        let (send, result) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || send.send(Ok(Some(response))).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        inspector.job = Some(OwnerInspectorJob {
+            target: current,
+            genome_offset: 0,
+            result,
+            worker,
+        });
+        let now = Instant::now();
+        inspector.last_request = Some(now);
+        inspector.poll(Some(current), now);
+        assert!(inspector.panel(&frame, 0).contains("visible"));
+        assert!(!inspector.panel(&frame, 0).contains("future"));
+        assert_eq!(inspector.pending_sample.as_ref().unwrap().target, future);
+
+        frame.owner_source = Some((future.source, future.epoch));
+        inspector.poll(Some(future), now);
+        assert!(inspector.panel(&frame, 0).contains("future"));
+        assert!(inspector.pending_sample.is_none());
+        inspector.install_visible_sample(sample(current, "older"));
+        assert!(inspector.panel(&frame, 0).contains("future"));
+
+        inspector.pending_sample = Some(sample(future, "discarded"));
+        frame.agents[0].uid = AgentUid(current.uid.0 + 1);
+        assert!(!inspector.panel(&frame, 0).contains("future"));
+        inspector.poll(None, now);
+        assert!(inspector.sample.is_none());
+        assert!(inspector.pending_sample.is_none());
+    }
+
+    #[test]
     fn failed_refresh_keeps_labeled_detail_only_for_the_same_subject() {
         let mut owner = TestOwner::new();
         owner.serve();
@@ -19034,19 +19617,70 @@ mod owner_inspector_tests {
     }
 
     #[test]
+    fn inspector_retry_starts_one_request_for_cached_failure_or_future_only_sample() {
+        for future_only in [false, true] {
+            let mut owner = TestOwner::new();
+            owner.serve();
+            let frame = owner.frame();
+            let target = InspectorTarget::from_frame(&frame).unwrap();
+            let mut sample = capture_owner_inspector(&owner.port, target)
+                .unwrap()
+                .unwrap();
+            let mut inspector = OwnerInspector::new(owner.port.clone());
+            if future_only {
+                sample.target.source.published_snapshot = scriptbots_runtime::SnapshotRevision::new(
+                    target.source.published_snapshot.get() + 1,
+                );
+                inspector.pending_sample = Some(sample);
+            } else {
+                inspector.sample = Some(sample);
+                inspector.last_failure = Some("simulated failure".into());
+            }
+            inspector.last_attempt = Some(target);
+            inspector.last_request = Some(Instant::now());
+            let mut app = App::new();
+            app.insert_resource(SnapshotState {
+                latest: Some(frame),
+                ..default()
+            })
+            .init_resource::<InspectorPage>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .insert_non_send_resource(inspector)
+            .add_systems(
+                Update,
+                (handle_inspector_page, poll_owner_inspector).chain(),
+            );
+
+            app.update();
+            assert!(
+                app.world()
+                    .non_send_resource::<OwnerInspector>()
+                    .job
+                    .is_none()
+            );
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(KeyCode::KeyI);
+            app.update();
+            let inspector = app.world().non_send_resource::<OwnerInspector>();
+            assert!(inspector.job.is_some(), "retry must enqueue one owner read");
+            assert!(inspector.pending_sample.is_none());
+        }
+    }
+
+    #[test]
     fn unmatched_owner_detail_is_a_retryable_failure_not_a_death() {
         let mut owner = TestOwner::new();
         owner.serve();
         let frame = owner.frame();
         let target = InspectorTarget::from_frame(&frame).unwrap();
-        let latest = owner.port.snapshot_hub().latest();
         let mut detail = owner
             .port
             .inspect_agent_for_hud_before(target.uid, Instant::now() + Duration::from_secs(1))
             .unwrap()
             .unwrap();
         assert_eq!(
-            inspector_target_for_detail(&detail, target, &latest).unwrap(),
+            inspector_target_for_detail(&detail, target).unwrap(),
             target
         );
 
@@ -19054,14 +19688,21 @@ mod owner_inspector_tests {
         detail.source.published_snapshot =
             scriptbots_runtime::SnapshotRevision::new(original.published_snapshot.get() + 1);
         assert!(
-            inspector_target_for_detail(&detail, target, &latest)
+            inspector_target_for_detail(&detail, target)
                 .unwrap_err()
                 .contains("did not match a published frame")
         );
         detail.source = original;
+        detail.epoch = target.epoch + 1;
+        assert!(
+            inspector_target_for_detail(&detail, target)
+                .unwrap_err()
+                .contains("subject or source changed")
+        );
+        detail.epoch = target.epoch;
         detail.uid = AgentUid(target.uid.0 + 1);
         assert!(
-            inspector_target_for_detail(&detail, target, &latest)
+            inspector_target_for_detail(&detail, target)
                 .unwrap_err()
                 .contains("subject or source changed")
         );
@@ -19071,9 +19712,41 @@ mod owner_inspector_tests {
         changed_request.source.published_snapshot =
             scriptbots_runtime::SnapshotRevision::new(original.published_snapshot.get() + 1);
         assert_eq!(
-            inspector_target_for_detail(&detail, changed_request, &latest).unwrap(),
+            inspector_target_for_detail(&detail, changed_request).unwrap(),
             target,
-            "a response matching the independently read publication stays valid"
+            "a response matching the owner-retained publication stays valid"
+        );
+    }
+
+    #[test]
+    fn owner_detail_survives_a_newer_hub_publication() {
+        let mut owner = TestOwner::new();
+        owner.serve();
+        let target = InspectorTarget::from_frame(&owner.frame()).unwrap();
+        let mut detail = owner
+            .port
+            .inspect_agent_for_hud_before(target.uid, Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+
+        // Model publications 1, 2 and 3 around a real owner response.
+        // Other source and subject fields remain those captured by the owner.
+        detail.source.published_snapshot = scriptbots_runtime::SnapshotRevision::new(2);
+        Arc::make_mut(&mut detail.publication).revision =
+            scriptbots_runtime::SnapshotRevision::new(2);
+        let mut earlier_request = target;
+        earlier_request.source.published_snapshot = scriptbots_runtime::SnapshotRevision::new(1);
+        let mut later_publication = detail.publication.as_ref().clone();
+        later_publication.revision = scriptbots_runtime::SnapshotRevision::new(3);
+        assert_ne!(detail.source, earlier_request.source);
+        assert!(!detail.source.matches_snapshot(&later_publication));
+        assert!(detail.source.matches_snapshot(&detail.publication));
+        assert_eq!(
+            inspector_target_for_detail(&detail, earlier_request).unwrap(),
+            InspectorTarget {
+                source: detail.source,
+                ..target
+            }
         );
     }
 
@@ -19475,8 +20148,10 @@ fn handle_selection_input(
         Option<Res<AgentRegistry>>,
         Query<&AgentDisplayPose>,
     ),
-    submitter: Option<Res<CommandSubmitter>>,
-    lab: Option<Res<lab_workflows::LabPresentation>>,
+    (submitter, lab): (
+        Option<Res<CommandSubmitter>>,
+        Option<Res<lab_workflows::LabPresentation>>,
+    ),
     ui_interactions: Query<&Interaction, With<Node>>,
     mut rig: ResMut<CameraRig>,
 ) {
@@ -20776,7 +21451,7 @@ fn control_camera(
 
     let authoritative_follow = match rig.follow_mode {
         FollowMode::Off => None,
-        FollowMode::Selected => state.selection_center.or(state.first_agent_position),
+        FollowMode::Selected => state.selection_center,
         FollowMode::Oldest => state
             .oldest_position
             .or(state.selection_center)
@@ -20818,9 +21493,13 @@ fn control_camera(
         if follow_waiting && focus_override.is_none() {
             rig.focus_smoothed
         } else {
-            focus_override
-                .or(follow_target)
-                .unwrap_or(state.focus_point)
+            focus_override.or(follow_target).unwrap_or_else(|| {
+                if rig.follow_mode == FollowMode::Selected {
+                    rig.focus_smoothed
+                } else {
+                    state.focus_point
+                }
+            })
         }
     };
 
@@ -20832,6 +21511,7 @@ fn control_camera(
             .as_ref()
             .is_some_and(|snapshot| !snapshot.paused)
         && motion.as_ref().is_none_or(|settings| settings.enabled)
+        && follow_target.is_some()
     {
         target_focus += match rig.follow_mode {
             FollowMode::Off => Vec2::ZERO,
@@ -22635,17 +23315,21 @@ fn creature_terrain_map_image(
     Some(image)
 }
 
+type CreatureTerrainMapQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut ImageNode, &'static mut Node),
+    (
+        With<CreatureTerrainMap>,
+        Without<CreatureTerrainMapUnavailable>,
+    ),
+>;
+
 fn update_creature_terrain_map(
     state: Res<SnapshotState>,
     accessibility: Res<AccessibilityState>,
     mut images: ResMut<Assets<Image>>,
-    mut maps: Query<
-        (&mut ImageNode, &mut Node),
-        (
-            With<CreatureTerrainMap>,
-            Without<CreatureTerrainMapUnavailable>,
-        ),
-    >,
+    mut maps: CreatureTerrainMapQuery<'_, '_>,
     mut placeholders: Query<
         &mut Node,
         (
@@ -22936,7 +23620,9 @@ mod terrain_tests {
                 creature_eye_field_image(invalid.0, invalid.1)
                     .data
                     .unwrap()
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .all(|pixel| pixel[3] == 0)
             );
         }
@@ -23465,7 +24151,7 @@ mod terrain_tests {
         let Some(Indices::U32(indices)) = first.indices() else {
             panic!("groundcover must use indexed triangles");
         };
-        for pair in indices.chunks_exact(6) {
+        for pair in indices.as_chunks::<6>().0 {
             assert_eq!([pair[0], pair[1], pair[2]], [pair[5], pair[4], pair[3]]);
         }
         assert!(!original.is_empty());
@@ -23949,7 +24635,7 @@ mod terrain_tests {
             panic!("food indices")
         };
         assert_eq!(indices.len(), FOOD_MOTE_SEGMENTS as usize * 6);
-        for triangle in indices.chunks_exact(3) {
+        for triangle in indices.as_chunks::<3>().0 {
             let a = Vec3::from_array(points[triangle[0] as usize]);
             let b = Vec3::from_array(points[triangle[1] as usize]);
             let c = Vec3::from_array(points[triangle[2] as usize]);
@@ -24055,7 +24741,7 @@ mod terrain_tests {
                 "the actual food mesh must clear the rendered peak"
             );
             assert!(food_colors(&mesh)[0][3] * (1.0 - s - t) > 0.0);
-            for triangle in indices.chunks_exact(3) {
+            for triangle in indices.as_chunks::<3>().0 {
                 let a = Vec3::from_array(points[triangle[0] as usize]);
                 let b = Vec3::from_array(points[triangle[1] as usize]);
                 let c = Vec3::from_array(points[triangle[2] as usize]);
@@ -24844,7 +25530,7 @@ mod terrain_tests {
             let cap_length = 2.35 * 0.5 - half;
             half + cap_length * (1.0 - (p.y * p.y + p.z * p.z) / 0.88_f32.powi(2)).sqrt()
         };
-        for tri in indices.chunks_exact(3) {
+        for tri in indices.as_chunks::<3>().0 {
             let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| Vec3::from_array(points[i as usize]));
             for p in [a, b, c, (a + b + c) / 3.0] {
                 let clearance = p.x - surface(p);
@@ -26170,7 +26856,7 @@ mod terrain_tests {
         let data = image.data.as_ref().unwrap();
         assert_eq!(image.texture_descriptor.size.width, 3);
         assert_eq!(image.texture_descriptor.size.height, 3);
-        assert!(data.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(data.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
         let center = terrain_vertex_color(terrain, 1, 1, ColorPaletteMode::Natural);
         let unfiltered = center[..3]
             .iter()
@@ -26184,7 +26870,9 @@ mod terrain_tests {
             flooded
                 .data
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .all(|pixel| pixel[3] == 0)
         );
     }
@@ -27575,6 +28263,127 @@ mod terrain_tests {
     }
 
     #[test]
+    fn stationary_pose_and_wheel_do_not_mark_transforms_changed() {
+        #[derive(Resource, Default)]
+        struct TransformChanges(Vec<(usize, usize)>);
+
+        fn record_changes(
+            roots: Query<(), (With<AgentDisplayPose>, Changed<Transform>)>,
+            wheels: Query<(), (With<WheelGroundContact>, Changed<Transform>)>,
+            mut changes: ResMut<TransformChanges>,
+        ) {
+            changes
+                .0
+                .push((roots.iter().count(), wheels.iter().count()));
+        }
+
+        let mut snapshot = sample_world_snapshot();
+        snapshot.world_size = Vec2::splat(300.0);
+        snapshot.agent_radius = 10.0;
+        snapshot.paused = true;
+        snapshot.terrain_height.dims = UVec2::splat(4);
+        snapshot.terrain_height.cell_size = 100;
+        snapshot.terrain_height.elevation = vec![0.5; 16].into();
+        let mut agent = sample_agent_visual();
+        agent.position = Vec2::splat(150.0);
+        agent.spike_length = 0.0;
+        let (translation, rotation) = agent_surface_pose(&snapshot, &agent);
+        let target = AgentPoseTarget {
+            translation,
+            rotation,
+            tick: snapshot.tick,
+        };
+        let mut app = App::new();
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot.clone()),
+            ..default()
+        })
+        .init_resource::<TransformChanges>()
+        .add_systems(
+            Update,
+            (smooth_agent_poses, conform_agent_wheels, record_changes).chain(),
+        );
+        let root = app
+            .world_mut()
+            .spawn((
+                target,
+                AgentDisplayPose {
+                    translation,
+                    rotation,
+                    previous_target: target,
+                },
+                Transform::from_translation(translation).with_rotation(rotation),
+                agent_ground_footprint(&snapshot, &agent),
+            ))
+            .id();
+        app.world_mut()
+            .spawn((Transform::default(), WheelGroundContact { root, side: 1.0 }));
+
+        app.update();
+        app.update();
+        app.world_mut()
+            .get_mut::<AgentPoseTarget>(root)
+            .unwrap()
+            .translation
+            .y += 1.0;
+        app.update();
+        assert_eq!(
+            app.world().resource::<TransformChanges>().0,
+            [(1, 1), (0, 0), (1, 1)]
+        );
+    }
+
+    #[test]
+    fn snapshot_sync_preserves_stationary_root_and_updates_capture_pose() {
+        #[derive(Resource, Default)]
+        struct RootChanges(Vec<usize>);
+
+        fn record_changes(
+            roots: Query<(), (With<AgentDisplayPose>, Changed<Transform>)>,
+            mut changes: ResMut<RootChanges>,
+        ) {
+            changes.0.push(roots.iter().count());
+        }
+
+        let mut snapshot = sample_world_snapshot();
+        snapshot.revision = 1;
+        snapshot.paused = true;
+        snapshot.agents.push(sample_agent_visual());
+        let mut app = presentation_test_app();
+        app.insert_resource(SnapshotState {
+            latest: Some(snapshot),
+            ..default()
+        })
+        .init_resource::<RootChanges>()
+        .add_systems(Update, (sync_world, record_changes).chain());
+
+        app.update();
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .revision += 1;
+        app.update();
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.agents[0].position.x += 5.0;
+        }
+        let expected = {
+            let state = app.world().resource::<SnapshotState>();
+            let snapshot = state.latest.as_ref().unwrap();
+            agent_surface_pose(snapshot, &snapshot.agents[0])
+        };
+        app.update();
+        let record = &app.world().resource::<AgentRegistry>().records[&AgentUid(1)];
+        let root = app.world().get::<Transform>(record.root).unwrap();
+        assert_eq!((root.translation, root.rotation), expected);
+        assert_eq!(app.world().resource::<RootChanges>().0, [1, 0, 1]);
+    }
+
+    #[test]
     fn wheel_joint_joins_body_to_suspended_wheel_without_sampled_ground_intersections() {
         let mut snapshot = sample_world_snapshot();
         snapshot.world_size = Vec2::splat(300.0);
@@ -28669,15 +29478,22 @@ fn apply_agent_visuals(
     let visuals = canonical_agent_visual_params(agent);
     let (translation, rotation) = agent_surface_pose(snapshot, agent);
     let footprint = agent_ground_footprint(snapshot, agent);
-    commands.entity(record.root).insert((
-        Transform::from_translation(translation).with_rotation(rotation),
-        footprint,
-        AgentPoseTarget {
-            translation,
-            rotation,
-            tick: snapshot.tick,
-        },
-    ));
+    let root_transform = Transform::from_translation(translation).with_rotation(rotation);
+    let target = AgentPoseTarget {
+        translation,
+        rotation,
+        tick: snapshot.tick,
+    };
+    commands
+        .entity(record.root)
+        .queue(move |mut entity: bevy::ecs::world::EntityWorldMut| {
+            // Captures consume this pose directly, before any motion system;
+            // preserve that contract without flagging identical snapshots.
+            if entity.get::<Transform>() != Some(&root_transform) {
+                entity.insert(root_transform);
+            }
+            entity.insert((footprint, target));
+        });
 
     let scale_factor = (snapshot.agent_radius / meshes.base_radius).clamp(0.2, 1024.0);
     let body_length = scale_factor * 2.35;
@@ -29399,7 +30215,10 @@ fn conform_agent_wheels(
         );
         if support.is_finite() {
             let travel = (root.translation.y - support).clamp(0.0, radius * 0.65);
-            wheel.translation = center - root.rotation.inverse() * Vec3::Y * travel;
+            let target = center - root.rotation.inverse() * Vec3::Y * travel;
+            if wheel.translation != target {
+                wheel.translation = target;
+            }
         }
     }
 }
@@ -31952,6 +32771,100 @@ mod tests {
     }
 
     #[test]
+    fn stationary_spike_and_idle_body_do_not_mark_transforms_changed() {
+        #[derive(Resource, Default)]
+        struct PartChanges(Vec<(usize, usize)>);
+
+        fn record_changes(
+            spikes: Query<(), (With<SpikePoseTarget>, Changed<Transform>)>,
+            bodies: Query<(), (With<IdleBodyTarget>, Changed<Transform>)>,
+            mut changes: ResMut<PartChanges>,
+        ) {
+            changes
+                .0
+                .push((spikes.iter().count(), bodies.iter().count()));
+        }
+
+        let mut snapshot = sample_world_snapshot();
+        snapshot.paused = true;
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(SnapshotState {
+                latest: Some(snapshot),
+                ..default()
+            })
+            .insert_resource(AgentMotionSettings { enabled: true })
+            .init_resource::<PartChanges>()
+            .add_systems(
+                Update,
+                (smooth_spike_poses, animate_idle_bodies, record_changes).chain(),
+            );
+        let spike = app
+            .world_mut()
+            .spawn((
+                Transform::IDENTITY,
+                SpikePoseTarget {
+                    transform: Transform::IDENTITY,
+                    tick: 1,
+                },
+                SpikeDisplayPose {
+                    transform: Transform::IDENTITY,
+                    tick: 1,
+                },
+            ))
+            .id();
+        let body = app
+            .world_mut()
+            .spawn((
+                Transform::IDENTITY,
+                IdleBodyTarget {
+                    transform: Transform::IDENTITY,
+                    phase: 0.0,
+                },
+            ))
+            .id();
+
+        app.update();
+        app.update();
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .paused = false;
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(1));
+        app.world_mut()
+            .get_mut::<SpikePoseTarget>(spike)
+            .unwrap()
+            .transform
+            .translation
+            .x = 1.0;
+        app.update();
+        assert_ne!(
+            *app.world().get::<Transform>(body).unwrap(),
+            Transform::IDENTITY
+        );
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .latest
+            .as_mut()
+            .unwrap()
+            .paused = true;
+        app.update();
+        app.update();
+        assert_eq!(
+            *app.world().get::<Transform>(body).unwrap(),
+            Transform::IDENTITY
+        );
+        assert_eq!(
+            app.world().resource::<PartChanges>().0,
+            [(1, 1), (0, 0), (1, 1), (0, 1), (0, 0)]
+        );
+    }
+
+    #[test]
     fn keyboard_pan_is_inertial_frame_independent_and_respects_reduced_motion() {
         fn run(dt: f32, frames: usize, diagonal: bool, reduced: bool) -> Vec2 {
             let mut app = App::new();
@@ -32658,6 +33571,67 @@ mod tests {
         );
         assert!((ignored.0 - 2200.0).abs() < 0.001);
         assert!(ignored.1.is_finite());
+    }
+
+    #[test]
+    fn follow_selected_waits_for_a_selection_instead_of_following_another_agent() {
+        let world = WorldState::new(ScriptBotsConfig::default()).expect("world init");
+        let snapshot = WorldSnapshot::from_world(&world).expect("snapshot generation");
+        let original = snapshot.world_size * 0.4;
+        let unrelated = snapshot.world_size * 0.8;
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .insert_resource(Messages::<MouseMotion>::default())
+            .insert_resource(Messages::<MouseWheel>::default())
+            .insert_resource(AgentMotionSettings { enabled: false })
+            .insert_resource(CameraRig {
+                follow_mode: FollowMode::Selected,
+                focus_smoothed: original,
+                recenter_now: true,
+                ..default()
+            })
+            .insert_resource(SnapshotState {
+                world_size: snapshot.world_size,
+                world_center: snapshot.world_size * 0.5,
+                focus_point: unrelated,
+                first_agent_position: Some(unrelated),
+                selected_lead: Vec2::splat(100.0),
+                latest: Some(snapshot),
+                ..default()
+            })
+            .add_systems(Update, control_camera);
+        app.world_mut().spawn((PrimaryCamera, Transform::default()));
+
+        app.update();
+        app.update();
+        assert_eq!(app.world().resource::<CameraRig>().focus_smoothed, original);
+        app.world_mut()
+            .resource_mut::<SnapshotState>()
+            .selection_center = Some(unrelated);
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraRig>().focus_smoothed,
+            unrelated
+        );
+    }
+
+    #[test]
+    fn displayed_follow_does_not_substitute_an_unselected_creature() {
+        let mut snapshot = sample_world_snapshot();
+        let mut agent = sample_agent_visual();
+        agent.selection = SelectionState::None;
+        snapshot.agents.push(agent);
+        let displayed = Vec2::new(25.0, 50.0);
+        assert_eq!(
+            displayed_follow_target(&snapshot, FollowMode::Selected, |_| Some(displayed)),
+            None
+        );
+        assert_eq!(
+            displayed_follow_target(&snapshot, FollowMode::Oldest, |_| Some(displayed)),
+            Some(displayed)
+        );
     }
 
     #[test]

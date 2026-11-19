@@ -8931,10 +8931,10 @@ mod tests {
         let hub = SnapshotHub::new(Arc::clone(&initial));
         let mut fast = hub.watch().unwrap();
         let mut slow = hub.watch().unwrap();
-        let fast_wakes = Arc::new(SnapshotCountingWake::default());
-        let slow_wakes = Arc::new(SnapshotCountingWake::default());
-        let fast_waker = Waker::from(Arc::clone(&fast_wakes));
-        let slow_waker = Waker::from(Arc::clone(&slow_wakes));
+        let fast_count = Arc::new(SnapshotCountingWake::default());
+        let slow_count = Arc::new(SnapshotCountingWake::default());
+        let fast_waker = Waker::from(Arc::clone(&fast_count));
+        let slow_waker = Waker::from(Arc::clone(&slow_count));
         consume_initial_watch(&mut fast, &fast_waker);
         consume_initial_watch(&mut slow, &slow_waker);
         let mut fast_wait = fast.changed();
@@ -8962,8 +8962,8 @@ mod tests {
             weak.upgrade().is_none(),
             "stalled watchers must not retain superseded snapshots"
         );
-        assert_eq!(fast_wakes.0.load(Ordering::SeqCst), 1);
-        assert_eq!(slow_wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(fast_count.0.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_count.0.load(Ordering::SeqCst), 1);
         let Poll::Ready(observed) =
             Pin::new(&mut fast_wait).poll(&mut Context::from_waker(&fast_waker))
         else {
@@ -8980,7 +8980,7 @@ mod tests {
         let latest = newer_watch_snapshot(&hub, 10);
         hub.publish(Arc::clone(&latest)).unwrap();
         assert_eq!(
-            slow_wakes.0.load(Ordering::SeqCst),
+            slow_count.0.load(Ordering::SeqCst),
             1,
             "cancelled waits release their executor waker"
         );
@@ -9004,7 +9004,7 @@ mod tests {
         assert!(hub.publish(Arc::new(wrong_session)).is_err());
         assert!(hub.publish(newer_watch_snapshot(&hub, 10)).is_err());
         assert_eq!(
-            slow_wakes.0.load(Ordering::SeqCst),
+            slow_count.0.load(Ordering::SeqCst),
             1,
             "refused publications must not signal changes"
         );
@@ -9016,7 +9016,7 @@ mod tests {
         );
         drop(idle);
         assert_eq!(
-            Arc::strong_count(&slow_wakes),
+            Arc::strong_count(&slow_count),
             2,
             "idle cancellation must release the registered task"
         );
@@ -9067,31 +9067,30 @@ mod tests {
     fn snapshot_watch_publication_during_registration_never_waits_for_the_reader() {
         let hub = SnapshotHub::new(Arc::new(projection_snapshot()));
         let mut watcher = hub.watch().unwrap();
-        let wakes = Arc::new(SnapshotCountingWake::default());
-        let waker = Waker::from(Arc::clone(&wakes));
+        let counter = Arc::new(SnapshotCountingWake::default());
+        let waker = Waker::from(Arc::clone(&counter));
         consume_initial_watch(&mut watcher, &waker);
         let signal = Arc::clone(&watcher.signal);
         let registration = signal.waker.lock().unwrap();
         let (completed, completion) = std::sync::mpsc::channel();
-        let publishing_hub = hub.clone();
         let publisher = std::thread::spawn(move || {
-            let result = publishing_hub.publish(newer_watch_snapshot(&publishing_hub, 8));
+            let result = hub.publish(newer_watch_snapshot(&hub, 8));
             completed.send(result).unwrap();
         });
         // Model a task registering under its observer lock while publication
         // completes. Release the lock before asserting so even a regressed
         // blocking implementation is joined rather than leaving a test thread.
-        let published = completion.recv_timeout(Duration::from_secs(2));
+        let completion_result = completion.recv_timeout(Duration::from_secs(2));
         drop(registration);
         publisher.join().unwrap();
-        published
+        completion_result
             .expect("the publisher must not wait for an observer lock")
             .unwrap();
-        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
         assert!(signal.notified.load(AtomicOrdering::Acquire));
         signal.register(&waker);
         assert_eq!(
-            wakes.0.load(Ordering::SeqCst),
+            counter.0.load(Ordering::SeqCst),
             1,
             "registration must recover the missed try-lock wake"
         );
