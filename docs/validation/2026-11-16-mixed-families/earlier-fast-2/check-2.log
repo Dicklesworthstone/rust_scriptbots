@@ -1,0 +1,58 @@
+# dsr quality check
+# argv: node --test crates/scriptbots-web/web/tests/recipes.test.mjs crates/scriptbots-web/web/tests/permalink_fork_dom.test.js
+# cwd: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_first
+# env: PATH=/workspace/scratch/59c449fc313c/tooling/bin:/workspace/scratch/59c449fc313c/tooling/cargo/bin:/home/agent/.codex/tmp/arg0-linux/codex-arg0wyO7Ne:/opt/codex/codex-path:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback
+# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs/rust_scriptbots_fast/20261115T210957-SsJmF6Z0
+# env: DSR_QUALITY_TIMEOUT=120
+# env: DSR_REPOS_FILE=/workspace/scratch/59c449fc313c/tooling/dsr-quality/repos.yaml
+# env: DSR_CURRENT_CMD=quality
+# env: DSR_CURRENT_HOST=
+# env: DSR_RUN_ID=run-1794794806-2
+# env: CARGO_HOME=/workspace/scratch/59c449fc313c/tooling/cargo
+# env: RUSTUP_TOOLCHAIN=nightly-2026-08-31-x86_64-unknown-linux-gnu
+# env: RUSTUP_HOME=/workspace/scratch/59c449fc313c/tooling/rustup
+# env: DSR_CURRENT_TOOL=
+# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs
+# env: DSR_RUST_NATIVE_ENV_NAMES
+# started_monotonic_ms: 4231879
+# timeout_seconds: 120
+# ----
+FATAL: Test run failed: browserType.launch: Executable doesn't exist at /home/agent/.cache/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell
+╔════════════════════════════════════════════════════════════╗
+║ Looks like Playwright was just installed or updated.       ║
+║ Please run the following command to download new browsers: ║
+║                                                            ║
+║     npx playwright install                                 ║
+║                                                            ║
+║ <3 Playwright Team                                         ║
+╚════════════════════════════════════════════════════════════╝
+    at runTests (/workspace/scratch/59c449fc313c/rust_scriptbots_dsr_first/crates/scriptbots-web/web/tests/permalink_fork_dom.test.js:1012:34) {
+  log: [],
+  name: 'Error'
+}
+✖ crates/scriptbots-web/web/tests/permalink_fork_dom.test.js (3919.569591ms)
+✔ saved mixed worlds require every supported family in the observed registry order (16.185282ms)
+✔ mixed continuation admission refuses missing, foreign, duplicate or substituted families (0.839233ms)
+✔ browser recipes preserve exact full-width seeds and registered empty-world families (0.888028ms)
+✔ malformed metadata cannot round seeds or claim a different continuation contract (0.367396ms)
+✔ gallery references and saved owners retain their narrower recorded evidence (4.533148ms)
+✔ a usable owner with an oversized recipe keeps its known launch metadata (0.203198ms)
+✔ matching recorded inputs are displayed without promoting them to binary identity (1.516606ms)
+✔ unavailable identity clears earlier mismatch state and remains informational (3.94234ms)
+✔ legacy gallery references stay labelled and unknown status cannot leave a stale comparison (0.391651ms)
+ℹ tests 10
+ℹ suites 0
+ℹ pass 9
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 4015.840663
+
+✖ failing tests:
+
+test at crates/scriptbots-web/web/tests/permalink_fork_dom.test.js:1:1
+✖ crates/scriptbots-web/web/tests/permalink_fork_dom.test.js (3919.569591ms)
+  'test failed'
+
+# exit_code: 1

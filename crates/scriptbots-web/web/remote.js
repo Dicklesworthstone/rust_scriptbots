@@ -1,13 +1,15 @@
 // Remote presentation never owns or drives a local SimHandle. Binary decoding is
 // supplied by the shared Rust/WASM protocol; this module owns connection and
 // consumer cursors, with no queue of historical canvas frames.
-import { MAX_LAB_ARTIFACT_BYTES, validateLabArtifact, validateLabIntervention } from "./checkpoint-lab.js";
+import { MAX_LAB_ARTIFACT_BYTES, validateCheckpointCanvas, validateLabArtifact,
+  validateLabCheckpoint, validateLabIntervention } from "./checkpoint-lab.js";
 import { EXPERIMENT_LIMITS, EXPERIMENT_ENDPOINT_METRICS, parseExperimentJson,
   prepareExperimentRequest } from "./experiment-protocol.js";
 
 const VERSION = 1;
 const STREAM_VERSION = 2;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+const MAX_CHECKPOINT_CANVAS_BYTES = 12 * 1024 * 1024;
 const MAX_CONTROL_BYTES = 16 * 1024;
 const MAX_SEND_BUFFER_BYTES = 64 * 1024;
 const MAX_REQUESTS = 32;
@@ -408,10 +410,10 @@ export class RemoteStreamClient {
   }
 
   /** Every Lab read/write is bound to the negotiated owner, including at the HTTP server. */
-  async labJson(path, sessionId, byteLimit, { signal, body, method = "GET", query = {}, parse = JSON.parse } = {}) {
+  async labJson(path, sessionId, byteLimit, { signal, body, method = "GET", query = {}, parse = JSON.parse, timeoutMs = 15000 } = {}) {
     const url = this.apiUrl(path, sessionId, query);
     const generation = this.generation;
-    const value = await boundedOwnerJson(url, byteLimit, { signal, body, method, sessionId, timeoutMs: 15000, parse });
+    const value = await boundedOwnerJson(url, byteLimit, { signal, body, method, sessionId, timeoutMs, parse });
     this.requireLabSource(sessionId, generation);
     return value;
   }
@@ -467,6 +469,38 @@ export class RemoteStreamClient {
   async listCheckpoints({ sessionId, cursor = null, limit = 12, signal } = {}) {
     return this.labJson("/api/v1/checkpoints", sessionId, 128 * 1024,
       { signal, query: labPageQuery(cursor, limit) });
+  }
+
+  /** Decode a bounded saved-world projection without admitting it to the live stream cursor. */
+  async checkpointCanvas(checkpointId, { sessionId, expected, signal } = {}) {
+    labIdentifier(checkpointId);
+    validateLabCheckpoint(expected);
+    if (expected.checkpoint_id !== checkpointId) throw new Error("Preview request differs from its selected checkpoint");
+    const result = await this.labJson(`/api/v1/checkpoints/${checkpointId}/canvas`, sessionId, MAX_CHECKPOINT_CANVAS_BYTES,
+      { signal, query: { session_id: sessionId }, timeoutMs: 35000 });
+    if (result?.schema !== "scriptbots.checkpoint-canvas.v1" || result.sourceSessionId !== sessionId) {
+      throw new Error("The saved-world response belongs to a different host or protocol");
+    }
+    const encoded = result.frameBase64;
+    if (typeof encoded !== "string" || encoded.length === 0 || encoded.length % 4 !== 0
+        || encoded.length > Math.ceil(MAX_FRAME_BYTES / 3) * 4 || /[^A-Za-z0-9+/=]/.test(encoded)) {
+      throw new Error("The saved-world frame exceeds its byte bound or has invalid base64");
+    }
+    const binary = atob(encoded);
+    if (binary.length > MAX_FRAME_BYTES || btoa(binary) !== encoded) {
+      throw new Error("The saved-world frame exceeds its byte bound or has noncanonical base64");
+    }
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const decoded = this.decodeFrame(bytes);
+    if (decoded?.schema !== "scriptbots.remote-frame.v2" || decoded.kind !== "canvas"
+        || decoded.coalescedPublications !== "0") {
+      throw new Error("The saved-world response is not one complete reconstructed canvas");
+    }
+    const value = { schema: result.schema, sourceSessionId: result.sourceSessionId, checkpoint: result.checkpoint,
+      frame: { schema: "scriptbots.browser-frame.v1", identity: decoded.identity, snapshot: decoded.payload,
+        playback: decoded.playback, environment: decoded.environment } };
+    return validateCheckpointCanvas(value, { sessionId, checkpoint: expected });
   }
 
   async listCheckpointBranches({ sessionId, cursor = null, limit = 12, signal } = {}) {

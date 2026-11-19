@@ -19,7 +19,493 @@ use scriptbots_runtime::lab_workflows::{
     LabWorkflowResponse,
 };
 
+#[derive(Clone, Copy)]
+enum LabGuideAction {
+    Open,
+    Hide,
+    Restart,
+    Next(LabGuideBoundary),
+    Perform(LabGuideBoundary),
+}
+
+#[derive(Clone, Copy)]
+struct LabGuideBoundary {
+    generation: u64,
+    step: LabGuideStep,
+    session_id: scriptbots_runtime::HostSessionId,
+    config_revision: scriptbots_runtime::ConfigRevision,
+    growth_proposal: Option<f32>,
+}
+
+/// A disclosed one-coefficient proposal; no scientific state is changed here.
+fn guide_growth_proposal(snapshot: &RenderSnapshot) -> Option<f32> {
+    let current = snapshot.config.food_growth_rate;
+    let proposed = if current == 0.0 {
+        0.0005
+    } else {
+        current * 0.75
+    };
+    if !proposed.is_finite() || proposed.to_bits() == current.to_bits() {
+        return None;
+    }
+    let mut config = snapshot.config.as_ref().clone();
+    config.food_growth_rate = proposed;
+    config.validate().ok().map(|()| proposed)
+}
+
 impl SimulationView {
+    /// Both windows observe the same owner and guide; neither advances science.
+    fn observe_lab_guide(&self) {
+        let snapshot = self.host.snapshot_hub().latest();
+        let focused = self.focused_agent();
+        let selected = focused.and_then(|id| {
+            snapshot
+                .world
+                .agents
+                .iter()
+                .find(|agent| agent.id == id.raw())
+                .map(|agent| agent.uid)
+        });
+        let pending = if let Ok(mut guide) = self.lab_guide.lock() {
+            guide.observe_snapshot(&snapshot, selected);
+            // Pending is observed only at actual save dispatch below. Repainting
+            // a request started before this learning step must not adopt it.
+            if let Some(save) = &self.lab_workflows.latest_checkpoint_save
+                && !matches!(&save.state, LabCheckpointSaveState::Pending)
+            {
+                guide.observe_checkpoint_save(save);
+            }
+            if let (Some(branch), Some(report)) = (
+                &self.lab_workflows.branch,
+                &self.lab_workflows.branch_report,
+            ) {
+                guide.observe_branch_report(snapshot.session_id, branch, report);
+            }
+            guide.pending_command_id()
+        } else {
+            None
+        };
+        if let Some(id) = pending
+            && let Ok(Some(status)) = self.host.try_published_command_status(id)
+            && let Ok(mut guide) = self.lab_guide.lock()
+        {
+            guide.observe_status(snapshot.session_id, &status);
+        }
+    }
+
+    fn guide_navigate(&mut self, tab: DashboardTab) {
+        if self.dashboard_tab != tab {
+            self.timeline_cancelled.store(true, AtomicOrdering::Release);
+            self.lab_workflows.invalidate();
+            self.dashboard_tab = tab;
+        }
+        self.synchronize_lab_source();
+    }
+
+    fn guide_action(&mut self, action: LabGuideAction, cx: &mut Context<Self>) {
+        match action {
+            LabGuideAction::Open | LabGuideAction::Hide | LabGuideAction::Restart => {
+                if let Ok(mut guide) = self.lab_guide.lock() {
+                    match action {
+                        LabGuideAction::Open => guide.open(),
+                        LabGuideAction::Hide => guide.visible = false,
+                        LabGuideAction::Restart => guide.restart(),
+                        _ => unreachable!("guide visibility action"),
+                    }
+                }
+                self.observe_lab_guide();
+            }
+            LabGuideAction::Next(expected) => {
+                self.observe_lab_guide();
+                if self.host.snapshot_hub().latest().session_id == expected.session_id
+                    && let Ok(mut guide) = self.lab_guide.lock()
+                    && guide.generation() == expected.generation
+                    && guide.step() == expected.step
+                {
+                    guide.advance();
+                }
+                self.observe_lab_guide();
+            }
+            LabGuideAction::Perform(expected) => {
+                self.observe_lab_guide();
+                let snapshot = self.host.snapshot_hub().latest();
+                if snapshot.session_id != expected.session_id {
+                    return;
+                }
+                let current = self.lab_guide.lock().ok().map(|guide| {
+                    (
+                        guide.generation(),
+                        guide.step(),
+                        guide.finished(),
+                        guide.ready(),
+                        guide.pending_command_id().is_some(),
+                        guide
+                            .saved_checkpoint()
+                            .map(|saved| saved.checkpoint_id.clone()),
+                    )
+                });
+                let Some((generation, step, finished, ready, pending, saved)) = current else {
+                    return;
+                };
+                let navigation = matches!(
+                    step,
+                    LabGuideStep::Identify | LabGuideStep::Inspect | LabGuideStep::Outcome
+                );
+                if generation != expected.generation
+                    || step != expected.step
+                    || finished
+                    || pending
+                    || (ready && !navigation)
+                {
+                    return;
+                }
+                if matches!(
+                    step,
+                    LabGuideStep::Pause
+                        | LabGuideStep::Step
+                        | LabGuideStep::Configure
+                        | LabGuideStep::Checkpoint
+                ) && !self.lab_world_is_live(cx)
+                {
+                    self.lab_workflows.set_notice(
+                        "Return the World window to live before this guide action. Historical views do not control their saved past.",
+                    );
+                    cx.notify();
+                    return;
+                }
+                if matches!(
+                    step,
+                    LabGuideStep::Step | LabGuideStep::Configure | LabGuideStep::Checkpoint
+                ) && !snapshot.playback.paused
+                {
+                    self.lab_workflows
+                        .set_notice("Pause the live world before continuing this guide step.");
+                    cx.notify();
+                    return;
+                }
+                match step {
+                    LabGuideStep::Identify => self.guide_navigate(DashboardTab::Overview),
+                    LabGuideStep::Inspect => self.guide_navigate(DashboardTab::Inspect),
+                    LabGuideStep::Pause => {
+                        self.submit_control_command(ControlCommand::Pause);
+                    }
+                    LabGuideStep::Step => {
+                        self.submit_control_command(ControlCommand::Step);
+                    }
+                    LabGuideStep::Configure => {
+                        if snapshot.revisions.config != expected.config_revision {
+                            self.lab_workflows.set_notice(
+                                "Configuration changed after this proposal was displayed. Review the updated value before retrying.",
+                            );
+                        } else if let Some(value) = expected.growth_proposal {
+                            let mut config = snapshot.config.as_ref().clone();
+                            config.food_growth_rate = value;
+                            if let Some(submit) = self.config_update_submit.clone() {
+                                let command = ControlCommand::UpdateConfig(Box::new(config.clone()));
+                                match submit(Box::new(config), snapshot.revisions) {
+                                    Ok(status) => {
+                                        let id = status.command_id();
+                                        if let Ok(mut guide) = self.lab_guide.lock() {
+                                            guide.observe_snapshot(&snapshot, None);
+                                            guide.record_command(&command, id, &snapshot);
+                                            guide.observe_status(snapshot.session_id, &status);
+                                        }
+                                        self.record_gui_command(
+                                            "Configuration",
+                                            GuiCommandSubmission::Enqueued(id),
+                                        );
+                                    }
+                                    Err(error) => self.lab_workflows.set_notice(format!(
+                                        "Configuration submission could not be confirmed: {error}"
+                                    )),
+                                }
+                            } else {
+                                self.lab_workflows.set_notice(
+                                    "Guarded configuration updates are unavailable in this view.",
+                                );
+                            }
+                        } else {
+                            self.lab_workflows.set_notice(
+                                "No distinct valid food-regrowth proposal is available for this configuration.",
+                            );
+                        }
+                    }
+                    LabGuideStep::Checkpoint => {
+                        self.guide_navigate(DashboardTab::Checkpoints);
+                        self.lab_action(LabAction::CreateCheckpoint, cx);
+                    }
+                    LabGuideStep::Branch => {
+                        self.guide_navigate(DashboardTab::Checkpoints);
+                        if let Some(id) = saved {
+                            if self.lab_workflows.is_busy() {
+                                self.lab_workflows.set_notice(
+                                    "Wait for the current Lab request before choosing this saved source.",
+                                );
+                            } else if self
+                                .lab_workflows
+                                .branch
+                                .as_ref()
+                                .is_some_and(|branch| branch.checkpoint_id == id)
+                            {
+                                let action = if self.lab_workflows.can_read_branch_report() {
+                                    LabAction::ReadCheckpointBranchReport
+                                } else {
+                                    LabAction::Refresh
+                                };
+                                self.lab_action(action, cx);
+                            } else {
+                                self.lab_workflows.dispatch(LabAction::BackToCheckpoints);
+                                self.lab_workflows
+                                    .dispatch(LabAction::SelectCheckpoint(id.clone()));
+                                if self
+                                    .lab_workflows
+                                    .selected_checkpoint_metadata()
+                                    .is_some_and(|checkpoint| checkpoint.checkpoint_id == id)
+                                {
+                                    self.lab_action(LabAction::NewCheckpointBranch, cx);
+                                } else {
+                                    self.lab_workflows.set_notice(
+                                        "The walkthrough's saved cut is unavailable in this catalog. Refresh or return to its retained save receipt.",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    LabGuideStep::Outcome => {
+                        self.guide_navigate(DashboardTab::Checkpoints);
+                        if self.lab_workflows.branch_report.is_none()
+                            && self.lab_workflows.can_read_branch_report()
+                        {
+                            self.lab_action(LabAction::ReadCheckpointBranchReport, cx);
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn guide_button(
+        &self,
+        id: &'static str,
+        label: String,
+        action: LabGuideAction,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(label.clone())
+            .rounded_md()
+            .border_1()
+            .border_color(chrome::border())
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(if enabled {
+                chrome::text_primary()
+            } else {
+                chrome::text_muted()
+            })
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if enabled {
+                        this.guide_action(action, cx);
+                    }
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                    if enabled && !event.is_held {
+                        this.guide_action(action, cx);
+                    }
+                    cx.stop_propagation();
+                }
+            }))
+    }
+
+    pub(super) fn render_lab_guide_launcher(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        self.guide_button(
+            "lab-guide-open",
+            "First-run guide".into(),
+            LabGuideAction::Open,
+            true,
+            cx,
+        )
+    }
+
+    pub(super) fn render_lab_guide(&self, cx: &mut Context<Self>) -> Div {
+        let state = self.lab_guide.lock().ok().and_then(|guide| {
+            guide.visible.then(|| {
+                (
+                    guide.generation(),
+                    guide.step(),
+                    guide.ready(),
+                    guide.finished(),
+                    guide.pending_command_id().is_some(),
+                    guide.status().to_owned(),
+                    guide.evidence().to_owned(),
+                )
+            })
+        });
+        let Some((generation, step, ready, finished, pending, status, evidence)) = state else {
+            return div();
+        };
+        let snapshot = self.host.snapshot_hub().latest();
+        let growth_proposal = (step == LabGuideStep::Configure)
+            .then(|| guide_growth_proposal(&snapshot))
+            .flatten();
+        let boundary = LabGuideBoundary {
+            generation,
+            step,
+            session_id: snapshot.session_id,
+            config_revision: snapshot.revisions.config,
+            growth_proposal,
+        };
+        let label = match step {
+            LabGuideStep::Identify => "Open run overview".to_owned(),
+            LabGuideStep::Inspect => "Open organism inspector".to_owned(),
+            LabGuideStep::Pause => "Pause this run".to_owned(),
+            LabGuideStep::Step => "Advance exactly one tick".to_owned(),
+            LabGuideStep::Configure => growth_proposal.map_or_else(
+                || "Food regrowth change unavailable".into(),
+                |value| {
+                    format!(
+                        "Set food regrowth: {} → {value}",
+                        snapshot.config.food_growth_rate,
+                    )
+                },
+            ),
+            LabGuideStep::Checkpoint => "Save live checkpoint".to_owned(),
+            LabGuideStep::Branch => "Configure or inspect the saved-source study".to_owned(),
+            LabGuideStep::Outcome => "Show verified study outcome".to_owned(),
+        };
+        let navigation = matches!(
+            step,
+            LabGuideStep::Identify | LabGuideStep::Inspect | LabGuideStep::Outcome
+        );
+        let available = !pending
+            && (navigation || !ready)
+            && !finished
+            && (step != LabGuideStep::Configure
+                || (growth_proposal.is_some() && self.config_update_submit.is_some()))
+            && (!matches!(
+                step,
+                LabGuideStep::Step | LabGuideStep::Configure | LabGuideStep::Checkpoint
+            ) || snapshot.playback.paused)
+            && (!matches!(
+                step,
+                LabGuideStep::Checkpoint | LabGuideStep::Branch | LabGuideStep::Outcome
+            ) || self.lab_workflows.submit.is_some());
+        let mut panel = div()
+            .id("lab-guide-panel")
+            .debug_selector(|| "lab-guide-panel".to_owned())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .mb_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(chrome::accent())
+            .bg(chrome::surface())
+            .child(div().text_sm().child(if finished {
+                "Walkthrough observations complete".to_owned()
+            } else {
+                format!(
+                    "{} / {} · {}",
+                    step.index() + 1,
+                    LabGuideStep::ALL.len(),
+                    step.title(),
+                )
+            }))
+            .child(div().text_xs().child(format!(
+                "Live owner {} · seed {} · tick {} · {} agents",
+                snapshot.session_id.get(),
+                snapshot.visual_seed,
+                snapshot.world.tick,
+                snapshot.world.agents.len(),
+            )))
+            .child(div().text_xs().child(step.instruction()))
+            .child(div().text_xs().child(status));
+        if !evidence.is_empty() {
+            panel = panel.child(div().text_xs().child(evidence));
+        }
+        if matches!(
+            step,
+            LabGuideStep::Step | LabGuideStep::Configure | LabGuideStep::Checkpoint
+        ) && !snapshot.playback.paused
+        {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .child("Pause the live world before continuing this guide step."),
+            );
+        }
+        if step == LabGuideStep::Configure && self.config_update_submit.is_none() {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .child("Guarded configuration updates are unavailable in this view."),
+            );
+        }
+        if self.lab_workflows.submit.is_none() {
+            panel = panel.child(div().text_xs().child(
+                "Checkpoint and study services are unavailable in this view.",
+            ));
+        }
+        if let Some(notice) = &self.lab_workflows.notice {
+            panel = panel.child(div().text_xs().child(notice.clone()));
+        }
+        div().child(panel.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(self.guide_button(
+                    "lab-guide-perform",
+                    label,
+                    LabGuideAction::Perform(boundary),
+                    available,
+                    cx,
+                ))
+                .child(self.guide_button(
+                    "lab-guide-next",
+                    if step == LabGuideStep::Outcome {
+                        "Finish".into()
+                    } else {
+                        "Next".into()
+                    },
+                    LabGuideAction::Next(boundary),
+                    ready && !finished,
+                    cx,
+                ))
+                .child(self.guide_button(
+                    "lab-guide-hide",
+                    "Hide; keep progress".into(),
+                    LabGuideAction::Hide,
+                    true,
+                    cx,
+                ))
+                .child(self.guide_button(
+                    "lab-guide-restart",
+                    "Restart guide".into(),
+                    LabGuideAction::Restart,
+                    true,
+                    cx,
+                )),
+        ))
+    }
+
     fn synchronize_lab_source(&mut self) {
         let panel = match self.dashboard_tab {
             DashboardTab::Experiments => LabPanel::Experiments,
@@ -46,6 +532,7 @@ impl SimulationView {
 
     pub(super) fn poll_lab_workflows(&mut self, cx: &mut Context<Self>) {
         if self.minimal_canvas_mode {
+            self.observe_lab_guide();
             return;
         }
         self.synchronize_lab_source();
@@ -89,6 +576,7 @@ impl SimulationView {
             });
         }
         self.lab_workflows.maybe_refresh();
+        self.observe_lab_guide();
     }
 
     fn lab_action(&mut self, action: LabAction, cx: &mut Context<Self>) {
@@ -110,7 +598,29 @@ impl SimulationView {
             self.timeline_cancelled
                 .store(false, AtomicOrdering::Release);
         }
+        let creating_checkpoint = action == LabAction::CreateCheckpoint;
+        let previous_pending = self
+            .lab_workflows
+            .latest_checkpoint_save
+            .as_ref()
+            .filter(|save| matches!(&save.state, LabCheckpointSaveState::Pending))
+            .map(|save| (save.session_id, save.request_id.clone()));
         self.lab_workflows.dispatch(action);
+        // Observe only an actual transition into Pending for this save action,
+        // including a retry. A cached old Pending or Saved cannot join a guide
+        // that reached Checkpoint after that request began.
+        if creating_checkpoint
+            && let Some(save) = &self.lab_workflows.latest_checkpoint_save
+            && matches!(&save.state, LabCheckpointSaveState::Pending)
+            && previous_pending
+                .as_ref()
+                .is_none_or(|(session, request)| {
+                    *session != save.session_id || request != &save.request_id
+                })
+            && let Ok(mut guide) = self.lab_guide.lock()
+        {
+            guide.observe_checkpoint_save(save);
+        }
         if return_live {
             self.return_world_to_live(cx);
             self.lab_workflows.notice = self.world_review_feedback.clone();
@@ -1536,6 +2046,264 @@ impl SimulationView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpui_guide_observes_shared_owner_receipts_and_refuses_stale_actions() {
+        use scriptbots_runtime::{HostCommand, lab_guide::LabGuideStep};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            closed: true,
+            population_minimum: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let selected = world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let host = Arc::new(TestHost::new(world));
+        let command_count = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::clone(&command_count);
+        let config_count = Arc::clone(&command_count);
+        let config_host = Arc::clone(&host);
+        let command_host = Arc::clone(&host);
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(move |command| {
+                submitted.fetch_add(1, Ordering::SeqCst);
+                Some(
+                    command_host
+                        .apply(HostCommand::try_from(command).unwrap())
+                        .command_id()
+                        .to_string(),
+                )
+            }),
+        );
+        session.config_update_submit = Some(Arc::new(move |config, expected| {
+            config_count.fetch_add(1, Ordering::SeqCst);
+            let id = scriptbots_runtime::CommandId::from_client_sequence(
+                1,
+                config_host.next_command.fetch_add(1, AtomicOrdering::Relaxed),
+            );
+            config_host
+                .port
+                .clone()
+                .submit(
+                    scriptbots_runtime::CommandEnvelope::new(id, HostCommand::UpdateConfig(config))
+                        .expecting_control_revision(expected.control)
+                        .expecting_scientific_revision(expected.scientific)
+                        .expecting_config_revision(expected.config),
+                )
+                .map_err(|error| error.to_string())
+        }));
+        let context = gpui::TestAppContext::single();
+        let windows = context
+            .update(|app| Arc::new(session).install(app))
+            .unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let canvas = context.update(|app| windows.canvas.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(1_000.0), px(1_800.0)));
+        let draw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
+            draw(lab);
+            let bounds = lab.debug_bounds(selector).expect("visible guide control");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        let wait_ready = |lab: &mut gpui::VisualTestContext| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(lab);
+                if context.update(|app| hud.read(app).lab_guide.lock().unwrap().ready()) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "guide owner receipt deadline");
+                std::thread::yield_now();
+            }
+        };
+        let before = host.port.scientific_digest_v1().unwrap();
+        click(&mut lab, "lab-guide-open");
+        wait_ready(&mut lab);
+        context.update(|app| {
+            assert!(Arc::ptr_eq(
+                &hud.read(app).lab_guide,
+                &canvas.read(app).lab_guide,
+            ));
+        });
+        click(&mut lab, "lab-guide-next");
+        draw(&mut lab);
+        context.update(|app| {
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert_eq!(guide.step(), LabGuideStep::Inspect);
+            assert!(!guide.ready(), "an unselected living agent is insufficient");
+        });
+        click(&mut lab, "lab-guide-next");
+        click(&mut lab, "lab-guide-hide");
+        click(&mut lab, "lab-guide-open");
+        context.update(|app| {
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert_eq!(guide.step(), LabGuideStep::Inspect);
+            assert!(guide.visible);
+        });
+        assert_eq!(command_count.load(Ordering::SeqCst), 0);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+
+        // Focus is frontend presentation state; commands below still pass
+        // through the actual shared owner and its published journal receipts.
+        context.update(|app| {
+            canvas.update(app, |view, _| {
+                view.inspector.lock().unwrap().focused_agent = Some(selected);
+            });
+        });
+        wait_ready(&mut lab);
+        click(&mut lab, "lab-guide-next");
+        click(&mut lab, "lab-guide-perform");
+        wait_ready(&mut lab);
+        assert!(host.snapshot().playback.paused);
+        assert_eq!(command_count.load(Ordering::SeqCst), 1);
+        click(&mut lab, "lab-guide-next");
+        let step_source = host.snapshot();
+        let step_tick = step_source.world.tick;
+        let step_action = LabGuideBoundary {
+            generation: context.update(|app| hud.read(app).lab_guide.lock().unwrap().generation()),
+            step: LabGuideStep::Step,
+            session_id: step_source.session_id,
+            config_revision: step_source.revisions.config,
+            growth_proposal: None,
+        };
+        click(&mut lab, "lab-guide-perform");
+        wait_ready(&mut lab);
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.guide_action(LabGuideAction::Perform(step_action), cx);
+            });
+        });
+        assert_eq!(host.snapshot().world.tick, step_tick + 1);
+        assert!(host.snapshot().playback.paused);
+        assert_eq!(command_count.load(Ordering::SeqCst), 2);
+        click(&mut lab, "lab-guide-next");
+        draw(&mut lab);
+
+        let offered = host.snapshot();
+        let stale = LabGuideBoundary {
+            generation: context.update(|app| hud.read(app).lab_guide.lock().unwrap().generation()),
+            step: LabGuideStep::Configure,
+            session_id: offered.session_id,
+            config_revision: offered.revisions.config,
+            growth_proposal: guide_growth_proposal(&offered),
+        };
+        let mut updated = offered.config.as_ref().clone();
+        updated.food_growth_rate *= 0.5;
+        host.apply(HostCommand::UpdateConfig(Box::new(updated)));
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.guide_action(LabGuideAction::Perform(stale), cx);
+            });
+        });
+        assert_eq!(command_count.load(Ordering::SeqCst), 2);
+        context.update(|app| {
+            assert!(
+                hud.read(app)
+                    .lab_workflows
+                    .notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Configuration changed")
+            );
+        });
+        let current = host.snapshot();
+        let expected = guide_growth_proposal(&current).unwrap();
+        click(&mut lab, "lab-guide-perform");
+        wait_ready(&mut lab);
+        assert_eq!(
+            host.snapshot().config.food_growth_rate.to_bits(),
+            expected.to_bits(),
+        );
+        assert_eq!(host.snapshot().world.tick, step_tick + 1);
+        assert_eq!(command_count.load(Ordering::SeqCst), 3);
+
+        // A callback from the previous guide step cannot perform another
+        // configuration change or advance the newly entered checkpoint step.
+        click(&mut lab, "lab-guide-next");
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.guide_action(LabGuideAction::Perform(stale), cx);
+                view.guide_action(LabGuideAction::Next(stale), cx);
+            });
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert_eq!(guide.step(), LabGuideStep::Checkpoint);
+            assert!(!guide.ready());
+        });
+        assert_eq!(command_count.load(Ordering::SeqCst), 3);
+        click(&mut lab, "lab-guide-perform");
+        context.update(|app| {
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert!(!guide.ready(), "missing checkpoint services cannot report a save");
+        });
+
+        // A cached request from before Checkpoint cannot become fresh merely
+        // because the guide paints its Pending and then its Saved DTO.
+        let frame = host.snapshot();
+        let mut cached = scriptbots_runtime::lab_workflows::LabCheckpointSave {
+            request_id: "earlier-save".into(),
+            session_id: frame.session_id,
+            state: LabCheckpointSaveState::Pending,
+        };
+        context.update(|app| {
+            hud.update(app, |view, _| {
+                view.lab_workflows.latest_checkpoint_save = Some(cached.clone());
+                view.observe_lab_guide();
+            });
+        });
+        cached.state = LabCheckpointSaveState::Saved(LabCheckpoint {
+            checkpoint_id: "earlier-cut".into(),
+            tick: frame.world.tick,
+            agent_count: frame.world.agents.len(),
+            byte_size: 4096,
+            world_digest: host.port.scientific_digest_v1().unwrap().overall,
+        });
+        context.update(|app| {
+            hud.update(app, |view, _| {
+                view.lab_workflows.latest_checkpoint_save = Some(cached);
+                view.observe_lab_guide();
+            });
+            assert!(!hud.read(app).lab_guide.lock().unwrap().ready());
+        });
+
+        // Re-entering the same step after restart must not revive an old
+        // callback, even though the owner and configuration still match.
+        let frame = host.snapshot();
+        let old_identify = LabGuideBoundary {
+            generation: stale.generation,
+            step: LabGuideStep::Identify,
+            session_id: frame.session_id,
+            config_revision: frame.revisions.config,
+            growth_proposal: None,
+        };
+        click(&mut lab, "lab-guide-restart");
+        wait_ready(&mut lab);
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.guide_action(LabGuideAction::Next(old_identify), cx);
+            });
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert_eq!(guide.step(), LabGuideStep::Identify);
+            assert!(guide.ready());
+            assert!(guide.generation() > old_identify.generation);
+        });
+        assert_eq!(command_count.load(Ordering::SeqCst), 3);
+    }
 
     fn experiment_capabilities() -> LabExperimentCapabilities {
         LabExperimentCapabilities {

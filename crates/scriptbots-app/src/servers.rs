@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::Engine as _;
 use fastmcp_rust::{
     Content, Cx, JsonRpcRequest, McpError, McpErrorCode, McpResult, NotificationSender,
     PendingRequests, RequestSender, Session, ToolHandler,
@@ -66,6 +67,19 @@ use scriptbots_runtime::remote_subscription::{
 use scriptbots_runtime::{RenderSnapshot, SnapshotWatcher};
 // keep image out of servers unless needed
 
+/// Application-owned configuration submission with exact owner revision guards.
+///
+/// Both receipt axes are retained so native clients can distinguish admission,
+/// rejection, application, and journal commitment without inferring success.
+pub type ConfigUpdateSubmit = Arc<
+    dyn Fn(
+            Box<scriptbots_core::ScriptBotsConfig>,
+            scriptbots_runtime::HostRevisions,
+        ) -> std::result::Result<scriptbots_runtime::CommandStatus, String>
+        + Send
+        + Sync,
+>;
+
 /// Default loopback address for the REST control surface.
 pub const DEFAULT_CONTROL_REST_ADDRESS: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8088);
@@ -83,6 +97,12 @@ const WS_CONTROL_PROTOCOL_VERSION: u16 = 1;
 const MAX_WS_CONTROL_MESSAGE_BYTES: usize = REMOTE_MAX_REQUEST_BYTES;
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const LAB_SESSION_HEADER: &str = "x-scriptbots-session";
+const CHECKPOINT_CANVAS_SCHEMA: &str = "scriptbots.checkpoint-canvas.v1";
+const MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
+const CHECKPOINT_CANVAS_TIMEOUT: Duration = Duration::from_secs(30);
+// Reconstruction owns a separate world and can outlive a disconnected HTTP
+// request. Keep its permit inside the blocking worker until encoding finishes.
+static CHECKPOINT_CANVAS_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Return the control CLI's default REST base URL from the server's socket authority.
 #[must_use]
@@ -974,6 +994,19 @@ impl ControlRuntime {
         self.control_handle.clone()
     }
 
+    /// Build a guarded configuration adapter using the live control client's identity.
+    ///
+    /// No adapter is available for a runtime without an owner control handle.
+    #[must_use]
+    pub fn config_update_submit(&self) -> Option<ConfigUpdateSubmit> {
+        let handle = self.control_handle.clone()?;
+        Some(Arc::new(move |config, expected| {
+            handle
+                .submit_config_update(config, expected)
+                .map_err(|error| error.to_string())
+        }))
+    }
+
     /// The slot a frontend publishes its presented frames into.
     ///
     /// Handed out as a clone of the Arc, so the frontend writes exactly where
@@ -1678,6 +1711,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
         post_v1_checkpoints,
         get_v1_checkpoints,
         get_v1_checkpoint_by_id,
+        get_v1_checkpoint_canvas,
         post_v1_checkpoint_branches,
         get_v1_checkpoint_branches,
         get_v1_checkpoint_branch,
@@ -1737,6 +1771,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
             ExperimentSummaryDto,
             CheckpointCreateRequest,
             CheckpointMetadataDto,
+            CheckpointCanvasResponse,
             CheckpointRetentionDto,
             CheckpointBranchRequest,
             CheckpointBranchStatusDto,
@@ -2621,19 +2656,21 @@ struct PreparedRemoteFrame {
     delivered_subscription: RemoteSubscription,
 }
 
+/// Cancel queued blocking work when its requesting connection closes. Running
+/// work retains its own resource permit until it reaches its bounded completion.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn prepare_remote_frames(
     mut subscription: RemoteSubscription,
     snapshot: Arc<RenderSnapshot>,
     awaiting_channels: Vec<RemoteChannel>,
 ) -> Result<Vec<PreparedRemoteFrame>, AppError> {
-    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-    impl<T> Drop for AbortOnDrop<T> {
-        fn drop(&mut self) {
-            // Cancels queued blocking work if this connection closes or times
-            // out. A job already running has only the bounded projection to finish.
-            self.0.abort();
-        }
-    }
     let mut projection = AbortOnDrop(tokio::task::spawn_blocking(move || {
         let mut frames = Vec::with_capacity(subscription.channels().len());
         for channel in subscription.channels().to_vec() {
@@ -3237,6 +3274,8 @@ pub struct NarrativeSearchQueryParams {
     pub to: Option<u64>,
     /// Optional maximum number of hits (capped at 4096, default 32)
     pub limit: Option<usize>,
+    /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+    pub run_id: Option<String>,
 }
 
 #[utoipa::path(
@@ -3260,6 +3299,7 @@ async fn get_narrative_search(
         from_tick: params.from,
         to_tick: params.to,
         limit: params.limit,
+        run_id: params.run_id,
     };
     let hits = run_control(move || state.handle.narrative_search(query)).await?;
     Ok(Json(hits))
@@ -3269,6 +3309,8 @@ async fn get_narrative_search(
 pub struct NarrativeAroundQueryParams {
     /// Half-window size in ticks (capped at 10000, default 100)
     pub window: Option<u64>,
+    /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+    pub run_id: Option<String>,
 }
 
 #[utoipa::path(
@@ -3293,6 +3335,7 @@ async fn get_narrative_around(
     let query = NarrativeAroundQuery {
         tick,
         window: params.window,
+        run_id: params.run_id,
     };
     let hits = run_control(move || state.handle.narrative_around(query)).await?;
     Ok(Json(hits))
@@ -4394,6 +4437,166 @@ async fn get_v1_checkpoint_by_id(
     Ok(Json(meta))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCanvasQuery {
+    session_id: String,
+}
+
+impl CheckpointCanvasQuery {
+    fn session(&self) -> Result<scriptbots_runtime::HostSessionId, AppError> {
+        self.session_id
+            .parse::<u64>()
+            .ok()
+            .filter(|value| value.to_string() == self.session_id)
+            .map(scriptbots_runtime::HostSessionId::new)
+            .ok_or_else(|| {
+                AppError::bad_request(
+                    "checkpoint canvas session_id must be a canonical u64 decimal string",
+                )
+            })
+    }
+}
+
+/// A verified saved scientific cut, distinct from a live owner publication.
+/// The binary payload retains exact integer identities through the existing
+/// browser decoder; its environment and agents share the saved boundary.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CheckpointCanvasResponse {
+    schema: String,
+    source_session_id: String,
+    checkpoint: CheckpointMetadataDto,
+    frame_base64: String,
+}
+
+fn checkpoint_canvas_protocol_error(
+    error: scriptbots_runtime::remote::RemoteProtocolError,
+) -> AppError {
+    use scriptbots_runtime::remote::RemoteProtocolError;
+    match error {
+        bound @ (RemoteProtocolError::FrameTooLarge(_)
+        | RemoteProtocolError::LimitExceeded { .. }) => {
+            AppError::payload_too_large(bound.to_string())
+        }
+        error => AppError::internal(format!("checkpoint canvas projection failed: {error}")),
+    }
+}
+
+fn checkpoint_canvas_response(
+    handle: &ControlHandle,
+    checkpoint_id: &str,
+    expected_session: scriptbots_runtime::HostSessionId,
+) -> Result<CheckpointCanvasResponse, AppError> {
+    use scriptbots_runtime::remote::{RemoteEnvironmentSnapshot, RemoteFramePayload};
+
+    if handle.session_id() != expected_session {
+        return Err(AppError::conflict(
+            "checkpoint canvas host session changed; reconnect before reviewing saved worlds",
+        ));
+    }
+    let (checkpoint, snapshot) = handle
+        .checkpoint_canvas_bounded(checkpoint_id)
+        .map_err(AppError::from)?;
+    if snapshot.session_id != expected_session
+        || snapshot.world.tick != checkpoint.tick
+        || snapshot.world.agents.len() != checkpoint.agent_count
+    {
+        return Err(AppError::conflict(
+            "checkpoint canvas does not match its requested owner and saved scientific cut",
+        ));
+    }
+    let environment = RemoteEnvironmentSnapshot::capture(&snapshot)
+        .map_err(checkpoint_canvas_protocol_error)?;
+    let frame = RemoteFrame {
+        identity: snapshot.as_ref().into(),
+        playback: snapshot.playback,
+        coalesced_publications: 0,
+        environment: Some(Arc::new(environment)),
+        payload: RemoteFramePayload::Canvas(snapshot.world.clone()),
+    };
+    let bytes = encode_remote_frame(&frame).map_err(checkpoint_canvas_protocol_error)?;
+    if handle.session_id() != expected_session {
+        return Err(AppError::conflict(
+            "checkpoint canvas host session changed during reconstruction",
+        ));
+    }
+    Ok(CheckpointCanvasResponse {
+        schema: CHECKPOINT_CANVAS_SCHEMA.to_owned(),
+        source_session_id: expected_session.get().to_string(),
+        checkpoint,
+        frame_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints/{checkpoint_id}/canvas",
+    tag = "checkpoints",
+    params(
+        ("checkpoint_id" = String, Path, description = "Unique saved checkpoint identifier"),
+        ("session_id" = String, Query, description = "Required exact canonical decimal session of the connected live owner"),
+        ("X-ScriptBots-Session" = Option<String>, Header, description = "Exact canonical decimal host session negotiated by the remote stream")
+    ),
+    responses(
+        (status = 200, description = "Read-only reconstructed science and bounded environment in a base64 SBWS canvas frame; not an original host publication or a live-owner replacement", body = CheckpointCanvasResponse),
+        (status = 400, description = "Invalid identity or corrupt saved artifact"),
+        (status = 404, description = "Checkpoint unavailable"),
+        (status = 409, description = "Owner or saved-source identity changed"),
+        (status = 413, description = "Source or canvas exceeds reconstruction or transport bounds"),
+        (status = 500, description = "Saved science could not be projected or encoded"),
+        (status = 503, description = "Reconstruction capacity or deadline unavailable")
+    )
+)]
+async fn get_v1_checkpoint_canvas(
+    State(state): State<ApiState>,
+    axum::extract::Path(checkpoint_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<CheckpointCanvasQuery>,
+) -> Result<Response, AppError> {
+    let expected_session = query.session()?;
+    if state.handle.session_id() != expected_session {
+        return Err(AppError::conflict(
+            "checkpoint canvas host session changed; reconnect before reviewing saved worlds",
+        ));
+    }
+    // Reject overload before queueing a blocking task. A cancelled request must
+    // not release capacity while its non-cancellable reconstruction still runs.
+    let permit = CHECKPOINT_CANVAS_SLOTS.try_acquire().map_err(|_| {
+        AppError::service_unavailable(
+            "a checkpoint canvas is still being reconstructed; retry when it completes",
+        )
+    })?;
+    let mut reconstruction = AbortOnDrop(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let response =
+            checkpoint_canvas_response(&state.handle, &checkpoint_id, expected_session)?;
+        let bytes = serde_json::to_vec(&response)
+            .map_err(|error| AppError::internal(format!("checkpoint canvas encoding: {error}")))?;
+        if bytes.len() > MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES {
+            return Err(AppError::payload_too_large(
+                "checkpoint canvas response exceeds its 12 MiB transport bound",
+            ));
+        }
+        Ok(bytes)
+    }));
+    let bytes = tokio::time::timeout(CHECKPOINT_CANVAS_TIMEOUT, &mut reconstruction.0)
+        .await
+        .map_err(|_| {
+            AppError::service_unavailable(
+                "checkpoint canvas deadline exceeded; running reconstruction retains its slot until it finishes",
+            )
+        })?
+        .map_err(|error| AppError::internal(format!("checkpoint canvas worker failed: {error}")))??;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/checkpoints/branches",
@@ -4647,6 +4850,10 @@ fn prepare_rest_server(
         .route(
             "/api/v1/checkpoints/{checkpoint_id}",
             get(get_v1_checkpoint_by_id),
+        )
+        .route(
+            "/api/v1/checkpoints/{checkpoint_id}/canvas",
+            get(get_v1_checkpoint_canvas),
         )
         .route(
             "/api/v1/checkpoints/branches",
@@ -5120,6 +5327,11 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                     "type": "string",
                     "description": "Full-text query string (e.g. population, extinction, drought)"
                 },
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$",
+                    "description": "Stored run ID; required for multi-run databases. Explicit selection never uses live memory."
+                },
                 "from_tick": {
                     "type": "integer",
                     "minimum": 0,
@@ -5132,7 +5344,7 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                 },
                 "limit": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": 4096,
                     "description": "Max events to return (default 32, max 4096)"
                 }
@@ -5156,9 +5368,14 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                     "minimum": 0,
                     "description": "Center tick to retrieve events around"
                 },
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$",
+                    "description": "Stored run ID; required for multi-run databases. Explicit selection never uses live memory."
+                },
                 "window": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": 10000,
                     "description": "Half-window size in ticks (default 100, max 10000)"
                 }
@@ -6075,38 +6292,25 @@ impl ToolHandler for ControlTool {
                 make_tool_result(status)
             }
             ControlToolKind::NarrativeSearch => {
-                let query_str =
-                    arguments
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::new(McpErrorCode::InvalidParams, "missing 'query' field")
-                        })?;
-                let from_tick = arguments.get("from_tick").and_then(|v| v.as_u64());
-                let to_tick = arguments.get("to_tick").and_then(|v| v.as_u64());
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize);
-                let query = NarrativeSearchQuery {
-                    query: query_str.to_string(),
-                    from_tick,
-                    to_tick,
-                    limit,
-                };
+                let query: NarrativeSearchQuery = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid narrative_search parameters: {error}"),
+                        )
+                    })?;
                 let handle = self.handle.clone();
                 let hits = run_control_mcp_sync(move || handle.narrative_search(query))?;
                 make_tool_result(hits)
             }
             ControlToolKind::NarrativeAround => {
-                let tick = arguments
-                    .get("tick")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        McpError::new(McpErrorCode::InvalidParams, "missing 'tick' field")
+                let query: NarrativeAroundQuery = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid narrative_around parameters: {error}"),
+                        )
                     })?;
-                let window = arguments.get("window").and_then(|v| v.as_u64());
-                let query = NarrativeAroundQuery { tick, window };
                 let handle = self.handle.clone();
                 let hits = run_control_mcp_sync(move || handle.narrative_around(query))?;
                 make_tool_result(hits)
@@ -7099,6 +7303,210 @@ mod tests {
         assert!(policy.check(&headers, &uri, Version::HTTP_11).is_err());
     }
 
+    #[tokio::test]
+    #[serial(checkpoint_canvas)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real saved world crosses the HTTP response codec and corruption refusal"
+    )]
+    async fn checkpoint_canvas_endpoint_preserves_saved_science_and_live_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 10,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+        for _ in 0..2 {
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .unwrap();
+            assert!(world.bind_agent_brain(id, brains.population()[0]).unwrap());
+        }
+        let host = crate::control::tests::TestHost::spawn(world);
+        let root = directory.path().join("artifacts");
+        let handle = host.handle().with_artifacts_dir(root.clone()).unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let saved_publication = host.port.snapshot_hub().latest();
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest {
+                description: Some("saved canvas transport source".into()),
+                idempotency_key: Some("canvas-source".into()),
+            })
+            .unwrap();
+        let (artifact, _) = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let live = host.port.snapshot_hub().latest();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        assert_ne!(saved.tick, live.world.tick);
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let query = || {
+            axum::extract::Query(CheckpointCanvasQuery {
+                session_id: handle.session_id().get().to_string(),
+            })
+        };
+        let response = get_v1_checkpoint_canvas(
+            State(state.clone()),
+            axum::extract::Path(saved.checkpoint_id.clone()),
+            query(),
+        )
+        .await
+        .expect("real saved source projects through the endpoint");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(
+            response.into_body(),
+            MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES,
+        )
+        .await
+        .unwrap();
+        let response: CheckpointCanvasResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.schema, CHECKPOINT_CANVAS_SCHEMA);
+        assert_eq!(response.source_session_id, handle.session_id().get().to_string());
+        assert_eq!(response.checkpoint, saved);
+        let binary = base64::engine::general_purpose::STANDARD
+            .decode(&response.frame_base64)
+            .unwrap();
+        let frame = scriptbots_runtime::remote::decode_remote_frame(&binary).unwrap();
+        assert_eq!(frame.identity.session_id, u128::from(handle.session_id().get()));
+        assert_eq!(frame.identity.tick, saved.tick);
+        assert!(frame.playback.paused);
+        assert_eq!(frame.coalesced_publications, 0);
+        let expected_environment =
+            scriptbots_runtime::remote::RemoteEnvironmentSnapshot::capture(&saved_publication)
+                .unwrap();
+        let environment = frame.environment.as_deref().expect("saved environment");
+        assert_eq!(environment.width, expected_environment.width);
+        assert_eq!(environment.height, expected_environment.height);
+        assert_eq!(environment.source_width, expected_environment.source_width);
+        assert_eq!(environment.source_height, expected_environment.source_height);
+        assert_eq!(environment.cell_size, expected_environment.cell_size);
+        assert_eq!(
+            environment.food_max.to_bits(),
+            expected_environment.food_max.to_bits()
+        );
+        assert_eq!(
+            environment.hydrology_enabled,
+            expected_environment.hydrology_enabled
+        );
+        assert_eq!(environment.cells, expected_environment.cells);
+        // Layer revisions belong to the fresh presentation owner; they cannot
+        // be presented as the saved live host's publication history.
+        assert_eq!(environment.terrain_revision, 1);
+        assert_eq!(environment.food_revision, 1);
+        assert_eq!(
+            environment.hydrology_revision,
+            u64::from(environment.hydrology_enabled)
+        );
+        let scriptbots_runtime::remote::RemoteFramePayload::Canvas(canvas) = frame.payload else {
+            panic!("saved-world endpoint must return a canvas");
+        };
+        assert_eq!(canvas.agents.len(), saved.agent_count);
+        // A science checkpoint does not retain arena slots or the preceding
+        // tick's mortality counter. Every other dynamic field must survive.
+        let logical = |mut value: Value| {
+            for agent in value["agents"].as_array_mut().unwrap() {
+                agent.as_object_mut().unwrap().remove("id").unwrap();
+            }
+            value["summary"]
+                .as_object_mut()
+                .unwrap()
+                .remove("deaths")
+                .unwrap();
+            value
+        };
+        assert_eq!(
+            logical(serde_json::to_value(&canvas).unwrap()),
+            logical(serde_json::to_value(&saved_publication.world).unwrap())
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &live));
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(&artifact.relative_path))
+            .unwrap()
+            .write_all(&[0xff])
+            .unwrap();
+        let refusal = get_v1_checkpoint_canvas(
+            State(state),
+            axum::extract::Path(saved.checkpoint_id),
+            query(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.status, StatusCode::BAD_REQUEST);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &live));
+    }
+
+    #[tokio::test]
+    #[serial(checkpoint_canvas)]
+    async fn checkpoint_canvas_refuses_foreign_sources_and_busy_work_before_artifact_reads() {
+        let host = test_host();
+        let handle = host.handle();
+        let before = host.port.scientific_digest_v1().unwrap();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let permit = CHECKPOINT_CANVAS_SLOTS.acquire().await.unwrap();
+        for (session, status) in [
+            ("01".to_owned(), StatusCode::BAD_REQUEST),
+            (
+                handle.session_id().get().wrapping_add(1).to_string(),
+                StatusCode::CONFLICT,
+            ),
+            (
+                handle.session_id().get().to_string(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let refusal = get_v1_checkpoint_canvas(
+                State(state.clone()),
+                axum::extract::Path("missing-checkpoint".into()),
+                axum::extract::Query(CheckpointCanvasQuery { session_id: session }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refusal.status, status);
+        }
+        drop(permit);
+        let missing = get_v1_checkpoint_canvas(
+            State(state),
+            axum::extract::Path("missing-checkpoint".into()),
+            axum::extract::Query(CheckpointCanvasQuery {
+                session_id: handle.session_id().get().to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        assert_eq!(
+            CheckpointCanvasQuery {
+                session_id: u64::MAX.to_string(),
+            }
+            .session()
+            .unwrap()
+            .get(),
+            u64::MAX
+        );
+    }
+
     #[test]
     fn lab_session_header_requires_one_exact_canonical_owner_identity() {
         let session = scriptbots_runtime::HostSessionId::new(u64::MAX);
@@ -7186,6 +7594,10 @@ mod tests {
             (reqwest::Method::POST, "/api/v1/checkpoints"),
             (reqwest::Method::GET, "/api/v1/checkpoints"),
             (reqwest::Method::GET, "/api/v1/checkpoints/missing"),
+            (
+                reqwest::Method::GET,
+                "/api/v1/checkpoints/missing/canvas?session_id=0",
+            ),
             (reqwest::Method::POST, "/api/v1/checkpoints/branches"),
             (reqwest::Method::GET, "/api/v1/checkpoints/branches"),
             (reqwest::Method::GET, "/api/v1/checkpoints/branches/missing"),

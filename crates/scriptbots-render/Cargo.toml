@@ -11,7 +11,6 @@ scriptbots-core = { path = "../scriptbots-core" }
 scriptbots-runtime = { path = "../scriptbots-runtime" }
 slotmap = { workspace = true }
 scriptbots-storage = { path = "../scriptbots-storage" }
-kira = { workspace = true, optional = true }
 rand = { workspace = true }
 # bd-lelp: HUD layout persistence only. Both are already workspace dependencies
 # and already in Cargo.lock, so this is a crate-level opt-in that adds no new
@@ -33,7 +32,7 @@ scriptbots-brain = { path = "../scriptbots-brain" }
 
 [features]
 default = ["world_wgpu"]
-audio = ["kira"]
+audio = ["scriptbots-core/audio"]
 world_wgpu = ["scriptbots-world-gfx", "pollster", "wgpu"]
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -56,6 +56,28 @@ function sameCheckpoint(left, right) {
     .every((key) => left[key] === right[key]);
 }
 
+/** A reconstructed canvas is a saved scientific cut, never a live publication. */
+export function validateCheckpointCanvas(value, { sessionId, checkpoint }) {
+  validateLabCheckpoint(checkpoint);
+  validateLabCheckpoint(value?.checkpoint);
+  exactIdentity(sessionId);
+  if (value?.schema !== "scriptbots.checkpoint-canvas.v1"
+      || value.sourceSessionId !== sessionId || !sameCheckpoint(value.checkpoint, checkpoint)) {
+    throw new Error("The saved-world preview does not match the selected checkpoint and host");
+  }
+  const frame = value.frame, identity = frame?.identity, snapshot = frame?.snapshot;
+  for (const field of ["sessionId", "publicationRevision", "scientificRevision",
+    "controlRevision", "configRevision", "tick"]) exactIdentity(identity?.[field]);
+  if (frame?.schema !== "scriptbots.browser-frame.v1" || identity.sessionId !== sessionId
+      || identity.tick !== String(checkpoint.tick) || snapshot?.tick !== checkpoint.tick
+      || snapshot.summary?.agentCount !== checkpoint.agent_count || !Array.isArray(snapshot.agents)
+      || snapshot.agents.length !== checkpoint.agent_count || frame.playback?.paused !== true
+      || frame.playback.speedMultiplier !== 1 || !object(frame.environment)) {
+    throw new Error("The reconstructed canvas disagrees with its saved scientific cut");
+  }
+  return value;
+}
+
 function validatePage(page, cursor, validateItem, identityKey) {
   const offset = cursor === null ? 0 : Number(cursor);
   if (!object(page) || !Array.isArray(page.items) || page.items.length > CHECKPOINT_LAB_PAGE_SIZE
@@ -182,9 +204,9 @@ function validateDownload(result, artifactId, expected, branchId) {
 
 /** One bounded request slot, with explicit retries for potentially admitted mutations. */
 export class CheckpointLabController {
-  constructor({ list, listStudies, save, launch, status, cancel, artifacts, download, onChange = () => {},
+  constructor({ list, listStudies, save, review, launch, status, cancel, artifacts, download, onChange = () => {},
     id = interventionRequestId, now = () => performance.now(), parseReport = parseSavedStudyReport }) {
-    this.services = { list, listStudies, save, launch, status, cancel, artifacts, download };
+    this.services = { list, listStudies, save, review, launch, status, cancel, artifacts, download };
     this.onChange = onChange;
     this.id = id;
     this.now = now;
@@ -200,6 +222,7 @@ export class CheckpointLabController {
     this.page = null;
     this.cursor = null;
     this.selected = null;
+    this.canvasPreview = null;
     this.saveRequest = null;
     this.saveReceipt = null;
     this.saveState = "idle";
@@ -220,9 +243,10 @@ export class CheckpointLabController {
 
   get busy() { return this.operation !== null; }
   get canOperate() { return this.enabled && this.source !== null && !this.busy; }
-  get canSave() { return this.canOperate && this.saveState !== "unconfirmed"; }
+  get canSave() { return this.canOperate && this.canvasPreview === null && this.saveState !== "unconfirmed"; }
+  get canReview() { return this.canOperate && this.selected !== null && typeof this.services.review === "function"; }
   get canSelectStudy() { return this.canOperate && this.branchState !== "unconfirmed"; }
-  get canLaunch() { return this.canOperate && this.selected !== null
+  get canLaunch() { return this.canOperate && this.canvasPreview === null && this.selected !== null
     && (!this.branch || this.branchState === "refused" || TERMINAL.has(this.branch.status?.status)); }
 
   emit() { this.onChange(this); }
@@ -337,7 +361,34 @@ export class CheckpointLabController {
     const selected = this.page?.items.find((row) => row.checkpoint_id === checkpointId)
       ?? (this.saveReceipt?.checkpoint_id === checkpointId ? this.saveReceipt : null);
     if (!selected) return;
+    if (!this.selected || !sameCheckpoint(this.selected, selected)) this.canvasPreview = null;
     this.selected = copy(selected);
+    this.emit();
+  }
+
+  /** One explicit background reconstruction, through the existing bounded request slot. */
+  reviewSelected() {
+    if (!this.canReview) return Promise.resolve(null);
+    const request = { sessionId: this.source.sessionId, checkpoint: this.selected };
+    this.notice = "Reconstructing the selected saved world; the live server continues independently.";
+    return this.run("Saved-world review unavailable", (signal) => this.services.review(request, signal), (value) => {
+      validateCheckpointCanvas(value, request);
+      if (!this.selected || !sameCheckpoint(this.selected, request.checkpoint)) {
+        throw new Error("The selected checkpoint changed while its preview was loading");
+      }
+      this.canvasPreview = freeze(value);
+      this.notice = `Saved-world preview ready at tick ${value.checkpoint.tick}. Return to live before controlling or inspecting the current population.`;
+      return this.canvasPreview;
+    });
+  }
+
+  /** Leaving a preview cancels a pending replacement; its late result cannot replace live. */
+  returnToLive() {
+    const pending = this.operation?.kind === "Saved-world review unavailable";
+    if (pending) this.invalidate();
+    if (this.canvasPreview === null && !pending) { this.emit(); return; }
+    this.canvasPreview = null;
+    this.notice = "Returned to the current live view. No simulation command was submitted.";
     this.emit();
   }
 
@@ -422,11 +473,13 @@ export class CheckpointLabController {
   }
 
   retrySave() {
-    if (!this.canOperate || this.saveState !== "unconfirmed" || this.saveRequest?.sessionId !== this.source.sessionId) return Promise.resolve(null);
+    if (!this.canOperate || this.canvasPreview !== null || this.saveState !== "unconfirmed"
+        || this.saveRequest?.sessionId !== this.source.sessionId) return Promise.resolve(null);
     return this.submitSave();
   }
 
   submitSave() {
+    if (this.canvasPreview !== null) return Promise.resolve(null);
     const request = this.saveRequest;
     const priorUncertainty = this.saveState === "unconfirmed";
     this.saveState = "pending";
@@ -466,12 +519,12 @@ export class CheckpointLabController {
   }
 
   retryLaunch() {
-    if (!this.canOperate || this.branchState !== "unconfirmed" || this.branch?.request?.sessionId !== this.source.sessionId) return Promise.resolve(null);
+    if (!this.canOperate || this.canvasPreview !== null || this.branchState !== "unconfirmed" || this.branch?.request?.sessionId !== this.source.sessionId) return Promise.resolve(null);
     return this.submitBranch();
   }
 
   submitBranch() {
-    if (!this.canOperate || !this.branch?.request || !this.branch.checkpoint) return Promise.resolve(null);
+    if (!this.canOperate || this.canvasPreview !== null || !this.branch?.request || !this.branch.checkpoint) return Promise.resolve(null);
     const branch = this.branch;
     const priorUncertainty = this.branchState === "unconfirmed";
     this.branchState = "pending";
@@ -510,7 +563,7 @@ export class CheckpointLabController {
   }
 
   cancelBranch() {
-    if (!this.canOperate || !this.branch?.status || TERMINAL.has(this.branch.status.status)) return Promise.resolve(null);
+    if (!this.canOperate || this.canvasPreview !== null || !this.branch?.status || TERMINAL.has(this.branch.status.status)) return Promise.resolve(null);
     const branch = this.branch;
     const request = { sessionId: this.source.sessionId, branchId: branch.status.branch_id };
     this.notice = "Requesting cancellation; the previous status remains the last observed outcome.";
@@ -638,13 +691,14 @@ export function renderCheckpointLab(panel, controller) {
     : retention ? `${controller.page.total} saved checkpoints; ${retention.file_bytes} of ${retention.max_bytes} retained bytes. Choose one to study.` : "No saved checkpoint selected.");
   disable("lab-checkpoint-select", !ready);
   disable("lab-checkpoint-save", !controller.canSave);
-  disable("lab-checkpoint-retry", !ready || controller.saveState !== "unconfirmed");
+  disable("lab-checkpoint-retry", !ready || controller.canvasPreview !== null || controller.saveState !== "unconfirmed");
   disable("lab-checkpoint-refresh", !ready);
   disable("lab-checkpoint-first", !ready || controller.cursor === null);
   disable("lab-checkpoint-next", !ready || !controller.page?.next_cursor);
   disable("lab-checkpoint-download", !ready || !selected);
+  disable("lab-checkpoint-review", !controller.canReview);
   disable("lab-branch-launch", !controller.canLaunch);
-  disable("lab-branch-retry", !ready || controller.branchState !== "unconfirmed");
+  disable("lab-branch-retry", !ready || controller.canvasPreview !== null || controller.branchState !== "unconfirmed");
   const branch = controller.branch, status = branch?.status;
   const history = (controller.historyPage?.items ?? []).map((row) => row.branch_id === status?.branch_id ? status : row);
   if (status && !history.some((row) => row.branch_id === status.branch_id)) history.unshift(status);
@@ -659,7 +713,7 @@ export function renderCheckpointLab(panel, controller) {
     : controller.historyPage ? `${controller.historyPage.total} retained studies; page begins at ${controller.historyPage.offset + 1}. Selecting a study reads its current status without starting it again.`
       : "Load retained studies from this host to reconnect to their status and downloads after a browser refresh or host restart.");
   disable("lab-branch-refresh", !ready || !status);
-  disable("lab-branch-cancel", !ready || !status || TERMINAL.has(status.status));
+  disable("lab-branch-cancel", !ready || controller.canvasPreview !== null || !status || TERMINAL.has(status.status));
   disable("lab-report-download", !ready || status?.status !== "completed");
   disable("lab-report-preview", !ready || status?.status !== "completed");
   write("lab-branch-detail", branch

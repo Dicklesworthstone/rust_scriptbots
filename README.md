@@ -4,6 +4,30 @@ ScriptBots is a modern Rust reimagining of Andrej Karpathy’s classic agent-bas
 
 The authoritative roadmap is `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`. The older GPUI port plan is retained as historical design evidence, and a sibling WebAssembly plan lives in `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md`.
 
+### First-run Lab guide
+
+The opt-in terminal and GPUI walkthrough connects the live world, organism
+inspector, Pause, one scientific tick, a food-growth change, a fresh checkpoint,
+and a control/intervention study. In the terminal, open it with **F1** or
+**First-run Lab Guide** in the command palette; **Esc** hides it while retaining
+progress. In GPUI, choose **First-run guide** in the Lab window. Its action
+buttons open the relevant tools, show the proposed growth change, and wait for
+evidence before enabling **Next**. Hiding and reopening keeps the same journey.
+
+Food-growth proposals are applied through the normal command path with owner
+checks for the observed control, scientific, and configuration revisions. If
+another client changes that boundary, the owner rejects the stale proposal.
+A user-interface precheck alone cannot protect against that race.
+
+Progress follows the actual owner, command identity, applied publication and
+journal receipt. A memory-only commitment is labelled `CommittedVolatile`.
+Saving requires a fresh request/result pair; the study must match that saved
+cut and its verified two-arm report. Its outcome describes one seed and does
+not establish a general effect. This is an optional guided path; automatic
+first-install onboarding and full native acceptance under `bd-2z0.10.4` remain
+open. The guide's newly authored tests and native builds have not been executed
+in the current implementation session.
+
 ### Philosophy & purpose
 - **Why this exists**: ScriptBots is a minimalist artificial life laboratory. By rebuilding the original simulator with rigorously deterministic Rust systems, we can observe, measure, and reproduce emergent behavior at scale—without undefined behavior or global state muddying results.
 - **What we learn**: How simple sensory channels and local rules produce complex population dynamics—cooperation vs. predation, resource gradients shaping migration, lineage divergence under different mutation schedules, and the role of perception in survival.
@@ -261,10 +285,16 @@ RUST_LOG=info cargo run -p scriptbots-app
   identity has actually been displayed. `X` can deny an unpresented request or
   discard a submitted request's result; admitted work continues independently.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
-  catalog row. It shows that saved cut's population and first twelve characters
-  of its `WorldDigestV1`, separately from the live tick and artifact checksums.
-  The full selected checkpoint ID appears below the comparison section; table
-  IDs are shortened to keep measured columns visible in an 80-column terminal.
+  catalog row. `[` returns to the first page and `]` opens the next page;
+  `R` refreshes and Page Up/Page Down scroll the visible evidence. Each row
+  shows the saved cut's population, checkpoint ID and scientific digest,
+  separately from the observed live tick and artifact checksums.
+  `B` opens retained branch studies and `A` returns to saved checkpoints.
+  In the study catalog, Enter opens details; Enter or `V` in those details
+  reads the verified report, including actual control/treatment endpoints,
+  differences, first divergence and provenance. The report labels the result
+  as one saved seed with descriptive outcomes. A failed verification clears
+  the previous report. Browsing a study clears the hidden saved-cut selection.
   REST/MCP checkpoint metadata carries `agent_count` and the full
   `world_digest_v1`. These values describe the saved cut even after the world
   advances or an identical capture request is retried. Viewing the catalog
@@ -310,6 +340,16 @@ RUST_LOG=info cargo run -p scriptbots-app
   slot as direct checkpoint review. Live controls continue to address the owner.
   Native-window/PTY
   and full DSR acceptance remain open.
+- Saved-checkpoint review, event reconstruction and managed branch studies recognize
+  the configured versioned NeuroFlow registry when the application is built with
+  `neuro`. The saved constructor identity must match exactly, including hidden
+  layers and activation; changing those settings after installing the registry
+  does not authorize reconstructing it from the newer settings. These consumers
+  share the application's compiled checkpoint-preset catalog. The `reel` command
+  and montage library use that catalog too, supporting exact checkpoint replay
+  for MLP, DWRAON, Assembly, Mixed, and the optional Frankentorch and configured
+  NeuroFlow presets. Custom registries and the existing restrictions on raw
+  scientific checkpoints still apply.
 - Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses only a renderer compiled into the binary—GPUI first, then Bevy—and only in a real native graphical session; otherwise it uses the terminal. Linux/Unix sessions require a display environment; local macOS sessions use the native window system without X11 variables, while SSH sessions choose the terminal.
 - Auto-mode policy overrides:
   - `SCRIPTBOTS_FORCE_TERMINAL=1` → choose terminal in Auto mode even when a display server is present.
@@ -505,12 +545,13 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - `ml` → enable `scriptbots-brain-ml`
   - `brain-ft` → propagate the non-default pinned Frankentorch dependencies and code-first `FtBrain` family through `scriptbots-brain-ml`
   - `neuro` → enable `scriptbots-brain-neuro`
+  - `audio` → enable the shared native soundscape for a selected `gui` or `bevy_render` frontend; this flag does not select a frontend or open a device by itself
   - `fast-alloc` → enable mimalloc as the global allocator for improved multithreaded performance
   - Example: `cargo run -p scriptbots-app --features neuro`
   - Frankentorch compile, determinism, and benchmark acceptance is DSR-only through the pinned `rust_scriptbots` profile; GitHub Actions and direct Cargo invocations are not acceptance evidence.
   - Note: default features enable `ml`, `neuro`, and `fast-alloc`. To disable defaults, use `--no-default-features` and opt-in explicitly.
-- **`scriptbots-render`**:
-  - `audio` → enable Kira-driven audio in the UI layer
+- **`scriptbots-render` and `scriptbots-bevy`**:
+  - `audio` → enable the shared Kira soundscape, initially off until the user enables it
 - **`scriptbots-index`**: the uniform-grid backend is unconditional; there are no backend-selection feature flags.
 - **`scriptbots-brain-ml`**:
   - `candle` enables real tensor forward/batch inference, without production heritable-family registration.
@@ -1275,8 +1316,51 @@ Simulation controls and retained-history playback are separate. The unmodified `
 - Persistence safety: a spawn shortcut is refused after the current tick is admitted under the selected storage guarantee; advance to the next open tick boundary before spawning. An unresolved admission is reported separately and must be resolved by retrying the exact retained batch before either the world or an external arrival can advance. Both typed reasons are logged without consuming simulation RNG.
 
 ### Audio system
-- Optional `kira`-backed mixer (feature `audio`) with event-driven cues (births, deaths, spikes) and accessibility toggles.
-- Channels planned for ambience/effects; platform caveats apply on Linux/WSL2. Audio is disabled in wasm; use Web Audio API from JS if needed.
+
+The native soundscape connects completed simulation snapshots to a real Kira audio
+callback. Population drives a continuous drone; births, deaths and combat drive
+bounded bell, thud and transient cues. The soundscape is optional at build time and
+starts **off** in both native frontends.
+
+Select one of these application feature sets in the DSR build profile, then launch
+the resulting application with the indicated mode:
+
+| Frontend | Application features | Launch mode | Enable and mix |
+|---|---|---|---|
+| GPUI | `gui,audio` | `--mode gui` | Settings → Soundscape → Enable soundscape; master and four layer gain controls |
+| Bevy | `bevy_render,audio` | `--mode bevy` | Display settings → Sound, or F9; master volume and layer buttons cycling full, half and off |
+
+World and Lab share one GPUI device and projector. Bevy keeps its unrelated default
+audio plugin disabled, so enabling this feature does not create an eager second
+device. Merely starting the application, painting a window or updating controls
+while sound is off does not open audio.
+
+Audio reads immutable owner publications and never advances science or accesses
+storage. Repeated control publications do not repeat events; adjacent ticks with
+equal event counts remain distinct observations. A latest-value subscriber may miss
+ticks, and the controls show skipped ticks and transport drops without reconstructing
+unobserved cues. The input queue holds eight frames, each observation admits at most
+eight one-shots, and the synthesizer caps concurrent voices at 32.
+
+Pause, frozen playback speed, unhealthy owners and saved-world review silence the
+soundscape. Background playback is muted by default; Bevy also exposes an explicit
+background preference. Resuming or changing owners starts with current ambience and
+discards old event tails. Master and layer controls apply to active output; muted
+event layers cannot consume the cue budget of audible layers.
+
+A frontend attempts device initialization once after explicit opt-in. Initialization
+failure, a reported native backend error, invalid snapshot values or a disconnected
+consumer disables sound with a persistent reason and restart instruction. Kira may
+attempt internal device recovery before its backend reports an error to the frontend.
+
+Current native output is mono, duplicated to the device's stereo frames. Spatial
+positioning and the original 10k-agent performance acceptance remain open under
+`bd-16g.14` and `bd-2z0.14.1.11`. Canonical offline soundtrack export remains a separate
+fixed-point rendering path; live callbacks are not claimed to reproduce its PCM bytes.
+The new callback, projector and frontend regressions are authored but have not run:
+DSR dependency checks and repeated workspace outages blocked executable qualification.
+No physical-device, native-journey or performance pass is claimed. The browser frontend
+does not enable this native audio feature.
 
 ### Terminal mode
 The interactive frontend runs FrankenTUI's `Program` and retains Ratatui widgets; headless mode uses its buffer adapter. Automatic selection chooses terminal mode only before launch; an explicit GPUI/Bevy request or a native window launch failure is surfaced rather than silently changing products.
@@ -1358,6 +1442,29 @@ order by kind;
 ```
 
 JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. Integer flags are decoded at the storage boundary into Rust booleans.
+
+### Search narratives from a selected run
+
+`control_cli narrative search` reads the stored full-text index, and
+`control_cli narrative around` reads a chronological window. Select a run in a
+multi-run database with its canonical 32-character lowercase hexadecimal ID:
+
+```bash
+control_cli narrative search population --db runs/example.sqlite --run-id 00000000000000000000000000000001 --from-tick 100 --to-tick 500 --limit 32 --json
+control_cli narrative around 250 --db runs/example.sqlite --run-id 00000000000000000000000000000001 --window 50 --json
+```
+
+Replace the example ID with the retained run's actual ID. Omit `--db` to query
+the running service; `--run-id` is forwarded in that mode too. REST accepts
+`run_id` on `GET /api/narrative/search` and
+`GET /api/narrative/around/{tick}`. MCP tools `narrative_search` and
+`narrative_around` accept the same optional `run_id` string.
+
+An omitted selector is accepted for a single-run database. A multi-run database
+requires a selection; an unknown or malformed ID is an error. Explicit run
+selection always requires accessible stored evidence and never falls back to
+the live event ring. Search `limit: 0` still verifies an explicitly selected
+run; an around-query `window: 0` selects the exact tick.
 
 ### Offline narrative timelines
 
@@ -2102,6 +2209,15 @@ status, or an invalid checkpoint produces a refusal and preserves the evidence.
 Existing final bundle directories are never overwritten; legacy incomplete
 final directories still require explicit reconciliation.
 
+An empty or truncated temporary status write can also recover from the existing
+valid committed status. Running work requires a restorable continuation cut or
+independently verified completed bundle; completed work requires its verified
+bundle. A pending record cannot hide an advanced cut or unfinished publication.
+Recovery preserves the exact truncated bytes in one exclusively created
+`status.json.interrupted/status.tmp` directory before normal execution resumes.
+Missing evidence, invalid complete JSON, aliases and a second retained incident
+remain refusals. Recovery does not reset an already started run to tick zero.
+
 Completed experiment files also reappear through artifact list/get/download after
 restart, using their original IDs. A first request verifies the saved scientific
 evidence and complete bundle before publishing its files; no create or resume
@@ -2454,6 +2570,11 @@ press **N**. Choose the horizon with **Up/Down** or **+/-** and the treatment wi
 **Left/Right**, then press **Enter** to start. **Esc/X** discards the draft; **X**
 in Replay requests cancellation of an active study. The status panel identifies
 the source and target ticks, observed execution state, and completed report artifact.
+Press **B** to browse retained studies, **Enter** to select one, then **Enter/V**
+to read its verified report. **[ / ]** navigate the first/next catalog page,
+**R** refreshes, and **Page Up/Page Down** scroll long results. **A/Esc** returns
+to saved checkpoints. The active study owned by this terminal is labelled
+separately from the retained study being inspected.
 
 The report compares one source trajectory and does not count its ticks as independent
 replicates. The saved cut restores science state; the original owner's pending commands,

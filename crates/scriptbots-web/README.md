@@ -47,8 +47,12 @@ The crate exposes the following wasm-bindgen surface:
   - `config`: optional full `ScriptBotsConfig` override (rarely needed; defaults are usually sufficient).
   - `snapshot_format`: `"json"` (default) or `"binary"` (Postcard-encoded `Uint8Array`).
   - `default_brain`: `"mlp"`, `"dwraon"`, or `"assembly"` to bind agents to a
-    versioned, heritable brain family during seeding. Omitting both brain choices
+    versioned, heritable brain family during seeding. Omitting the brain choices
     starts with MLP. Assembly is an experimental evolving program family.
+  - `mixed_brains` (bool, default false): seed MLP, DWRAON and Assembly founders
+    in repeating order. All three families remain registered even for a zero
+    population. A selected `default_brain` or Wander strategy conflicts with this
+    option and is refused; clear `default_brain` when extending default options.
   - `seed_strategy`: explicitly choose `"wander"` for the legacy movement demo or
     `"none"` for unbound agents when `default_brain` is absent. A selected
     `default_brain` takes precedence. Wander cannot export continuations.
@@ -91,24 +95,39 @@ The crate exposes the following wasm-bindgen surface:
 - `SimHandle::reset(seed?: number)` — rebuilds the world. An explicit seed
   overrides the nested config for that reset; omitting it falls back to the
   original `config.rng_seed` (or entropy when the nested seed is also absent).
+  An imported mixed-family continuation has no recorded founder distribution,
+  so reset refuses until `registerBrain` explicitly chooses a new-world preset.
 - `SimHandle::registerBrain(kind: string)` — rebuilds the world with `"mlp"`,
-  `"dwraon"`, `"assembly"`, `"wander"`, or `"none"`. Unknown or invalid presets
-  leave the active owner intact.
+  `"dwraon"`, `"assembly"`, `"mixed"`, `"wander"`, or `"none"`. Mixed starts the
+  fixed three-family founder recipe. Unknown or invalid presets leave the active
+  owner intact.
 - `SimHandle::checkpoint() -> Uint8Array` — settles the current volatile journal
   boundary and exports the existing full owner checkpoint: science, evaluators,
   command history and cadence credit. It does not advance elapsed time. Legacy
-  wander evaluators are refused; MLP, DWRAON, Assembly and unbound worlds are
-  supported, including empty populations.
+  wander evaluators are refused; MLP, DWRAON, Assembly, mixtures of these three
+  families, and unbound worlds are supported, including empty populations.
+  Registered families remain part of the saved state after their last agent dies.
 - `restore_checkpoint(bytes: Uint8Array) -> SimHandle` — validates and restores a
   new owner, with a new command namespace and rebased elapsed clock. Failed
   imports preserve existing handles. Future science matches the saved state;
-  offline wall time adds no ticks. Reset starts a new world using the loaded
-  configuration, checkpoint population and saved brain family. Restoration uses
-  that family's exact registry and evaluator identity; unknown or mismatched
-  families are refused instead of being substituted.
+  offline wall time adds no ticks. Restoration retains every registered family
+  in its exact key order and restores its exact registry and evaluator identity.
+  Unsupported families, mismatched adapters, noncanonical registry key layouts,
+  and worlds outside browser resource limits are refused before owner replacement.
+  A single-family reset uses the loaded configuration, checkpoint population and
+  saved brain family. A mixed continuation requires an explicit new-world preset
+  before reset because the checkpoint does not record its founder distribution.
+  The demo displays the retained roster and keeps Reset disabled until a new
+  preset is selected. Selecting a preset leaves the live continuation intact;
+  pressing Reset then creates the requested fresh world.
 - `checkpoint_byte_limit() -> number` — the canonical owner codec's file bound,
   also checked before the demo reads a selected file.
 - `SimHandle::brainPreset() -> string` — the new-world brain preset for this handle.
+  Both fresh mixed founders and imported mixed continuations report `"mixed"`;
+  `launchInfo()` distinguishes a restartable recipe from a saved continuation.
+- `SimHandle::brainFamilies() -> string[]` — the versioned family roster in registry
+  key order, including empty or extinct families. Unbound and Wander owners
+  return an empty array.
 - `SimHandle::launchInfo() -> JsValue` — describes the retained initial-world
   recipe, its exact decimal-string seed, founder count and brain preset. A loaded
   continuation has no original launch recipe and reports `shareable: false`.
@@ -120,13 +139,49 @@ The crate exposes the following wasm-bindgen surface:
 - `permalink_info(link: string) -> JsValue` — reads launch metadata before
   replacing an owner. `permalink_diff(link)` exposes recorded knob changes;
   `fork(handle, changes)` creates another initial-condition recipe while retaining
-  the other configuration, founder count and selected brain family.
+  the other configuration, founder count and selected brain recipe.
 - `decode_snapshot_binary(bytes: &[u8]) -> JsValue` — helper exposed for JS callers to convert binary snapshots back into structured data.
+
+### Mixed founder worlds
+
+Select **Mixed MLP + DWRAON + Assembly** and press Reset to create a new mixed
+world. The equivalent initialization is:
+
+```javascript
+const mixed = init_sim({
+  population: 151,
+  seed: 17,
+  mixed_brains: true,
+  default_brain: null,
+  seed_strategy: "none",
+});
+```
+
+Founders repeat the fixed order MLP, DWRAON, Assembly, so this example starts
+with 51, 50 and 50 agents respectively. Each founder has its family's real
+heritable genome and evaluator; reproduction and extinction then follow the
+ordinary scientific rules. The mixture specifies the founders, not a quota
+maintained during evolution.
+
+This explicit founder recipe uses version 2 of the existing `sbb1` envelope.
+Its links and forks retain the mixture and resolved seed. API resets retain the
+mixture with the seed rules above; the demo Reset creates a new seed. Reload the
+recipe link to restart its recorded initial conditions.
+Version 1 single-family and demo recipes keep their existing canonical bytes
+and meaning. Older packages refuse the unsupported mixed recipe. The demo also
+refuses to replace a live world if a stale package ignores the mixed choice or
+returns an incomplete family roster.
+
+Save a continuation to preserve evolved agents and evaluator state. Importing
+one resumes the actual saved mixture, including extinct registered families,
+without inventing its original founder distribution. The disabled **Mixed
+continuation** selection makes this distinction visible; choose any new-world
+preset, including Mixed, before pressing Reset.
 
 ### Initial-world sharing
 
 Browser links retain the effective configuration, resolved root seed, founder
-population, brain family or explicit Wander/Unbound strategy, and the versioned
+population, brain family or mixed recipe or explicit Wander/Unbound strategy, and the versioned
 founder recipe. This fixes the former default-gallery substitution, which could
 not reconstruct an ordinary browser world's configuration. Reset and brain
 replacement record the newly constructed owner's recipe; failed replacements
@@ -179,7 +234,7 @@ Full packaged-browser/DSR acceptance remains with `bd-2z0.12.3` and `bd-azi3`;
 native unit tests alone do not establish browser scheduling or durability.
 
 The demo starts with **MLP**, with canonical inherited genomes and evaluator
-state. **Brain for new worlds** also offers DWRAON, experimental Assembly,
+state. **Brain for new worlds** also offers DWRAON, experimental Assembly, Mixed,
 Unbound and the legacy Wander movement demo; the choice takes effect on Reset.
 All except Wander support saved continuations. Wander visibly disables both
 save controls. **Load Continuation File** validates a saved owner before replacing

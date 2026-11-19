@@ -9,7 +9,7 @@ import { InspectionController, pickAgent, renderInspector, renderInspectorSource
 import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource } from "./genome.js";
 import { InterventionController, renderInterventions, validateInterventionAction } from "./interventions.js";
 import { NarrativeController, renderNarrative, renderNarrativeSource } from "./narrative.js";
-import { validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
+import { validateContinuationBrains, validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
 import { CheckpointLabController, renderCheckpointLab } from "./checkpoint-lab.js";
 import { ExperimentController } from "./experiments.js";
 import { readExperimentForm, renderExperimentLab, experimentObservationExport } from "./experiment-view.js";
@@ -40,6 +40,12 @@ let captureUrl = null;
 let renderer = null;
 let rendererGeneration = 0;
 let lastPaintedFrame = null;
+let lastPaintedLiveFrame = null;
+let presentationGeneration = 0;
+let reviewedCheckpoint = null;
+const checkpointView = document.getElementById("checkpoint-view");
+const checkpointViewStatus = document.getElementById("checkpoint-view-status");
+const checkpointReturnLive = document.getElementById("checkpoint-return-live");
 let presentationFailure = null;
 const fpsEl = document.getElementById("metric-fps");
 const tpsEl = document.getElementById("metric-tps");
@@ -56,6 +62,7 @@ const checkpointLoadInput = document.getElementById("checkpoint-load");
 const checkpointStatus = document.getElementById("checkpoint-status");
 const checkpointCapability = document.getElementById("checkpoint-capability");
 let activeBrainPreset = null;
+let activeBrainFamilies = [];
 let checkpointLoadPending = false;
 const browserSaveButton = document.getElementById("checkpoint-browser-save");
 const browserRestoreButton = document.getElementById("checkpoint-browser-restore");
@@ -171,7 +178,7 @@ const experiments = new ExperimentController({
 function updateExperimentVisibility() {
   const observed = remoteFrame && lastPaintedFrame?.sessionId === remoteFrame.identity.sessionId
     && lastPaintedFrame.simulationGeneration === simulationGeneration;
-  experiments.setEnabled(remoteMode && remoteConnected && !!observed && !!experimentPanel?.open && !document.hidden);
+  experiments.setEnabled(remoteMode && remoteConnected && !reviewedCheckpoint && !!observed && !!experimentPanel?.open && !document.hidden);
 }
 
 function observeExperiments(frame) {
@@ -251,6 +258,9 @@ const checkpointLab = new CheckpointLabController({
   list: (request, signal) => remoteClient.listCheckpoints({ ...request, signal }),
   listStudies: (request, signal) => remoteClient.listCheckpointBranches({ ...request, signal }),
   save: (request, signal) => remoteClient.saveCheckpoint(request, { signal }),
+  review: (request, signal) => remoteClient.checkpointCanvas(request.checkpoint.checkpoint_id, {
+    sessionId: request.sessionId, expected: request.checkpoint, signal,
+  }),
   launch: (request, signal) => remoteClient.launchCheckpointBranch(request, { signal }),
   status: (request, signal) => remoteClient.checkpointBranchStatus(request.branchId, { sessionId: request.sessionId, signal }),
   cancel: (request, signal) => remoteClient.cancelCheckpointBranch(request.branchId, { sessionId: request.sessionId, signal }),
@@ -261,12 +271,13 @@ const checkpointLab = new CheckpointLabController({
   onChange: (controller) => {
     renderCheckpointLab(checkpointLabPanel, controller);
     renderStudyReport(labReportPanel, controller.reportModel);
+    synchronizeCheckpointView(controller);
   },
 });
 
 function updateCheckpointLabVisibility() {
-  const observed = remoteFrame && lastPaintedFrame?.sessionId === remoteFrame.identity.sessionId
-    && lastPaintedFrame.simulationGeneration === simulationGeneration;
+  const observed = remoteFrame && lastPaintedLiveFrame?.sessionId === remoteFrame.identity.sessionId
+    && lastPaintedLiveFrame.simulationGeneration === simulationGeneration;
   checkpointLab.setEnabled(remoteMode && remoteConnected && !!observed && !!checkpointLabPanel?.open && !document.hidden);
 }
 
@@ -275,6 +286,57 @@ function observeCheckpointLab(frame) {
     checkpointLab.observe(frame, remoteClient.url);
     updateCheckpointLabVisibility();
   }
+}
+
+function renderCheckpointView() {
+  const pending = checkpointLab.operation?.kind === "Saved-world review unavailable"
+    && !checkpointLab.operation.abort.signal.aborted;
+  if (checkpointView) checkpointView.hidden = !reviewedCheckpoint && !pending;
+  if (checkpointReturnLive) checkpointReturnLive.textContent = reviewedCheckpoint ? "Return to live" : "Cancel saved-world review";
+  if (!checkpointViewStatus) return;
+  const checkpoint = reviewedCheckpoint?.checkpoint;
+  const painted = checkpoint && lastPaintedFrame?.presentationGeneration === presentationGeneration;
+  const message = checkpoint
+    ? `${painted ? "Reviewing" : "Preparing"} saved checkpoint ${checkpoint.checkpoint_id} at tick ${checkpoint.tick}; world digest ${checkpoint.world_digest_v1}. This is a reconstructed scientific state. Live controls and creature inspection are unavailable here. ${remoteConnected ? "The server and its event timeline continue independently." : "The server is disconnected; this saved view is retained."}`
+    : "Reconstructing the selected saved world. The current canvas stays visible until the saved state is ready.";
+  if (checkpointViewStatus.textContent !== message) checkpointViewStatus.textContent = message;
+  Object.assign(checkpointViewStatus.dataset, { state: checkpoint ? painted ? "ready" : "preparing" : "loading",
+    checkpointId: checkpoint?.checkpoint_id ?? "", tick: checkpoint ? String(checkpoint.tick) : "",
+    sourceSessionId: reviewedCheckpoint?.sourceSessionId ?? "", worldDigestV1: checkpoint?.world_digest_v1 ?? "" });
+}
+
+function synchronizeCheckpointView(controller) {
+  if (reviewedCheckpoint !== controller.canvasPreview) {
+    reviewedCheckpoint = controller.canvasPreview;
+    // Restored publications and environment revisions are newly reconstructed.
+    // They cannot share renderer caches or outstanding PNGs with the live owner.
+    presentationGeneration += 1;
+    lastPaintedFrame = null;
+    if (!reviewedCheckpoint) lastPaintedLiveFrame = null;
+    if (captureRequest) finishCapture(captureRequest, new Error("Displayed view changed"));
+    inspector.reset();
+    brainInspector.reset();
+    genomeInspector.reset();
+    updateInspectorVisibility();
+    updateBrainVisibility();
+    updateGenomeVisibility();
+    for (const input of inspectorPanel?.querySelectorAll("input, button") ?? []) input.disabled = !!reviewedCheckpoint;
+    if (reviewedCheckpoint) {
+      for (const id of ["inspector-status", "brain-status", "genome-status"]) {
+        const status = document.getElementById(id);
+        if (status) status.textContent = "Saved-world review: return to live to inspect the current population.";
+      }
+    }
+    document.getElementById("sim-container").dataset.view = reviewedCheckpoint ? "checkpoint" : "live";
+    canvas.setAttribute("aria-label", reviewedCheckpoint
+      ? "Saved checkpoint canvas. Creature inspection is unavailable; use Return to live to inspect the current population."
+      : "Simulation canvas. Click a creature to inspect it; Escape clears selection.");
+    const metricsHeading = document.getElementById("metrics-heading");
+    if (metricsHeading) metricsHeading.textContent = reviewedCheckpoint ? "Saved World Metrics" : "Live Metrics";
+    resetPerformanceWindows(reviewedCheckpoint?.frame.snapshot ?? remoteFrame?.snapshot);
+    updateRemoteControls();
+  }
+  renderCheckpointView();
 }
 
 function updateLabTreatmentFields() {
@@ -326,6 +388,7 @@ async function offerLabDownload(operation) {
   }
 }
 
+checkpointReturnLive?.addEventListener("click", () => checkpointLab.returnToLive());
 checkpointLabPanel?.addEventListener("toggle", updateCheckpointLabVisibility);
 document.addEventListener("visibilitychange", updateCheckpointLabVisibility);
 document.getElementById("lab-branch-kind")?.addEventListener("change", updateLabTreatmentFields);
@@ -346,6 +409,7 @@ for (const [id, action] of [
   ["lab-history-next", () => checkpointLab.nextHistoryPage()],
   ["lab-checkpoint-save", () => checkpointLab.save()],
   ["lab-checkpoint-retry", () => checkpointLab.retrySave()],
+  ["lab-checkpoint-review", () => checkpointLab.reviewSelected()],
   ["lab-checkpoint-refresh", () => checkpointLab.refresh(true)],
   ["lab-checkpoint-first", () => checkpointLab.firstPage()],
   ["lab-checkpoint-next", () => checkpointLab.nextPage()],
@@ -404,6 +468,9 @@ const inspector = new InspectionController({
   onChange: (state, frame) => renderInspector(inspectorPanel, state, frame),
   onFrame: (state, frame) => renderInspectorSource(inspectorPanel, state, frame),
 });
+const updateInspectorVisibility = () => inspector.setEnabled(!reviewedCheckpoint && !document.hidden);
+document.addEventListener("visibilitychange", updateInspectorVisibility);
+updateInspectorVisibility();
 const brainPanel = document.getElementById("brain-inspector");
 const brainInspector = new InspectionController({
   enabled: false,
@@ -416,7 +483,7 @@ const brainInspector = new InspectionController({
   onChange: (state, frame) => renderBrainInspector(brainPanel, state, frame),
   onFrame: (state, frame) => renderBrainSource(brainPanel, state, frame),
 });
-const updateBrainVisibility = () => brainInspector.setEnabled(Boolean(brainPanel?.open) && !document.hidden);
+const updateBrainVisibility = () => brainInspector.setEnabled(!reviewedCheckpoint && Boolean(brainPanel?.open) && !document.hidden);
 brainPanel?.addEventListener("toggle", updateBrainVisibility);
 document.addEventListener("visibilitychange", updateBrainVisibility);
 document.getElementById("brain-refresh")?.addEventListener("click", () => { void brainInspector.refresh(true); });
@@ -432,7 +499,7 @@ const genomeInspector = new GenomeInspectionController({
   onChange: (state, frame) => renderGenomeInspector(genomePanel, state, frame),
   onFrame: (state, frame) => renderGenomeSource(genomePanel, state, frame),
 });
-const updateGenomeVisibility = () => genomeInspector.setEnabled(Boolean(genomePanel?.open) && !document.hidden);
+const updateGenomeVisibility = () => genomeInspector.setEnabled(!reviewedCheckpoint && Boolean(genomePanel?.open) && !document.hidden);
 genomePanel?.addEventListener("toggle", updateGenomeVisibility);
 document.addEventListener("visibilitychange", updateGenomeVisibility);
 document.getElementById("genome-refresh")?.addEventListener("click", () => { void genomeInspector.restart(); });
@@ -483,7 +550,7 @@ interventions = localInterventions;
 let localInterventionOwner = null;
 let remoteInterventionEndpoint = null;
 let interventionNeedsAttach = false;
-const updateInterventionVisibility = () => interventions.setEnabled(Boolean(interventionPanel?.open)
+const updateInterventionVisibility = () => interventions.setEnabled(!reviewedCheckpoint && Boolean(interventionPanel?.open)
   && !document.hidden && !interventionNeedsAttach && (!remoteMode || (remoteConnected && remoteFrame !== null)));
 function observeInterventions(frame) {
   if (interventionNeedsAttach) {
@@ -515,6 +582,7 @@ function interventionNumber(id) {
   return Number(text);
 }
 interventionField("use-selected")?.addEventListener("click", () => {
+  if (reviewedCheckpoint) return;
   const creature = interventions.frame?.snapshot.agents.find((agent) => agent.uid === inspector.selectedUid);
   if (!creature) { interventionField("form-error").textContent = "Select a creature in the displayed world first."; return; }
   interventionField("x").value = String(creature.position[0]);
@@ -572,6 +640,7 @@ for (const action of ["pause", "step", "resume"]) {
 }
 
 function selectCreature(uid) {
+  if (reviewedCheckpoint) return;
   inspector.select(uid);
   brainInspector.select(uid);
   genomeInspector.select(uid);
@@ -580,7 +649,7 @@ function selectCreature(uid) {
 }
 
 document.getElementById("sim-container")?.addEventListener("click", (event) => {
-  if (event.target !== canvas || event.button !== 0 || !inspector.frame) return;
+  if (reviewedCheckpoint || event.target !== canvas || event.button !== 0 || !inspector.frame) return;
   const bounds = canvas.getBoundingClientRect();
   const uid = pickAgent(inspector.frame.snapshot, event.clientX - bounds.left, event.clientY - bounds.top,
     { width: bounds.width, height: bounds.height, canvasWidth: canvas.width, canvasHeight: canvas.height });
@@ -619,8 +688,10 @@ populationSlider.addEventListener("input", () => {
   population = Number(populationSlider.value);
 });
 
+brainPresetSelect?.addEventListener("change", updateCheckpointControls);
+
 resetButton.addEventListener("click", () => {
-  if (remoteMode) return;
+  if (remoteMode || brainPresetSelect?.value === "mixed_continuation") return;
   if (permalinkStatus) {
     permalinkStatus.textContent = "";
   }
@@ -645,7 +716,7 @@ function appendLog(message) {
 }
 
 function hasPresentationFrame() {
-  return remoteMode ? remoteFrame !== null : simHandle !== null;
+  return remoteMode ? reviewedCheckpoint !== null || remoteFrame !== null : simHandle !== null;
 }
 
 function updateRemoteControls() {
@@ -658,11 +729,12 @@ function updateRemoteControls() {
   }
   remoteLocal.disabled = !remoteMode;
   remoteReconnect.disabled = !remoteMode || !remoteClient || remoteConnected;
-  for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteConnected;
+  for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteConnected || !!reviewedCheckpoint;
   remoteRefresh.disabled = !remoteConnected || !lastRemoteCommandId;
-  remoteRetry.disabled = !remoteConnected || !lastRemoteRequestId;
+  remoteRetry.disabled = !remoteConnected || !!reviewedCheckpoint || !lastRemoteRequestId;
   captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
-  remoteOverlay.hidden = !remoteMode || !!remoteFrame;
+  remoteOverlay.hidden = !remoteMode || !!remoteFrame || !!reviewedCheckpoint;
+  renderCheckpointView();
   updateCheckpointControls();
 }
 
@@ -670,6 +742,7 @@ function updateCheckpointControls() {
   const supportsContinuation = activeBrainPreset !== "wander";
   const recoveryBusy = browserRecovery?.pending === true;
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
+  resetButton.disabled = remoteMode || brainPresetSelect?.value === "mixed_continuation";
   if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle || checkpointLoadPending || !supportsContinuation;
   if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending || recoveryBusy;
   const storageBusy = remoteMode || !browserContinuationStore || checkpointLoadPending || browserStorePending || recoveryBusy;
@@ -679,7 +752,11 @@ function updateCheckpointControls() {
     ? "These continuation controls apply to your local browser world. Return to Local Simulation to use them."
     : !supportsContinuation
       ? "This Wander world is a movement demo without inherited genomes or saved continuations. Choose MLP, DWRAON or Assembly, then Reset Simulation to start an evolving world."
-      : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
+      : activeBrainPreset === "mixed"
+        ? activeLaunchInfo?.kind === "browser_launch"
+          ? "This world starts with MLP, DWRAON and Assembly founders in repeating order. Share its recipe to restart or save a continuation to retain its evolution."
+          : `This saved world retains ${activeBrainFamilies.join(" + ")} brain families, including any extinct family. Resume or save it to continue; choose a new-world preset before resetting.`
+        : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
   browserRecovery?.setAvailable(!remoteMode && !!simHandle && supportsContinuation && !document.hidden
     && !queuedReset && !checkpointLoadPending && !browserStorePending);
   renderRecoveryControls();
@@ -717,6 +794,9 @@ function receiveRemoteFrame(frame) {
     const browserFrame = { schema: "scriptbots.browser-frame.v1", identity: frame.identity,
       snapshot: frame.payload, environment: frame.environment, playback: frame.playback };
     validateFrameIdentity(browserFrame);
+    if (reviewedCheckpoint && reviewedCheckpoint.sourceSessionId !== frame.identity.sessionId) {
+      checkpointLab.reset("The connected host changed; choose a checkpoint from the new session.");
+    }
     remoteFrame = browserFrame;
     if (frame.coalescedPublications !== "0") {
       remoteStatus.textContent = `Connected — latest publication ${frame.identity.publicationRevision}; skipped ${frame.coalescedPublications} intermediate publications.`;
@@ -739,6 +819,7 @@ function receiveRemoteState(state) {
     remoteFrame = null;
     interventionNeedsAttach = true;
     lastPaintedFrame = null;
+    lastPaintedLiveFrame = null;
   }
   remoteStatus.dataset.state = state.state;
   remoteStatus.textContent = state.message || state.state;
@@ -746,6 +827,7 @@ function receiveRemoteState(state) {
     remoteStatus.textContent += " Showing the last received frame.";
   }
   if (state.state === "session_changed") {
+    checkpointLab.reset("The connected host changed; reconnect before reviewing a saved world.");
     remoteStatus.textContent += " Connect to Server starts a fresh subscription; old cursors are not reused.";
   }
   updateRemoteControls();
@@ -794,6 +876,7 @@ function connectRemote() {
     simulationTimer = null;
     queuedReset = false;
     interventions.setEnabled(false);
+    checkpointLab.returnToLive();
     remoteClient?.disconnect();
     if (remoteClient?.url !== nextClient.url) {
       checkpointLab.reset("Connected endpoint changed; choose a checkpoint from the new server.");
@@ -810,6 +893,8 @@ function connectRemote() {
     lastRemoteCommandId = null;
     lastRemoteStatusRequestId = null;
     simulationGeneration += 1;
+    presentationGeneration += 1;
+    lastPaintedLiveFrame = null;
     narrative.reset("remote");
     inspector.reset();
     brainInspector.reset();
@@ -840,6 +925,7 @@ remoteReconnect.addEventListener("click", () => {
   catch (error) { receiveRemoteState({ state: "error", message: error.message }); }
 });
 remoteLocal.addEventListener("click", () => {
+  checkpointLab.returnToLive();
   interventions.setEnabled(false);
   checkpointLab.setEnabled(false);
   experiments.setEnabled(false);
@@ -850,6 +936,8 @@ remoteLocal.addEventListener("click", () => {
   remoteClient = null;
   remoteFrame = null;
   simulationGeneration += 1;
+  presentationGeneration += 1;
+  lastPaintedLiveFrame = null;
   narrative.reset("local");
   inspector.reset();
   brainInspector.reset();
@@ -875,6 +963,7 @@ remoteLocal.addEventListener("click", () => {
 
 function sendRemoteControl(command) {
   try {
+    if (reviewedCheckpoint) throw new Error("Return to live before controlling the server");
     lastRemoteCommandId = null;
     lastRemoteStatusRequestId = null;
     lastRemoteRequestId = remoteClient.sendControl(command);
@@ -900,6 +989,7 @@ remoteRefresh.addEventListener("click", () => {
 });
 remoteRetry.addEventListener("click", () => {
   try {
+    if (reviewedCheckpoint) throw new Error("Return to live before retrying a server command");
     remoteClient.retryControl(lastRemoteRequestId);
     remoteReceipt.textContent = `Retried the same command identity (${lastRemoteRequestId}); awaiting the server's receipt.`;
   } catch (error) { remoteReceipt.textContent = `Retry failed: ${error.message}`; }
@@ -987,7 +1077,17 @@ function validateFrameIdentity(frame) {
   }
 }
 
-function drawSnapshot(frame) {
+function observePresentedLiveFrame(frame) {
+  lastPaintedLiveFrame = { simulationGeneration, sessionId: frame.identity.sessionId };
+  inspector.observe(frame, simulationGeneration);
+  brainInspector.observe(frame, simulationGeneration);
+  genomeInspector.observe(frame, simulationGeneration);
+  observeInterventions(frame);
+  observeCheckpointLab(frame);
+  observeExperiments(frame);
+}
+
+function drawSnapshot(frame, historical = false) {
   if (!renderer) return false;
   try {
     validateFrameIdentity(frame);
@@ -997,23 +1097,19 @@ function drawSnapshot(frame) {
     return false;
   }
   if (lastPaintedFrame?.simulationGeneration === simulationGeneration
+      && lastPaintedFrame.presentationGeneration === presentationGeneration
       && lastPaintedFrame.publicationRevision === frame.identity.publicationRevision
       && lastPaintedFrame.sessionId === frame.identity.sessionId
       && lastPaintedFrame.width === canvas.width && lastPaintedFrame.height === canvas.height
       && (!captureRequest || captureRequest.encoding)) {
-    inspector.observe(frame, simulationGeneration);
-    brainInspector.observe(frame, simulationGeneration);
-    genomeInspector.observe(frame, simulationGeneration);
-    observeInterventions(frame);
-    observeCheckpointLab(frame);
-    observeExperiments(frame);
+    if (!historical) observePresentedLiveFrame(frame);
     return true;
   }
   try {
     if (renderer.render(frame.snapshot, { environment: frame.environment, identity: frame.identity,
-      layer: environmentLayer?.value ?? "combined", generation: simulationGeneration,
-      selectedUid: inspector.selectionFor(frame, simulationGeneration) })) {
-      lastPaintedFrame = { simulationGeneration, publicationRevision: frame.identity.publicationRevision,
+      layer: environmentLayer?.value ?? "combined", generation: presentationGeneration,
+      selectedUid: historical ? null : inspector.selectionFor(frame, simulationGeneration) })) {
+      lastPaintedFrame = { simulationGeneration, presentationGeneration, publicationRevision: frame.identity.publicationRevision,
         sessionId: frame.identity.sessionId, width: canvas.width, height: canvas.height };
       for (const [key, value] of Object.entries(frame.identity)) {
         rendererStatus.dataset[key === "tick" ? "snapshotTick" : key] = value;
@@ -1025,13 +1121,11 @@ function drawSnapshot(frame) {
         environmentStatus.dataset.publicationRevision = frame.identity.publicationRevision;
         environmentStatus.dataset.layer = environmentLayer?.value ?? "combined";
       }
+      rendererStatus.dataset.view = historical ? "checkpoint" : "live";
+      rendererStatus.dataset.checkpointId = historical ? reviewedCheckpoint.checkpoint.checkpoint_id : "";
+      renderCheckpointView();
       captureAdmittedFrame(frame.identity);
-      inspector.observe(frame, simulationGeneration);
-      brainInspector.observe(frame, simulationGeneration);
-      genomeInspector.observe(frame, simulationGeneration);
-      observeInterventions(frame);
-      observeCheckpointLab(frame);
-      observeExperiments(frame);
+      if (!historical) observePresentedLiveFrame(frame);
       return true;
     }
   } catch (error) {
@@ -1063,7 +1157,7 @@ function finishCapture(request, error = null) {
 
 captureButton.addEventListener("click", () => {
   if (!hasPresentationFrame() || captureRequest || encodingRequest) return;
-  const request = { simulationGeneration, encoding: false, timeout: null };
+  const request = { simulationGeneration, presentationGeneration, encoding: false, timeout: null };
   request.timeout = setTimeout(() => finishCapture(request, new Error(encodingRequest === request
     ? "No PNG completed within 10 seconds; encoding is still finishing"
     : "No frame admitted within 10 seconds; try again")), 10_000);
@@ -1078,10 +1172,15 @@ function captureAdmittedFrame(frameIdentity) {
   const request = captureRequest;
   if (!request || request.encoding) return;
   try {
-    if (request.simulationGeneration !== simulationGeneration) throw new Error("World changed before capture; try again");
+    if (request.simulationGeneration !== simulationGeneration || request.presentationGeneration !== presentationGeneration) {
+      throw new Error("Displayed world changed before capture; try again");
+    }
     const identity = { ...frameIdentity };
+    const checkpoint = reviewedCheckpoint?.checkpoint;
     const backend = rendererStatus.dataset.renderer;
-    const filename = `scriptbots-session-${identity.sessionId}-p${identity.publicationRevision}-s${identity.scientificRevision}-c${identity.controlRevision}-g${identity.configRevision}-t${identity.tick}-${backend}.png`;
+    const filename = checkpoint
+      ? `scriptbots-checkpoint-${checkpoint.checkpoint_id}-t${checkpoint.tick}-${checkpoint.world_digest_v1}-${backend}.png`
+      : `scriptbots-session-${identity.sessionId}-p${identity.publicationRevision}-s${identity.scientificRevision}-c${identity.controlRevision}-g${identity.configRevision}-t${identity.tick}-${backend}.png`;
     request.encoding = true;
     encodingRequest = request;
     captureStatus.dataset.state = "encoding";
@@ -1099,7 +1198,9 @@ function captureAdmittedFrame(frameIdentity) {
         return;
       }
       try {
-        if (request.simulationGeneration !== simulationGeneration) throw new Error("World changed during capture; try again");
+        if (request.simulationGeneration !== simulationGeneration || request.presentationGeneration !== presentationGeneration) {
+          throw new Error("Displayed world changed during capture; try again");
+        }
         if (!blob || blob.type !== "image/png") throw new Error("The browser did not produce a PNG");
         if (captureUrl) URL.revokeObjectURL(captureUrl);
         captureUrl = URL.createObjectURL(blob);
@@ -1107,8 +1208,12 @@ function captureAdmittedFrame(frameIdentity) {
         link.href = captureUrl;
         link.download = filename;
         link.click();
-        Object.assign(captureStatus.dataset, identity, { renderer: backend, state: "ready", filename });
-        captureStatus.textContent = `PNG ready — tick ${identity.tick}, science revision ${identity.scientificRevision}, publication ${identity.publicationRevision} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`;
+        Object.assign(captureStatus.dataset, identity, { renderer: backend, state: "ready", filename,
+          view: checkpoint ? "checkpoint" : "live", checkpointId: checkpoint?.checkpoint_id ?? "",
+          worldDigestV1: checkpoint?.world_digest_v1 ?? "" });
+        captureStatus.textContent = checkpoint
+          ? `Saved-world PNG ready — ${checkpoint.checkpoint_id}, tick ${checkpoint.tick}, world digest ${checkpoint.world_digest_v1} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`
+          : `PNG ready — tick ${identity.tick}, science revision ${identity.scientificRevision}, publication ${identity.publicationRevision} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`;
         finishCapture(request);
       } catch (error) {
         finishCapture(request, error);
@@ -1137,13 +1242,26 @@ window.addEventListener("pagehide", () => {
   captureUrl = null;
 });
 
-function updateStats(snapshot, now) {
+function updateStats(snapshot, now, historical = false) {
   const frameDt = now - metrics.lastFrameTs;
   metrics.lastFrameTs = now;
 
   if (frameDt > 0) {
     const instantaneous = 1000 / frameDt;
     metrics.fps = metrics.fps * 0.85 + instantaneous * 0.15;
+  }
+
+  if (historical) {
+    fpsEl.textContent = metrics.fps.toFixed(1);
+    tpsEl.textContent = "—";
+    tickEl.textContent = snapshot.tick.toLocaleString();
+    popEl.textContent = snapshot.summary.agentCount.toLocaleString();
+    // Checkpoints retain scientific state, not the original per-tick activity.
+    birthsEl.textContent = "—";
+    deathsEl.textContent = "—";
+    energyEl.textContent = snapshot.summary.averageEnergy.toFixed(3);
+    healthEl.textContent = snapshot.summary.averageHealth.toFixed(3);
+    return;
   }
 
   const statsDt = now - metrics.lastStatsTs;
@@ -1188,10 +1306,11 @@ function presentSimulation(now) {
   try {
     if (!hasPresentationFrame()) return;
 
-    const frame = remoteMode ? remoteFrame : simHandle.frame();
-    narrative.observe(frame, simulationGeneration);
-    const presented = drawSnapshot(frame);
-    updateStats(frame.snapshot, now);
+    const liveFrame = remoteMode ? remoteFrame : simHandle.frame();
+    if (liveFrame) narrative.observe(liveFrame, simulationGeneration);
+    const frame = reviewedCheckpoint?.frame ?? liveFrame;
+    const presented = drawSnapshot(frame, !!reviewedCheckpoint);
+    updateStats(frame.snapshot, now, !!reviewedCheckpoint);
     if (presented && presentationFailure) {
       if (rendererStatus.textContent === presentationFailure.message) {
         rendererStatus.textContent = presentationFailure.previousStatus;
@@ -1258,10 +1377,11 @@ function releaseSimulation(handle) {
   }
 }
 
-function replaceSimulation(next, { continuation = false, permalink = null, expectedTick = null } = {}) {
+function replaceSimulation(next, { continuation = false, permalink = null, expectedTick = null, expectedBrainPreset = null } = {}) {
   const nextSpeed = continuation ? 0 : speedMultiplier;
   let frame;
   let brainPreset;
+  let brainFamilies = [];
   let launchInfo;
   try {
     // All fallible owner reads happen before the active world, clock, or UI is
@@ -1273,13 +1393,21 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
       throw new Error("Saved continuation tick does not match its checkpoint bytes");
     }
     brainPreset = next.brainPreset?.() ?? null;
+    if (expectedBrainPreset !== null && brainPreset !== expectedBrainPreset) {
+      throw new Error("The browser package did not create the requested brain preset; reload an updated package");
+    }
     launchInfo = typeof next.launchInfo === "function" ? validateLaunchInfo(next.launchInfo()) : continuation ? {
       kind: "checkpoint_continuation", semantics: "saved_owner_continuation", shareable: false,
       seed: null, initial_population: null, brain_preset: null, recipe_version: null,
       reason: "This package did not record the original launch recipe for the saved owner.",
     } : null;
-    if (continuation && !["mlp", "dwraon", "assembly", "none"].includes(brainPreset)) {
-      throw new Error("Saved continuation has an unsupported brain family");
+    if (continuation || brainPreset === "mixed") {
+      brainFamilies = validateContinuationBrains(brainPreset, next.brainFamilies?.() ?? null);
+    }
+    if (!continuation && brainPreset === "mixed"
+        && (launchInfo?.kind !== "browser_launch" || launchInfo.brain_preset !== "mixed"
+          || launchInfo.recipe_version !== 2 || brainFamilies.join(",") !== "mlp,dwraon,assembly")) {
+      throw new Error("Mixed founder recipe has an inconsistent family roster");
     }
     if (launchInfo?.shareable === false) {
       permalink = null;
@@ -1298,11 +1426,14 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   recoveryReadStatus = "";
   browserRecovery?.attach(next);
   activeBrainPreset = brainPreset;
+  activeBrainFamilies = brainFamilies;
   activeLaunchInfo = launchInfo;
   latestForkedLink = null;
   if (forkOutput) forkOutput.style.display = "none";
   if (forkRecipeInfo) forkRecipeInfo.textContent = "";
   simulationGeneration += 1;
+  presentationGeneration += 1;
+  lastPaintedLiveFrame = null;
   narrative.reset("local");
   inspector.reset();
   brainInspector.reset();
@@ -1317,7 +1448,9 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   if (continuation) {
     speedMultiplier = 0;
     stepsSlider.value = "0";
-    if (brainPresetSelect) brainPresetSelect.value = brainPreset;
+  }
+  if (brainPresetSelect && brainPreset !== null) {
+    brainPresetSelect.value = continuation && brainPreset === "mixed" ? "mixed_continuation" : brainPreset;
   }
   resetPerformanceWindows(frame.snapshot);
   if (captureRequest) finishCapture(captureRequest, new Error("World changed during capture; try again"));
@@ -1612,17 +1745,20 @@ async function resetSimulation(populationOverride) {
   const defaults = default_init_options ? default_init_options() : {};
   const seed = Math.floor(Math.random() * 1_000_000);
   const preset = brainPresetSelect?.value || "mlp";
+  if (preset === "mixed_continuation") throw new Error("Choose a new-world brain preset before resetting this mixed continuation");
   const evolutionary = ["mlp", "dwraon", "assembly"].includes(preset);
-  if (!evolutionary && !["wander", "none"].includes(preset)) throw new Error("Choose a supported brain family");
+  const mixed = preset === "mixed";
+  if (!evolutionary && !mixed && !["wander", "none"].includes(preset)) throw new Error("Choose a supported brain family");
   const options = {
     ...defaults,
     seed,
     population: populationOverride,
     default_brain: evolutionary ? preset : null,
+    mixed_brains: mixed,
     seed_strategy: preset === "wander" ? "wander" : "none",
   };
 
-  const installed = replaceSimulation(init_sim(options));
+  const installed = replaceSimulation(init_sim(options), { expectedBrainPreset: mixed ? "mixed" : null });
   currentPermalink = installed.permalink;
   if (permalinkInput) permalinkInput.value = currentPermalink ?? "";
 

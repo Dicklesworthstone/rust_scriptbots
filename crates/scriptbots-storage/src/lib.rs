@@ -2764,6 +2764,7 @@ const AGENT_COLUMNS: &[&str] = &[
 
 /// Working-set budget for one multi-row scientific INSERT, not the engine's maximum.
 const MAX_SCIENCE_INSERT_BINDINGS: usize = 1_024;
+const DOMAIN_EVENT_INSERT_WIDTH: usize = 10;
 
 /// Number of values bound by [`scriptbots_agent_insert_sql`].
 #[cfg(test)]
@@ -19927,7 +19928,15 @@ impl Storage {
                 "domain-event projection inserted {batch_rows} batch rows"
             )));
         }
-        for prepared in &projection.events {
+        if projection.events.is_empty() {
+            return Ok(());
+        }
+        let sql = "INSERT INTO host_domain_events (
+                run_id, host_session_id, scientific_event_sequence, event_ordinal,
+                journal_sequence, tick, kind, actor_agent_uid, payload_json,
+                archive_payload_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+        let rows = projection.events.iter().map(|prepared| {
             let ordinal = i64::try_from(prepared.ordinal)
                 .map_err(|error| FrankenError::Internal(error.to_string()))?;
             let actor_agent_uid = prepared
@@ -19936,32 +19945,20 @@ impl Storage {
                 .map(|uid| i64::try_from(uid.0))
                 .transpose()
                 .map_err(|error| FrankenError::Internal(error.to_string()))?;
-            let event_rows = transaction.execute_with_params(
-                "INSERT INTO host_domain_events (
-                    run_id, host_session_id, scientific_event_sequence, event_ordinal,
-                    journal_sequence, tick, kind, actor_agent_uid, payload_json,
-                    archive_payload_digest
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                &[
-                    sqlite_run_id(run_id),
-                    session.as_str().into(),
-                    event.as_str().into(),
-                    ordinal.into(),
-                    journal.as_str().into(),
-                    tick.into(),
-                    prepared.payload.kind().as_str().into(),
-                    sqlite_optional_i64(actor_agent_uid),
-                    prepared.payload_json.as_str().into(),
-                    projection.archive_payload_digest.as_str().into(),
-                ],
-            )?;
-            if event_rows != 1 {
-                return Err(FrankenError::Internal(format!(
-                    "domain-event projection inserted {event_rows} rows for ordinal {}",
-                    prepared.ordinal
-                )));
-            }
-        }
+            Ok([
+                sqlite_run_id(run_id),
+                session.as_str().into(),
+                event.as_str().into(),
+                ordinal.into(),
+                journal.as_str().into(),
+                tick.into(),
+                prepared.payload.kind().as_str().into(),
+                sqlite_optional_i64(actor_agent_uid),
+                prepared.payload_json.as_str().into(),
+                projection.archive_payload_digest.as_str().into(),
+            ])
+        });
+        Self::execute_fallible_bounded_insert::<DOMAIN_EVENT_INSERT_WIDTH>(transaction, sql, rows)?;
         Ok(())
     }
 
@@ -21916,13 +21913,24 @@ impl Storage {
 
     /// Preserve input order while amortizing statement setup and FK schema refreshes.
     /// The binding budget bounds each statement's temporary storage; the enclosing
-    /// `flush_attempt` transaction remains responsible for rolling back every chunk.
+    /// transaction remains responsible for rolling back every chunk.
     /// The returned row count must match the chunk. `RETURNING` selects the pinned engine's
     /// direct VDBE path; non-returning multi-row inserts with FKs replay and reload each row.
     fn execute_bounded_insert<const WIDTH: usize>(
         tx: &Transaction<'_>,
         one_row_sql: &str,
-        mut rows: impl Iterator<Item = [SqliteValue; WIDTH]>,
+        rows: impl Iterator<Item = [SqliteValue; WIDTH]>,
+    ) -> Result<usize, FrankenError> {
+        Self::execute_fallible_bounded_insert(tx, one_row_sql, rows.map(Ok))
+    }
+
+    /// Materialize only one statement's rows at a time, retaining checked conversions.
+    /// A conversion failure, like a SQL failure, requires the caller to roll back
+    /// the entire enclosing transaction, including any earlier successful chunks.
+    fn execute_fallible_bounded_insert<const WIDTH: usize>(
+        tx: &Transaction<'_>,
+        one_row_sql: &str,
+        mut rows: impl Iterator<Item = Result<[SqliteValue; WIDTH], FrankenError>>,
     ) -> Result<usize, FrankenError> {
         if WIDTH == 0 || WIDTH > MAX_SCIENCE_INSERT_BINDINGS {
             return Err(FrankenError::Internal(format!(
@@ -21936,6 +21944,7 @@ impl Storage {
             parameters.clear();
             sql.truncate(one_row_sql.len());
             for values in rows.by_ref().take(MAX_SCIENCE_INSERT_BINDINGS / WIDTH) {
+                let values = values?;
                 if !parameters.is_empty() {
                     sql.push_str(", (");
                     for column in 0..WIDTH {
@@ -30407,6 +30416,315 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_typed::<i64>(0)?, 1);
         connection.close()?;
+        Ok(())
+    }
+
+    fn capture_domain_projection_batch(
+        founders: usize,
+    ) -> Result<Arc<JournalBatch>, Box<dyn std::error::Error>> {
+        use scriptbots_runtime::{
+            JournalAdmission, JournalPort, JournalReceipt, ManualHostDriver,
+            ShutdownCommitRequirement, VolatileJournal,
+        };
+
+        struct Capture {
+            inner: VolatileJournal,
+            batches: Arc<Mutex<Vec<Arc<JournalBatch>>>>,
+        }
+        impl JournalPort for Capture {
+            fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+                self.batches
+                    .lock()
+                    .expect("capture lock")
+                    .push(Arc::clone(batch));
+                self.inner.try_admit(batch)
+            }
+
+            fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+                self.inner.poll_receipts(limit)
+            }
+
+            fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+                ShutdownCommitRequirement::CommittedVolatile
+            }
+        }
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(0x51a7_0f5e),
+            closed: true,
+            population_minimum: 0,
+            history_capacity: 8,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })?;
+        for _ in 0..founders {
+            world.try_spawn_agent(AgentData::default())?;
+        }
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let mut owner = HostCore::with_journal(
+            HostSessionId::new(0x5107),
+            world,
+            HostCoreOptions {
+                tick_period_nanos: 1,
+                initial_playback: PlaybackSnapshot {
+                    paused: false,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            Box::new(Capture {
+                inner: VolatileJournal::default(),
+                batches: Arc::clone(&batches),
+            }),
+        )?;
+        owner.drive(ManualInstant::from_nanos(0))?;
+        owner.drive(ManualInstant::from_nanos(1))?;
+        let batch = batches
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .find(|batch| batch.scientific().is_some())
+            .cloned()
+            .expect("the actual owner must publish a scientific boundary");
+        Ok(batch)
+    }
+
+    fn assert_domain_projection_rows(
+        storage: &Storage,
+        projection: &PreparedDomainEventProjection,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let session = encode_journal_u64(projection.batch_id.session_id().get());
+        let sequence = encode_journal_u64(projection.scientific_event_sequence.get());
+        let identity = [
+            sqlite_run_id(storage.run_id),
+            session.as_str().into(),
+            sequence.as_str().into(),
+        ];
+        let metadata = storage.connection()?.query_with_params(
+            "SELECT event_count, archive_payload_digest FROM host_domain_event_batches
+             WHERE run_id = ?1 AND host_session_id = ?2 AND scientific_event_sequence = ?3",
+            &identity,
+        )?;
+        assert_eq!(metadata.len(), 1, "zero-event boundaries still need metadata");
+        assert_eq!(
+            metadata[0].get_typed::<i64>(0)?,
+            i64::try_from(projection.events.len())?
+        );
+        assert_eq!(
+            metadata[0].get_typed::<String>(1)?,
+            projection.archive_payload_digest
+        );
+        let rows = storage.connection()?.query_with_params(
+            "SELECT event_ordinal, kind, actor_agent_uid, payload_json, tick, journal_sequence
+             FROM host_domain_events
+             WHERE run_id = ?1 AND host_session_id = ?2 AND scientific_event_sequence = ?3
+             ORDER BY event_ordinal ASC",
+            &identity,
+        )?;
+        assert_eq!(rows.len(), projection.events.len());
+        for (row, expected) in rows.iter().zip(&projection.events) {
+            assert_eq!(row.get_typed::<i64>(0)?, i64::try_from(expected.ordinal)?);
+            assert_eq!(row.get_typed::<String>(1)?, expected.payload.kind().as_str());
+            assert_eq!(
+                row.get_typed::<Option<i64>>(2)?,
+                expected
+                    .payload
+                    .actor_agent_uid()
+                    .map(|uid| i64::try_from(uid.0))
+                    .transpose()?
+            );
+            assert_eq!(row.get_typed::<String>(3)?, expected.payload_json);
+            assert_eq!(row.get_typed::<i64>(4)?, i64::try_from(projection.tick.0)?);
+            assert_eq!(
+                row.get_typed::<String>(5)?,
+                encode_journal_u64(projection.batch_id.sequence())
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_domain_projection_rollback(
+        storage: &Storage,
+        prepared: &PreparedHostJournalArchive,
+        batch_id: JournalBatchId,
+        failure: StorageError,
+        case: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let StorageError::Transaction {
+            commit_state,
+            source,
+            ..
+        } = failure
+        else {
+            panic!("{case}: expected transaction rollback, observed {failure:?}");
+        };
+        assert_eq!(commit_state, FailureCommitState::RolledBack, "{case}");
+        match case {
+            "ordinal" | "actor" => assert!(
+                matches!(&source, FrankenError::Internal(detail)
+                    if detail == &i64::try_from(u64::MAX)
+                        .expect_err("u64::MAX cannot fit in i64").to_string()),
+                "{case}: unexpected conversion failure {source:?}"
+            ),
+            "payload" => assert!(
+                matches!(
+                    &source,
+                    FrankenError::CheckViolation { name }
+                        if name.contains("payload_json != ''")
+                ) || matches!(
+                    &source,
+                    FrankenError::Internal(detail)
+                        if detail.starts_with("VDBE halted with code 19: CHECK constraint failed:")
+                            && detail.contains("payload_json != ''")
+                ),
+                "expected the empty payload CHECK failure, observed {source:?}"
+            ),
+            "duplicate" => assert!(
+                source
+                    .to_string()
+                    .contains("UNIQUE constraint failed: host_domain_events."),
+                "{source:?}"
+            ),
+            _ => unreachable!(),
+        }
+        for table in ["host_domain_events", "host_domain_event_batches"] {
+            assert_eq!(
+                storage
+                    .connection()?
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"))?
+                    .get_typed::<i64>(0)?,
+                0,
+                "{case}: earlier projection writes escaped rollback"
+            );
+        }
+        assert_eq!(
+            Storage::host_journal_state(storage.connection()?, storage.run_id, batch_id)?,
+            HostJournalState::Admitted
+        );
+        let retained = storage
+            .connection()?
+            .query_row("SELECT payload_json, payload_digest FROM host_journal_archive")?;
+        assert_eq!(retained.get_typed::<String>(0)?, prepared.payload_json);
+        assert_eq!(retained.get_typed::<String>(1)?, prepared.payload_digest);
+        assert_eq!(
+            storage
+                .connection()?
+                .query_row("PRAGMA foreign_keys")?
+                .get_typed::<i64>(0)?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chunked_domain_events_preserve_real_owner_projections_and_empty_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let multi_chunk_count = 2 * (MAX_SCIENCE_INSERT_BINDINGS / DOMAIN_EVENT_INSERT_WIDTH) + 1;
+        for founders in [0, multi_chunk_count] {
+            let batch = capture_domain_projection_batch(founders)?;
+            let mut storage = Storage::unattributed_memory()?;
+            let prepared = prepare_host_journal_archive(
+                storage.run_id,
+                &batch,
+                MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+            )?;
+            let projection = prepared.domain_events.as_ref().expect("scientific projection");
+            assert!(projection.events.len() >= founders);
+            if founders == 0 {
+                assert!(projection.events.is_empty());
+            }
+            assert!(prepared.persistence.is_none());
+            assert!(prepared.command.is_none());
+            storage.register_host_journal_session(batch.id().session_id())?;
+            storage.admit_host_journal_archive(&batch, &prepared)?;
+            assert_eq!(
+                storage.complete_host_journal_archive(
+                    batch.id(),
+                    batch.scientific_event_sequence(),
+                    batch.applied().tick.0,
+                    None,
+                    Some(projection),
+                    None,
+                )?,
+                JournalReceiptState::CommittedVolatile
+            );
+            assert_domain_projection_rows(&storage, projection)?;
+            storage.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chunked_domain_events_roll_back_late_failures_and_retry_the_original_archive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let multi_chunk_count = 2 * (MAX_SCIENCE_INSERT_BINDINGS / DOMAIN_EVENT_INSERT_WIDTH) + 1;
+        let batch = capture_domain_projection_batch(multi_chunk_count)?;
+        for case in ["ordinal", "actor", "payload", "duplicate"] {
+            let mut storage = Storage::unattributed_memory()?;
+            let prepared = prepare_host_journal_archive(
+                storage.run_id,
+                &batch,
+                MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+            )?;
+            let projection = prepared.domain_events.as_ref().expect("scientific projection");
+            assert!(projection.events.len() >= multi_chunk_count);
+            let mut invalid = projection.clone();
+            let mut overflowing_birth = projection
+                .events
+                .iter()
+                .find_map(|event| {
+                    if let DomainEventPayload::Birth(birth) = &event.payload {
+                        Some(birth.clone())
+                    } else {
+                        None
+                    }
+                })
+                .expect("real founder birth");
+            overflowing_birth.agent_uid = AgentUid(u64::MAX);
+            let last = invalid.events.last_mut().expect("multi-chunk projection");
+            match case {
+                "ordinal" => last.ordinal = u64::MAX,
+                "actor" => {
+                    last.payload = DomainEventPayload::Birth(overflowing_birth);
+                    last.payload_json = last.payload.encode_json()?;
+                }
+                "payload" => last.payload_json.clear(),
+                "duplicate" => last.ordinal = 0,
+                _ => unreachable!(),
+            }
+            storage.register_host_journal_session(batch.id().session_id())?;
+            storage.admit_host_journal_archive(&batch, &prepared)?;
+            let failure = storage
+                .complete_host_journal_archive(
+                    batch.id(),
+                    batch.scientific_event_sequence(),
+                    batch.applied().tick.0,
+                    None,
+                    Some(&invalid),
+                    None,
+                )
+                .expect_err("a late conversion or SQL constraint must refuse the whole projection");
+            assert_domain_projection_rollback(
+                &storage,
+                &prepared,
+                batch.id(),
+                failure,
+                case,
+            )?;
+            storage.complete_host_journal_archive(
+                batch.id(),
+                batch.scientific_event_sequence(),
+                batch.applied().tick.0,
+                None,
+                Some(projection),
+                None,
+            )?;
+            assert_domain_projection_rows(&storage, projection)?;
+            storage.close()?;
+        }
         Ok(())
     }
 

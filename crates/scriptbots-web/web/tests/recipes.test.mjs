@@ -1,6 +1,30 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateLaunchInfo, launchInfoText, renderBuildComparison } from "../recipes.js";
+import { validateContinuationBrains, validateLaunchInfo, launchInfoText, renderBuildComparison } from "../recipes.js";
+
+test("saved mixed worlds require every supported family in the observed registry order", () => {
+  for (const families of [["assembly", "mlp"], ["dwraon", "assembly", "mlp"]]) {
+    const admitted = validateContinuationBrains("mixed", families);
+    assert.deepEqual(admitted, families);
+    assert.notEqual(admitted, families, "the view must not retain a mutable owner array");
+  }
+  for (const family of ["mlp", "dwraon", "assembly"]) {
+    assert.deepEqual(validateContinuationBrains(family, [family]), [family]);
+    assert.deepEqual(validateContinuationBrains(family), [family]);
+  }
+  assert.deepEqual(validateContinuationBrains("none", []), []);
+  assert.deepEqual(validateContinuationBrains("none"), []);
+});
+
+test("mixed continuation admission refuses missing, foreign, duplicate or substituted families", () => {
+  for (const [preset, families] of [["mixed", null], ["mixed", []], ["mixed", ["mlp"]],
+    ["mixed", ["mlp", "mlp"]], ["mixed", ["mlp", "neuroflow"]],
+    ["mixed", ["mlp", "dwraon", "assembly", "mlp"]], ["mixed", "mlp,dwraon"],
+    ["mlp", ["dwraon"]], ["mlp", ["mlp", "dwraon"]], ["none", ["assembly"]],
+    ["wander", []], ["unknown", null]]) {
+    assert.throws(() => validateContinuationBrains(preset, families), /brain-family roster/);
+  }
+});
 
 const browserRecipe = (overrides = {}) => ({
   kind: "browser_launch", semantics: "initial_conditions_restart", shareable: true,
@@ -30,6 +54,26 @@ test("browser recipes preserve exact full-width seeds and registered empty-world
     for (const initial_population of [0, 50_000]) {
       assert.equal(validateLaunchInfo(browserRecipe({ brain_preset, initial_population })).initial_population, initial_population);
     }
+  }
+});
+
+test("mixed founders require their explicit version two recipe", () => {
+  for (const initial_population of [0, 1, 2, 7, 50_000]) {
+    const recipe = validateLaunchInfo(browserRecipe({
+      brain_preset: "mixed", recipe_version: 2, initial_population,
+    }));
+    const text = launchInfoText(recipe);
+    assert.ok(text.includes("MLP + DWRAON + Assembly"));
+    assert.ok(text.includes("assigned in repeating order"));
+    assert.ok(text.includes("Recipe v2"));
+  }
+  for (const metadata of [
+    browserRecipe({ brain_preset: "mixed" }),
+    browserRecipe({ brain_preset: "mixed", recipe_version: 3 }),
+    ...["mlp", "dwraon", "assembly", "wander", "none"].map((brain_preset) =>
+      browserRecipe({ brain_preset, recipe_version: 2 })),
+  ]) {
+    assert.throws(() => validateLaunchInfo(metadata), /unsupported founder recipe/);
   }
 });
 

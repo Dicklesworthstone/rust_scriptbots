@@ -357,6 +357,9 @@ enum NarrativeSubcommand {
         /// Optional path to SQLite database for direct querying without a running server.
         #[arg(long = "db")]
         db: Option<PathBuf>,
+        /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+        #[arg(long)]
+        run_id: Option<String>,
     },
     /// Retrieve chronological event window around a specific tick.
     Around {
@@ -371,6 +374,9 @@ enum NarrativeSubcommand {
         /// Optional path to SQLite database for direct querying without a running server.
         #[arg(long = "db")]
         db: Option<PathBuf>,
+        /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+        #[arg(long)]
+        run_id: Option<String>,
     },
 }
 
@@ -2423,6 +2429,7 @@ async fn narrative_command(
             limit,
             json,
             db,
+            run_id,
         } => {
             let hits: Vec<NarrativeSearchHitDto> = if let Some(ref db_path) = db {
                 let db_path = db_path.clone();
@@ -2438,6 +2445,7 @@ async fn narrative_command(
                                 from_tick,
                                 to_tick,
                                 limit,
+                                run_id,
                             },
                         )
                     })
@@ -2448,6 +2456,9 @@ async fn narrative_command(
             } else {
                 let url = join_url(base_url, "/api/narrative/search");
                 let mut req = client.get(url).query(&[("q", &query)]);
+                if let Some(run_id) = run_id {
+                    req = req.query(&[("run_id", run_id)]);
+                }
                 if let Some(from) = from_tick {
                     let s = from.to_string();
                     req = req.query(&[("from", s)]);
@@ -2484,6 +2495,7 @@ async fn narrative_command(
             window,
             json,
             db,
+            run_id,
         } => {
             let hits: Vec<NarrativeSearchHitDto> = if let Some(ref db_path) = db {
                 let db_path = db_path.clone();
@@ -2494,7 +2506,11 @@ async fn narrative_command(
                         execute_narrative_around(
                             Some(db_path.as_path()),
                             None,
-                            NarrativeAroundQuery { tick, window },
+                            NarrativeAroundQuery {
+                                tick,
+                                window,
+                                run_id,
+                            },
                         )
                     })
                     .context("failed to spawn narrative around worker thread")?
@@ -2505,6 +2521,9 @@ async fn narrative_command(
                 let path = format!("/api/narrative/around/{tick}");
                 let url = join_url(base_url, &path);
                 let mut req = client.get(url);
+                if let Some(run_id) = run_id {
+                    req = req.query(&[("run_id", run_id)]);
+                }
                 if let Some(w) = window {
                     let s = w.to_string();
                     req = req.query(&[("window", s)]);

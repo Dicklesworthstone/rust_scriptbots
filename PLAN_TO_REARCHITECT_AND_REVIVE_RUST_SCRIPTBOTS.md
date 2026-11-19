@@ -2,6 +2,203 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Live native soundscape integration (2026-11-16):**
+[Source implemented and independently reviewed — executable qualification remains open
+under `bd-16g.14` and `bd-2z0.14.1.11`]
+
+- Connected the existing bounded synthesis engine to a real Kira callback, replacing
+  the empty device sink. Input generations discard old owners and muted queues;
+  device-sized rendering does not retrigger observed ticks. Active layer controls,
+  finite-input validation, a bounded drone phase and actual device-rate handling are
+  implemented. Muted event layers no longer starve audible cues.
+- Added a shared immutable-snapshot projector. Canonical population metrics, configured
+  diet classification and exact completed-tick counts stay observational. Duplicate
+  publications do not replay events; missed ticks are counted without inventing cues.
+- Added explicit opt-in sound and mixer controls to GPUI and Bevy. World/Lab share one
+  device; pause, history, background and lifecycle gates mute or rebase it. Device
+  initialization and observed runtime failures have visible terminal status.
+- Authored production-callback, transport, mixer, real-owner projection and frontend
+  policy regressions. Independent review corrected stale-queue ordering, muted-layer
+  budget starvation, active-tail volume and frontend lifetime/error handling.
+
+DSR dependency probes stopped before compilation at the existing uncached pinned
+`xcb` Git dependency. A scoped dependency fetch and intermediate formatter execution
+completed, but repeated execution-workspace outages prevented the new tests and final
+compiler/Clippy/format qualification. The published source is independently reviewed;
+these observations do not constitute executable acceptance. Native output is currently
+mono, and physical-device journeys, spatial output, the original 10k performance budget
+and live/offline soundtrack equivalence remain unqualified. Original Bead criteria and
+statuses remain unchanged.
+
+**Saved-world inspection and registry portability (2026-11-16):**
+[Source implemented and independently reviewed — Codex; executable qualification remains open]
+
+The saved-world product loop now has a native-to-browser review path:
+
+- `75e54a3` reconstructs the recorded compiled brain registry in its saved order,
+  including supported subsets and extinct families. Complete protocol and constructor
+  identities remain required. Canvas and montage replay no longer guess from today's
+  preset roster; managed study provenance still requires a true matching founder preset.
+- `fb1c648` adds `GET /api/v1/checkpoints/{checkpoint_id}/canvas?session_id=...`.
+  It verifies the retained descriptor, exact payload bytes and both checksums, restores
+  the saved scientific cut and checks its digest. The live owner is neither stepped nor
+  replaced. One reconstruction slot, a 30-second response deadline, 16 MiB source and
+  8 MiB binary-frame bounds, bounded populations, grids and history capacities provide
+  explicit admission limits; these are not a total resident-memory guarantee.
+- The browser exposes **Review saved world** and **Return to live**, keeps the live
+  stream and event timeline separate, and disables live mutations and UID inspection
+  while displaying saved science. It checks the source session, saved identity and
+  frame boundary, rejects stale results and invalidates presentation caches on view
+  changes. Saved PNGs identify the checkpoint, tick and digest. Original per-tick
+  activity and live tick rate are unavailable for a reconstructed scientific cut.
+
+Authored regressions cover registry portability and deterministic continuation,
+unchanged-owner canvas/reel replay, cold and cached sources, corrupt/oversized artifacts,
+admission boundaries, session and capacity refusals, browser cancellation and unchanged
+stream cursors. A real native/browser journey exercises review, both PNG renderers,
+incoming live frames and return to live. These new tests have **not run**.
+
+DSR refused native build admission for insufficient disk capacity, then the execution
+workspace disconnected. Independent source review found and corrected test/lifecycle
+issues, but establishes no compiler, formatter, Clippy, Rust, JavaScript or live-browser
+pass. Qualification must use DSR when execution is available. Original checkpoint,
+replay and browser Beads retain their acceptance criteria and statuses; none is closed
+by this source-only increment.
+**Mixed-family browser worlds and bounded journal writes (2026-11-16):**
+[Source committed and independently reviewed — Codex; scoped JavaScript checks
+passed; original acceptance remains open under `bd-ywtv` and `bd-50bg`]
+
+Three functional increments are published on main:
+
+- `eac2c9c` batches canonical domain-event projection inserts within the existing
+  1,024-binding budget (102 ten-field events per statement). Checked identities,
+  exact payload bytes, empty-boundary metadata, returned-row checks and transaction
+  rollback remain intact. No schema, database pin or foreign-key policy changed.
+- `4433f24` restores compatible volatile browser checkpoints with any supported
+  combination of MLP, DWRAON and Assembly families. Registry order, complete
+  adapter/genome/evaluator identity and empty or extinct families are retained.
+  Browser resource limits apply before executable restoration. Imported mixed
+  continuations require an explicit fresh-world choice before reset.
+- `9486777` creates opt-in mixed founder worlds in repeating MLP, DWRAON, Assembly
+  order, including zero-founder registries. A version 2 founder recipe preserves
+  this choice through sharing, forks and reset; existing version 1 bytes and
+  default seeding are preserved. Browser controls distinguish a fresh mixed
+  recipe from a saved continuation and refuse stale or incomplete packages before
+  replacing the active owner. Links retain their recorded seed; demo Reset
+  creates a new seed.
+
+Authored regressions cover real reproduction, checkpoint science and evaluator
+parity, recipe compatibility, browser replacement/refusal, canonical multi-chunk
+event readback, late conversion/SQL failures and original-archive retry.
+Independent source review corrected test diagnostics before publication.
+
+DSR on unchanged source `9486777` passed all **10 JavaScript recipe unit tests**.
+The formatter returned zero but printed eight diffs in the unchanged terminal
+`frankentui_shell.rs`; no web/storage diffs were emitted and no clean workspace
+format claim is made. Chromium was refused socket creation before any DOM
+assertion ran. The native `browser_mixed` probe hit its configured 300-second
+deadline after logging dependency acquisition; no Rust test pass was observed.
+Workspace checking, Clippy, storage Rust regressions, WASM execution and throughput
+qualification remain unpassed.
+
+[The validation record](docs/validation/2026-11-16-mixed-families/README.md)
+retains raw receipts, configurations and logs for the current checks and the two
+earlier failed attempts. Source inventories remained unchanged during the current
+checks. Progress comments were exported through `br`; original bead criteria,
+ownership and in-progress status remain unchanged. No browser durable-watermark,
+cross-target equivalence, measured speedup or broad bead closure is claimed.
+
+
+**Shared first-run Lab guide in terminal and GPUI (2026-11-15):**
+[Source implemented and independently reviewed — executable qualification remains open under `bd-2z0.10.4`]
+
+Added a shared, versioned eight-step walkthrough and opt-in terminal and GPUI
+surfaces: identify the live world, inspect a living stable UID, pause, advance
+one tick, change only food growth, save a fresh cut, run a two-arm study, and
+read its descriptive outcome. Both terminal event paths and the shared World/Lab
+guide observe actual command receipts and publications. Admission alone cannot
+advance the guide; volatile journal commitments are labelled explicitly. Old
+saves, foreign owners, stale callbacks, unchanged single-arm continuations, and
+mismatched reports cannot satisfy steps. Hiding the guide preserves progress
+and opening it does not mutate science.
+
+GPUI action buttons use the existing inspector, live controls, saved-checkpoint
+composer and verified report loader. The growth-edit adapter retains the normal
+application command identity and attaches all three owner revision guards.
+That closes the race between a client precheck and application of a whole
+configuration. A real-owner regression separately exercises stale control,
+scientific and configuration rejection while preserving the competing state.
+
+Model and real-owner adapter regressions are authored but unexecuted. The
+required DSR health preflight refused insufficient storage capacity before
+checks; the workspace subsequently became unavailable. No compiler, formatter,
+Clippy, terminal, or GUI pass is claimed for these changes. Automatic first-run
+presentation, the default meadow/provenance experience, and the complete actual
+native journey remain open acceptance work; the broad bead is not closed.
+
+**Terminal saved-study results and portable intervention inputs (2026-11-14):**
+[Source committed and independently reviewed — Codex; terminal executable qualification remains open]
+
+The terminal journey from a saved scientific cut to an interpretable study
+result now uses the existing shared Lab provider. Bounded checkpoint and
+retained-study catalogs, explicit study selection, and verified report readback
+preserve the existing pending/final presentation rail for
+save, historical review, branch creation and cancellation. Original real-PTY,
+runtime and broader scientific qualification under `bd-2z0.6.8` remains open.
+
+Repaired the independently reproduced `StudyIntervention` JSON field-order
+failure: with arbitrary-precision JSON enabled, a valid `params`-before-`type`
+input reaches Serde's intermediate buffering and rejects finite f32 parameters.
+Preserved the current wire representation, duplicate/unknown-field refusal and
+scientific meanings. Ordinary JSON and direct JSON Value round trips passed the
+causal probe; only the reordered arbitrary-precision input failed.
+
+- [x] Connect paged saved checkpoints and retained studies to the live Replay route.
+- [x] Expose verified control/treatment report observations and their single-seed scope.
+- [x] Preserve saved-cut review, mutation ordering, bounded workers and source invalidation.
+- [x] Repair order-independent scientific intervention decoding with regression coverage.
+- [x] Run source-bound DSR checks and record their exact scope before publication.
+- [ ] Execute the actual terminal/provider/PTY regressions when the locked app graph resolves.
+
+The codec is published as `08a94fd`; Replay is published as `049553e`.
+Genuine DSR executed the actual production codec and core wire types with all
+11 extracted registry versions/checksums matching `Cargo.lock`. The original
+codec passes all three regressions normally and fails all three with arbitrary
+precision; the replacement passes all three in both modes. Strict Clippy and
+pinned formatting also pass (DSR receipt `20261114T230225-EHnII3Cv`, 4/4).
+This closes scoped codec bead `bd-2z0.12.2.2`; full-plan/CLI/API/scientific runner
+qualification remains with the parent. The initial small probe and later full
+regression matrix differ in coverage, not in the underlying field-order defect.
+
+Replay's three changed Rust files pass pinned DSR formatting (receipt
+`20261114T230325-DV4J9xya`, 3/3). Authored tests cover actual saved-canvas and
+branch-service journeys, paging, hidden-source refusal, retained worker bounds,
+changed source/route invalidation and corrupted report refusal. Those tests
+have not executed: the pinned Zed revision below still blocks the application
+dependency graph. Source review and formatting do not establish runtime passage.
+
+**Narrative queries for retained simulation runs (2026-11-14):**
+[Source implemented and independently reviewed — Codex; executable acceptance open under `bd-urtp`]
+
+Connected the storage reader's existing explicit run selection to narrative
+search and chronological windows through the shared query DTO, direct/remote
+CLI, REST and MCP. Previously, the unqualified reader refused multi-run
+databases with no selection path on these surfaces. The new optional `run_id`
+preserves that refusal when no run is chosen, validates canonical run IDs and
+refuses live-memory fallback for an explicitly selected stored run, including
+zero-limit requests. MCP advertises zero limits/windows consistently with the
+existing shared handler semantics.
+
+The new real same-file two-run regression overlaps keyword, event kind and
+tick while retaining distinguishable text/severity, checks both query modes
+across all five surfaces, and refuses omitted/unknown/malformed selections.
+Direct reads receive a conflicting live-event decoy. Missing-storage and
+canonical-ID unit regressions are also authored. Pinned DSR formatting passes
+for all four Rust files, with final server-schema check bound to SHA256
+`8a2dc3692e98e5533586dd1589d0ccb0b72ada30aa55dc8d09592aaf7d8b740a`.
+The actual storage/transport tests remain unexecuted due to the same pinned
+application dependency blocker; `bd-urtp` remains in progress.
+
 **Terminal experiment workflow convergence (2026-11-15):**
 [Source committed and independently reviewed — Codex; executable qualification under `bd-2z0.6.8`]
 
@@ -27,7 +224,7 @@ preserved, including detail-view bracket shortcuts and legacy provider regressio
   stop acknowledgements, foreign owners/navigation/shutdown and receipt eviction.
 - [ ] Execute real-provider integration and refusal/lifecycle regression cases.
 - [x] Pass pinned DSR formatting and independent source review; publish coherent code increments.
-- [ ] Export the final Beads qualification notes with `br` when the execution workspace returns.
+- [x] Reconcile original Beads notes and current progress through `br` after workspace recovery.
 
 The source-bound app check with the exact locked dependencies timed out after
 900 seconds before Rust compilation, while fetching Zed. Its offline follow-up
@@ -4854,6 +5051,32 @@ clean source-status and source-diff digests plus Cargo.lock digest
 `27efb05ff6b7dafa4f7ea7f00a9fcd4218eb6b303fc64f9162dcbf27c7b19700`.
 
 ### 7.7 experiment runner
+
+**Checkpoint recovery and replay integration — Codex, 2026-11-15:**
+[Source implemented and independently reviewed; executable qualification open]
+
+Torn temporary status writes now recover only when the existing committed
+status and required executable continuation evidence validate (`295a416`).
+The exact torn bytes are retained in one exclusive incident directory before
+normal publication resumes. Missing cuts, invalid bundles, complete invalid
+successors, aliases and repeated incidents still refuse. Existing running work
+is never reset to tick zero. Original acceptance under `bd-2z0.5.11` stays open.
+
+Saved-canvas review, event reconstruction and managed branch studies now restore
+configured NeuroFlow through a shared compiled application-preset catalog
+(`1ddb8f4`). The `reel` command's checkpoint replay uses the same catalog for
+DWRAON, Assembly and feature-enabled Ft/Neuro registries as well as MLP, Mixed
+and no-brain worlds. Full saved registry identity remains mandatory, including
+NeuroFlow constructor settings; changed settings cannot authorize a substitute.
+
+Regression source covers nonzero owner continuation, completed-bundle recovery,
+refusal and evidence preservation, all compiled replay families, independent
+uninterrupted digests, configured NeuroFlow service paths and repeatable ASCII/GIF
+encoding. Pinned DSR formatting passed for the exact four changed Rust files
+(receipt `20261114T231028-UeSIpqE3`, 1/1). The locked application check with
+`--no-default-features --features neuro` was killed with exit 137 after dependency
+downloads, before Rust source diagnostics. No compile, test or Clippy pass is
+claimed, and the original checkpoint/host qualification remains open.
 
 **Source implementation extension — Codex, 2026-11-08:** Lab proposals expose
 ordered intervention schedules as a bounded treatment axis. Configuration factors,

@@ -97,7 +97,7 @@ pub(crate) const STUDY_BUNDLE_VERIFICATION_LIMITS: RunBundleVerificationLimits =
     };
 
 /// Specific intervention perturbations for branch studies.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", content = "params", deny_unknown_fields)]
 pub enum StudyIntervention {
     /// Suppress food regrowth in a region for a specified duration.
@@ -136,6 +136,114 @@ pub enum StudyIntervention {
     Core(Intervention),
     /// Arbitrary configuration patch resolved via pure precedence.
     ConfigPatch(serde_json::Value),
+}
+
+impl<'de> Deserialize<'de> for StudyIntervention {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Study plans and service requests use JSON. Adjacent-tagged derive buffers `params`
+        // through Serde Content when it precedes `type`, which turns AP-enabled JSON floats
+        // into private number maps. Retain the original JSON until its variant is known so
+        // typed decoding preserves float bits and still detects duplicate nested fields.
+        #[derive(Deserialize)]
+        enum Kind {
+            Drought,
+            ResourceShock,
+            TemperatureShift,
+            ClosedWorld,
+            Cooperation,
+            Core,
+            ConfigPatch,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Envelope {
+            #[serde(rename = "type")]
+            kind: Kind,
+            params: Box<serde_json::value::RawValue>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct DroughtParams {
+            region: Option<Region>,
+            duration_ticks: u32,
+            growth_scale: f32,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ResourceShockParams {
+            region: Option<Region>,
+            bloom_amount: f32,
+            scorch: f32,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TemperatureShiftParams {
+            discomfort_rate: f32,
+            comfort_band: f32,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ClosedWorldParams {
+            closed: bool,
+        }
+
+        let envelope = Envelope::deserialize(deserializer)?;
+        let params = envelope.params.get();
+        let decode_error = <D::Error as serde::de::Error>::custom;
+        Ok(match envelope.kind {
+            Kind::Drought => {
+                let DroughtParams {
+                    region,
+                    duration_ticks,
+                    growth_scale,
+                } = serde_json::from_str(params).map_err(decode_error)?;
+                Self::Drought {
+                    region,
+                    duration_ticks,
+                    growth_scale,
+                }
+            }
+            Kind::ResourceShock => {
+                let ResourceShockParams {
+                    region,
+                    bloom_amount,
+                    scorch,
+                } = serde_json::from_str(params).map_err(decode_error)?;
+                Self::ResourceShock {
+                    region,
+                    bloom_amount,
+                    scorch,
+                }
+            }
+            Kind::TemperatureShift => {
+                let TemperatureShiftParams {
+                    discomfort_rate,
+                    comfort_band,
+                } = serde_json::from_str(params).map_err(decode_error)?;
+                Self::TemperatureShift {
+                    discomfort_rate,
+                    comfort_band,
+                }
+            }
+            Kind::ClosedWorld => {
+                let ClosedWorldParams { closed } =
+                    serde_json::from_str(params).map_err(decode_error)?;
+                Self::ClosedWorld { closed }
+            }
+            Kind::Cooperation => {
+                Self::Cooperation(serde_json::from_str(params).map_err(decode_error)?)
+            }
+            Kind::Core => Self::Core(serde_json::from_str(params).map_err(decode_error)?),
+            Kind::ConfigPatch => {
+                Self::ConfigPatch(serde_json::from_str(params).map_err(decode_error)?)
+            }
+        })
+    }
 }
 
 /// Parameters for cooperation and altruistic sharing studies.
@@ -3655,6 +3763,265 @@ mod tests {
         assert!(!output.exists());
     }
 
+    fn study_intervention_codec_cases() -> Vec<(&'static str, StudyIntervention)> {
+        let disc = Region::Disc {
+            x: -0.0,
+            y: f32::from_bits(0x3eaa_aaab),
+            radius: 12.5,
+        };
+        vec![
+            (
+                "Drought",
+                StudyIntervention::Drought {
+                    region: Some(disc),
+                    duration_ticks: u32::MAX,
+                    growth_scale: f32::from_bits(0x3e4c_cccd),
+                },
+            ),
+            (
+                "Drought",
+                StudyIntervention::Drought {
+                    region: None,
+                    duration_ticks: 1,
+                    growth_scale: 0.0,
+                },
+            ),
+            (
+                "ResourceShock",
+                StudyIntervention::ResourceShock {
+                    region: Some(Region::Rect {
+                        x: -0.0,
+                        y: 0.125,
+                        w: 10.25,
+                        h: 20.5,
+                    }),
+                    bloom_amount: f32::from_bits(0x3f80_0001),
+                    scorch: 0.125,
+                },
+            ),
+            (
+                "TemperatureShift",
+                StudyIntervention::TemperatureShift {
+                    discomfort_rate: f32::from_bits(1),
+                    comfort_band: 0.25,
+                },
+            ),
+            (
+                "ClosedWorld",
+                StudyIntervention::ClosedWorld { closed: true },
+            ),
+            (
+                "Cooperation",
+                StudyIntervention::Cooperation(CooperationParams {
+                    food_sharing_rate: 0.125,
+                    food_transfer_rate: f32::from_bits(0x3eaa_aaab),
+                    food_sharing_distance: 24.5,
+                    reproduction_partner_chance: Some(0.75),
+                }),
+            ),
+            (
+                "Cooperation",
+                StudyIntervention::Cooperation(CooperationParams {
+                    food_sharing_rate: 0.0,
+                    food_transfer_rate: 0.0,
+                    food_sharing_distance: 0.0,
+                    reproduction_partner_chance: None,
+                }),
+            ),
+            (
+                "Core",
+                StudyIntervention::Core(Intervention::Bloom {
+                    region: disc,
+                    amount: f32::from_bits(0x3f80_0001),
+                }),
+            ),
+            (
+                "Core",
+                StudyIntervention::Core(Intervention::InjectCohort {
+                    count: 3,
+                    genome: scriptbots_core::CohortSource::RegisteredBrain { key: u64::MAX },
+                    placement: scriptbots_core::Placement::Seeded {
+                        region: disc,
+                        seed: u64::MAX,
+                    },
+                    herbivore_tendency: f32::from_bits(0x3eaa_aaab),
+                }),
+            ),
+            (
+                "ConfigPatch",
+                StudyIntervention::ConfigPatch(serde_json::json!({
+                    "food_max": 0.125,
+                    "closed": true,
+                    "rng_seed": u64::MAX,
+                })),
+            ),
+            // The existing decoder accepts arbitrary patch values; validate() requires an
+            // object later. Keep decoding separate from physical/configuration validation.
+            (
+                "ConfigPatch",
+                StudyIntervention::ConfigPatch(serde_json::Value::Null),
+            ),
+        ]
+    }
+
+    #[test]
+    fn study_intervention_json_roundtrips_every_variant_in_either_field_order() {
+        for (tag, expected) in study_intervention_codec_cases() {
+            let wire = serde_json::to_string(&expected).unwrap();
+            let value = serde_json::to_value(&expected).unwrap();
+            assert_eq!(value["type"], tag);
+            assert_eq!(value.as_object().unwrap().len(), 2);
+            assert!(wire.starts_with(&format!("{{\"type\":\"{tag}\",\"params\":")));
+            let reordered = format!(
+                "{{\"params\":{},\"type\":{}}}",
+                value["params"], value["type"]
+            );
+            for decoded in [
+                serde_json::from_str::<StudyIntervention>(&wire).unwrap(),
+                serde_json::from_str::<StudyIntervention>(&reordered).unwrap(),
+                serde_json::from_slice::<StudyIntervention>(reordered.as_bytes()).unwrap(),
+                serde_json::from_value::<StudyIntervention>(value.clone()).unwrap(),
+                StudyIntervention::deserialize(&value).unwrap(),
+            ] {
+                assert_eq!(decoded, expected, "{tag}");
+                // Exact serialized floats distinguish -0.0 from +0.0 as well as changed bits.
+                assert_eq!(serde_json::to_string(&decoded).unwrap(), wire, "{tag}");
+            }
+        }
+    }
+
+    #[test]
+    fn study_intervention_json_preserves_f32_bits_with_params_first() {
+        for bits in [
+            0,
+            0x8000_0000,
+            1,
+            0x007f_ffff,
+            0x0080_0000,
+            0x3eaa_aaab,
+            0x3f80_0001,
+            0x7f7f_ffff,
+            0xff7f_ffff,
+        ] {
+            let scalar = f32::from_bits(bits);
+            let params = serde_json::to_string(&scalar).unwrap();
+            let wire = format!(
+                "{{\"params\":{{\"discomfort_rate\":{params},\"comfort_band\":{params}}},\"type\":\"TemperatureShift\"}}"
+            );
+            let StudyIntervention::TemperatureShift {
+                discomfort_rate,
+                comfort_band,
+            } = serde_json::from_str(&wire).unwrap()
+            else {
+                panic!("temperature-shift parameters must retain their variant");
+            };
+            assert_eq!(discomfort_rate.to_bits(), bits);
+            assert_eq!(comfort_band.to_bits(), bits);
+        }
+    }
+
+    #[test]
+    fn study_intervention_json_rejects_invalid_or_duplicate_fields_in_either_order() {
+        let invalid_params = [
+            ("Drought", r#"{"growth_scale":0.5}"#),
+            ("Drought", r#"{"duration_ticks":1}"#),
+            (
+                "Drought",
+                r#"{"duration_ticks":1,"growth_scale":0.5,"scorch":0.2}"#,
+            ),
+            (
+                "Drought",
+                r#"{"duration_ticks":1,"growth_scale":0.5,"growth_scale":0.2}"#,
+            ),
+            (
+                "Drought",
+                r#"{"region":{"shape":"disc","x":1,"x":2,"y":0,"radius":5},"duration_ticks":1,"growth_scale":0.5}"#,
+            ),
+            ("ResourceShock", r#"{"bloom_amount":1}"#),
+            (
+                "ResourceShock",
+                r#"{"bloom_amount":1,"scorch":0.2,"duration_ticks":1}"#,
+            ),
+            (
+                "ResourceShock",
+                r#"{"bloom_amount":1,"bloom_amount":2,"scorch":0.2}"#,
+            ),
+            ("TemperatureShift", r#"{"discomfort_rate":0.1}"#),
+            (
+                "TemperatureShift",
+                r#"{"discomfort_rate":0.1,"comfort_band":0.2,"closed":true}"#,
+            ),
+            (
+                "TemperatureShift",
+                r#"{"discomfort_rate":0.1,"comfort_band":0.2,"comfort_band":0.3}"#,
+            ),
+            ("ClosedWorld", "{}"),
+            ("ClosedWorld", r#"{"closed":true,"growth_scale":0.5}"#),
+            ("ClosedWorld", r#"{"closed":true,"closed":false}"#),
+            (
+                "Cooperation",
+                r#"{"food_sharing_rate":0.1,"food_transfer_rate":0.2}"#,
+            ),
+            (
+                "Cooperation",
+                r#"{"food_sharing_rate":0.1,"food_transfer_rate":0.2,"food_sharing_distance":3,"food_sharing_distnace":4}"#,
+            ),
+            (
+                "Cooperation",
+                r#"{"food_sharing_rate":0.1,"food_transfer_rate":0.2,"food_sharing_distance":3,"food_transfer_rate":0.3}"#,
+            ),
+            (
+                "Core",
+                r#"{"kind":"bloom","region":{"shape":"all"},"amount":1,"amount":2}"#,
+            ),
+            (
+                "Core",
+                r#"{"kind":"bloom","region":{"shape":"rect","x":0,"y":0,"w":2,"w":3,"h":4},"amount":1}"#,
+            ),
+            ("UnknownTreatment", "{}"),
+            ("TemperatureShift", "null"),
+            (
+                "TemperatureShift",
+                r#"{"discomfort_rate":"0.1","comfort_band":0.2}"#,
+            ),
+        ];
+        for (tag, params) in invalid_params {
+            for wire in [
+                format!("{{\"type\":\"{tag}\",\"params\":{params}}}"),
+                format!("{{\"params\":{params},\"type\":\"{tag}\"}}"),
+            ] {
+                assert!(
+                    serde_json::from_str::<StudyIntervention>(&wire).is_err(),
+                    "{wire}"
+                );
+            }
+        }
+        for wire in [
+            r#"{"params":{"closed":true}}"#,
+            r#"{"type":"ClosedWorld"}"#,
+            r#"{"type":"ClosedWorld","params":{"closed":true},"extra":0}"#,
+            r#"{"type":"ClosedWorld","type":"ClosedWorld","params":{"closed":true}}"#,
+            r#"{"params":{"closed":true},"type":"ClosedWorld","params":{"closed":false}}"#,
+            r#"{"type":3,"params":{"closed":true}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<StudyIntervention>(wire).is_err(),
+                "{wire}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<StudyIntervention>(
+                r#"{"params":{"duration_ticks":1,"growth_scale":0.5},"type":"Drought"}"#
+            )
+            .unwrap(),
+            StudyIntervention::Drought {
+                region: None,
+                duration_ticks: 1,
+                growth_scale: 0.5
+            }
+        );
+    }
+
     #[test]
     fn json_study_plans_reject_misspelled_fields_instead_of_ignoring_them() {
         let plan = BranchStudyPlan::standard_five_branch("strict-json", 42, 2, 3);
@@ -3662,6 +4029,12 @@ mod tests {
         assert!(value.get("source_checkpoint").is_none());
         assert_eq!(
             serde_json::from_value::<BranchStudyPlan>(value.clone()).unwrap(),
+            plan
+        );
+        // External JSON formatters can sort `params` ahead of `type` throughout a plan.
+        assert_eq!(
+            serde_json::from_slice::<BranchStudyPlan>(&serde_json::to_vec(&value).unwrap())
+                .unwrap(),
             plan
         );
         let mut bad_plan = value.clone();

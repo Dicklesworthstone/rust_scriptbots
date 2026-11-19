@@ -21,8 +21,8 @@ use scriptbots_app::{
     host_thread::HostThread,
     narrative_search::{
         MAX_NARRATIVE_PAGE_LIMIT, MAX_NARRATIVE_QUERY_BYTES, NarrativeAroundQuery,
-        NarrativeSearchHitDto, NarrativeSearchQuery, execute_narrative_around,
-        execute_narrative_search, format_hits_table,
+        NarrativeSearchError, NarrativeSearchHitDto, NarrativeSearchQuery,
+        execute_narrative_around, execute_narrative_search, format_hits_table,
     },
 };
 use scriptbots_core::{
@@ -32,7 +32,7 @@ use scriptbots_core::{
 use scriptbots_runtime::{
     HostCoreOptions, HostSessionId, VolatileJournal, channel::ChannelHostOptions,
 };
-use scriptbots_storage::StoragePipeline;
+use scriptbots_storage::{RunId, RunManifestRecord, StoragePipeline, StorageReader};
 use serde_json::Value;
 use serial_test::serial;
 
@@ -335,6 +335,7 @@ fn test_narrative_search_cross_surface_parity_and_ordering() {
             from_tick: None,
             to_tick: None,
             limit: None,
+            run_id: None,
         },
     )
     .expect("direct facade search");
@@ -486,6 +487,7 @@ fn test_narrative_around_cross_surface_parity() {
         NarrativeAroundQuery {
             tick: 20,
             window: Some(15),
+            run_id: None,
         },
     )
     .expect("direct facade around");
@@ -730,6 +732,319 @@ fn test_narrative_validation_errors_consistent_envelope() {
     .expect("rest window too large");
     assert_eq!(status, 400);
     assert!(body.contains("exceeds maximum allowable"));
+}
+
+fn append_second_narrative_run(fixture: &NarrativeFixture) -> (RunId, RunId) {
+    let path = fixture.db_path.to_str().expect("database path");
+    let reader = StorageReader::open(path).expect("first run is initially unambiguous");
+    let first = reader.run_id();
+    reader
+        .close()
+        .expect("close first-run reader before append");
+    let second = RunId::new(first.get().wrapping_add(1));
+    assert_ne!(first, second);
+    let mut pipeline = StoragePipeline::append_run(path, RunManifestRecord::unattributed(second))
+        .expect("append an independent run after the original writer closed");
+    pipeline
+        .submit(&PersistenceBatch {
+            summary: TickSummary {
+                tick: Tick(10),
+                agent_count: 50,
+                births: 0,
+                deaths: 0,
+                total_energy: 500.0,
+                average_energy: 10.0,
+                average_health: 1.0,
+                max_age: 100,
+                spike_hits: 0,
+            },
+            epoch: 0,
+            closed: false,
+            metrics: Vec::new(),
+            events: Vec::new(),
+            agents: Vec::new(),
+            births: Vec::new(),
+            deaths: Vec::new(),
+            replay_events: Vec::new(),
+            narrative_events: vec![make_event(
+                10,
+                EventKind::PopulationCrash,
+                0.25,
+                "Population crash isolated to second-run violet",
+            )],
+            genomes: Vec::new(),
+        })
+        .expect("second-run narrative batch admitted");
+    let receipt = pipeline.shutdown().expect("close second-run writer");
+    assert_eq!(receipt.committed_tick, Some(10));
+    let catalog = StorageReader::catalog_page(path, 0, 8).expect("retained run catalog");
+    assert_eq!(catalog.len(), 2);
+    assert!(catalog.iter().any(|entry| entry.run_id == first));
+    assert!(catalog.iter().any(|entry| entry.run_id == second));
+    (first, second)
+}
+
+fn run_selection_direct(
+    fixture: &NarrativeFixture,
+    search: bool,
+    run_id: Option<&str>,
+) -> std::result::Result<Vec<NarrativeSearchHitDto>, NarrativeSearchError> {
+    let decoy = [make_event(
+        10,
+        EventKind::PopulationCrash,
+        0.5,
+        "Population crash in unrelated live memory",
+    )];
+    if search {
+        execute_narrative_search(
+            Some(&fixture.db_path),
+            Some(&decoy),
+            NarrativeSearchQuery {
+                query: "population".into(),
+                from_tick: Some(10),
+                to_tick: Some(11),
+                limit: Some(8),
+                run_id: run_id.map(str::to_owned),
+            },
+        )
+    } else {
+        execute_narrative_around(
+            Some(&fixture.db_path),
+            Some(&decoy),
+            NarrativeAroundQuery {
+                tick: 10,
+                window: Some(1),
+                run_id: run_id.map(str::to_owned),
+            },
+        )
+    }
+}
+
+fn run_selection_path(search: bool, run_id: Option<&str>) -> String {
+    let mut path = if search {
+        "/api/narrative/search?q=population&from=10&to=11&limit=8"
+    } else {
+        "/api/narrative/around/10?window=1"
+    }
+    .to_owned();
+    if let Some(run_id) = run_id {
+        path.push_str("&run_id=");
+        path.push_str(run_id);
+    }
+    path
+}
+
+fn run_selection_mcp(fixture: &NarrativeFixture, search: bool, run_id: Option<&str>) -> Value {
+    let (name, mut arguments) = if search {
+        (
+            "narrative_search",
+            serde_json::json!({
+                "query": "population", "from_tick": 10, "to_tick": 11, "limit": 8
+            }),
+        )
+    } else {
+        (
+            "narrative_around",
+            serde_json::json!({"tick": 10, "window": 1}),
+        )
+    };
+    if let Some(run_id) = run_id {
+        arguments["run_id"] = serde_json::json!(run_id);
+    }
+    let (status, response) = mcp_json_rpc(
+        fixture.mcp_addr,
+        Some(401),
+        "tools/call",
+        Some(serde_json::json!({"name": name, "arguments": arguments})),
+    )
+    .expect("MCP run selection request");
+    assert_eq!(
+        status, 200,
+        "MCP transport must return its JSON-RPC outcome"
+    );
+    response
+}
+
+fn run_selection_cli(
+    fixture: &NarrativeFixture,
+    search: bool,
+    run_id: Option<&str>,
+    local: bool,
+) -> std::process::Output {
+    let mut command = control_cli_cmd();
+    if !local {
+        command.args(["--base-url", &format!("http://{}", fixture.rest_addr)]);
+    }
+    if search {
+        command.args([
+            "narrative",
+            "search",
+            "population",
+            "--from-tick",
+            "10",
+            "--to-tick",
+            "11",
+            "--limit",
+            "8",
+        ]);
+    } else {
+        command.args(["narrative", "around", "10", "--window", "1"]);
+    }
+    if local {
+        command.arg("--db").arg(&fixture.db_path);
+    }
+    if let Some(run_id) = run_id {
+        command.args(["--run-id", run_id]);
+    }
+    command
+        .arg("--json")
+        .output()
+        .expect("CLI run selection request")
+}
+
+fn assert_selected_narrative_surfaces(
+    fixture: &NarrativeFixture,
+    search: bool,
+    run_id: RunId,
+    expected_text: &str,
+    expected_severity: f32,
+) {
+    let run_id = run_id.to_string();
+    let selected = Some(run_id.as_str());
+    let direct = run_selection_direct(fixture, search, selected).expect("selected stored run");
+    assert_eq!(
+        direct.len(),
+        1,
+        "exactly one matching row from the selected run"
+    );
+    assert_eq!(direct[0].tick, 10);
+    assert_eq!(direct[0].kind, "population_crash");
+    assert_eq!(direct[0].human_text, expected_text);
+    assert_eq!(direct[0].severity.to_bits(), expected_severity.to_bits());
+    assert_eq!(direct[0].score.is_some(), search);
+
+    let (status, body) = http_request(
+        fixture.rest_addr,
+        "GET",
+        &run_selection_path(search, selected),
+        &[],
+        None,
+    )
+    .expect("REST selected narrative run");
+    assert_eq!(status, 200, "selected run failed: {body}");
+    let rest: Vec<NarrativeSearchHitDto> = serde_json::from_str(&body).expect("REST selected hits");
+    assert_eq!(
+        rest, direct,
+        "REST must preserve the selected run's complete rows"
+    );
+
+    let response = run_selection_mcp(fixture, search, selected);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("MCP selected run failed: {response}"));
+    let mcp: Vec<NarrativeSearchHitDto> = serde_json::from_str(text).expect("MCP selected hits");
+    assert_eq!(
+        mcp, direct,
+        "MCP must preserve the selected run's complete rows"
+    );
+
+    for local in [true, false] {
+        let output = run_selection_cli(fixture, search, selected, local);
+        assert!(
+            output.status.success(),
+            "CLI local={local} selected run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hits: Vec<NarrativeSearchHitDto> =
+            serde_json::from_slice(&output.stdout).expect("CLI selected hits");
+        assert_eq!(
+            hits, direct,
+            "CLI local={local} must preserve the selected run's rows"
+        );
+    }
+}
+
+fn assert_refused_narrative_surfaces(
+    fixture: &NarrativeFixture,
+    search: bool,
+    run_id: Option<&str>,
+    expected_status: u16,
+    expected_reason: &str,
+) {
+    let direct = run_selection_direct(fixture, search, run_id)
+        .expect_err("invalid selection must not fall back to another run or live memory");
+    assert!(direct.to_string().contains(expected_reason), "{direct}");
+    let (status, body) = http_request(
+        fixture.rest_addr,
+        "GET",
+        &run_selection_path(search, run_id),
+        &[],
+        None,
+    )
+    .expect("REST invalid narrative selection");
+    assert_eq!(status, expected_status, "{body}");
+    assert!(body.contains(expected_reason), "{body}");
+
+    let response = run_selection_mcp(fixture, search, run_id);
+    assert!(
+        response["error"]["code"].is_number()
+            || response["result"]["isError"] == true
+            || response["result"]["is_error"] == true,
+        "MCP must refuse this selection: {response}"
+    );
+    // Malformed values may be refused by MCP's schema before the service validator.
+    if expected_status != 400 {
+        assert!(response.to_string().contains(expected_reason), "{response}");
+    }
+    for local in [true, false] {
+        let output = run_selection_cli(fixture, search, run_id, local);
+        assert!(
+            !output.status.success(),
+            "CLI local={local} must refuse this selection"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains(expected_reason),
+            "CLI local={local}: {error}"
+        );
+        assert!(
+            serde_json::from_slice::<Vec<NarrativeSearchHitDto>>(&output.stdout).is_err(),
+            "a refused CLI selection must not print success rows"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn test_narrative_selected_runs_remain_isolated_across_all_surfaces() {
+    let fixture = setup_narrative_fixture();
+    let (first, second) = append_second_narrative_run(&fixture);
+    let unknown = RunId::new(second.get().wrapping_add(1)).to_string();
+    for search in [true, false] {
+        assert_selected_narrative_surfaces(
+            &fixture,
+            search,
+            first,
+            "Catastrophic population crash: colony dwindled rapidly",
+            0.8,
+        );
+        assert_selected_narrative_surfaces(
+            &fixture,
+            search,
+            second,
+            "Population crash isolated to second-run violet",
+            0.25,
+        );
+        assert_refused_narrative_surfaces(&fixture, search, None, 500, "multiple runs");
+        assert_refused_narrative_surfaces(&fixture, search, Some(&unknown), 500, "does not exist");
+        assert_refused_narrative_surfaces(
+            &fixture,
+            search,
+            Some("not-a-run"),
+            400,
+            "32 lowercase hexadecimal",
+        );
+    }
 }
 
 #[test]

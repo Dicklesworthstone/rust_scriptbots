@@ -83,9 +83,12 @@ mod serde_optional_arc {
 
 pub mod allopatry;
 pub mod archipelago;
+pub mod audio;
 pub mod channel;
 pub mod host_core;
 pub mod inspector;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod lab_guide;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod lab_workflows;
 pub mod migrator;

@@ -9,6 +9,7 @@ anyhow = { workspace = true }
 arc-swap = { workspace = true }
 asupersync = { workspace = true }
 axum = { version = "0.8.0", features = ["macros", "json", "ws"] }
+base64 = { workspace = true }
 async-trait = "0.1"
 blake3 = { workspace = true }
 clap = { version = "4.6.1", features = ["derive", "env"] }
@@ -43,7 +44,7 @@ rayon = { workspace = true }
 scriptbots-storage = { path = "../scriptbots-storage" }
 scriptbots-bevy = { path = "../scriptbots-bevy", optional = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 postcard = { workspace = true }
 serde_path_to_error = "0.1"
 smallvec = "1.13"
@@ -80,6 +81,8 @@ wayland-client = "0.31"
 llm-anthropic = ["reqwest/blocking"]
 default = ["ml", "neuro", "fast-alloc"]
 gui = ["dep:scriptbots-render"]
+# Opt-in soundscape for whichever native frontend the caller selected.
+audio = ["scriptbots-render?/audio", "scriptbots-bevy?/audio"]
 ml = ["scriptbots-brain-ml"]
 brain-ft = ["ml", "scriptbots-brain-ml/brain-ft"]
 neuro = ["scriptbots-brain-neuro"]

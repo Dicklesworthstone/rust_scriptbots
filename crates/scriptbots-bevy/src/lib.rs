@@ -729,9 +729,9 @@ fn drive_adaptive_quality(
 }
 
 fn renderer_plugins(logging: LoggingOwnership) -> bevy::app::PluginGroupBuilder {
-    // This renderer does not play audio. Bevy's default audio plugin opens an
-    // output stream eagerly, which can repeatedly report device failures even
-    // when no sound is requested. Enable it deliberately when audio is added.
+    // The optional soundscape opens Kira only on an explicit user request.
+    // Bevy's unrelated audio plugin would open a second device eagerly, even
+    // when sound is off, so it remains disabled in both feature variants.
     let mut plugins = DefaultPlugins
         .set(WindowPlugin {
             primary_window: Some(Window {
@@ -990,6 +990,20 @@ pub fn run_renderer(ctx: BevyRendererContext) -> Result<()> {
         Update,
         lab_workflows::refresh_panel.after(lab_workflows::update),
     );
+
+    #[cfg(feature = "audio")]
+    app.init_resource::<SoundscapePreferences>()
+        .insert_non_send_resource(BevySoundscape::default())
+        .add_systems(
+            Update,
+            (
+                handle_soundscape_controls,
+                update_live_soundscape,
+                update_soundscape_controls,
+            )
+                .chain()
+                .after(lab_workflows::update),
+        );
 
     if diagnostics_enabled {
         app.insert_resource(DiagnosticsTicker::new(DIAGNOSTIC_REPORT_INTERVAL))
@@ -3991,6 +4005,532 @@ struct HudDisplaySettingsButton;
 
 #[derive(Component)]
 struct HudDisplaySettingsPanel;
+
+#[cfg(feature = "audio")]
+#[derive(Resource, Clone, Debug, PartialEq, Eq)]
+struct SoundscapePreferences {
+    enabled: bool,
+    // Integer UI steps avoid cumulative floating-point drift from repeated clicks.
+    master_steps: u8,
+    layer_steps: [u8; 4],
+    mute_on_background: bool,
+}
+
+#[cfg(feature = "audio")]
+impl Default for SoundscapePreferences {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            master_steps: 8,
+            layer_steps: [2; 4],
+            mute_on_background: true,
+        }
+    }
+}
+
+#[cfg(feature = "audio")]
+impl SoundscapePreferences {
+    fn master_gain(&self) -> f32 {
+        f32::from(self.master_steps) / 10.0
+    }
+
+    fn layer_gains(&self) -> scriptbots_core::audio::LayerGains {
+        let defaults = scriptbots_core::audio::LayerGains::default();
+        scriptbots_core::audio::LayerGains {
+            drone: defaults.drone * f32::from(self.layer_steps[0]) / 2.0,
+            bell: defaults.bell * f32::from(self.layer_steps[1]) / 2.0,
+            thud: defaults.thud * f32::from(self.layer_steps[2]) / 2.0,
+            transient: defaults.transient * f32::from(self.layer_steps[3]) / 2.0,
+        }
+    }
+
+    fn presentation_audible(&self, focused: bool, reviewing: bool) -> bool {
+        self.enabled
+            && self.master_steps > 0
+            && self.layer_steps.iter().any(|level| *level > 0)
+            && !reviewing
+            && (focused || !self.mute_on_background)
+    }
+
+    fn apply(&mut self, action: SoundscapeAction, available: bool) {
+        match action {
+            SoundscapeAction::Toggle => {
+                self.enabled = available && !self.enabled;
+            }
+            SoundscapeAction::Quieter => {
+                self.master_steps = self.master_steps.saturating_sub(1);
+            }
+            SoundscapeAction::Louder => {
+                self.master_steps = self.master_steps.saturating_add(1).min(10);
+            }
+            SoundscapeAction::Background => {
+                self.mute_on_background = !self.mute_on_background;
+            }
+            layer => {
+                if let Some(index) = layer.layer_index() {
+                    self.layer_steps[index] = match self.layer_steps[index] {
+                        2 => 1,
+                        1 => 0,
+                        _ => 2,
+                    };
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "audio")]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+enum SoundscapeAction {
+    Toggle,
+    Quieter,
+    Louder,
+    Drone,
+    Births,
+    Deaths,
+    Combat,
+    Background,
+}
+
+#[cfg(feature = "audio")]
+impl SoundscapeAction {
+    const fn layer_index(self) -> Option<usize> {
+        match self {
+            Self::Drone => Some(0),
+            Self::Births => Some(1),
+            Self::Deaths => Some(2),
+            Self::Combat => Some(3),
+            _ => None,
+        }
+    }
+
+    fn label(self, preferences: &SoundscapePreferences, unavailable: bool) -> String {
+        match self {
+            Self::Toggle if unavailable => "Sound unavailable".into(),
+            Self::Toggle => format!(
+                "Sound: {} (F9)",
+                if preferences.enabled { "on" } else { "off" }
+            ),
+            Self::Quieter => "Volume -".into(),
+            Self::Louder => "Volume +".into(),
+            Self::Background => format!(
+                "Background: {}",
+                if preferences.mute_on_background { "mute" } else { "play" }
+            ),
+            layer => {
+                let (index, name) = match layer {
+                    Self::Drone => (0, "Drone"),
+                    Self::Births => (1, "Births"),
+                    Self::Deaths => (2, "Deaths"),
+                    Self::Combat => (3, "Combat"),
+                    _ => unreachable!("non-layer actions handled above"),
+                };
+                format!("{name}: {}%", preferences.layer_steps[index] * 50)
+            }
+        }
+    }
+
+    fn active(self, preferences: &SoundscapePreferences) -> bool {
+        match self {
+            Self::Toggle => preferences.enabled,
+            Self::Background => preferences.mute_on_background,
+            layer => layer
+                .layer_index()
+                .is_some_and(|index| preferences.layer_steps[index] > 0),
+        }
+    }
+}
+
+#[cfg(feature = "audio")]
+#[derive(Component)]
+struct SoundscapeButtonLabel(SoundscapeAction);
+
+#[cfg(feature = "audio")]
+#[derive(Component)]
+struct SoundscapeStatusLabel;
+
+/// The only audio-device owner in Bevy. It never receives a world handle or
+/// command sender; synthesis lives on Kira's audio callback, not the UI thread.
+#[cfg(feature = "audio")]
+#[derive(Default)]
+struct BevySoundscape {
+    output: Option<scriptbots_core::audio::KiraSoundscape>,
+    initialization_attempted: bool,
+    failure: Option<String>,
+    seed: Option<u64>,
+    projector: scriptbots_runtime::audio::SnapshotAudioProjector,
+    dropped_frames: u64,
+    status: &'static str,
+}
+
+#[cfg(feature = "audio")]
+impl BevySoundscape {
+    fn initialize_with(
+        &mut self,
+        requested: bool,
+        seed: u64,
+        open: impl FnOnce(
+            scriptbots_core::audio::AudioConfig,
+        ) -> std::result::Result<scriptbots_core::audio::KiraSoundscape, String>,
+    ) {
+        if !requested || self.initialization_attempted {
+            return;
+        }
+        self.initialization_attempted = true;
+        match open(scriptbots_core::audio::AudioConfig {
+            run_seed: seed,
+            is_muted: true,
+            ..scriptbots_core::audio::AudioConfig::default()
+        }) {
+            Ok(output) => {
+                self.output = Some(output);
+                self.seed = Some(seed);
+            }
+            Err(error) => {
+                warn!(%error, "Bevy soundscape unavailable; device initialization will not retry");
+                self.failure = Some(error);
+            }
+        }
+    }
+
+    fn observe(
+        &mut self,
+        snapshot: &RenderSnapshot,
+        preferences: &mut SoundscapePreferences,
+        focused: bool,
+        reviewing: bool,
+    ) {
+        use scriptbots_core::audio::{AudioSendError, KiraSoundscape};
+
+        self.initialize_with(preferences.enabled, snapshot.visual_seed, KiraSoundscape::new);
+        if let Some(error) = self.output.as_mut().and_then(KiraSoundscape::take_error) {
+            warn!(%error, "Bevy soundscape device failed; sound is disabled for this session");
+            self.output = None;
+            self.failure = Some(error);
+        }
+        if self.failure.is_some() {
+            preferences.enabled = false;
+        }
+        let audible = preferences.presentation_audible(focused, reviewing);
+        let update = self.projector.observe(snapshot, audible);
+        let mut terminal_error = None;
+        if let Some(output) = &self.output {
+            if update.muted {
+                output.set_muted(true);
+            }
+            if self.seed != Some(snapshot.visual_seed) {
+                output.reset_with_seed(snapshot.visual_seed);
+                self.seed = Some(snapshot.visual_seed);
+            } else if update.reset {
+                output.reset();
+            }
+            output.set_master_gain(preferences.master_gain());
+            output.set_layer_gains(preferences.layer_gains());
+            // Unmuting advances the queue generation; publish the fresh
+            // ambience only after that transition so it is not discarded.
+            output.set_muted(update.muted);
+            if let Some(frame) = update.frame {
+                match output.try_send(frame) {
+                    Ok(()) | Err(AudioSendError::Full) => {}
+                    Err(AudioSendError::Disconnected) => {
+                        terminal_error = Some("audio callback disconnected");
+                    }
+                    Err(AudioSendError::InvalidFrame) => {
+                        terminal_error = Some("snapshot contains invalid audio values");
+                    }
+                }
+            }
+            self.dropped_frames = output.frames_dropped();
+        }
+        if let Some(error) = terminal_error {
+            warn!(%error, "Bevy soundscape failed; sound is disabled for this session");
+            self.output = None;
+            self.failure = Some(error.into());
+            preferences.enabled = false;
+        }
+        self.status = if self.failure.is_some() {
+            "Sound unavailable; restart the renderer to retry."
+        } else if !preferences.enabled {
+            "Sound is off."
+        } else if preferences.master_steps == 0
+            || preferences.layer_steps.iter().all(|level| *level == 0)
+        {
+            "Sound is muted by the mixer."
+        } else if reviewing {
+            "Sound is muted during saved-world review."
+        } else if preferences.mute_on_background && !focused {
+            "Sound is muted in the background."
+        } else if update.muted {
+            "Sound is muted while the simulation is paused or unavailable."
+        } else {
+            "Live sound is on."
+        };
+    }
+
+    fn status_line(&self, preferences: &SoundscapePreferences) -> String {
+        if let Some(error) = &self.failure {
+            return format!("Sound unavailable: {error}. Restart the renderer to retry.");
+        }
+        format!(
+            "{} Volume {}%. Unsampled ticks: {}. Dropped audio frames: {}.",
+            self.status,
+            preferences.master_steps * 10,
+            self.projector.skipped_ticks(),
+            self.dropped_frames,
+        )
+    }
+}
+
+#[cfg(feature = "audio")]
+fn handle_soundscape_controls(
+    keys: Option<Res<ButtonInput<KeyCode>>>,
+    buttons: Query<(&Interaction, &SoundscapeAction), Changed<Interaction>>,
+    soundscape: NonSend<BevySoundscape>,
+    mut preferences: ResMut<SoundscapePreferences>,
+) {
+    let available = soundscape.failure.is_none();
+    for (interaction, action) in &buttons {
+        if *interaction == Interaction::Pressed {
+            preferences.apply(*action, available);
+        }
+    }
+    if keys.is_some_and(|keys| keys.just_pressed(KeyCode::F9)) {
+        preferences.apply(SoundscapeAction::Toggle, available);
+    }
+}
+
+#[cfg(feature = "audio")]
+fn update_live_soundscape(
+    monitor: Res<HostLifecycleMonitor>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    presentation: Res<lab_workflows::LabPresentation>,
+    mut soundscape: NonSendMut<BevySoundscape>,
+    mut preferences: ResMut<SoundscapePreferences>,
+) {
+    // The published host frame remains authoritative even while the canvas is
+    // showing a saved cut. No owner request, storage access, or clone of the
+    // agent buffers is needed here.
+    let snapshot = monitor.snapshots.latest();
+    let focused = windows.iter().any(|window| window.focused);
+    soundscape.observe(&snapshot, &mut preferences, focused, presentation.reviewing());
+}
+
+#[cfg(feature = "audio")]
+fn update_soundscape_controls(
+    preferences: Res<SoundscapePreferences>,
+    soundscape: NonSend<BevySoundscape>,
+    mut buttons: Query<(&Interaction, &SoundscapeAction, &mut BackgroundColor)>,
+    mut labels: Query<(&SoundscapeButtonLabel, &mut Text), Without<SoundscapeStatusLabel>>,
+    mut statuses: Query<&mut Text, With<SoundscapeStatusLabel>>,
+) {
+    for (interaction, action, mut color) in &mut buttons {
+        let desired = if action.active(&preferences) {
+            follow_active_color()
+        } else if *interaction == Interaction::Hovered {
+            follow_hover_color()
+        } else {
+            follow_idle_color()
+        };
+        if color.0 != desired {
+            color.0 = desired;
+        }
+    }
+    for (label, mut text) in &mut labels {
+        set_hud_text_if_changed(
+            &mut text,
+            label.0.label(&preferences, soundscape.failure.is_some()),
+        );
+    }
+    for mut status in &mut statuses {
+        set_hud_text_if_changed(&mut status, soundscape.status_line(&preferences));
+    }
+}
+
+#[cfg(all(test, feature = "audio"))]
+mod live_soundscape_tests {
+    use super::*;
+
+    #[test]
+    fn device_initialization_requires_opt_in_and_a_failure_is_not_retried() {
+        let mut soundscape = BevySoundscape::default();
+        soundscape.initialize_with(false, 91, |_| panic!("sound is off"));
+        assert!(!soundscape.initialization_attempted);
+        assert!(soundscape.output.is_none());
+
+        let mut attempts = 0;
+        soundscape.initialize_with(true, 91, |config| {
+            attempts += 1;
+            assert_eq!(config.run_seed, 91);
+            assert!(config.is_muted, "the device must open silently");
+            Err("injected unavailable device".into())
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            soundscape.failure.as_deref(),
+            Some("injected unavailable device")
+        );
+        soundscape.initialize_with(true, 92, |_| panic!("a failed device must not retry"));
+        soundscape.initialize_with(false, 92, |_| panic!("disabled audio must not retry"));
+        assert!(soundscape.output.is_none());
+    }
+
+    #[test]
+    fn real_ecs_controls_update_the_mixer_and_honor_an_unavailable_device() {
+        let mut app = App::new();
+        app.init_resource::<SoundscapePreferences>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .insert_non_send_resource(BevySoundscape::default())
+            .add_systems(
+                Update,
+                (handle_soundscape_controls, update_soundscape_controls).chain(),
+            );
+        let births = app
+            .world_mut()
+            .spawn((
+                Interaction::None,
+                SoundscapeAction::Births,
+                BackgroundColor(follow_idle_color()),
+            ))
+            .id();
+        let birth_label = app
+            .world_mut()
+            .spawn((
+                Text::new(""),
+                SoundscapeButtonLabel(SoundscapeAction::Births),
+            ))
+            .id();
+        let toggle = app
+            .world_mut()
+            .spawn((
+                Interaction::None,
+                SoundscapeAction::Toggle,
+                BackgroundColor(follow_idle_color()),
+            ))
+            .id();
+        let toggle_label = app
+            .world_mut()
+            .spawn((
+                Text::new(""),
+                SoundscapeButtonLabel(SoundscapeAction::Toggle),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(toggle_label).unwrap().0,
+            "Sound: off (F9)"
+        );
+        let original = app.world().resource::<SoundscapePreferences>().layer_gains();
+        for (percent, gain) in [(50, original.bell * 0.5), (0, 0.0), (100, original.bell)] {
+            *app.world_mut().get_mut::<Interaction>(births).unwrap() = Interaction::Pressed;
+            app.update();
+            let current = app.world().resource::<SoundscapePreferences>().layer_gains();
+            assert_eq!(current.bell, gain);
+            assert_eq!(current.drone, original.drone);
+            assert_eq!(current.thud, original.thud);
+            assert_eq!(current.transient, original.transient);
+            assert_eq!(
+                app.world().get::<Text>(birth_label).unwrap().0,
+                format!("Births: {percent}%")
+            );
+            *app.world_mut().get_mut::<Interaction>(births).unwrap() = Interaction::None;
+            app.update();
+        }
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::F9);
+        app.update();
+        assert!(app.world().resource::<SoundscapePreferences>().enabled);
+        assert_eq!(
+            app.world().get::<Text>(toggle_label).unwrap().0,
+            "Sound: on (F9)"
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.world_mut()
+            .non_send_resource_mut::<BevySoundscape>()
+            .failure = Some("injected device failure".into());
+        app.world_mut()
+            .resource_mut::<SoundscapePreferences>()
+            .enabled = false;
+        *app.world_mut().get_mut::<Interaction>(toggle).unwrap() = Interaction::Pressed;
+        app.update();
+        assert!(!app.world().resource::<SoundscapePreferences>().enabled);
+        assert_eq!(
+            app.world().get::<Text>(toggle_label).unwrap().0,
+            "Sound unavailable"
+        );
+        assert!(
+            !app.world()
+                .non_send_resource::<BevySoundscape>()
+                .initialization_attempted,
+            "editing presentation controls must not itself open a device"
+        );
+    }
+
+    #[test]
+    fn background_history_and_silent_mixer_gate_live_presentation() {
+        let mut preferences = SoundscapePreferences::default();
+        assert!(!preferences.presentation_audible(true, false));
+        preferences.enabled = true;
+        assert!(preferences.presentation_audible(true, false));
+        assert!(!preferences.presentation_audible(false, false));
+        assert!(!preferences.presentation_audible(true, true));
+        preferences.mute_on_background = false;
+        assert!(preferences.presentation_audible(false, false));
+        assert!(!preferences.presentation_audible(false, true));
+        preferences.master_steps = 0;
+        assert!(!preferences.presentation_audible(true, false));
+        preferences.master_steps = 8;
+        preferences.layer_steps = [0; 4];
+        assert!(!preferences.presentation_audible(true, false));
+        preferences.layer_steps[1] = 1;
+        assert!(preferences.presentation_audible(true, false));
+    }
+
+    #[test]
+    fn disabled_and_failed_audio_leave_the_authoritative_snapshot_untouched() {
+        use scriptbots_runtime::{
+            HostSessionId,
+            host_core::{HostCore, HostCoreOptions},
+        };
+
+        let world = WorldState::new(scriptbots_core::ScriptBotsConfig {
+            rng_seed: Some(91),
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 40,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            ..Default::default()
+        })
+        .expect("finite test world");
+        let host = HostCore::new(HostSessionId::new(91), world, HostCoreOptions::default())
+            .expect("snapshot owner");
+        let before = host.scientific_digest_v1().expect("initial digest").overall;
+        let snapshot = host.latest_snapshot();
+        let mut soundscape = BevySoundscape::default();
+        let mut preferences = SoundscapePreferences::default();
+        for _ in 0..4 {
+            soundscape.observe(&snapshot, &mut preferences, true, false);
+        }
+        assert!(!soundscape.initialization_attempted);
+        assert!(soundscape.output.is_none());
+        assert_eq!(soundscape.status, "Sound is off.");
+
+        soundscape.initialize_with(true, snapshot.visual_seed, |_| {
+            Err("injected unavailable device".into())
+        });
+        preferences.enabled = true;
+        soundscape.observe(&snapshot, &mut preferences, true, false);
+        assert!(!preferences.enabled);
+        assert!(soundscape.status_line(&preferences).contains("unavailable"));
+        assert_eq!(host.scientific_digest_v1().expect("final digest").overall, before);
+        assert!(Arc::ptr_eq(&snapshot, &host.latest_snapshot()));
+    }
+}
 
 #[derive(Resource, Default)]
 struct HudFollowMenu(bool);
@@ -8049,6 +8589,53 @@ fn setup_scene(
                         TextColor(secondary_text_color),
                     ));
                 });
+
+                #[cfg(feature = "audio")]
+                {
+                    let preferences = SoundscapePreferences::default();
+                    for action in [
+                        SoundscapeAction::Toggle,
+                        SoundscapeAction::Quieter,
+                        SoundscapeAction::Louder,
+                        SoundscapeAction::Drone,
+                        SoundscapeAction::Births,
+                        SoundscapeAction::Deaths,
+                        SoundscapeAction::Combat,
+                        SoundscapeAction::Background,
+                    ] {
+                        row.spawn((
+                            Button,
+                            button_node.clone(),
+                            BackgroundColor(follow_idle_color()),
+                            BorderRadius::all(Val::Px(6.0)),
+                            BorderColor::all(button_border_color),
+                            action,
+                        ))
+                        .with_children(|btn| {
+                            btn.spawn((
+                                Text::new(action.label(&preferences, false)),
+                                secondary_font.clone(),
+                                TextColor(secondary_text_color),
+                                SoundscapeButtonLabel(action),
+                            ));
+                        });
+                    }
+                    row.spawn((
+                        Text::new("Sound is off."),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                        Node {
+                            width: Val::Percent(100.0),
+                            ..default()
+                        },
+                        SoundscapeStatusLabel,
+                    ));
+                    row.spawn((
+                        Text::new("Layer buttons cycle 100%, 50%, and off."),
+                        secondary_font.clone(),
+                        TextColor(secondary_text_color),
+                    ));
+                }
             });
     });
 

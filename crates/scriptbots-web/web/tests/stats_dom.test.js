@@ -1608,6 +1608,94 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
       throw new Error("Same-ID browser retry after a lost receipt/reconnect duplicated a native Step");
     }
     await control("#remote-refresh", "status");
+    // A saved scientific view must remain frozen while the real subscription
+    // consumes new frames, then return to the latest verified live publication.
+    await page.evaluate(() => { document.getElementById("checkpoint-lab").open = true; });
+    await page.waitForFunction(() => !document.getElementById("lab-checkpoint-save").disabled);
+    const [savedResponse] = await Promise.all([
+      page.waitForResponse((response) => new URL(response.url()).pathname === "/api/v1/checkpoints"
+        && response.request().method() === "POST"),
+      page.click("#lab-checkpoint-save"),
+    ]);
+    if (!savedResponse.ok()) throw new Error("The browser could not save the native checkpoint");
+    const saved = await savedResponse.json();
+    await page.waitForFunction((id) => document.getElementById("lab-checkpoint-select").value === id
+      && !document.getElementById("lab-checkpoint-review").disabled, saved.checkpoint_id);
+    const beforeReview = await request("/api/status");
+    const controlsBeforeReview = await page.evaluate(() => window.__remoteWire.sent.filter(
+      (message) => ["pause", "resume", "step", "speed"].includes(message.command)).length);
+    const [reviewResponse] = await Promise.all([
+      page.waitForResponse((response) => new URL(response.url()).pathname === `/api/v1/checkpoints/${saved.checkpoint_id}/canvas`),
+      page.click("#lab-checkpoint-review"),
+    ]);
+    if (!reviewResponse.ok()) throw new Error("The native checkpoint canvas reconstruction was refused");
+    const reviewEnvelope = await reviewResponse.json();
+    const rebuilt = await page.evaluate(async ({ moduleFile, encoded }) => {
+      const { decode_remote_frame_binary: decode } = await import(`/pkg/${moduleFile}`);
+      return decode(Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0)));
+    }, { moduleFile: packageInfo.moduleFile, encoded: reviewEnvelope.frameBase64 });
+    const savedEnvironment = (environment) => Object.fromEntries(
+      ["width", "height", "sourceWidth", "sourceHeight", "cellSize", "foodMax", "hydrologyEnabled", "cells"]
+        .map((key) => [key, environment[key]]));
+    const savedAgents = (snapshot) => snapshot.agents.map(({ uid, position, health, color }) => ({ uid, position, health, color }))
+      .sort((left, right) => BigInt(left.uid) < BigInt(right.uid) ? -1 : BigInt(left.uid) > BigInt(right.uid) ? 1 : 0);
+    if (rebuilt.identity.sessionId !== expectedPng.sessionId || rebuilt.identity.tick !== String(saved.tick)
+        || JSON.stringify(savedAgents(rebuilt.payload)) !== JSON.stringify(savedAgents(sourceFrame.payload))
+        || JSON.stringify(savedEnvironment(rebuilt.environment)) !== JSON.stringify(savedEnvironment(sourceFrame.environment))) {
+      throw new Error("Checkpoint reconstruction changed the saved agents or environment samples");
+    }
+    await page.waitForFunction((id) => document.getElementById("checkpoint-view-status").dataset.state === "ready"
+      && document.getElementById("renderer-status").dataset.view === "checkpoint"
+      && document.getElementById("renderer-status").dataset.checkpointId === id, saved.checkpoint_id);
+    observations.checkpointReview = { checkpoint: saved, sourceSessionId: reviewEnvelope.sourceSessionId, png: {} };
+    const reviewUi = await page.evaluate(() => ({
+      tick: document.getElementById("metric-tick").textContent,
+      births: document.getElementById("metric-births").textContent,
+      deaths: document.getElementById("metric-deaths").textContent,
+      tps: document.getElementById("metric-tps").textContent,
+      blocked: ["remote-pause", "remote-step", "remote-resume", "remote-retry", "inspector-uid",
+        "lab-checkpoint-save", "lab-branch-launch"].every((id) => document.getElementById(id).disabled),
+    }));
+    if (!reviewUi.blocked || reviewUi.tick !== saved.tick.toLocaleString()
+        || [reviewUi.births, reviewUi.deaths, reviewUi.tps].some((value) => value !== "—")) {
+      throw new Error("Saved-world review exposed live controls or invented original per-tick activity");
+    }
+    for (const backend of ["canvas", "webgpu"]) {
+      await page.selectOption("#renderer", backend);
+      await page.waitForFunction((backend) => document.getElementById("renderer-status").dataset.renderer === backend, backend);
+      const [download] = await Promise.all([page.waitForEvent("download"), page.click("#capture-btn")]);
+      await download.saveAs(path.join(proof, `checkpoint-${backend}.png`));
+      if (await download.failure()) throw new Error("Saved-world PNG download failed");
+      await page.waitForFunction(() => document.getElementById("capture-status").dataset.state === "ready");
+      const exported = await page.evaluate(() => ({ ...document.getElementById("capture-status").dataset }));
+      const expected = `scriptbots-checkpoint-${saved.checkpoint_id}-t${saved.tick}-${saved.world_digest_v1}-${backend}.png`;
+      if (exported.view !== "checkpoint" || exported.checkpointId !== saved.checkpoint_id
+          || exported.worldDigestV1 !== saved.world_digest_v1 || exported.tick !== String(saved.tick)
+          || download.suggestedFilename() !== expected) throw new Error("Saved-world PNG was labeled as a live publication");
+      observations.checkpointReview.png[backend] = exported;
+    }
+    const afterReview = await request("/api/status");
+    for (const field of ["tick", "scientific_revision", "control_revision", "config_revision", "paused"]) {
+      if (afterReview[field] !== beforeReview[field]) throw new Error("Saved-world review mutated the live owner");
+    }
+    if (await page.evaluate(() => window.__remoteWire.sent.filter(
+      (message) => ["pause", "resume", "step", "speed"].includes(message.command)).length) !== controlsBeforeReview) {
+      throw new Error("Review or PNG export submitted a live playback command");
+    }
+    const independentStep = await request("/api/control/step", { method: "POST" });
+    await until(() => request(`/api/control/status/${independentStep.command_id}`),
+      (receipt) => receipt.application_state === "applied" && receipt.journal_state === "durable", "live step during saved review");
+    const advanced = await request("/api/status");
+    await page.waitForFunction((tick) => window.__remoteWire.frames.canvas.identity.tick === String(tick), advanced.tick);
+    if (await page.evaluate(() => document.getElementById("renderer-status").dataset.snapshotTick) !== String(saved.tick)) {
+      throw new Error("Incoming live frame replaced the saved canvas");
+    }
+    await page.click("#checkpoint-return-live");
+    await page.waitForFunction((tick) => document.getElementById("renderer-status").dataset.view === "live"
+      && document.getElementById("renderer-status").dataset.snapshotTick === String(tick)
+      && !document.getElementById("remote-step").disabled
+      && document.getElementById("checkpoint-view").hidden, advanced.tick);
+    observations.checkpointReview.returnedLiveTick = advanced.tick;
     observations.resume = await control("#remote-resume", "resume");
     await until(() => request("/api/status"), (status) => !status.paused && status.tick > observations.afterStep.tick, "remote science after Resume");
     await control("#remote-pause", "pause");
