@@ -2632,6 +2632,41 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn fresh_scientific_imports_can_immediately_save_full_owner_continuations() {
+        let mut sources: Vec<_> = BrainPreset::ALL
+            .into_iter()
+            .map(|preset| checkpoint_world(Some(preset), SeedStrategy::None))
+            .collect();
+        sources.extend([
+            checkpoint_world(None, SeedStrategy::None),
+            mixed_checkpoint_world(&BrainPreset::ALL, 2, false),
+        ]);
+        for mut original in sources {
+            let before = original.core.scientific_digest_v1().unwrap();
+            let science = original.world_checkpoint().unwrap();
+            let mut imported = Simulation::from_world_checkpoint(&science).unwrap();
+            let full = imported.checkpoint().unwrap();
+            let mut continued = Simulation::from_checkpoint(&full).unwrap();
+            assert_eq!(imported.core.world_tick().0, 0);
+            assert_eq!(continued.core.world_tick().0, 0);
+            assert!(imported.core.latest_snapshot().playback.paused);
+            assert_eq!(original.core.scientific_digest_v1().unwrap(), before);
+            assert_eq!(imported.core.scientific_digest_v1().unwrap(), before);
+            assert_eq!(continued.core.scientific_digest_v1().unwrap(), before);
+            assert_eq!(continued.checkpoint().unwrap(), full);
+            for steps in [1, 3] {
+                original.tick(steps).unwrap();
+                imported.tick(steps).unwrap();
+                continued.tick(steps).unwrap();
+                let expected = original.core.scientific_digest_v1().unwrap();
+                assert_eq!(imported.core.scientific_digest_v1().unwrap(), expected);
+                assert_eq!(continued.core.scientific_digest_v1().unwrap(), expected);
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn browser_scientific_checkpoint_preserves_mixed_and_extinct_registry_state() {
         let presets = [BrainPreset::Assembly, BrainPreset::Mlp, BrainPreset::Dwraon];
         for (founders, dying) in [(0, false), (2, false), (2, true)] {

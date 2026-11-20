@@ -106,6 +106,9 @@ The crate exposes the following wasm-bindgen surface:
   command history and cadence credit. It does not advance elapsed time. Legacy
   wander evaluators are refused; MLP, DWRAON, Assembly, mixtures of these three
   families, and unbound worlds are supported, including empty populations.
+  Fresh founders can be saved at tick zero; their pending origins and genome
+  declarations survive restore and reach the same first recording boundary.
+  Completed births do not block a save after their boundary has settled.
   Registered families remain part of the saved state after their last agent dies.
 - `restore_checkpoint(bytes: Uint8Array) -> SimHandle` — validates and restores a
   new owner, with a new command namespace and rebased elapsed clock. Failed

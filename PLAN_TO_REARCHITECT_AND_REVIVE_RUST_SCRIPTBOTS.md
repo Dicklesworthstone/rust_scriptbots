@@ -2,6 +2,22 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Saved-world continuity and experiment retries (2026-11-20):**
+[Currently In Progress — Codex; `bd-e32s`, `bd-5ygz`]
+
+- [x] Read the architecture plan and authoritative Beads; select reproducible
+  saved-world and experiment failures that block normal user workflows.
+- [x] Preserve tick-zero founder origins and genome declarations in full-owner
+  continuations without advancing science or discarding pending records.
+- [x] Retain completed demographic/combat counters while continuing to reject
+  unresolved persistence, replay anchors, commands and later arrivals.
+- [x] Reconstruct pending genome declarations when importing a scientific cut,
+  so a fresh imported world can immediately become a full-owner continuation.
+- [ ] Execute the real browser, core and native checkpoint regressions through
+  DSR, including numeric recipe fidelity and retries after a lost receipt.
+- [ ] Publish meaningful verified changes directly to `main`; keep the original
+  broader acceptance beads open until their named probes actually pass.
+
 **Native/browser scientific checkpoint transfer (2026-11-20):**
 [Source implemented and independently reviewed — full native/WASM qualification remains open]
 

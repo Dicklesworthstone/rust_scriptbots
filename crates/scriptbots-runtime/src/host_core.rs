@@ -61,7 +61,7 @@ pub const MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES: usize = 1024 * 1024;
 /// Full owner checkpoint schema; distinct from the science-only core schema.
 pub const HOST_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.host-checkpoint.v1";
 /// Canonical envelope revision for [`HostCheckpointV1`].
-pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 3;
+pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 4;
 /// Actual envelope, payload and corruption-checksum codecs.
 pub const HOST_CHECKPOINT_V1_CODEC: &str = "postcard-envelope+json+blake3-v1";
 /// Fixed resource ceiling for a complete encoded host artifact.

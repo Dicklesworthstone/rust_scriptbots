@@ -34,10 +34,11 @@ use crate::{
     CharacterizationError, CombatEventFlags, FoodCellProfile, FoodGrid, Generation, HydrologyField,
     HydrologyFlowDirection, HydrologyState, HydrologyTile, HydrologyTileLayer, INPUT_SIZE,
     IndicatorState, MapArtifactMetadata, MapGeneratorKind, MutationRates, NUM_EYES, OUTPUT_SIZE,
-    PersistenceBoundaryStatus, Position, Region, RngDomainDigestV1, RngDomainDigestsV1,
-    ScientificStateError, ScriptBotsConfig, SelectionState, TerrainLayer, TerrainTile, Tick,
-    TickCadence, TraitModifiers, WorldDigestV1, WorldDigestV1ContractError, WorldState,
-    WorldStateError, brain_registry_digest_v1, clamp01, validate_finite, world_counters_digest_v1,
+    PersistedGenome, PersistenceBoundaryStatus, Position, Region, RngDomainDigestV1,
+    RngDomainDigestsV1, ScientificStateError, ScriptBotsConfig, SelectionState, TerrainLayer,
+    TerrainTile, Tick, TickCadence, TraitModifiers, WorldDigestV1, WorldDigestV1ContractError,
+    WorldState, WorldStateError, brain_registry_digest_v1, clamp01, validate_finite,
+    world_counters_digest_v1,
 };
 use scriptbots_index::UniformGridIndex;
 use serde::de::{SeqAccess, Visitor};
@@ -114,6 +115,8 @@ pub struct WorldHostCheckpointV1 {
     replay_tick: u64,
     replay_interactions: (usize, u64, usize, usize, usize, usize),
     reported_lifecycle_records: (usize, usize),
+    #[serde(deserialize_with = "deserialize_checkpoint_pending_genomes")]
+    pending_genomes: Vec<PersistedGenome>,
     last_tick_counts: (usize, usize, u32, u32),
     carcass_totals: (f32, f32),
     combat_counts: (u32, u32),
@@ -321,7 +324,60 @@ impl WorldHostCheckpointV1 {
                 "invalid observer identity or counter".to_owned(),
             );
         }
+        self.validate_pending_genomes(world)?;
         self.validate_auxiliary_state(world)?;
+        Ok(())
+    }
+
+    fn validate_pending_genomes(
+        &self,
+        world: &WorldCheckpointV1,
+    ) -> Result<(), WorldCheckpointError> {
+        ensure_count_bound(
+            "host.pending_genomes",
+            self.pending_genomes.len(),
+            MAX_CHECKPOINT_AGENTS,
+        )?;
+        if world.tick() != Tick::zero()
+            && (!world.state.pending_birth_records.is_empty() || !self.pending_genomes.is_empty())
+        {
+            return contract_error(
+                "host.pending_genomes",
+                "only initial founder records may precede the first owner boundary",
+            );
+        }
+        let founders: BTreeSet<_> = world
+            .state
+            .pending_birth_records
+            .iter()
+            .map(|record| record.agent_uid)
+            .collect();
+        let expected: HashMap<_, _> = world
+            .state
+            .agents
+            .iter()
+            .filter_map(|agent| match &agent.brain {
+                AgentBrainCheckpointV1::Protocol { genome, .. }
+                    if founders.contains(&agent.identity.uid) =>
+                {
+                    Some((agent.identity.uid, genome))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut observed = BTreeSet::new();
+        if self.pending_genomes.len() != expected.len()
+            || self.pending_genomes.iter().any(|record| {
+                record.created_at_tick != Tick::zero()
+                    || expected.get(&record.agent_uid).copied() != Some(&record.envelope)
+                    || !observed.insert(record.agent_uid)
+            })
+        {
+            return contract_error(
+                "host.pending_genomes",
+                "founder declarations must exactly match the retained origin records and genomes",
+            );
+        }
         Ok(())
     }
 
@@ -1321,8 +1377,13 @@ impl WorldState {
         science: &WorldCheckpointV1,
     ) -> Result<WorldHostCheckpointV1, WorldCheckpointError> {
         self.ensure_checkpoint_has_no_deferred_host_output()?;
-        if self.has_pending_persistence_material()
-            || !self.pending_genomes.is_empty()
+        if (self.tick != Tick::zero()
+            && (!self.pending_birth_records.is_empty() || !self.pending_genomes.is_empty()))
+            || !self.narrative.pending_persistence().is_empty()
+            || self.replay_interactions_observed_pending != 0
+            || self.replay_interactions_persisted_pending != 0
+            || self.replay_interactions_sampled_out_pending != 0
+            || self.replay_interactions_truncated_pending != 0
             || !self.pending_communication_metrics.is_empty()
             || self.replay_world_digest_pending
             || self.resource_ledger.working.is_some()
@@ -1409,6 +1470,7 @@ impl WorldState {
                 self.replay_interactions_truncated_pending,
             ),
             reported_lifecycle_records: self.reported_lifecycle_records,
+            pending_genomes: self.pending_genomes.clone(),
             last_tick_counts: (
                 self.last_births,
                 self.last_deaths,
@@ -1539,6 +1601,9 @@ impl WorldState {
             world.replay_interactions_truncated_pending,
         ) = continuity.replay_interactions;
         world.reported_lifecycle_records = continuity.reported_lifecycle_records;
+        world
+            .pending_genomes
+            .clone_from(&continuity.pending_genomes);
         (
             world.last_births,
             world.last_deaths,
@@ -1847,6 +1912,27 @@ impl WorldState {
             .pending_birth_records
             .iter()
             .map(BirthRecordCheckpointV1::restore)
+            .collect();
+        let pending_origins: BTreeSet<_> = restored
+            .pending_birth_records
+            .iter()
+            .map(|record| record.agent_uid)
+            .collect();
+        restored.pending_genomes = state
+            .agents
+            .iter()
+            .filter_map(|agent| match &agent.brain {
+                AgentBrainCheckpointV1::Protocol { genome, .. }
+                    if pending_origins.contains(&agent.identity.uid) =>
+                {
+                    Some(PersistedGenome {
+                        agent_uid: agent.identity.uid,
+                        created_at_tick: state.tick,
+                        envelope: genome.clone(),
+                    })
+                }
+                _ => None,
+            })
             .collect();
         // bd-it29: restored pending birth records count as NOT YET REPORTED, so
         // the restored world reports them at its next boundary exactly as the
@@ -3220,6 +3306,18 @@ where
     deserialize_bounded_vec::<D, BirthRecordCheckpointV1, MAX_CHECKPOINT_ORIGINS>(
         deserializer,
         "checkpoint pending origins",
+    )
+}
+
+fn deserialize_checkpoint_pending_genomes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PersistedGenome>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, PersistedGenome, MAX_CHECKPOINT_AGENTS>(
+        deserializer,
+        "checkpoint pending founder genomes",
     )
 }
 

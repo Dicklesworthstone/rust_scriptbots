@@ -10,6 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/rust_scriptbots>
 
 ---
 
+## Unreleased
+
+### Fixed
+- Full-owner checkpoints preserve the pending founder genome declarations at tick zero, so fresh single-family and mixed-family browser worlds can be saved without advancing the simulation. Restoring the checkpoint retains the exact first recording batch.
+- Owner checkpoints preserve settled history and accounting while still refusing unresolved commands, replay anchors, persistence batches and later arrivals.
+
+### Compatibility
+- The full-owner checkpoint codec is now revision 4 because it carries founder genome declarations. Earlier owner checkpoint revisions are refused explicitly. The science-only world checkpoint codec remains revision 8.
+
 ## [v0.5.0] - 2026-11-12
 
 Source release (GitHub Release notes, same venue as v0.4.0; no prebuilt binaries).
