@@ -72,6 +72,9 @@ use scriptbots_runtime::{
 pub const MAX_BROWSER_CHECKPOINT_BYTES: usize =
     scriptbots_runtime::MAX_VOLATILE_HOST_CHECKPOINT_BYTES;
 
+/// Scientific interchange uses the core codec's independent byte bound.
+pub const MAX_BROWSER_WORLD_CHECKPOINT_BYTES: usize = scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES;
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 extern "C" {
@@ -183,9 +186,7 @@ impl BrainPreset {
     }
 
     fn from_kind(kind: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|preset| preset.kind() == kind)
+        Self::ALL.into_iter().find(|preset| preset.kind() == kind)
     }
 
     fn register(self, registry: &mut scriptbots_core::BrainRegistry) -> Result<u64> {
@@ -213,6 +214,8 @@ struct SimSpec {
     // Keep its registry roster for continuation; only an explicit new-world
     // preset can replace it with a fresh founder recipe.
     continuation_brains: Vec<BrainPreset>,
+    // A scientific cut creates a new owner; it is not an old owner continuation.
+    scientific_checkpoint_import: bool,
     permalink: Option<Permalink>,
     launch: Option<launch::BrowserLaunch>,
     preserve_population_config: bool,
@@ -695,6 +698,7 @@ impl SimSpec {
             default_brain,
             mixed_brains: false,
             continuation_brains: Vec::new(),
+            scientific_checkpoint_import: false,
             permalink: None,
             launch: None,
             preserve_population_config: false,
@@ -712,6 +716,7 @@ impl SimSpec {
             default_brain: None,
             mixed_brains: false,
             continuation_brains: Vec::new(),
+            scientific_checkpoint_import: false,
             permalink: Some(permalink),
             launch: None,
             preserve_population_config: true,
@@ -770,6 +775,18 @@ fn fresh_browser_session() -> Result<HostSessionId> {
 }
 
 impl Simulation {
+    fn world_checkpoint(&mut self) -> Result<Vec<u8>> {
+        Self::validate_scientific_interchange_world(self.core.world())?;
+        // Settle deferred receipts at the already observed clock boundary. This
+        // never accrues elapsed time or consumes a scientific transition.
+        self.core.drive(ManualInstant::from_nanos(self.now_nanos))?;
+        self.core
+            .capture_checkpoint_v1()
+            .context("browser science is not checkpointable at this boundary")?
+            .encode()
+            .map_err(anyhow::Error::from)
+    }
+
     fn checkpoint(&mut self) -> Result<Vec<u8>> {
         // Complete the previous boundary's deferred volatile-journal receipt.
         // Reusing the exact clock boundary adds no elapsed science time.
@@ -793,47 +810,11 @@ impl Simulation {
         );
         let checkpoint = scriptbots_runtime::VolatileHostCheckpointV1::decode(bytes)?;
         let science = checkpoint.host_checkpoint().world_checkpoint();
-        launch::validate_config(science.config(), science.agent_count())
-            .map_err(anyhow::Error::msg)
-            .context("checkpoint exceeds browser world limits")?;
-        let required = science.required_brain_registry();
-        ensure!(
-            required.entries.len() <= BrainPreset::ALL.len()
-                && required.next_key == u64::try_from(required.entries.len())?,
-            "checkpoint requires a brain registry layout unavailable in this browser"
-        );
-        let mut registry = scriptbots_core::BrainRegistry::new();
-        let mut presets = Vec::with_capacity(required.entries.len());
-        for entry in &required.entries {
-            let preset = BrainPreset::from_kind(&entry.kind)
-                .context("checkpoint requires a brain registry unavailable in this browser")?;
-            let key = preset.register(&mut registry)?;
-            ensure!(
-                key == entry.key,
-                "checkpoint requires a brain registry layout unavailable in this browser"
-            );
-            presets.push(preset);
-        }
-        let default_brain = match presets.as_slice() {
-            [preset] => Some(*preset),
-            _ => None,
-        };
+        let (registry, presets) = Self::checkpoint_registry(science)?;
         // The existing owner codec validates complete evaluator/registry identity;
         // browser import must never substitute newly randomized brains.
         let world = checkpoint.host_checkpoint().restore_world(registry)?;
-        let mut spec = SimSpec::new(
-            world.config().clone(),
-            world.agent_count(),
-            world.config().rng_seed,
-            SnapshotFormat::Json,
-            SeedStrategy::None,
-            default_brain,
-        );
-        // This is an observed world configuration, not fresh-demo options.
-        spec.preserve_population_config = true;
-        if presets.len() > 1 {
-            spec.continuation_brains = presets;
-        }
+        let spec = Self::continuation_spec(&world, presets);
         let persistence = world.bind_persistence(Box::new(scriptbots_core::NullPersistence))?;
         let core = HostCore::restore_volatile_host_checkpoint_v1(
             &checkpoint,
@@ -863,6 +844,121 @@ impl Simulation {
         })
     }
 
+    fn from_world_checkpoint(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() <= MAX_BROWSER_WORLD_CHECKPOINT_BYTES,
+            "scientific checkpoint exceeds {MAX_BROWSER_WORLD_CHECKPOINT_BYTES} bytes"
+        );
+        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(bytes)
+            .context("invalid scientific world checkpoint")?;
+        Self::validate_scientific_interchange_config(checkpoint.config())?;
+        let (registry, presets) = Self::checkpoint_registry(&checkpoint)?;
+        // Restoration verifies the complete registry/evaluator identities and
+        // scientific digest. No executable adapter is taken from the file.
+        let world = WorldState::restore_checkpoint_v1(&checkpoint, registry)
+            .context("scientific checkpoint cannot be restored by this browser build")?;
+        Self::validate_scientific_interchange_world(&world)?;
+        ensure!(
+            &world.world_digest_v1()? == checkpoint.source_digest(),
+            "restored science differs from the scientific checkpoint digest"
+        );
+        let mut spec = Self::continuation_spec(&world, presets);
+        spec.scientific_checkpoint_import = true;
+        let mut core = HostCore::new(
+            fresh_browser_session()?,
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..Default::default()
+            },
+        )
+        .context("failed to establish a new browser owner for the scientific cut")?;
+        core.drive(ManualInstant::from_nanos(0))?;
+        let controls = NullFrontend::new(core.local_port(), 1);
+        Ok(Self {
+            core,
+            controls,
+            spec,
+            now_nanos: 0,
+            environment_cache: RemoteEnvironmentCache::default(),
+            environment_js: None,
+        })
+    }
+
+    fn validate_scientific_interchange_config(config: &ScriptBotsConfig) -> Result<()> {
+        // Match the native saved-checkpoint study's supported science. A raw
+        // cut does not carry the auxiliary history in the full owner codec.
+        ensure!(
+            config.selection_mode == scriptbots_core::EvolutionSelectionMode::Fitness,
+            "scientific checkpoint interchange requires Fitness selection; raw cuts omit novelty and curiosity selection history"
+        );
+        ensure!(
+            !config.communication_scramble,
+            "scientific checkpoint interchange requires communication_scramble=false; raw cuts omit the scrambling RNG state"
+        );
+        Ok(())
+    }
+
+    fn validate_scientific_interchange_world(world: &WorldState) -> Result<()> {
+        Self::validate_scientific_interchange_config(world.config())?;
+        ensure!(
+            world.map_metadata().is_none(),
+            "scientific checkpoint interchange refuses imported maps; raw cuts omit map temperature and food profiles"
+        );
+        Ok(())
+    }
+
+    fn checkpoint_registry(
+        science: &scriptbots_core::WorldCheckpointV1,
+    ) -> Result<(scriptbots_core::BrainRegistry, Vec<BrainPreset>)> {
+        launch::validate_config(science.config(), science.agent_count())
+            .map_err(anyhow::Error::msg)
+            .context("checkpoint exceeds browser world limits")?;
+        let required = science.required_brain_registry();
+        ensure!(
+            required.entries.len() <= BrainPreset::ALL.len()
+                && required.next_key == u64::try_from(required.entries.len())?,
+            "checkpoint requires a brain registry layout unavailable in this browser"
+        );
+        let mut registry = scriptbots_core::BrainRegistry::new();
+        let mut presets = Vec::with_capacity(required.entries.len());
+        for entry in &required.entries {
+            let preset = BrainPreset::from_kind(&entry.kind)
+                .context("checkpoint requires a brain registry unavailable in this browser")?;
+            let key = preset.register(&mut registry)?;
+            ensure!(
+                key == entry.key,
+                "checkpoint requires a brain registry layout unavailable in this browser"
+            );
+            presets.push(preset);
+        }
+        Ok((registry, presets))
+    }
+
+    fn continuation_spec(world: &WorldState, presets: Vec<BrainPreset>) -> SimSpec {
+        let default_brain = match presets.as_slice() {
+            [preset] => Some(*preset),
+            _ => None,
+        };
+        let mut spec = SimSpec::new(
+            world.config().clone(),
+            world.agent_count(),
+            world.config().rng_seed,
+            SnapshotFormat::Json,
+            SeedStrategy::None,
+            default_brain,
+        );
+        // This is an observed world configuration, not fresh-demo options.
+        spec.preserve_population_config = true;
+        if presets.len() > 1 {
+            spec.continuation_brains = presets;
+        }
+        spec
+    }
+
     fn new(mut spec: SimSpec) -> Result<Self> {
         ensure!(
             spec.continuation_brains.is_empty(),
@@ -873,6 +969,7 @@ impl Simulation {
                 || (spec.default_brain.is_none() && spec.seed_strategy == SeedStrategy::None),
             "mixed founders cannot be combined with a default brain family or Wander strategy"
         );
+        spec.scientific_checkpoint_import = false;
         let mut config = spec.config();
         // Resolve entropy before constructing the world so both its scientific
         // configuration and launch recipe record the same actual root seed.
@@ -1116,9 +1213,9 @@ impl InitOptions {
         // Omitting both choices starts an evolvable, checkpointable world.
         // Explicit legacy `wander` and unbound `none` strategies retain their
         // existing meaning for callers and the named native/WASM parity cases.
-        let default_brain = self.default_brain.or(
-            (!self.mixed_brains && self.seed_strategy.is_none()).then_some(BrainPreset::Mlp),
-        );
+        let default_brain = self
+            .default_brain
+            .or((!self.mixed_brains && self.seed_strategy.is_none()).then_some(BrainPreset::Mlp));
 
         let mut spec = SimSpec::new(
             config,
@@ -1135,6 +1232,16 @@ impl InitOptions {
 
 #[wasm_bindgen]
 impl SimHandle {
+    /// Export a canonical scientific cut for native checkpoint tools.
+    ///
+    /// This excludes the owner session, commands, history, schedule and journal.
+    /// Fitness selection, unscrambled communication and no imported map are
+    /// required because the raw core format omits their auxiliary state.
+    #[wasm_bindgen(js_name = worldCheckpoint)]
+    pub fn world_checkpoint_js(&self) -> Result<Vec<u8>, JsValue> {
+        self.inner.borrow_mut().world_checkpoint().map_err(js_error)
+    }
+
     /// Export a complete volatile owner continuation, without claiming disk durability.
     /// Legacy wander evaluators are explicitly refused by the core codec.
     #[wasm_bindgen(js_name = checkpoint)]
@@ -1463,6 +1570,25 @@ impl SimHandle {
     #[must_use]
     pub fn launch_info(&self) -> LaunchInfo {
         let simulation = self.inner.borrow();
+        if simulation.spec.scientific_checkpoint_import {
+            return LaunchInfo {
+                kind: "scientific_checkpoint".to_owned(),
+                semantics: "scientific_cut_new_owner".to_owned(),
+                shareable: false,
+                seed: Some(
+                    simulation
+                        .core
+                        .world()
+                        .agent_substream_protocol_v1()
+                        .root_seed()
+                        .to_string(),
+                ),
+                initial_population: None,
+                brain_preset: None,
+                recipe_version: None,
+                reason: Some("A verified scientific cut in a new browser owner. Original commands, journal, history and scheduled inputs are not imported; new receipts are volatile. The source build's future equivalence is not certified. Save a continuation for this owner, or reset explicitly to create new founders.".to_owned()),
+            };
+        }
         if let Some(link) = &simulation.spec.permalink {
             return gallery_launch_info(link);
         }
@@ -1718,6 +1844,32 @@ pub fn version() -> String {
 )]
 pub fn checkpoint_byte_limit() -> usize {
     MAX_BROWSER_CHECKPOINT_BYTES
+}
+
+/// Maximum scientific interchange file size, checked before reading a selected file.
+#[must_use]
+#[wasm_bindgen]
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "wasm_bindgen rejects const exports; the bound itself is a canonical constant"
+)]
+pub fn world_checkpoint_byte_limit() -> usize {
+    MAX_BROWSER_WORLD_CHECKPOINT_BYTES
+}
+
+/// Import a native scientific checkpoint as a separate, paused browser owner.
+///
+/// This is distinct from [`restore_checkpoint`]: the previous owner identity,
+/// journal, commands, schedule and retained history are not in a science cut.
+/// Only supported, bounded science with matching compiled adapters is admitted.
+/// Refusal leaves all existing handles untouched.
+#[wasm_bindgen]
+pub fn import_world_checkpoint(bytes: &[u8]) -> Result<SimHandle, JsValue> {
+    ensure_panic_hook_installed();
+    let simulation = Simulation::from_world_checkpoint(bytes).map_err(js_error)?;
+    Ok(SimHandle {
+        inner: Rc::new(RefCell::new(simulation)),
+    })
 }
 
 /// Validate a full owner continuation and construct a new browser handle.
@@ -2389,6 +2541,347 @@ mod tests {
         }
     }
 
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_roundtrips_core_codec_and_future_transitions() {
+        for preset in [
+            None,
+            Some(BrainPreset::Mlp),
+            Some(BrainPreset::Dwraon),
+            Some(BrainPreset::Assembly),
+        ] {
+            let mut original = checkpoint_world(preset, SeedStrategy::None);
+            original.tick(5).unwrap();
+            let source_session = original.core.latest_snapshot().session_id;
+            let source_command = original
+                .core
+                .latest_snapshot()
+                .last_applied_command
+                .unwrap();
+            let source_digest = original.core.scientific_digest_v1().unwrap();
+            let source_revisions = original.core.latest_snapshot().revisions;
+            let bytes = original.world_checkpoint().unwrap();
+            assert_eq!(original.core.scientific_digest_v1().unwrap(), source_digest);
+            assert_eq!(original.core.latest_snapshot().revisions, source_revisions);
+            let cut = scriptbots_core::WorldCheckpointV1::decode(&bytes).unwrap();
+            assert_eq!(cut.encode().unwrap(), bytes);
+            assert_eq!(cut.source_digest(), &source_digest);
+
+            // The independent core consumer uses the same raw codec as native
+            // checkpoint tools; it never passes through the browser owner codec.
+            let (registry, _) = Simulation::checkpoint_registry(&cut).unwrap();
+            let mut native = WorldState::restore_checkpoint_v1(&cut, registry).unwrap();
+            let imported = import_world_checkpoint(&bytes).unwrap();
+            assert_eq!(imported.launch_info().kind, "scientific_checkpoint");
+            assert_eq!(imported.launch_info().semantics, "scientific_cut_new_owner");
+            assert_eq!(imported.launch_info().seed.as_deref(), Some("17"));
+            assert_eq!(imported.launch_info().initial_population, None);
+            assert!(!imported.launch_info().shareable);
+            assert!(imported.permalink_string().is_err());
+            assert!(imported.fork_patch(&[]).is_err());
+            let mut imported = imported.inner.borrow_mut();
+            let snapshot = imported.core.latest_snapshot();
+            assert_ne!(snapshot.session_id, source_session);
+            assert!(snapshot.playback.paused);
+            assert_eq!(snapshot.last_applied_command, None);
+            assert_eq!(snapshot.revisions.control.get(), 0);
+            assert!(snapshot.summary_history.is_empty());
+            assert!(
+                imported
+                    .controls
+                    .command_status(source_command)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(imported.core.scientific_digest_v1().unwrap(), source_digest);
+            imported.drive(10_000.0).unwrap();
+            assert_eq!(imported.core.world_tick().0, 5, "import starts paused");
+            assert_eq!(imported.world_checkpoint().unwrap(), bytes);
+
+            let full = imported.checkpoint().unwrap();
+            let full = scriptbots_runtime::VolatileHostCheckpointV1::decode(&full).unwrap();
+            assert_eq!(
+                full.host_checkpoint().journal_cut().last_journal_sequence,
+                0
+            );
+            assert_eq!(
+                full.host_checkpoint()
+                    .journal_cut()
+                    .last_scientific_event_sequence,
+                0
+            );
+            for _ in 0..4 {
+                original.tick(1).unwrap();
+                imported.tick(1).unwrap();
+                native.step().unwrap();
+                let expected = native.world_digest_v1().unwrap();
+                assert_eq!(original.core.scientific_digest_v1().unwrap(), expected);
+                assert_eq!(imported.core.scientific_digest_v1().unwrap(), expected);
+            }
+            let continued = Simulation::from_checkpoint(&imported.checkpoint().unwrap()).unwrap();
+            assert_eq!(
+                continued.core.scientific_digest_v1().unwrap(),
+                imported.core.scientific_digest_v1().unwrap()
+            );
+            assert_eq!(
+                continued.core.latest_snapshot().session_id,
+                snapshot.session_id
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_preserves_mixed_and_extinct_registry_state() {
+        let presets = [BrainPreset::Assembly, BrainPreset::Mlp, BrainPreset::Dwraon];
+        for (founders, dying) in [(0, false), (2, false), (2, true)] {
+            let mut original = mixed_checkpoint_world(&presets, founders, dying);
+            original.tick(1).unwrap();
+            let bytes = original.world_checkpoint().unwrap();
+            let mut imported = Simulation::from_world_checkpoint(&bytes).unwrap();
+            assert_eq!(imported.spec.continuation_brains, presets);
+            assert_eq!(imported.spec.default_brain, None);
+            assert_same_mixed_science(&original, &imported);
+            assert_eq!(imported.world_checkpoint().unwrap(), bytes);
+            if dying || founders == 0 {
+                assert_eq!(imported.core.world().agent_count(), 0);
+            }
+            let before = imported.core.scientific_digest_v1().unwrap();
+            assert!(imported.reset(Some(41)).is_err());
+            assert_eq!(imported.core.scientific_digest_v1().unwrap(), before);
+            for _ in 0..3 {
+                original.tick(1).unwrap();
+                imported.tick(1).unwrap();
+                assert_same_mixed_science(&original, &imported);
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_public_api_returns_an_advanced_core_cut() {
+        let config = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None)
+            .spec
+            .config();
+        let mut native = WorldState::new(config).unwrap();
+        seed_agents(
+            &mut native,
+            3,
+            SeedStrategy::None,
+            Some(BrainPreset::Mlp),
+            &mut None,
+        )
+        .unwrap();
+        for _ in 0..7 {
+            native.step().unwrap();
+        }
+        let bytes = native.checkpoint_v1().unwrap().encode().unwrap();
+        let browser = import_world_checkpoint(&bytes).unwrap();
+        for steps in [0, 1, 3] {
+            for _ in 0..steps {
+                native.step().unwrap();
+            }
+            let snapshot = browser.tick_snapshot(steps).unwrap();
+            assert_eq!(snapshot.tick, native.tick().0);
+            let returned = browser.world_checkpoint_js().unwrap();
+            let cut = scriptbots_core::WorldCheckpointV1::decode(&returned).unwrap();
+            assert_eq!(cut.source_digest(), &native.world_digest_v1().unwrap());
+            let mut registry = scriptbots_core::BrainRegistry::new();
+            BrainPreset::Mlp.register(&mut registry).unwrap();
+            let mut exported = WorldState::restore_checkpoint_v1(&cut, registry).unwrap();
+            native.step().unwrap();
+            exported.step().unwrap();
+            browser.tick_snapshot(1).unwrap();
+            assert_eq!(
+                native.world_digest_v1().unwrap(),
+                exported.world_digest_v1().unwrap()
+            );
+            let browser_cut =
+                scriptbots_core::WorldCheckpointV1::decode(&browser.world_checkpoint_js().unwrap())
+                    .unwrap();
+            assert_eq!(
+                browser_cut.source_digest(),
+                &native.world_digest_v1().unwrap()
+            );
+        }
+        browser.register_brain_js("dwraon").unwrap();
+        assert_eq!(browser.launch_info().kind, "browser_launch");
+        assert!(browser.launch_info().shareable);
+        assert_eq!(browser.tick_snapshot(0).unwrap().tick, 0);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_reports_the_rng_root_after_config_seed_edits() {
+        for configured_seed in [None, Some(991)] {
+            let config = checkpoint_world(None, SeedStrategy::None).spec.config();
+            let mut source = WorldState::new(config).unwrap();
+            seed_agents(
+                &mut source,
+                3,
+                SeedStrategy::None,
+                Some(BrainPreset::Mlp),
+                &mut None,
+            )
+            .unwrap();
+            source.step().unwrap();
+            let mut edited = source.config().clone();
+            edited.rng_seed = configured_seed;
+            source.apply_config_update(edited).unwrap();
+            assert_eq!(source.agent_substream_protocol_v1().root_seed(), 17);
+            let bytes = source.checkpoint_v1().unwrap().encode().unwrap();
+            let browser = import_world_checkpoint(&bytes).unwrap();
+            assert_eq!(browser.launch_info().seed.as_deref(), Some("17"));
+            assert_eq!(
+                browser.inner.borrow().core.world().config().rng_seed,
+                configured_seed
+            );
+            assert_eq!(browser.world_checkpoint_js().unwrap(), bytes);
+            source.step().unwrap();
+            browser.tick_snapshot(1).unwrap();
+            let returned =
+                scriptbots_core::WorldCheckpointV1::decode(&browser.world_checkpoint_js().unwrap())
+                    .unwrap();
+            assert_eq!(returned.source_digest(), &source.world_digest_v1().unwrap());
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_refuses_omitted_auxiliary_state() {
+        use scriptbots_core::EvolutionSelectionMode;
+
+        for (selection_mode, communication_scramble, reason) in [
+            (EvolutionSelectionMode::Novelty, false, "selection history"),
+            (
+                EvolutionSelectionMode::Curiosity { w: 0.5 },
+                false,
+                "selection history",
+            ),
+            (EvolutionSelectionMode::Fitness, true, "scrambling RNG"),
+        ] {
+            let mut spec = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None).spec;
+            spec.base_config.selection_mode = selection_mode;
+            spec.base_config.communication_scramble = communication_scramble;
+            let mut source = Simulation::new(spec).unwrap();
+            let before = source.core.scientific_digest_v1().unwrap();
+            let bytes = source
+                .core
+                .capture_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap();
+            let error = Simulation::from_world_checkpoint(&bytes).err().unwrap();
+            assert!(format!("{error:#}").contains(reason));
+            let error = source.world_checkpoint().unwrap_err();
+            assert!(format!("{error:#}").contains(reason));
+            assert_eq!(source.core.scientific_digest_v1().unwrap(), before);
+
+            // Only raw scientific interchange has this refusal. The complete
+            // owner checkpoint retains the auxiliary state and remains usable.
+            let full = source.checkpoint().unwrap();
+            let continued = Simulation::from_checkpoint(&full).unwrap();
+            assert_eq!(continued.core.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_refuses_maps_even_with_a_matching_digest() {
+        let spec = checkpoint_world(None, SeedStrategy::None).spec;
+        let mut world = WorldState::new(spec.config()).unwrap();
+        let width = world.terrain().width();
+        let height = world.terrain().height();
+        let cells = world.terrain().tiles().len();
+        let artifact = scriptbots_core::MapArtifact::new(
+            world.terrain().clone(),
+            None,
+            Some(scriptbots_core::ScalarField::new(width, height, vec![0.9; cells]).unwrap()),
+            None,
+            None,
+            scriptbots_core::MapArtifactMetadata {
+                generator: scriptbots_core::MapGeneratorKind::RuleBased,
+                tileset_id: "browser-scientific-import".to_owned(),
+                tileset_hash: 1,
+                seed: 17,
+                width,
+                height,
+                attempt_count: 1,
+                succeeded_on: 1,
+                generated_at_epoch_ms: 0,
+            },
+        )
+        .unwrap();
+        world.apply_map_artifact(&artifact).unwrap();
+        let mut source = owner_for_checkpoint_test(world, spec);
+        let cut = source.core.capture_checkpoint_v1().unwrap();
+        let bytes = cut.encode().unwrap();
+        let native =
+            WorldState::restore_checkpoint_v1(&cut, scriptbots_core::BrainRegistry::new()).unwrap();
+        assert_eq!(native.world_digest_v1().unwrap(), *cut.source_digest());
+        assert!(native.map_metadata().is_some());
+        let error = Simulation::from_world_checkpoint(&bytes).err().unwrap();
+        assert!(format!("{error:#}").contains("imported maps"));
+        assert!(
+            source
+                .world_checkpoint()
+                .unwrap_err()
+                .to_string()
+                .contains("imported maps")
+        );
+        assert_eq!(
+            source.core.scientific_digest_v1().unwrap(),
+            *cut.source_digest()
+        );
+        let full = source.checkpoint().unwrap();
+        let continued = Simulation::from_checkpoint(&full).unwrap();
+        assert_eq!(
+            continued.core.scientific_digest_v1().unwrap(),
+            *cut.source_digest()
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_refusals_preserve_the_existing_owner() {
+        let mut active = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None);
+        active.tick(3).unwrap();
+        let before = active.core.scientific_digest_v1().unwrap();
+        let source_session = active.core.latest_snapshot().session_id;
+        let bytes = active.world_checkpoint().unwrap();
+        for index in [0, bytes.len() / 2, bytes.len() - 1] {
+            let mut damaged = bytes.clone();
+            damaged[index] ^= 1;
+            assert!(Simulation::from_world_checkpoint(&damaged).is_err());
+        }
+        assert!(Simulation::from_world_checkpoint(&[]).is_err());
+        assert!(Simulation::from_world_checkpoint(&bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(Simulation::from_world_checkpoint(&trailing).is_err());
+        assert!(Simulation::from_world_checkpoint(&active.checkpoint().unwrap()).is_err());
+        assert!(Simulation::from_checkpoint(&bytes).is_err());
+        let oversized = vec![0; MAX_BROWSER_WORLD_CHECKPOINT_BYTES + 1];
+        let error = Simulation::from_world_checkpoint(&oversized).err().unwrap();
+        assert!(error.to_string().contains("exceeds"));
+        assert_eq!(active.core.scientific_digest_v1().unwrap(), before);
+        assert_eq!(active.core.latest_snapshot().session_id, source_session);
+        assert_eq!(active.world_checkpoint().unwrap(), bytes);
+        active.tick(1).unwrap();
+        assert_eq!(active.core.world_tick().0, 4);
+
+        // A native core cut can be valid while exceeding browser admission.
+        let mut config = checkpoint_world(None, SeedStrategy::None).spec.config();
+        config.population_spawn_count = u32::from(u16::MAX);
+        let world = WorldState::new(config).unwrap();
+        let native_bytes = world.checkpoint_v1().unwrap().encode().unwrap();
+        let error = Simulation::from_world_checkpoint(&native_bytes)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("browser world limits"));
+        assert_eq!(active.core.world_tick().0, 4);
+    }
+
     fn owner_for_checkpoint_test(world: WorldState, spec: SimSpec) -> Simulation {
         let mut core = HostCore::new(
             fresh_browser_session().unwrap(),
@@ -2562,7 +3055,10 @@ mod tests {
         };
         handle.register_brain_js("mixed").unwrap();
         assert_eq!(handle.brain_preset_js(), "mixed");
-        assert_eq!(handle.inner.borrow().spec.brain_families(), BrainPreset::ALL);
+        assert_eq!(
+            handle.inner.borrow().spec.brain_families(),
+            BrainPreset::ALL
+        );
         assert_eq!(handle.launch_info().recipe_version, Some(2));
         let bytes = handle.inner.borrow_mut().checkpoint().unwrap();
         assert!(handle.register_brain_js("unknown").is_err());
@@ -2677,7 +3173,11 @@ mod tests {
                 .iter()
                 .filter(|record| record.origin == scriptbots_core::BirthOrigin::Born)
                 .collect::<Vec<_>>();
-            assert_eq!(born.len(), 1, "each actual family must produce a real child");
+            assert_eq!(
+                born.len(),
+                1,
+                "each actual family must produce a real child"
+            );
             let birth = born[0];
             assert_eq!(birth.parent_a, Some(parent_uid));
             assert_eq!(birth.parent_b, None);
@@ -2819,7 +3319,13 @@ mod tests {
         assert_eq!(simulation.core.world().agent_count(), 4);
         for id in simulation.core.world().agents().iter_handles() {
             assert_eq!(
-                simulation.core.world().agent_runtime(id).unwrap().brain.kind(),
+                simulation
+                    .core
+                    .world()
+                    .agent_runtime(id)
+                    .unwrap()
+                    .brain
+                    .kind(),
                 Some(BrainPreset::Assembly.kind())
             );
         }
@@ -2881,6 +3387,16 @@ mod tests {
             let before = source.core.scientific_digest_v1().unwrap();
             let bytes = source.checkpoint().unwrap();
             assert!(Simulation::from_checkpoint(&bytes).is_err(), "{defect}");
+            let science = source
+                .core
+                .capture_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap();
+            assert!(
+                Simulation::from_world_checkpoint(&science).is_err(),
+                "scientific interchange must refuse {defect}"
+            );
             assert_eq!(source.core.scientific_digest_v1().unwrap(), before);
             assert_eq!(source.checkpoint().unwrap(), bytes);
         }
