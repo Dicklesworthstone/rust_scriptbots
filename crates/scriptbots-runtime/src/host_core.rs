@@ -8764,6 +8764,175 @@ mod tests {
         );
     }
 
+    fn checkpoint_lifecycle_events(
+        core: &HostCore,
+    ) -> (VolatileHostCheckpointV1, crate::EventPage) {
+        let mut client = crate::HostClient::new(core.local_port());
+        let mut cursor = client.event_cursor();
+        let crate::EventPoll::Contiguous(page) = client.read_events(&mut cursor, 64).unwrap()
+        else {
+            panic!("actual lifecycle events must remain readable");
+        };
+        assert_eq!(cursor.last_seen(), page.latest);
+        let digest = core.scientific_digest_v1().unwrap();
+        let checkpoint = core.capture_volatile_host_checkpoint_v1().unwrap();
+        let decoded = VolatileHostCheckpointV1::decode(&checkpoint.encode().unwrap()).unwrap();
+        let world = decoded
+            .host_checkpoint()
+            .restore_world(scriptbots_core::BrainRegistry::new())
+            .unwrap();
+        let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+        let restored = HostCore::restore_volatile_host_checkpoint_v1(
+            &decoded,
+            world,
+            persistence,
+            None,
+            ManualInstant::from_nanos(100),
+        )
+        .unwrap();
+        assert_eq!(core.scientific_digest_v1().unwrap(), digest);
+        assert_eq!(restored.scientific_digest_v1().unwrap(), digest);
+        let mut restored_client = crate::HostClient::new(restored.local_port());
+        let mut restored_cursor = restored_client.event_cursor();
+        assert_eq!(
+            restored_client
+                .read_events(&mut restored_cursor, 64)
+                .unwrap(),
+            crate::EventPoll::Contiguous(page.clone())
+        );
+        assert_eq!(restored_cursor, cursor);
+        (decoded, page)
+    }
+
+    fn assert_lifecycle_timestamp_refusals(
+        checkpoint: &VolatileHostCheckpointV1,
+        page: &crate::EventPage,
+        births: bool,
+    ) {
+        for defect in ["stale", "future", "natural", "genesis"] {
+            let mut changed = page.clone();
+            let entry = changed
+                .events
+                .iter_mut()
+                .find(|entry| {
+                    let boundary = entry.event.boundary.as_ref();
+                    if births {
+                        !boundary.births.is_empty()
+                    } else {
+                        !boundary.deaths.is_empty()
+                    }
+                })
+                .unwrap();
+            let event = Arc::make_mut(&mut entry.event);
+            let tick = event.tick;
+            let boundary = Arc::make_mut(&mut event.boundary);
+            if births {
+                let record = &mut boundary.births[0];
+                match defect {
+                    "stale" => record.tick = Tick(tick.0 - 2),
+                    "future" => record.tick = tick.next(),
+                    "natural" => record.origin = scriptbots_core::BirthOrigin::Born,
+                    "genesis" => record.origin = scriptbots_core::BirthOrigin::Seeded,
+                    _ => unreachable!(),
+                }
+            } else {
+                let record = &mut boundary.deaths[0];
+                match defect {
+                    "stale" => record.tick = Tick(tick.0 - 2),
+                    "future" => record.tick = tick.next(),
+                    "natural" => record.cause = scriptbots_core::DeathCause::Starvation,
+                    "genesis" => record.tick = Tick::zero(),
+                    _ => unreachable!(),
+                }
+            }
+            let cursor = crate::EventCursor::beginning(page.session_id);
+            assert!(
+                crate::validate_event_page(cursor, &changed, 64).is_err(),
+                "{defect}"
+            );
+            let host = checkpoint.host_checkpoint();
+            let mut events = host.state.events.clone();
+            events.entries.clone_from(&changed.events);
+            assert!(
+                events
+                    .validate(
+                        host.journal_cut(),
+                        host.tick(),
+                        host.state.options.scientific_event_capacity,
+                        host.state.options.genesis_origin_capacity,
+                    )
+                    .is_err(),
+                "{defect}"
+            );
+        }
+    }
+
+    #[test]
+    fn between_step_arrivals_survive_host_checkpoint_and_event_reads() {
+        let mut config = continuation_world().config().clone();
+        config.persistence_interval = 0;
+        let mut core = HostCore::new(
+            HostSessionId::new(0x4152_5249),
+            WorldState::new(config).unwrap(),
+            options(true),
+        )
+        .unwrap();
+        for (id, command) in [
+            (1, HostCommand::Step),
+            (
+                2,
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 0.5,
+                },
+            ),
+            (3, HostCommand::Step),
+        ] {
+            settle_continuation_command(&mut core, envelope(id, command), 0);
+        }
+        let (checkpoint, page) = checkpoint_lifecycle_events(&core);
+        assert_eq!(core.world_tick(), Tick(2));
+        assert_eq!(page.events.len(), 2);
+        let boundary = page.events[1].event.boundary.as_ref();
+        assert_eq!(boundary.births.len(), 1);
+        assert_eq!(
+            boundary.births[0].origin,
+            scriptbots_core::BirthOrigin::Injected
+        );
+        assert_eq!(boundary.births[0].tick, Tick(1));
+        assert_eq!(boundary.summary.births, 0);
+        assert_lifecycle_timestamp_refusals(&checkpoint, &page, true);
+    }
+
+    #[test]
+    fn map_culling_events_survive_host_checkpoint_and_event_reads() {
+        let (mut core, artifact) = map_culling_owner(3);
+        for (id, command) in [
+            (1, HostCommand::Step),
+            (
+                2,
+                HostCommand::ApplyMap {
+                    artifact: Box::new(artifact),
+                    existing_agent_policy: scriptbots_core::ExistingAgentPolicy::CullIncompatible,
+                },
+            ),
+            (3, HostCommand::Step),
+            (4, HostCommand::Step),
+        ] {
+            settle_continuation_command(&mut core, envelope(id, command), 0);
+        }
+        let (checkpoint, page) = checkpoint_lifecycle_events(&core);
+        assert_eq!(core.world_tick(), Tick(3));
+        assert_eq!(page.events.len(), 3);
+        let boundary = page.events[1].event.boundary.as_ref();
+        assert_eq!(boundary.deaths.len(), 3);
+        assert!(boundary.deaths.iter().all(|record| {
+            record.tick == Tick(1) && record.cause == scriptbots_core::DeathCause::MapIncompatible
+        }));
+        assert_eq!(boundary.summary.deaths, 0);
+        assert!(page.events[2].event.boundary.deaths.is_empty());
+        assert_lifecycle_timestamp_refusals(&checkpoint, &page, false);
+    }
+
     fn host(paused: bool) -> (HostCore, LocalHostPort) {
         let core = HostCore::new(HostSessionId::new(7), world(0), options(paused))
             .expect("host construction");

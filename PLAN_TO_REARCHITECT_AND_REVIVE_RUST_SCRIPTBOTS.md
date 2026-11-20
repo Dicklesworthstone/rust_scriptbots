@@ -2,6 +2,24 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Between-step lifecycle events and archipelago continuation (2026-11-20):**
+[Source implemented; focused runtime regressions passed — Codex; `bd-uxvp`]
+
+- Preserve actual arrival and map-removal ticks when the next completed step
+  publishes those records. Permit only the immediately preceding nonzero tick
+  for injected arrivals and map-incompatibility deaths.
+- Exercise real paused commands, event clients and encoded owner restoration;
+  retain explicit refusals for stale/future rows and mistimed natural events.
+- Re-run the observed archipelago continuation failure with random migrations.
+
+DSR on unchanged source passed all four real-MLP founder integration tests,
+29 runtime checkpoint tests (including the formerly failing archipelago case),
+the genesis-origin regression and targeted formatting. Both new event-client
+and encoded-owner regressions exercise real paused injections/map culls and
+refuse stale/future rows and mistimed natural events. UBS still reports its
+pre-existing constant-time-comparison false positive on public numeric session
+IDs; its aggregate is not green. This does not qualify the full workspace.
+
 **Saved-world continuity and experiment retries (2026-11-20):**
 [Currently In Progress — Codex; `bd-e32s`, `bd-5ygz`]
 

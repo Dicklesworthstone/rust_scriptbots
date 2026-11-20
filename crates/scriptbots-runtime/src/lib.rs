@@ -10,12 +10,12 @@
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use scriptbots_core::{
-    AgentUid, AppliedInterventionRecord, BirthRecord, BrainInspectionLimits,
-    BrainInspectionResponse, ConfigAuditEntry, ControlCommand, DeathRecord, DynamicAgentSnapshot,
-    DynamicAgentVisuals, DynamicWorldSnapshot, Generation, HydrologyFlowDirection,
-    PersistenceBatch, ResourceLedgerTick, ScientificStateError, ScriptBotsConfig, SelectionState,
-    SelectionUpdate, SimulationCommand, TerrainKind, Tick, TickCombatSummary, TickEvents,
-    TickSummary, toroidal_delta,
+    AgentUid, AppliedInterventionRecord, BirthOrigin, BirthRecord, BrainInspectionLimits,
+    BrainInspectionResponse, ConfigAuditEntry, ControlCommand, DeathCause, DeathRecord,
+    DynamicAgentSnapshot, DynamicAgentVisuals, DynamicWorldSnapshot, Generation,
+    HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScientificStateError,
+    ScriptBotsConfig, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, Tick,
+    TickCombatSummary, TickEvents, TickSummary, toroidal_delta,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -5849,17 +5849,24 @@ fn validate_event_page(
 
 fn scientific_boundary_matches_event(event: &ScientificEvent) -> bool {
     let boundary = event.boundary.as_ref();
+    let previous_tick = event
+        .tick
+        .0
+        .checked_sub(1)
+        .filter(|tick| *tick != 0)
+        .map(Tick);
     boundary.events.tick == event.tick
         && boundary.summary.tick == event.tick
         && boundary.config_revision == event.revisions.config.get()
-        && boundary
-            .births
-            .iter()
-            .all(|record| record.tick == event.tick)
-        && boundary
-            .deaths
-            .iter()
-            .all(|record| record.tick == event.tick)
+        && boundary.births.iter().all(|record| {
+            record.tick == event.tick
+                || (record.origin == BirthOrigin::Injected && Some(record.tick) == previous_tick)
+        })
+        && boundary.deaths.iter().all(|record| {
+            record.tick == event.tick
+                || (record.cause == DeathCause::MapIncompatible
+                    && Some(record.tick) == previous_tick)
+        })
         && boundary
             .resource_tick
             .as_ref()
