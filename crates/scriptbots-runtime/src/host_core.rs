@@ -4343,7 +4343,12 @@ impl HostCore {
         host.events.restore_checkpoint(&state.events)?;
         host.restore_checkpoint_observers(state);
         host.schedule = schedule;
-        host.scheduled_patches = Arc::new(state.scheduled_patches.clone());
+        host.scheduled_patches =
+            if state.snapshot.scheduled_patches.as_ref() == &state.scheduled_patches {
+                Arc::clone(&state.snapshot.scheduled_patches)
+            } else {
+                Arc::new(state.scheduled_patches.clone())
+            };
         host.playback = state.playback;
         host.health = state.health.clone();
         host.revisions = state.revisions;
@@ -6936,6 +6941,27 @@ mod tests {
         assert_eq!(restored.next_journal_sequence, oracle.next_journal_sequence);
     }
 
+    fn assert_idle_checkpoint_unchanged(owner: &mut HostCore, now: u64) {
+        let before = owner
+            .capture_host_checkpoint_v1()
+            .unwrap()
+            .encode()
+            .unwrap();
+        let snapshot = owner.latest_snapshot();
+        let receipt = owner.drive(ManualInstant::from_nanos(now)).unwrap();
+        assert_eq!(receipt.scientific_steps, 0);
+        assert_eq!(receipt.snapshots_published, 0);
+        assert!(Arc::ptr_eq(&snapshot, &owner.latest_snapshot()));
+        assert_eq!(
+            owner
+                .capture_host_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap(),
+            before
+        );
+    }
+
     fn assert_retained_step_traces(checkpoint: &HostCheckpointV1, completed_steps: u64) {
         let capacity = checkpoint.state.options.trace_history_capacity;
         assert_eq!(
@@ -7022,6 +7048,7 @@ mod tests {
             )
             .unwrap();
             assert_continued_owner_outputs(&restored, &oracle);
+            assert_idle_checkpoint_unchanged(&mut restored, 100);
             if completed > 0 {
                 assert_continued_command_retry(&restored, completed);
             }
@@ -7117,6 +7144,9 @@ mod tests {
             )
             .unwrap();
             assert_continued_owner_outputs(&restored, &oracle);
+            if initialized_clock {
+                assert_idle_checkpoint_unchanged(&mut restored, 100);
+            }
             let envelope = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
             settle_continuation_command(&mut restored, envelope.clone(), 200);
             settle_continuation_command(&mut oracle, envelope, 200);
@@ -7902,6 +7932,7 @@ mod tests {
                 restored.persistence.last_admitted_tick(),
                 Some(Tick(completed_steps))
             );
+            assert_idle_checkpoint_unchanged(&mut restored, 1_000);
             assert_continued_command_retry(&restored, completed_steps);
             let next = CommandEnvelope::new(CommandId::new(99), HostCommand::Step);
             settle_continuation_command(&mut restored, next.clone(), 1_010);
@@ -7917,6 +7948,10 @@ mod tests {
             assert_eq!(
                 after.scheduled_patch_history().len(),
                 if completed_steps == 1 { 1 } else { 2 }
+            );
+            assert_eq!(
+                restored.latest_snapshot().scheduled_patches.as_slice(),
+                after.scheduled_patch_history()
             );
             assert!(
                 after.journal_cut().last_journal_sequence

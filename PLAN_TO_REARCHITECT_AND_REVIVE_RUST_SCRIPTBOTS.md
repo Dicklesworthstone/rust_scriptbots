@@ -21,7 +21,8 @@ pre-existing constant-time-comparison false positive on public numeric session
 IDs; its aggregate is not green. This does not qualify the full workspace.
 
 **Saved-world continuity and experiment retries (2026-11-20):**
-[Currently In Progress — Codex; `bd-e32s`, `bd-5ygz`]
+[Source implemented; focused regressions passed — full workspace acceptance open
+under `bd-e32s` and `bd-5ygz`]
 
 - [x] Read the architecture plan and authoritative Beads; select reproducible
   saved-world and experiment failures that block normal user workflows.
@@ -31,10 +32,30 @@ IDs; its aggregate is not green. This does not qualify the full workspace.
   unresolved persistence, replay anchors, commands and later arrivals.
 - [x] Reconstruct pending genome declarations when importing a scientific cut,
   so a fresh imported world can immediately become a full-owner continuation.
-- [ ] Execute the real browser, core and native checkpoint regressions through
-  DSR, including numeric recipe fidelity and retries after a lost receipt.
-- [ ] Publish meaningful verified changes directly to `main`; keep the original
+- [x] Reuse the restored schedule-history allocation when it matches the saved
+  snapshot, preserving idle-drive revisions and exact re-saved bytes while real
+  later schedule changes remain observable.
+- [x] Execute core, runtime and browser regressions through DSR, including both
+  ordinary and arbitrary-precision JSON feature configurations.
+- [ ] Complete the full workspace and native application checkpoint acceptance,
+  including retries after a lost receipt.
+- [x] Publish meaningful verified changes directly to `main`; keep the original
   broader acceptance beads open until their named probes actually pass.
+
+Frozen DSR `scriptbots-browser-final/20261120T162650-qxlQRaJq` passed all
+29 runtime checkpoint tests and the complete native browser-library suite in
+both JSON modes: **80 passed, 0 failed, 1 intentionally ignored** in each run.
+The two originally named browser failures and fresh single/mixed-family import,
+save and continuation regressions pass. Targeted formatting also passed.
+
+Workspace qualification remains open. Focused Clippy stopped at 26 existing
+diagnostics in unchanged `scriptbots-runtime/src/lab_guide.rs`. The full workspace
+check stopped at a linker SIGBUS in `visibility`, and full Clippy then failed for
+disk exhaustion. Full formatting printed differences in unchanged native app
+files despite returning zero; only the targeted check was clean. The native
+application checkpoint attempt was killed in `asupersync` before tests ran.
+UBS retains the existing public-session-ID comparison false positive described
+above. Neither original workspace-acceptance bead is closed by these results.
 
 **Native/browser scientific checkpoint transfer (2026-11-20):**
 [Source implemented and independently reviewed — full native/WASM qualification remains open]
