@@ -1378,7 +1378,9 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
   const port = reservation.address().port;
   await new Promise((resolve) => reservation.close(resolve));
   const endpoint = `http://127.0.0.1:${port}`;
-  const args = ["--mode", "server", "--storage", "file", "--threads", "1", "--bootstrap-ticks", "0", "--rng-seed", "17"];
+  // Use a family compiled into both the native application and the browser.
+  // The native Mixed preset may also register optional NeuroFlow adapters.
+  const args = ["--mode", "server", "--storage", "file", "--threads", "1", "--bootstrap-ticks", "0", "--rng-seed", "17", "--brain", "mlp"];
   const log = fs.openSync(path.join(proof, "native.log"), "wx");
   const child = spawn(binary, args, { stdio: ["ignore", log, log], env: { ...process.env,
     SCRIPTBOTS_STORAGE_PATH: path.join(proof, "run.sqlite"),
@@ -1478,7 +1480,8 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     observations.connected = await page.evaluate(() => ({ frames: window.__remoteWire.frames,
       sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
       disabled: ["steps-per-frame", "population", "reset-btn", "brain-preset", "checkpoint-save", "checkpoint-load",
-        "checkpoint-browser-save", "checkpoint-browser-restore"].map((id) => [id, document.getElementById(id)?.disabled]) }));
+        "checkpoint-browser-save", "checkpoint-browser-restore", "world-checkpoint-export", "world-checkpoint-import"]
+        .map((id) => [id, document.getElementById(id)?.disabled]) }));
     const { canvas, telemetry, events } = observations.connected.frames;
     for (const frame of [canvas, telemetry, events]) {
       if (frame.identity.tick !== String(observations.initial.tick)
@@ -1621,6 +1624,19 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     const saved = await savedResponse.json();
     await page.waitForFunction((id) => document.getElementById("lab-checkpoint-select").value === id
       && !document.getElementById("lab-checkpoint-review").disabled, saved.checkpoint_id);
+    const savedConfig = await request("/api/config");
+    if (savedConfig.tick !== saved.tick) throw new Error("Checkpoint configuration was not observed at its saved boundary");
+    const [sourceDownload] = await Promise.all([
+      page.waitForEvent("download"), page.click("#lab-checkpoint-download"),
+    ]);
+    const sourcePath = path.join(proof, "native-source.bin");
+    await sourceDownload.saveAs(sourcePath);
+    if (await sourceDownload.failure()) throw new Error("Native checkpoint download failed");
+    const sourceBytes = fs.readFileSync(sourcePath);
+    if (sourceBytes.length !== saved.byte_size
+        || createHash("sha256").update(sourceBytes).digest("hex") !== saved.checksum_sha256) {
+      throw new Error("Downloaded native checkpoint bytes disagree with the saved artifact");
+    }
     const beforeReview = await request("/api/status");
     const controlsBeforeReview = await page.evaluate(() => window.__remoteWire.sent.filter(
       (message) => ["pause", "resume", "step", "speed"].includes(message.command)).length);
@@ -1719,6 +1735,114 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     observations.returnedLocal = await page.evaluate(() => window.__remoteLocalHandle.frame().identity);
     if (observations.returnedLocal.sessionId !== observations.frozenLocal.sessionId
         || observations.returnedLocal.sessionId === expectedPng.sessionId) throw new Error("Return to Local replaced its saved owner or kept the native owner");
+
+    // Exercise the real saved-file controls and packaged WASM, then give its
+    // advanced raw cut to the same production native binary's study consumer.
+    // This observes two new owners, not continuation of the remote journal or
+    // equality of native and WASM trajectories after the transfer boundary.
+    const nativeBeforeTransfer = await request("/api/status");
+    if (!nativeBeforeTransfer.paused) throw new Error("Original native owner was not paused before scientific transfer");
+    await page.evaluate(() => { document.getElementById("world-checkpoint-transfer").open = true; });
+    await page.setInputFiles("#world-checkpoint-import", sourcePath);
+    await page.waitForFunction(() => document.getElementById("world-checkpoint-status").textContent.startsWith("Imported scientific state at tick"));
+    const imported = await page.evaluate(() => {
+      const owner = window.__remoteLocalHandle;
+      return { frame: owner.frame(), launch: owner.launchInfo(), preset: owner.brainPreset(),
+        sourceBytes: Array.from(owner.worldCheckpoint()) };
+    });
+    if (imported.frame.identity.tick !== String(saved.tick)
+        || imported.frame.identity.sessionId === expectedPng.sessionId
+        || imported.frame.identity.sessionId === observations.returnedLocal.sessionId
+        || !imported.frame.playback.paused || imported.preset !== "mlp"
+        || imported.launch.kind !== "scientific_checkpoint" || imported.launch.shareable
+        || imported.launch.semantics !== "scientific_cut_new_owner" || imported.launch.seed !== "17"
+        || await page.inputValue("#steps-per-frame") !== "0"
+        || !Buffer.from(imported.sourceBytes).equals(sourceBytes)) {
+      throw new Error("Native scientific import did not preserve the exact cut in a new paused browser owner");
+    }
+    delete imported.sourceBytes;
+    const advancedBrowser = await page.evaluate(() => {
+      const owner = window.__remoteLocalHandle;
+      owner.tick(2);
+      return owner.frame();
+    });
+    if (advancedBrowser.identity.tick !== String(saved.tick + 2)
+        || advancedBrowser.identity.sessionId !== imported.frame.identity.sessionId
+        || !advancedBrowser.playback.paused) throw new Error("Imported browser owner did not complete two explicit steps");
+    const [browserDownload] = await Promise.all([
+      page.waitForEvent("download"), page.click("#world-checkpoint-export"),
+    ]);
+    const browserPath = path.join(proof, "browser-advanced.sbworld");
+    await browserDownload.saveAs(browserPath);
+    if (await browserDownload.failure() || !browserDownload.suggestedFilename().endsWith(".sbworld")) {
+      throw new Error("Advanced browser scientific checkpoint download failed");
+    }
+    const browserBytes = fs.readFileSync(browserPath);
+    if (browserBytes.length === 0 || browserBytes.equals(sourceBytes)) {
+      throw new Error("Browser scientific export did not contain the advanced cut");
+    }
+    const checkpointTick = Number(advancedBrowser.identity.tick);
+    const studyPlan = {
+      study_id: "native-browser-native-transfer",
+      description: "Continue an advanced browser scientific cut in isolated native control and treatment owners",
+      base_seed: Number(imported.launch.seed), checkpoint_tick: checkpointTick, horizon_ticks: 2, brain_preset: "Mlp",
+      // WorldState::capture_checkpoint_quiescent normalizes this one host-only
+      // field to zero; /api/config still describes the original live recorder.
+      config: { ...savedConfig.config, persistence_interval: 0 }, source_checkpoint: browserPath,
+      branches: [
+        { branch_id: "control", description: "Continue the exported browser science", intervention: null, scheduled_tick: null },
+        { branch_id: "closure", description: "Change newcomer admission after one shared transition",
+          intervention: { type: "ClosedWorld", params: { closed: !savedConfig.config.closed } }, scheduled_tick: checkpointTick + 1 },
+      ],
+    };
+    const studyPlanPath = path.join(proof, "browser-study-plan.json");
+    const studyOutput = path.join(proof, "browser-study");
+    fs.writeFileSync(studyPlanPath, JSON.stringify(studyPlan, null, 2), { flag: "wx" });
+    const studyArgs = ["branch-study", "--plan", studyPlanPath, "--out", studyOutput];
+    const studyLog = fs.openSync(path.join(proof, "browser-study.log"), "wx");
+    const studyChild = spawn(binary, studyArgs, { cwd: proof, stdio: ["ignore", studyLog, studyLog],
+      env: { ...process.env, RAYON_NUM_THREADS: "1", SCRIPTBOTS_MAX_THREADS: "1", RUST_LOG: "warn" } });
+    fs.closeSync(studyLog);
+    let studyTimedOut = false;
+    const studyExit = await new Promise((resolve, reject) => {
+      const deadline = setTimeout(() => { studyTimedOut = true; studyChild.kill("SIGKILL"); }, 60_000);
+      studyChild.once("error", (error) => { clearTimeout(deadline); reject(error); });
+      studyChild.once("exit", (code, signal) => { clearTimeout(deadline); resolve({ code, signal }); });
+    });
+    if (studyTimedOut || studyExit.code !== 0 || studyExit.signal !== null) {
+      throw new Error(`Native study refused the browser scientific cut: ${JSON.stringify({ ...studyExit, timedOut: studyTimedOut })}`);
+    }
+    const studyReport = JSON.parse(fs.readFileSync(path.join(studyOutput, "study_report.json"), "utf8"));
+    const controlBranch = studyReport.branch_reports?.find((branch) => branch.branch_id === "control");
+    const treatmentBranch = studyReport.branch_reports?.find((branch) => branch.branch_id === "closure");
+    if (studyReport.study_id !== studyPlan.study_id || studyReport.checkpoint_tick !== checkpointTick
+        || studyReport.base_seed !== studyPlan.base_seed || studyReport.horizon_ticks !== studyPlan.horizon_ticks
+        || !studyReport.pre_intervention_digest_verified_for_all_branches
+        || studyReport.source?.kind !== "saved_checkpoint" || studyReport.source?.byte_size !== browserBytes.length
+        || !fs.readFileSync(path.join(studyOutput, "source_checkpoint.bin")).equals(browserBytes)
+        || studyReport.branch_reports.length !== 2 || !controlBranch?.bundle_verified || !treatmentBranch?.bundle_verified
+        || controlBranch.command_applied_tick !== null || controlBranch.first_divergence !== null
+        || treatmentBranch.command_applied_tick !== checkpointTick + 1
+        || treatmentBranch.first_divergence?.tick !== checkpointTick + 2
+        || controlBranch.terminal_sample.tick !== checkpointTick + 2 || treatmentBranch.terminal_sample.tick !== checkpointTick + 2
+        || treatmentBranch.final_digest === controlBranch.final_digest) {
+      throw new Error("Native study did not retain the browser source or apply an isolated control/treatment comparison");
+    }
+    const nativeAfterTransfer = await request("/api/status");
+    for (const field of ["tick", "scientific_revision", "config_revision", "paused", "last_applied_command"]) {
+      if (nativeAfterTransfer[field] !== nativeBeforeTransfer[field]) {
+        throw new Error("Scientific transfer or isolated native study mutated the original remote owner");
+      }
+    }
+    observations.scientificTransfer = {
+      sourcePath, sourceSha256: saved.checksum_sha256, sourceTick: saved.tick,
+      importedIdentity: imported.frame.identity, importedLaunch: imported.launch, advancedIdentity: advancedBrowser.identity,
+      browserPath, browserSha256: createHash("sha256").update(browserBytes).digest("hex"),
+      studyPlanPath, studyOutput, studyArgs, studyExit, source: studyReport.source,
+      preInterventionDigest: studyReport.pre_intervention_digest, controlDigest: controlBranch.final_digest,
+      treatmentDigest: treatmentBranch.final_digest, originalRemoteOwnerUnchanged: true,
+      scope: "Exact native cut imported by packaged WASM; browser advanced cut consumed by isolated native study. Cross-target future equivalence is not asserted.",
+    };
     const wire = await page.evaluate(() => ({ sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
       frames: window.__remoteWire.frames, decodeErrors: window.__remoteWire.decodeErrors, binaries: window.__remoteWire.binaries }));
     for (const [index, bytes] of wire.binaries.entries()) fs.writeFileSync(path.join(proof, `native-frame-${index}.bin`), new Uint8Array(bytes), { flag: "wx" });

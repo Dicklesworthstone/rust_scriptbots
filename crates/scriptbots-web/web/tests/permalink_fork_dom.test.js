@@ -6,6 +6,7 @@
 
 import fs from "node:fs";
 import http from "node:http";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -164,14 +165,24 @@ const mockWasmModule = `
     const tick = bytes.length === 1 ? 37 : Number(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(1, true));
     return createHandle("checkpoint", "sbw1.continuation", tick, owners.checkpointPreset || "mlp");
   }
-  export function decode_remote_frame_binary() { throw new Error("No remote frame in this lifecycle fixture"); }
+  export function world_checkpoint_byte_limit() { return 1024; }
+  export function import_world_checkpoint(bytes) {
+    if (bytes.length !== 1 || bytes[0] !== 77) throw new Error("intentional scientific checkpoint refusal");
+    return createHandle("scientific", "", 73, owners.checkpointPreset || "mlp", "18446744073709551615");
+  }
+  export function decode_remote_frame_binary(bytes) {
+    if (!window.__remoteTransferTest?.frame || bytes.length !== 1 || bytes[0] !== 91) {
+      throw new Error("No remote frame in this lifecycle fixture");
+    }
+    return structuredClone(window.__remoteTransferTest.frame);
+  }
 
   function createHandle(kind, link, initialTick = 0, preset = "mlp", seed = 1, population = 200) {
     const failure = owners.nextFailure;
     owners.nextFailure = null;
     if (failure === "create") throw new Error("intentional create failure");
     const families = preset === "mixed"
-      ? [...(kind === "checkpoint" ? owners.checkpointFamilies || ["assembly", "mlp", "dwraon"]
+      ? [...(["checkpoint", "scientific"].includes(kind) ? owners.checkpointFamilies || ["assembly", "mlp", "dwraon"]
         : owners.mixedFounderFamilies || ["mlp", "dwraon", "assembly"])]
       : ["mlp", "dwraon", "assembly"].includes(preset) ? [preset] : [];
     const record = { id: owners.records.length + 1, kind, preset, seed: String(seed), population, tick: initialTick,
@@ -199,6 +210,11 @@ const mockWasmModule = `
           seed: null, initial_population: null, brain_preset: null, recipe_version: null,
           reason: "Use a saved-owner continuation; the original launch recipe is unavailable."
         };
+        if (kind === "scientific") return {
+          kind: "scientific_checkpoint", semantics: "scientific_cut_new_owner", shareable: false,
+          seed: record.seed, initial_population: null, brain_preset: null, recipe_version: null,
+          reason: "New owner at a saved scientific cut, without the original host journal."
+        };
         if (kind === "permalink") return permalink_info(link);
         return { kind: "browser_launch", semantics: "initial_conditions_restart", shareable: failure !== "launch_unshareable",
           seed: String(seed), initial_population: population, brain_preset: preset, recipe_version: preset === "mixed" ? 2 : 1,
@@ -225,6 +241,11 @@ const mockWasmModule = `
         bytes[0] = 42;
         new DataView(bytes.buffer).setBigUint64(1, BigInt(record.tick), true);
         return bytes;
+      },
+      worldCheckpoint() {
+        check("world_checkpoint");
+        record.worldExports = (record.worldExports || 0) + 1;
+        return new Uint8Array([77]);
       },
       setSpeed(value) { check("speed"); record.speed = value; },
       drive(now) {
@@ -319,15 +340,17 @@ async function runOwnerLifecycleCases(page, context) {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   }, speed);
   const checkpointFile = { name: "lifecycle.sbcheckpoint", mimeType: "application/octet-stream", buffer: Buffer.from([42]) };
+  const scientificFile = { name: "native-world.sbworld", mimeType: "application/octet-stream", buffer: Buffer.from([77]) };
   const replace = async (operation) => {
-    if (operation === "checkpoint") {
+    if (operation === "checkpoint" || operation === "scientific") {
+      const selector = operation === "scientific" ? "#world-checkpoint-import" : "#checkpoint-load";
       await page.evaluate(() => { window.__ownerFileRead = null; });
-      await page.setInputFiles("#checkpoint-load", checkpointFile);
-      await page.evaluate(async () => {
+      await page.setInputFiles(selector, operation === "scientific" ? scientificFile : checkpointFile);
+      await page.evaluate(async (input) => {
         if (!window.__ownerFileRead) throw new Error("Checkpoint import did not read its file");
         await window.__ownerFileRead;
-        if (document.getElementById("checkpoint-load").disabled) throw new Error("Checkpoint import did not finish");
-      });
+        if (document.querySelector(input).disabled) throw new Error("Checkpoint import did not finish");
+      }, selector);
     } else {
       await page.evaluate((kind) => {
         if (kind === "permalink") {
@@ -464,6 +487,77 @@ async function runOwnerLifecycleCases(page, context) {
   observations.mixedContinuation = { owner: mixedOwner.id, families: ["assembly", "mlp", "dwraon"],
     resetRefused: true, explicitResetOwner: chosenOwner.id, unsupportedPreservedOwner: chosenOwner.id };
 
+  // The raw scientific file is deliberately a different format and ownership
+  // contract from a full browser continuation. Exercise the production controls
+  // with this explicit owner double; Rust tests prove the actual codec/science.
+  await setSpeed(0);
+  const beforeScientific = activeOwner(await state());
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointPreset = "mixed";
+    window.__ownerTest.checkpointFamilies = ["assembly", "mlp"];
+  });
+  await replace("scientific");
+  const scientificState = await state();
+  const scientificOwner = activeOwner(scientificState);
+  const scientificUi = await page.evaluate(() => ({
+    kind: document.getElementById("launch-info").dataset.kind,
+    text: document.getElementById("launch-info").textContent,
+    sharingDisabled: ["copy-permalink-btn", "fork-btn"].every((id) => document.getElementById(id).disabled),
+    continuationEnabled: !document.getElementById("checkpoint-save").disabled,
+    exportEnabled: !document.getElementById("world-checkpoint-export").disabled,
+    resetDisabled: document.getElementById("reset-btn").disabled,
+    recoveryEnabled: document.getElementById("checkpoint-recovery-enabled").checked,
+    link: document.getElementById("permalink-input").value,
+  }));
+  if (scientificOwner.id === beforeScientific.id || scientificOwner.tick !== 73 || scientificState.speed !== "0"
+      || scientificState.records[beforeScientific.id - 1].freeCalls !== 1 || scientificState.pendingTimers !== 1
+      || scientificOwner.preset !== "mixed" || scientificState.preset !== "mixed_continuation"
+      || scientificUi.kind !== "scientific_checkpoint" || !scientificUi.text.includes("18446744073709551615")
+      || !scientificUi.text.includes("new paused browser session") || !scientificUi.sharingDisabled
+      || !scientificUi.continuationEnabled || !scientificUi.exportEnabled || !scientificUi.resetDisabled
+      || scientificUi.recoveryEnabled || scientificUi.link !== "") {
+    throw new Error(`Scientific import changed its saved cut, family, or ownership contract: ${JSON.stringify({ scientificState, scientificUi })}`);
+  }
+  const downloadPromise = page.waitForEvent("download");
+  await page.evaluate(() => document.getElementById("world-checkpoint-export").click());
+  const scientificDownload = await downloadPromise;
+  const downloaded = [];
+  for await (const chunk of await scientificDownload.createReadStream()) downloaded.push(chunk);
+  const exported = activeOwner(await state());
+  if (scientificDownload.suggestedFilename() !== "scriptbots-scientific-tick-73.sbworld"
+      || !Buffer.concat(downloaded).equals(Buffer.from([77]))
+      || exported.id !== scientificOwner.id || exported.tick !== scientificOwner.tick
+      || exported.driveCalls !== scientificOwner.driveCalls || exported.worldExports !== 1) {
+    throw new Error("Scientific export changed the owner or did not download its actual bytes");
+  }
+  const scientificRefusals = [];
+  for (const [name, buffer, readExpected] of [["empty", Buffer.alloc(0), false],
+    ["oversized", Buffer.alloc(1025), false], ["corrupt", Buffer.from([0]), true],
+    ["full-owner-is-not-science", Buffer.from([42]), true]]) {
+    await page.evaluate(() => { window.__ownerFileRead = null; });
+    await page.setInputFiles("#world-checkpoint-import", { name: `${name}.sbworld`, mimeType: "application/octet-stream", buffer });
+    await page.evaluate(async () => { if (window.__ownerFileRead) await window.__ownerFileRead; });
+    await context.clock.runFor(32);
+    const refused = await state();
+    const message = await page.textContent("#world-checkpoint-status");
+    const readObserved = await page.evaluate(() => window.__ownerFileRead !== null);
+    if (activeOwner(refused).id !== scientificOwner.id || activeOwner(refused).tick !== 73
+        || refused.records.length !== scientificState.records.length || readObserved !== readExpected
+        || !message.startsWith("Scientific import failed:")) {
+      throw new Error(`Scientific ${name} refusal replaced the world or read oversized bytes`);
+    }
+    scientificRefusals.push({ name, readObserved, message });
+  }
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointPreset = null;
+    window.__ownerTest.checkpointFamilies = null;
+  });
+  observations.scientificTransfer = { sourceOwner: beforeScientific.id, importedOwner: scientificOwner.id,
+    savedTick: scientificOwner.tick, ui: scientificUi, exportName: scientificDownload.suggestedFilename(),
+    refusals: scientificRefusals, evidence: "real DOM/download and explicit WASM lifecycle double" };
+  await page.selectOption("#brain-preset", "mlp");
+  await replace("reset");
+
   // Keep reading the active owner after presentation faults, without flooding
   // the UI/log or creating a second scientific timer or RAF chain.
   await setSpeed(1);
@@ -569,9 +663,10 @@ async function runOwnerLifecycleCases(page, context) {
   // Refusals after allocation are different from a decoder rejecting input:
   // each failed candidate must be freed without moving the paused old world.
   await setSpeed(0);
-  for (const operation of ["reset", "permalink", "checkpoint"]) {
+  for (const operation of ["reset", "permalink", "checkpoint", "scientific"]) {
     for (const failure of ["create", "speed", "frame", "snapshot", "identity", "launch", "launch_schema", "launch_seed",
-      operation === "checkpoint" ? "preset" : "permalink"]) {
+      ["checkpoint", "scientific"].includes(operation) ? "preset" : "permalink",
+      ...(operation === "scientific" ? ["launch_missing", "families"] : [])]) {
       const before = await state();
       const previous = activeOwner(before);
       await page.evaluate((stage) => { window.__ownerTest.nextFailure = stage; }, failure);
@@ -681,7 +776,7 @@ async function runOwnerLifecycleCases(page, context) {
     observations.replacements.push({ operation, previousOwner: previous.id, newOwner: next.id });
   }
 
-  const beginDelayedImport = async () => {
+  const beginDelayedImport = async (scientific = false) => {
     await page.evaluate(() => {
       const read = File.prototype.arrayBuffer;
       window.__releaseOwnerRead = null;
@@ -694,14 +789,15 @@ async function runOwnerLifecycleCases(page, context) {
         });
       };
     });
-    await page.setInputFiles("#checkpoint-load", checkpointFile);
+    await page.setInputFiles(scientific ? "#world-checkpoint-import" : "#checkpoint-load", scientific ? scientificFile : checkpointFile);
     if (!await page.evaluate(() => typeof window.__releaseOwnerRead === "function")) {
       throw new Error("Delayed import did not reach its asynchronous read boundary");
     }
   };
-  const releaseCancelledImport = async () => {
+  const releaseCancelledImport = async (scientific = false) => {
     await page.evaluate(() => window.__releaseOwnerRead());
-    if (!await page.evaluate(() => document.getElementById("checkpoint-status").textContent.startsWith("Load cancelled"))) {
+    if (!await page.evaluate((isScientific) => document.getElementById(isScientific ? "world-checkpoint-status" : "checkpoint-status")
+      .textContent.startsWith(isScientific ? "Scientific import cancelled" : "Load cancelled"), scientific)) {
       throw new Error("Stale continuation read was not cancelled");
     }
   };
@@ -755,6 +851,36 @@ async function runOwnerLifecycleCases(page, context) {
     throw new Error("Return to local failed to resume its retained world with one timer");
   }
   observations.staleRemotePreservedOwner = activeOwner(returned).id;
+
+  await setSpeed(0);
+  await beginDelayedImport(true);
+  await replace("reset");
+  const scientificReset = await state();
+  await releaseCancelledImport(true);
+  await context.clock.runFor(32);
+  if (activeOwner(await state()).id !== activeOwner(scientificReset).id
+      || (await state()).records.length !== scientificReset.records.length) {
+    throw new Error("A delayed scientific import replaced a newer local world");
+  }
+  await beginDelayedImport(true);
+  await page.evaluate(() => document.getElementById("remote-connect").click());
+  const scientificRemote = await state();
+  await releaseCancelledImport(true);
+  if (!await page.isDisabled("#world-checkpoint-import") || !await page.isDisabled("#world-checkpoint-export")) {
+    throw new Error("Scientific transfer controls stayed enabled while viewing a remote owner");
+  }
+  await page.evaluate(() => document.getElementById("world-checkpoint-export").dispatchEvent(new Event("click")));
+  await context.clock.runFor(32);
+  if ((await state()).records.length !== scientificRemote.records.length
+      || activeOwner(await state()).id !== activeOwner(scientificRemote).id
+      || activeOwner(await state()).worldExports !== activeOwner(scientificRemote).worldExports
+      || (await state()).pendingTimers !== 0) {
+    throw new Error("Scientific transfer changed the retained local owner during a remote session");
+  }
+  await page.evaluate(() => document.getElementById("remote-local").click());
+  await context.clock.runFor(32);
+  observations.scientificTransfer.staleResetOwner = activeOwner(scientificReset).id;
+  observations.scientificTransfer.staleRemoteOwner = activeOwner(scientificRemote).id;
 
   // Real IndexedDB and DOM, with the same explicit WASM owner double. These
   // cases observe storage refusal and ownership races; stats_dom.test.js also
@@ -1050,6 +1176,150 @@ async function runOwnerLifecycleCases(page, context) {
   return observations;
 }
 
+async function runRemoteScientificTransferCase(page, context, baseUrl) {
+  // Real page, remote client, bounded HTTP reads and SHA-256 verification. The
+  // socket and WASM codec are explicit doubles, as in the local lifecycle cases.
+  const sessionId = "18446744073709551610";
+  const bytes = Buffer.from([77]);
+  const checkpoint = { checkpoint_id: "saved-native-world", tick: 73, agent_count: 0, byte_size: bytes.length,
+    world_digest_v1: "a".repeat(16), checksum_blake3: "b".repeat(64),
+    checksum_sha256: createHash("sha256").update(bytes).digest("hex"),
+    schema: "scriptbots.world-checkpoint.v1.3", created_at_utc: "1794000000" };
+  const artifact = { artifact_id: checkpoint.checkpoint_id, filename: "native-world.sbworld",
+    content_type: "application/octet-stream", byte_size: bytes.length,
+    checksum_blake3: checkpoint.checksum_blake3, checksum_sha256: checkpoint.checksum_sha256,
+    created_at_utc: checkpoint.created_at_utc, relative_path: "checkpoints/native-world.sbworld" };
+  const requests = [];
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request(), pathname = new URL(request.url()).pathname;
+    requests.push({ path: pathname, method: request.method(), session: request.headers()["x-scriptbots-session"] });
+    if (request.method() !== "GET") return route.fulfill({ status: 405, body: "Unexpected mutation" });
+    if (pathname === `/api/v1/artifacts/${checkpoint.checkpoint_id}/download`) {
+      return route.fulfill({ status: 200, contentType: artifact.content_type,
+        headers: { "Content-Length": String(bytes.length) }, body: bytes });
+    }
+    const body = pathname === "/api/v1/checkpoints"
+      ? { items: [checkpoint], total: 1, limit: 12, offset: 0, has_more: false,
+        retention: { max_count: 128, max_bytes: 65536, file_count: 1, file_bytes: bytes.length } }
+      : pathname === "/api/v1/checkpoints/branches"
+        ? { items: [], total: 0, limit: 12, offset: 0, has_more: false }
+        : pathname === `/api/v1/artifacts/${checkpoint.checkpoint_id}` ? artifact : null;
+    return route.fulfill({ status: body ? 200 : 404, contentType: "application/json", body: JSON.stringify(body) });
+  });
+  await page.goto(baseUrl);
+  await context.clock.runFor(32);
+  await page.evaluate((sourceSessionId) => {
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "0";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
+    const fixture = window.__remoteTransferTest = { sent: [], closes: 0, frame: {
+      schema: "scriptbots.remote-frame.v2", kind: "canvas", coalescedPublications: "0", environment: null,
+      identity: { sessionId: sourceSessionId, publicationRevision: "100", scientificRevision: "91",
+        controlRevision: "2", configRevision: "1", tick: "91" },
+      playback: { paused: false, speedMultiplier: 1 },
+      payload: { tick: 91, epoch: "0", world: { width: 1280, height: 720, closed: true }, agents: [],
+        summary: { agentCount: 0, births: 4, deaths: 4, totalEnergy: 0, averageEnergy: 0, averageHealth: 0 } },
+    } };
+    window.WebSocket = class extends EventTarget {
+      constructor() {
+        super();
+        this.readyState = 1;
+        this.bufferedAmount = 0;
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+      send(text) {
+        const request = JSON.parse(text);
+        fixture.sent.push(request);
+        if (request.command === "subscribe") queueMicrotask(() => {
+          this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
+            protocol_version: 1, type: "subscribed", request_id: request.request_id,
+            stream_protocol_version: 2, session_id: sourceSessionId,
+            channels: request.channels, max_fps: request.max_fps,
+          }) }));
+          this.dispatchEvent(new MessageEvent("message", { data: new Uint8Array([91]).buffer }));
+        });
+      }
+      close() { fixture.closes += 1; this.readyState = 3; }
+    };
+    document.getElementById("checkpoint-lab").open = true;
+    document.getElementById("remote-url").value = location.origin.replace("http", "ws") + "/api/ws/stream";
+    document.getElementById("remote-connect").click();
+  }, sessionId);
+  await context.clock.runFor(32);
+  await page.selectOption("#lab-checkpoint-select", checkpoint.checkpoint_id);
+  const state = () => page.evaluate(() => ({
+    records: window.__ownerTest.records, closes: window.__remoteTransferTest.closes,
+    sent: window.__remoteTransferTest.sent, remote: document.getElementById("remote-status").dataset.state,
+    session: document.getElementById("renderer-status").dataset.sessionId,
+    speed: document.getElementById("steps-per-frame").value,
+    timers: window.__ownerTimers.pending.size, maximumTimers: window.__ownerTimers.maximum,
+    selected: document.getElementById("lab-checkpoint-select").value,
+    transferDisabled: document.getElementById("lab-checkpoint-local").disabled,
+    remoteStepDisabled: document.getElementById("remote-step").disabled,
+    launchKind: document.getElementById("launch-info").dataset.kind,
+  }));
+  const connected = await state();
+  const retained = connected.records.find((owner) => owner.freeCalls === 0);
+  if (!retained || connected.remote !== "connected" || connected.session !== sessionId
+      || connected.timers !== 0 || connected.transferDisabled || connected.remoteStepDisabled) {
+    throw new Error(`Remote transfer did not start from a usable observed host: ${JSON.stringify(connected)}`);
+  }
+  const transfer = async (failure) => {
+    let timeout;
+    try {
+      await Promise.race([
+        page.evaluate((stage) => new Promise((resolve) => {
+          window.__ownerTest.nextFailure = stage;
+          const status = document.getElementById(stage ? "lab-notice" : "world-checkpoint-status");
+          const prefix = stage ? "Local checkpoint transfer unavailable:" : "Imported server checkpoint";
+          const observer = new MutationObserver(() => {
+            if (status.textContent.startsWith(prefix)) { observer.disconnect(); resolve(); }
+          });
+          observer.observe(status, { childList: true, characterData: true, subtree: true });
+          document.getElementById("lab-checkpoint-local").click();
+        }), failure),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`Remote transfer did not finish (${failure ?? "success"})`)), 10000);
+        }),
+      ]);
+    } finally { clearTimeout(timeout); }
+    await context.clock.runFor(64);
+    return state();
+  };
+  const refusals = [];
+  for (const failure of ["create", "identity"]) {
+    const before = await state();
+    const refused = await transfer(failure);
+    const live = refused.records.filter((owner) => owner.freeCalls === 0);
+    const candidates = refused.records.slice(before.records.length);
+    if (live.length !== 1 || live[0].id !== retained.id || live[0].tick !== retained.tick
+        || live[0].driveCalls !== retained.driveCalls || refused.closes !== 0 || refused.remote !== "connected"
+        || refused.session !== sessionId || refused.timers !== 0 || refused.transferDisabled || refused.remoteStepDisabled
+        || refused.selected !== checkpoint.checkpoint_id || candidates.length !== (failure === "create" ? 0 : 1)
+        || candidates.some((owner) => owner.freeCalls !== 1)) {
+      throw new Error(`Failed remote import changed either owner or leaked its candidate: ${JSON.stringify({ failure, refused })}`);
+    }
+    refusals.push({ failure, retainedOwner: retained.id, rejectedOwner: candidates[0]?.id ?? null });
+  }
+  const imported = await transfer(null);
+  const live = imported.records.filter((owner) => owner.freeCalls === 0);
+  if (live.length !== 1 || live[0].id === retained.id || live[0].kind !== "scientific"
+      || live[0].tick !== checkpoint.tick || live[0].speed !== 0 || imported.speed !== "0"
+      || imported.records[retained.id - 1].freeCalls !== 1
+      || imported.records[retained.id - 1].driveCalls !== retained.driveCalls
+      || imported.closes !== 1 || imported.remote !== "local" || imported.session !== String(2000 + live[0].id)
+      || imported.launchKind !== "scientific_checkpoint" || imported.timers !== 1 || imported.maximumTimers !== 1
+      || imported.sent.some((request) => !["subscribe", "stream_ack"].includes(request.command))
+      || requests.some((request) => request.method !== "GET" || request.session !== sessionId)
+      || requests.filter((request) => request.path.endsWith("/download")).length !== 3) {
+    throw new Error(`Remote transfer did not create one paused local owner without server mutation: ${JSON.stringify({ imported, requests })}`);
+  }
+  return { evidence: "production DOM/remote client/HTTP integrity checks with explicit socket and WASM doubles",
+    sourceSession: sessionId, sourceTick: 91, savedTick: checkpoint.tick, retainedOwner: retained.id,
+    importedOwner: live[0].id, refusals, requests, remoteCommands: imported.sent.map((request) => request.command),
+    socketCloses: imported.closes, paused: live[0].speed === 0 };
+}
+
 function createServer() {
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
@@ -1081,7 +1351,7 @@ async function runTests() {
   });
 
   try {
-    let ownerLifecycle;
+    let ownerLifecycle, remoteScientificTransfer;
     // =========================================================================
     // Test 1: Honest Build Mismatch Warning Banner & Simulation Execution
     // =========================================================================
@@ -1346,13 +1616,30 @@ async function runTests() {
       await context.close();
     }
 
+    // Real remote-view handoff, including failures before and after allocation.
+    {
+      const context = await browser.newContext();
+      const epoch = Date.UTC(2026, 0, 1);
+      await context.clock.install({ time: epoch });
+      await context.clock.pauseAt(epoch + 1000);
+      const page = await context.newPage();
+      const pageErrors = [];
+      page.on("pageerror", (error) => pageErrors.push(error.message));
+      await page.route("**/pkg/scriptbots_web.js", (route) => route.fulfill({
+        status: 200, contentType: "application/javascript; charset=utf-8", body: mockWasmModule,
+      }));
+      remoteScientificTransfer = await runRemoteScientificTransferCase(page, context, baseUrl);
+      if (pageErrors.length) throw new Error(`Unhandled remote handoff errors: ${pageErrors.join("; ")}`);
+      await context.close();
+    }
+
     const result = {
       schema: "scriptbots.browser-permalink-fork-dom.v1",
       timestamp: new Date().toISOString(),
       status: "pass",
-      cases_passed: 4,
+      cases_passed: 5,
       cases_failed: 0,
-      observations: { ownerLifecycle },
+      observations: { ownerLifecycle, remoteScientificTransfer },
     };
 
     console.log(JSON.stringify(result));

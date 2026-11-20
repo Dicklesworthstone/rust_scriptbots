@@ -2,6 +2,37 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Native/browser scientific checkpoint transfer (2026-11-20):**
+[Source implemented and independently reviewed — full native/WASM qualification remains open]
+
+- `24902d4` imports canonical `WorldCheckpointV1` files into fresh paused browser
+  owners and exports the same raw format without advancing science. Saved tick,
+  actual RNG root, complete supported registry/evaluator identities and restored
+  digest are checked, including mixed and extinct families. Raw interchange
+  refuses novelty/curiosity selection, communication scrambling and imported maps
+  because the format omits their auxiliary state. Full owner continuations remain
+  a separate supported format.
+- `4d0b12b` adds scientific file import/export and **Continue selected world locally
+  (paused)** in the native checkpoint catalog. Artifact size, identity and SHA-256
+  are verified before browser restoration. The retained local world and remote
+  view survive refusal; a successful handoff replaces only the local owner and
+  disconnects the viewer without sending a server mutation. Source changes cancel
+  pending transfers. Imported science carries no original host journal, schedule
+  or founder recipe, and does not certify cross-target future equivalence.
+- Regression coverage includes core/native consumer round trips, all supported
+  families and refusal boundaries, real DOM lifecycle cases with explicit WASM
+  doubles, and a packaged native-to-WASM-to-native branch-study journey. The real
+  journey uses MLP; arbitrary mixed or Unbound cuts need a compatible native
+  consumer and are not represented as supported named study presets.
+
+DSR on the final frozen browser source passed **239 JavaScript unit tests** and
+**five JavaScript syntax checks**. Pinned targeted Rust formatting also passed.
+Chromium refused Unix socket creation before any DOM assertion, so the DOM and
+packaged native/browser/native journeys remain unexecuted. Full workspace Rust
+dependency acquisition was blocked by the pinned Zed fetch through the environment
+proxy. These scoped results do not close the broader browser, checkpoint or
+cross-target acceptance beads.
+
 **Live native soundscape integration (2026-11-16):**
 [Source implemented and independently reviewed — executable qualification remains open
 under `bd-16g.14` and `bd-2z0.14.1.11`]
