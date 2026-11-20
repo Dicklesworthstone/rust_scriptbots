@@ -61,6 +61,9 @@ const checkpointSaveButton = document.getElementById("checkpoint-save");
 const checkpointLoadInput = document.getElementById("checkpoint-load");
 const checkpointStatus = document.getElementById("checkpoint-status");
 const checkpointCapability = document.getElementById("checkpoint-capability");
+const worldCheckpointExport = document.getElementById("world-checkpoint-export");
+const worldCheckpointImport = document.getElementById("world-checkpoint-import");
+const worldCheckpointStatus = document.getElementById("world-checkpoint-status");
 let activeBrainPreset = null;
 let activeBrainFamilies = [];
 let checkpointLoadPending = false;
@@ -270,10 +273,18 @@ const checkpointLab = new CheckpointLabController({
   }),
   onChange: (controller) => {
     renderCheckpointLab(checkpointLabPanel, controller);
+    updateLocalTransferControl(controller);
     renderStudyReport(labReportPanel, controller.reportModel);
     synchronizeCheckpointView(controller);
   },
 });
+
+function updateLocalTransferControl(controller = checkpointLab) {
+  const button = document.getElementById("lab-checkpoint-local");
+  if (button) button.disabled = !controller.canOperate || !controller.selected || checkpointLoadPending
+    || !remoteMode || !remoteConnected || !wasmInitialized || document.hidden
+    || typeof wasm.import_world_checkpoint !== "function" || typeof wasm.world_checkpoint_byte_limit !== "function";
+}
 
 function updateCheckpointLabVisibility() {
   const observed = remoteFrame && lastPaintedLiveFrame?.sessionId === remoteFrame.identity.sessionId
@@ -389,6 +400,39 @@ async function offerLabDownload(operation) {
 }
 
 checkpointReturnLive?.addEventListener("click", () => checkpointLab.returnToLive());
+document.getElementById("lab-checkpoint-local")?.addEventListener("click", async () => {
+  if (!remoteMode || !remoteConnected || !checkpointLab.canOperate || !checkpointLab.selected
+      || checkpointLoadPending || !wasmInitialized || document.hidden
+      || typeof wasm.import_world_checkpoint !== "function" || typeof wasm.world_checkpoint_byte_limit !== "function") return;
+  const client = remoteClient;
+  const sourceSessionId = checkpointLab.source.sessionId;
+  const generation = simulationGeneration;
+  const original = simHandle;
+  checkpointLoadPending = true;
+  updateCheckpointControls();
+  try {
+    const result = await checkpointLab.prepareLocalImport(wasm.world_checkpoint_byte_limit());
+    if (!result) return;
+    if (!remoteMode || !remoteConnected || document.hidden || client !== remoteClient
+        || generation !== simulationGeneration || original !== simHandle
+        || sourceSessionId !== remoteFrame?.identity.sessionId || sourceSessionId !== result.sourceSessionId
+        || result.sourceToken !== remoteClient.url || !checkpointLab.enabled) {
+      throw new Error("The displayed source changed during checkpoint transfer; select the saved world again");
+    }
+    // Restore and validate every candidate read before releasing the old local
+    // owner or disconnecting the server. Rejection leaves both sources usable.
+    const installed = installContinuation(result.bytes, String(result.checkpoint.tick), true);
+    returnToLocalSimulation();
+    worldCheckpointStatus.textContent = `Imported server checkpoint ${result.checkpoint.checkpoint_id} at tick ${installed.frame.identity.tick}; this new browser session is paused. The server continues independently; its commands, schedule and durable history are not transferred.`;
+    document.getElementById("world-checkpoint-transfer").open = true;
+  } catch (error) {
+    checkpointLab.notice = `Local checkpoint transfer unavailable: ${String(error.message || error).slice(0, 1024)}`;
+    checkpointLab.emit();
+  } finally {
+    checkpointLoadPending = false;
+    updateCheckpointControls();
+  }
+});
 checkpointLabPanel?.addEventListener("toggle", updateCheckpointLabVisibility);
 document.addEventListener("visibilitychange", updateCheckpointLabVisibility);
 document.getElementById("lab-branch-kind")?.addEventListener("change", updateLabTreatmentFields);
@@ -739,12 +783,19 @@ function updateRemoteControls() {
 }
 
 function updateCheckpointControls() {
+  updateLocalTransferControl();
   const supportsContinuation = activeBrainPreset !== "wander";
   const recoveryBusy = browserRecovery?.pending === true;
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
   resetButton.disabled = remoteMode || brainPresetSelect?.value === "mixed_continuation";
   if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle || checkpointLoadPending || !supportsContinuation;
   if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending || recoveryBusy;
+  if (worldCheckpointExport) worldCheckpointExport.disabled = remoteMode || !simHandle || !supportsContinuation
+    || checkpointLoadPending || browserStorePending || recoveryBusy || typeof simHandle.worldCheckpoint !== "function"
+    || typeof wasm.world_checkpoint_byte_limit !== "function";
+  if (worldCheckpointImport) worldCheckpointImport.disabled = remoteMode || !wasmInitialized
+    || checkpointLoadPending || browserStorePending || recoveryBusy || typeof wasm.import_world_checkpoint !== "function"
+    || typeof wasm.world_checkpoint_byte_limit !== "function";
   const storageBusy = remoteMode || !browserContinuationStore || checkpointLoadPending || browserStorePending || recoveryBusy;
   if (browserSaveButton) browserSaveButton.disabled = storageBusy || !simHandle || !supportsContinuation;
   if (browserRestoreButton) browserRestoreButton.disabled = storageBusy;
@@ -924,7 +975,7 @@ remoteReconnect.addEventListener("click", () => {
   try { remoteClient?.reconnect(); }
   catch (error) { receiveRemoteState({ state: "error", message: error.message }); }
 });
-remoteLocal.addEventListener("click", () => {
+function returnToLocalSimulation() {
   checkpointLab.returnToLive();
   interventions.setEnabled(false);
   checkpointLab.setEnabled(false);
@@ -959,7 +1010,8 @@ remoteLocal.addEventListener("click", () => {
   localInterventions.emit();
   updateRemoteControls();
   scheduleSimulation();
-});
+}
+remoteLocal.addEventListener("click", returnToLocalSimulation);
 
 function sendRemoteControl(command) {
   try {
@@ -1377,7 +1429,7 @@ function releaseSimulation(handle) {
   }
 }
 
-function replaceSimulation(next, { continuation = false, permalink = null, expectedTick = null, expectedBrainPreset = null } = {}) {
+function replaceSimulation(next, { continuation = false, permalink = null, expectedTick = null, expectedBrainPreset = null, expectedLaunchKind = null } = {}) {
   const nextSpeed = continuation ? 0 : speedMultiplier;
   let frame;
   let brainPreset;
@@ -1401,6 +1453,9 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
       seed: null, initial_population: null, brain_preset: null, recipe_version: null,
       reason: "This package did not record the original launch recipe for the saved owner.",
     } : null;
+    if (expectedLaunchKind !== null && launchInfo?.kind !== expectedLaunchKind) {
+      throw new Error("The browser package did not identify the imported scientific checkpoint; reload an updated package");
+    }
     if (continuation || brainPreset === "mixed") {
       brainFamilies = validateContinuationBrains(brainPreset, next.brainFamilies?.() ?? null);
     }
@@ -1800,8 +1855,10 @@ checkpointSaveButton?.addEventListener("click", () => {
   }
 });
 
-function installContinuation(bytes, expectedTick = null) {
-  const installed = replaceSimulation(wasm.restore_checkpoint(bytes), { continuation: true, expectedTick });
+function installContinuation(bytes, expectedTick = null, scientificCheckpoint = false) {
+  const next = scientificCheckpoint ? wasm.import_world_checkpoint(bytes) : wasm.restore_checkpoint(bytes);
+  const installed = replaceSimulation(next, { continuation: true, expectedTick,
+    expectedLaunchKind: scientificCheckpoint ? "scientific_checkpoint" : null });
   currentPermalink = null;
   if (permalinkInput) permalinkInput.value = "";
   latestForkedLink = null;
@@ -1816,6 +1873,59 @@ function installContinuation(bytes, expectedTick = null) {
   } catch (_) {}
   return installed;
 }
+
+worldCheckpointExport?.addEventListener("click", () => {
+  if (remoteMode || !simHandle || checkpointLoadPending || browserStorePending || browserRecovery?.pending
+      || typeof simHandle.worldCheckpoint !== "function" || typeof wasm.world_checkpoint_byte_limit !== "function") return;
+  try {
+    // Export observes the current completed cut. It does not drive the owner or
+    // change playback; the explicit import path creates a separate paused owner.
+    const bytes = simHandle.worldCheckpoint();
+    if (!(bytes instanceof Uint8Array) || bytes.length === 0 || bytes.length > wasm.world_checkpoint_byte_limit()) {
+      throw new Error("The package returned an invalid or oversized scientific checkpoint");
+    }
+    const frame = simHandle.frame();
+    validateFrameIdentity(frame);
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `scriptbots-scientific-tick-${frame.identity.tick}.sbworld`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    worldCheckpointStatus.textContent = `Scientific checkpoint prepared at tick ${frame.identity.tick}. It contains saved science for a new session or compatible native tools, without the current host's journal or scheduled commands.`;
+  } catch (error) {
+    worldCheckpointStatus.textContent = `Scientific export failed: ${error.message || error}`;
+  }
+});
+
+worldCheckpointImport?.addEventListener("change", async () => {
+  const file = worldCheckpointImport.files?.[0];
+  worldCheckpointImport.value = "";
+  if (!file || remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending || browserRecovery?.pending
+      || typeof wasm.import_world_checkpoint !== "function" || typeof wasm.world_checkpoint_byte_limit !== "function") return;
+  const generation = simulationGeneration;
+  const original = simHandle;
+  checkpointLoadPending = true;
+  worldCheckpointStatus.textContent = "Reading scientific checkpoint…";
+  updateCheckpointControls();
+  try {
+    if (file.size === 0 || file.size > wasm.world_checkpoint_byte_limit()) {
+      throw new Error("Scientific checkpoint is empty or exceeds the browser size limit");
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (continuationReadIsStale(generation, original)) {
+      worldCheckpointStatus.textContent = "Scientific import cancelled because the active world changed.";
+      return;
+    }
+    const installed = installContinuation(bytes, null, true);
+    worldCheckpointStatus.textContent = `Imported scientific state at tick ${installed.frame.identity.tick}; the new browser session is paused. Original host commands, scheduled changes and durable history are not continued.`;
+  } catch (error) {
+    worldCheckpointStatus.textContent = `Scientific import failed: ${error.message || error}`;
+  } finally {
+    checkpointLoadPending = false;
+    updateCheckpointControls();
+  }
+});
 
 function continuationReadIsStale(generation, original) {
   return remoteMode || queuedReset || simulationGeneration !== generation || simHandle !== original;

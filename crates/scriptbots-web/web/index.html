@@ -547,6 +547,14 @@
                 <label for="checkpoint-load">Load Continuation File (pauses the loaded world)</label>
                 <input id="checkpoint-load" type="file" accept=".sbcheckpoint,application/octet-stream" disabled />
                 <div id="checkpoint-status" role="status" aria-live="polite"></div>
+                <details id="world-checkpoint-transfer">
+                    <summary>Transfer a scientific checkpoint</summary>
+                    <p>Import a native saved world to start a new paused browser session at its saved tick, or export this world's scientific state for compatible native tools. Supported MLP, DWRAON, Assembly and Unbound worlds retain their genomes and evaluator state. Host commands, scheduled changes and the durable journal are not transferred. Cross-target future trajectories are not certified as identical.</p>
+                    <button id="world-checkpoint-export" type="button" disabled>Export Scientific Checkpoint</button>
+                    <label for="world-checkpoint-import">Import Scientific Checkpoint (replaces the local world after validation)</label>
+                    <input id="world-checkpoint-import" type="file" accept=".sbworld,.bin,application/octet-stream" disabled />
+                    <div id="world-checkpoint-status" role="status" aria-live="polite"></div>
+                </details>
                 <button id="checkpoint-browser-save" type="button" disabled>Save in This Browser</button>
                 <button id="checkpoint-browser-restore" type="button" disabled>Restore Saved World (paused)</button>
                 <p>One saved continuation for this site and browser. Save replaces it; restore is always explicit. Browser storage can be cleared, so download a file for a portable copy.</p>
@@ -724,6 +732,8 @@
                 <div class="inspector-actions">
                     <button id="lab-checkpoint-review" type="button" disabled>Review saved world</button>
                     <button id="lab-checkpoint-download" type="button" disabled>Download selected checkpoint</button>
+                    <button id="lab-checkpoint-local" type="button" disabled>Continue selected world locally (paused)</button>
+                    <p>Continuing locally replaces your retained browser world after validation and disconnects this viewer. The server keeps running independently. Original host commands, scheduled changes and durable history stay on the server. Unsupported brain families or scientific state leave both worlds intact.</p>
                 </div>
                 <p>Review draws the saved agents and environment without changing the server. Return to live before controlling, inspecting or starting a study. Births, deaths and tick rate are unavailable for a saved state.</p>
                 <h3>2. Run a future from that state</h3>

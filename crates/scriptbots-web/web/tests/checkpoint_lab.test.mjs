@@ -517,6 +517,97 @@ test("unrelated or changed downloads are refused before becoming downloadable fi
   assert.equal((await valid).blob.size, 2);
 });
 
+function scientificDownload(source = checkpoint(), blob = new Blob([new Uint8Array(source.byte_size)])) {
+  return { blob, filename: "world.sbworld", metadata: artifact({ artifact_id: source.checkpoint_id,
+    filename: "world.sbworld", content_type: "application/octet-stream", relative_path: "checkpoints/world.sbworld",
+    byte_size: source.byte_size, checksum_blake3: source.checksum_blake3, checksum_sha256: source.checksum_sha256 }) };
+}
+
+test("local transfer reads the selected scientific bytes once without changing either owner", async () => {
+  const h = await harness();
+  const source = h.controller.selected;
+  const preview = h.controller.reviewSelected();
+  h.queues.review[0].resolve(savedCanvas());
+  await preview;
+  const retainedPreview = h.controller.canvasPreview;
+  const pending = h.controller.prepareLocalImport(2048);
+  assert.equal(h.controller.busy, true);
+  assert.equal(await h.controller.prepareLocalImport(2048), null);
+  assert.deepEqual(h.queues.download[0].request, { sessionId: SESSION, artifactId: source.checkpoint_id,
+    expected: source, maxBytes: 2048 });
+  const body = new Uint8Array(source.byte_size);
+  body[17] = 91;
+  h.queues.download[0].resolve(scientificDownload(source, new Blob([body])));
+  const transfer = await pending;
+  assert.deepEqual(transfer.bytes, body);
+  assert.equal(transfer.checkpoint, source);
+  assert.equal(transfer.sourceSessionId, SESSION);
+  assert.equal(transfer.sourceToken, SOURCE);
+  assert.equal(h.controller.canvasPreview, retainedPreview);
+  assert.equal(h.controller.selected, source);
+  assert.equal(h.controller.busy, false);
+  for (const kind of ["save", "launch", "cancel"]) assert.equal(h.queues[kind].length, 0);
+  assert.equal(h.identities(), 0, "transferring a file cannot mint an owner mutation identity");
+});
+
+test("local transfer refuses size before fetching and preserves download transport limits", async () => {
+  const h = await harness();
+  for (const maxBytes of [0, -1, 0.5, Infinity, NaN, "1024"]) {
+    assert.throws(() => h.controller.prepareLocalImport(maxBytes), /valid scientific checkpoint limit/);
+  }
+  assert.equal(await h.controller.prepareLocalImport(1023), null);
+  assert.match(h.controller.notice, /remains available for server studies/);
+  assert.equal(h.queues.download.length, 0);
+  const pending = h.controller.prepareLocalImport(128 * 1024 * 1024);
+  assert.equal(h.queues.download[0].request.maxBytes, MAX_LAB_ARTIFACT_BYTES);
+  h.queues.download[0].resolve(scientificDownload());
+  assert.equal((await pending).bytes.length, 1024);
+});
+
+test("local transfer rejects changed artifact metadata and corrupt read lengths", async () => {
+  for (const change of [
+    (result) => { result.metadata.checksum_sha256 = "d".repeat(64); },
+    (result) => { result.metadata.checksum_blake3 = "d".repeat(64); },
+    (result) => { result.metadata.artifact_id = "different-world"; },
+    (result) => { result.blob = new Blob([new Uint8Array(1025)]); },
+    (result) => { result.blob.arrayBuffer = async () => new ArrayBuffer(1023); },
+  ]) {
+    const h = await harness();
+    const source = h.controller.selected;
+    const pending = h.controller.prepareLocalImport(2048);
+    const response = scientificDownload();
+    change(response);
+    h.queues.download[0].resolve(response);
+    assert.equal(await pending, null);
+    assert.equal(h.controller.selected, source);
+    assert.match(h.controller.notice, /Local checkpoint transfer unavailable/);
+  }
+});
+
+test("source changes and hidden panels cancel even a late scientific Blob read", async () => {
+  for (const invalidate of [(controller) => controller.setEnabled(false),
+    (controller) => controller.observe(frame("7"), SOURCE),
+    (controller) => controller.observe(frame(), "wss://another.example/api/ws/stream"),
+    (controller) => controller.reset()]) {
+    const h = await harness();
+    const pending = h.controller.prepareLocalImport(2048);
+    const result = scientificDownload();
+    let resolveRead;
+    result.blob.arrayBuffer = () => new Promise((resolve) => { resolveRead = resolve; });
+    h.queues.download[0].resolve(result);
+    await flush();
+    assert.equal(typeof resolveRead, "function");
+    assert.equal(h.controller.busy, true);
+    invalidate(h.controller);
+    assert.equal(h.queues.download[0].signal.aborted, true);
+    assert.equal(await h.controller.prepareLocalImport(2048), null, "a cancelled uncompleted read still holds its slot");
+    resolveRead(new ArrayBuffer(1024));
+    assert.equal(await pending, null);
+    assert.equal(h.controller.busy, false);
+    assert.equal(h.queues.download.length, 1);
+  }
+});
+
 test("an existing catalog row cannot replace a selected cut with different scientific bytes", async () => {
   const h = await harness();
   const original = h.controller.selected;

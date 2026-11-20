@@ -610,6 +610,37 @@ export class CheckpointLabController {
     return this.download(this.selected.checkpoint_id, this.selected, null);
   }
 
+  /** Read one verified scientific file for an explicit new local owner. */
+  prepareLocalImport(maxBytes) {
+    if (!this.canOperate || !this.selected) return Promise.resolve(null);
+    if (!integer(maxBytes, 1)) throw new Error("The browser package did not provide a valid scientific checkpoint limit");
+    const limit = Math.min(maxBytes, MAX_LAB_ARTIFACT_BYTES);
+    const checkpoint = this.selected;
+    if (checkpoint.byte_size > limit) {
+      this.notice = `This checkpoint exceeds the ${limit} byte browser transfer limit. It remains available for server studies.`;
+      this.emit();
+      return Promise.resolve(null);
+    }
+    const request = { sessionId: this.source.sessionId, artifactId: checkpoint.checkpoint_id,
+      expected: checkpoint, maxBytes: limit };
+    const sourceToken = this.source.token;
+    this.notice = "Reading the selected checkpoint for a new paused local world; the server continues independently.";
+    return this.run("Local checkpoint transfer unavailable", async (signal) => {
+      const result = validateDownload(await this.services.download(request, signal), request.artifactId, checkpoint, null);
+      signal.throwIfAborted();
+      if (result.blob.size > limit) throw new Error("Scientific checkpoint exceeds the browser transfer byte limit");
+      const bytes = new Uint8Array(await result.blob.arrayBuffer());
+      signal.throwIfAborted();
+      return bytes;
+    }, (bytes) => {
+      if (!this.selected || !sameCheckpoint(this.selected, checkpoint) || bytes.length !== checkpoint.byte_size) {
+        throw new Error("The selected checkpoint changed during local transfer");
+      }
+      this.notice = "Scientific bytes verified. The browser still must validate and restore their scientific state.";
+      return { bytes, checkpoint, sourceSessionId: request.sessionId, sourceToken };
+    });
+  }
+
   downloadReport() {
     if (this.branch?.status?.status !== "completed") return Promise.resolve(null);
     return this.download(this.branch.status.artifact_id, null, this.branch.status.branch_id);
@@ -697,6 +728,7 @@ export function renderCheckpointLab(panel, controller) {
   disable("lab-checkpoint-next", !ready || !controller.page?.next_cursor);
   disable("lab-checkpoint-download", !ready || !selected);
   disable("lab-checkpoint-review", !controller.canReview);
+  disable("lab-checkpoint-local", !ready || !selected);
   disable("lab-branch-launch", !controller.canLaunch);
   disable("lab-branch-retry", !ready || controller.canvasPreview !== null || controller.branchState !== "unconfirmed");
   const branch = controller.branch, status = branch?.status;

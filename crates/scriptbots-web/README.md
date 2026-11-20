@@ -122,6 +122,22 @@ The crate exposes the following wasm-bindgen surface:
   pressing Reset then creates the requested fresh world.
 - `checkpoint_byte_limit() -> number` — the canonical owner codec's file bound,
   also checked before the demo reads a selected file.
+- `SimHandle::worldCheckpoint() -> Uint8Array` — exports the canonical core
+  `WorldCheckpointV1` scientific cut used by native checkpoint tools. It settles
+  the current receipt boundary without advancing science. The cut contains the
+  world, RNG and evaluator state; it excludes the owner session, command journal,
+  retained history and pending host schedule. Fitness selection, unscrambled
+  communication and no imported map are required because this raw format omits
+  their auxiliary state.
+- `import_world_checkpoint(bytes: Uint8Array) -> SimHandle` — validates a raw
+  scientific cut and starts a fresh, paused browser owner at its saved tick.
+  MLP, DWRAON, Assembly, supported mixtures and unbound worlds are admitted only
+  with exact registry/evaluator identities and a matching restored world digest.
+  Browser resource limits also apply. Unsupported or corrupt files leave existing
+  handles untouched. This does not continue the source owner's commands, history
+  or pending schedule, and does not certify cross-target future equivalence.
+- `world_checkpoint_byte_limit() -> number` — the independent core scientific
+  file bound (128 MiB), checked before the demo materializes a selected file.
 - `SimHandle::brainPreset() -> string` — the new-world brain preset for this handle.
   Both fresh mixed founders and imported mixed continuations report `"mixed"`;
   `launchInfo()` distinguishes a restartable recipe from a saved continuation.
@@ -131,6 +147,9 @@ The crate exposes the following wasm-bindgen surface:
 - `SimHandle::launchInfo() -> JsValue` — describes the retained initial-world
   recipe, its exact decimal-string seed, founder count and brain preset. A loaded
   continuation has no original launch recipe and reports `shareable: false`.
+  A raw science import reports `kind: "scientific_checkpoint"` and
+  `semantics: "scientific_cut_new_owner"`, the actual restored RNG root seed, and
+  no founder recipe; it is likewise not shareable as an initial-world permalink.
 - `SimHandle::permalinkOf() -> string` — encodes the complete initial-world
   recipe as a bounded `sbb1` link. This restarts the recorded founders at tick
   zero; current tick, live interventions and evolved state require a checkpoint.
@@ -259,6 +278,51 @@ world intact. This saved continuation is separate from the owner's journal
 receipt state. It does not write a SQLite image or ordered batch journal, or
 promote volatile receipts to `Durable`; those original `bd-ywtv` requirements
 remain open. Multiple tabs share the slot: the last completed manual save wins.
+
+## Moving scientific worlds between browser and native tools
+
+Open **Transfer a scientific checkpoint** in local mode. **Export Scientific
+Checkpoint** downloads `scriptbots-scientific-tick-<tick>.sbworld` without stepping
+the world or changing its playback. **Import Scientific Checkpoint** accepts that
+raw format, including native checkpoint catalog downloads, validates it completely,
+and replaces the local world with a new paused owner at the saved tick. Loading a
+full browser continuation through this input is refused; use **Load Continuation
+File** for that format. File selection is bounded before reading, and a delayed
+read cannot replace a newer reset or remote connection.
+
+When connected to a native server, open its saved checkpoint catalog, select a
+checkpoint, and choose **Continue selected world locally (paused)**. This downloads
+and verifies the selected artifact, restores its science in WASM, and returns the
+viewer to local mode only after candidate validation succeeds. The retained local
+world is then replaced. The native server continues independently and receives no
+Pause, Step or other mutation from this transfer. A failed download, unsupported
+brain or invalid checkpoint leaves both the current view and local owner intact.
+Changing endpoint, session or panel visibility cancels a pending transfer;
+checkpoint selection stays locked while its bytes are being read.
+The catalog transfer retains its existing 64 MiB artifact ceiling;
+local file imports use the core codec's 128 MiB ceiling plus browser world limits.
+
+Supported science uses Fitness selection, disabled communication scrambling, and
+no imported map. Raw cuts omit the auxiliary state needed to continue novelty or
+curiosity selection, scrambling, and imported map profiles faithfully, so these
+cases are refused. Supported registered brain families retain their exact order
+and evaluator state even after extinction. A mixed import requires an explicit
+new-world brain preset before Reset because the saved science has no original
+founder distribution. Source commands, pending scheduled inputs, host history and
+durable journal receipts are not transferred. Save a **continuation** after import
+to preserve the new browser owner's subsequent command history and cadence.
+
+The exported bytes also work with native consumers of `WorldCheckpointV1`.
+For a checkpoint-based `branch-study`, set the plan's `source_checkpoint` to the
+downloaded file and select a native brain preset whose registry exactly matches
+the checkpoint. Single-family MLP, DWRAON and Assembly have matching native presets.
+An arbitrary mixed-family roster may not match a named native preset, and the
+study runner has no Unbound preset; those cuts are refused by that consumer.
+The source path is relative to the
+invocation's working directory; the existing example plan is available through
+`scriptbots-app branch-study --example`. Matching codec identities and a restored
+digest establish the imported cut, not general equivalence of future transitions
+across native/WASM targets or different builds.
 
 ## Genome inspection and interventions
 

@@ -20,7 +20,7 @@ export function validateContinuationBrains(preset, families = null) {
 
 export function validateLaunchInfo(info) {
   const kinds = { browser_launch: "initial_conditions_restart", gallery_reference: "gallery_configuration_restart",
-    checkpoint_continuation: "saved_owner_continuation" };
+    checkpoint_continuation: "saved_owner_continuation", scientific_checkpoint: "scientific_cut_new_owner" };
   if (!info || Array.isArray(info) || !Object.hasOwn(kinds, info.kind) || info.semantics !== kinds[info.kind]
       || typeof info.shareable !== "boolean" || (info.reason !== null && (typeof info.reason !== "string" || info.reason.length > 2048))) {
     throw new Error("The browser package returned invalid launch metadata");
@@ -32,7 +32,11 @@ export function validateLaunchInfo(info) {
   } else {
     if (typeof info.seed !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(info.seed)
         || BigInt(info.seed) > 18446744073709551615n) throw new Error("Recipe seed must be an exact u64 decimal string");
-    if (info.kind === "browser_launch") {
+    if (info.kind === "scientific_checkpoint") {
+      if (info.shareable || [info.initial_population, info.brain_preset, info.recipe_version].some((value) => value !== null)) {
+        throw new Error("A scientific checkpoint cannot claim an original founder recipe");
+      }
+    } else if (info.kind === "browser_launch") {
       const supportedRecipe = info.recipe_version === 1
         ? ["mlp", "dwraon", "assembly", "wander", "none"].includes(info.brain_preset)
         : info.recipe_version === 2 && info.brain_preset === "mixed";
@@ -56,6 +60,7 @@ export function launchInfoText(info) {
       : `${recipe} Recipe sharing unavailable: ${info.reason || "this recipe exceeds the link size limit"} Save a continuation to retain this world.`;
   }
   if (info.kind === "gallery_reference") return `Gallery reference · seed ${info.seed}. This link does not encode a browser founder population or brain recipe.`;
+  if (info.kind === "scientific_checkpoint") return `Imported scientific checkpoint · source seed ${info.seed}. This world starts a new paused browser session at the saved tick. The original host's commands, scheduled changes and durable journal are not continued. Save a browser continuation to retain this new session. Native and WebAssembly future trajectories are not certified as identical.`;
   return "Saved owner continuation. The original launch recipe is unavailable; save another continuation to retain this evolved world.";
 }
 

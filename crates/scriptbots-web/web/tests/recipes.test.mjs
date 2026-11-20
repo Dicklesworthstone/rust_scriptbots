@@ -41,6 +41,27 @@ const continuation = () => ({
   seed: null, initial_population: null, brain_preset: null, recipe_version: null,
   reason: "Original launch recipe is unavailable.",
 });
+const scientificCheckpoint = () => ({
+  kind: "scientific_checkpoint", semantics: "scientific_cut_new_owner", shareable: false,
+  seed: "18446744073709551615", initial_population: null, brain_preset: null, recipe_version: null,
+  reason: "New owner at the saved scientific cut; original host history is unavailable.",
+});
+
+test("scientific imports retain the source seed without claiming founder or host continuity", () => {
+  const saved = validateLaunchInfo(scientificCheckpoint());
+  assert.equal(saved.seed, "18446744073709551615");
+  assert.equal(saved.shareable, false);
+  const text = launchInfoText(saved);
+  assert.ok(text.includes(saved.seed));
+  assert.ok(text.includes("new paused browser session"));
+  assert.ok(text.includes("scheduled changes and durable journal are not continued"));
+  assert.ok(text.includes("not certified as identical"));
+  for (const overrides of [{ shareable: true }, { seed: null }, { seed: "01" },
+    { seed: "18446744073709551616" }, { initial_population: 0 }, { brain_preset: "mlp" },
+    { recipe_version: 1 }, { semantics: "saved_owner_continuation" }]) {
+    assert.throws(() => validateLaunchInfo({ ...saved, ...overrides }));
+  }
+});
 
 test("browser recipes preserve exact full-width seeds and registered empty-world families", () => {
   const decoded = validateLaunchInfo(browserRecipe());
