@@ -63,6 +63,8 @@ pub const DEFAULT_CHANNEL_SUBMIT_DEADLINE: Duration = Duration::from_millis(10_0
 pub const DEFAULT_CHANNEL_MAINTENANCE_PERIOD: Duration = Duration::from_millis(20);
 /// Maximum retained contributors in an on-demand focused-agent explanation.
 pub const MAX_INSPECTOR_CONTRIBUTORS: usize = 64;
+/// Maximum genome nodes returned in one owner inspection.
+pub const INSPECTOR_GENOME_PAGE_SIZE: usize = 20;
 
 /// Bounds and deadlines for one channel host driver and its ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,15 +145,30 @@ pub enum ChannelHostOptionsError {
 
 /// One pre-admission message offered to the owner thread.
 enum IngressMessage {
+    GenomeInspection {
+        uid: AgentUid,
+        locus_offset: usize,
+        delta_offset: usize,
+        expires_at: Instant,
+        reply: Sender<Result<crate::inspector::GenomeInspection, HostAccessError>>,
+    },
+    BrainActivity {
+        uid: AgentUid,
+        expires_at: Instant,
+        reply: Sender<Result<crate::inspector::BrainActivityInspection, HostAccessError>>,
+    },
     BrainProjection {
         request: BrainProjectionRequest,
+        expires_at: Instant,
         reply: Sender<Result<BrainProjection, HostAccessError>>,
     },
     AgentInspection {
         uid: AgentUid,
         max_contributors: Option<usize>,
+        genome_offset: usize,
+        include_genome: bool,
         expires_at: Instant,
-        reply: Sender<Result<Option<AgentInspectorData>, HostAccessError>>,
+        reply: Sender<Result<(u64, Option<AgentInspectorData>), HostAccessError>>,
     },
     DebugAgents {
         query: AgentDebugQuery,
@@ -291,8 +308,19 @@ impl From<&scriptbots_core::AgentRuntime> for AgentPhysiologyData {
 pub struct AgentInspectorData {
     /// Source revisions for rejecting a detail paired with an older rendered frame.
     pub source: BrainProjectionSource,
+    /// Immutable publication observed by the owner when it captured this detail.
+    /// Retaining it lets a client validate the response even if the hub advances.
+    pub publication: Arc<RenderSnapshot>,
+    /// Evolution epoch captured at the inspected owner boundary.
+    pub epoch: u64,
     /// Stable subject identity, independent of slot reuse.
     pub uid: AgentUid,
+    /// Health at the same owner boundary as the physiology and signals.
+    pub health: f32,
+    /// Completed scientific ticks lived by the subject.
+    pub age: u32,
+    /// Heritable lineage generation.
+    pub generation: u32,
     /// Life-history values read at the same scientific boundary.
     pub life: AgentLifeData,
     /// Physiology and event markers read at the same scientific boundary.
@@ -463,14 +491,23 @@ impl ChannelHostPort {
     }
 
     fn bounded_before(&self, deadline: Instant) -> Result<Self, HostAccessError> {
+        self.bounded_before_with_error(
+            deadline,
+            Self::protocol_violation("channel caller budget elapsed before ingress"),
+        )
+    }
+
+    fn bounded_before_with_error(
+        &self,
+        deadline: Instant,
+        expired: HostAccessError,
+    ) -> Result<Self, HostAccessError> {
         let deadline = self
             .caller_deadline
             .map_or(deadline, |bound| bound.min(deadline));
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(Self::protocol_violation(
-                "channel caller budget elapsed before ingress",
-            ));
+            return Err(expired);
         }
         let mut bounded = self.clone();
         bounded.submit_deadline = bounded.submit_deadline.min(remaining);
@@ -495,9 +532,7 @@ impl ChannelHostPort {
             .caller_deadline
             .map_or(per_call, |outer| outer.min(per_call));
         if deadline <= now {
-            return Err(Self::protocol_violation(
-                "inspection budget elapsed before ingress",
-            ));
+            return Err(HostAccessError::OwnerReadTimeout);
         }
         Ok(deadline)
     }
@@ -520,14 +555,11 @@ impl ChannelHostPort {
     ) -> Result<R, HostAccessError> {
         let started = Instant::now();
         let (reply, receiver) = std::sync::mpsc::channel();
-        self.enqueue(message(reply), started)?;
+        self.enqueue_with_error(message(reply), started, HostAccessError::OwnerReadTimeout)?;
         receiver
             .recv_timeout(self.remaining_budget(started))
             .map_err(|error| match error {
-                RecvTimeoutError::Timeout => Self::protocol_violation(format!(
-                    "owner inspection reply exceeded {:?}",
-                    self.submit_deadline
-                )),
+                RecvTimeoutError::Timeout => HostAccessError::OwnerReadTimeout,
                 RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
             })?
     }
@@ -542,8 +574,47 @@ impl ChannelHostPort {
                 "brain target limit exceeded before enqueue",
             ));
         }
+        let expires_at = self.inspection_deadline()?;
         self.read_owner(|reply| IngressMessage::BrainProjection {
             request: request.clone(),
+            expires_at,
+            reply,
+        })
+    }
+
+    /// Read one browser brain observation with an epoch-stamped missing/unavailable result.
+    pub fn inspect_brain_activity_before(
+        &self,
+        uid: AgentUid,
+        deadline: Instant,
+    ) -> Result<crate::inspector::BrainActivityInspection, HostAccessError> {
+        let bounded =
+            self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?;
+        let expires_at = bounded.inspection_deadline()?;
+        bounded.read_owner(|reply| IngressMessage::BrainActivity {
+            uid,
+            expires_at,
+            reply,
+        })
+    }
+
+    /// Read one genome page without installing a probe or sharing a live evaluator.
+    pub fn inspect_genome_page_before(
+        &self,
+        uid: AgentUid,
+        locus_offset: usize,
+        delta_offset: usize,
+        deadline: Instant,
+    ) -> Result<crate::inspector::GenomeInspection, HostAccessError> {
+        crate::inspector::validate_genome_page_offsets(locus_offset, delta_offset)?;
+        let bounded =
+            self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?;
+        let expires_at = bounded.inspection_deadline()?;
+        bounded.read_owner(|reply| IngressMessage::GenomeInspection {
+            uid,
+            locus_offset,
+            delta_offset,
+            expires_at,
             reply,
         })
     }
@@ -554,7 +625,41 @@ impl ChannelHostPort {
         request: &BrainProjectionRequest,
         deadline: Instant,
     ) -> Result<BrainProjection, HostAccessError> {
-        self.bounded_before(deadline)?.project_brain(request)
+        self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
+            .project_brain(request)
+    }
+
+    /// Enqueue one bounded brain request and retain its owner acknowledgement.
+    ///
+    /// The caller must retain this receiver until it resolves before enqueuing
+    /// another request for the same consumer. Expiry prevents stale owner work;
+    /// it does not remove a message from the bounded ingress queue.
+    pub fn begin_brain_projection_before(
+        &self,
+        request: &BrainProjectionRequest,
+        deadline: Instant,
+    ) -> Result<std::sync::mpsc::Receiver<Result<BrainProjection, HostAccessError>>, HostAccessError>
+    {
+        if request.targets.len() > scriptbots_core::ACTIVATION_CAPTURE_BUDGET {
+            return Err(Self::protocol_violation(
+                "brain target limit exceeded before enqueue",
+            ));
+        }
+        let bounded =
+            self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?;
+        let expires_at = bounded.inspection_deadline()?;
+        let started = Instant::now();
+        let (reply, receiver) = std::sync::mpsc::channel();
+        bounded.enqueue_with_error(
+            IngressMessage::BrainProjection {
+                request: request.clone(),
+                expires_at,
+                reply,
+            },
+            started,
+            HostAccessError::OwnerReadTimeout,
+        )?;
+        Ok(receiver)
     }
 
     /// Read one living agent's inspector detail; a deceased UID returns `None`.
@@ -568,18 +673,30 @@ impl ChannelHostPort {
                 "sensor explanation contributor limit exceeded before enqueue",
             ));
         }
-        self.inspect_agent_with_attribution(uid, Some(max_contributors))
+        self.inspect_agent_with_attribution(uid, Some(max_contributors), 0, true)
+            .map(|(_, detail)| detail)
     }
 
     fn inspect_agent_with_attribution(
         &self,
         uid: AgentUid,
         max_contributors: Option<usize>,
-    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        genome_offset: usize,
+        include_genome: bool,
+    ) -> Result<(u64, Option<AgentInspectorData>), HostAccessError> {
+        if !genome_offset.is_multiple_of(INSPECTOR_GENOME_PAGE_SIZE)
+            || genome_offset
+                .checked_add(INSPECTOR_GENOME_PAGE_SIZE)
+                .is_none()
+        {
+            return Err(Self::protocol_violation("invalid genome page offset"));
+        }
         let expires_at = self.inspection_deadline()?;
         self.read_owner(|reply| IngressMessage::AgentInspection {
             uid,
             max_contributors,
+            genome_offset,
+            include_genome,
             expires_at,
             reply,
         })
@@ -592,7 +709,7 @@ impl ChannelHostPort {
         max_contributors: usize,
         deadline: Instant,
     ) -> Result<Option<AgentInspectorData>, HostAccessError> {
-        self.bounded_before(deadline)?
+        self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
             .inspect_agent(uid, max_contributors)
     }
 
@@ -602,8 +719,41 @@ impl ChannelHostPort {
         uid: AgentUid,
         deadline: Instant,
     ) -> Result<Option<AgentInspectorData>, HostAccessError> {
-        self.bounded_before(deadline)?
-            .inspect_agent_with_attribution(uid, None)
+        self.inspect_agent_for_hud_page_before(uid, 0, deadline)
+    }
+
+    /// Read a bounded genome slice without computing sensor explanations.
+    pub fn inspect_agent_for_hud_page_before(
+        &self,
+        uid: AgentUid,
+        genome_offset: usize,
+        deadline: Instant,
+    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
+            .inspect_agent_with_attribution(uid, None, genome_offset, true)
+            .map(|(_, detail)| detail)
+    }
+
+    /// Read fixed-size physiology and signals without genome decoding or sensor attribution.
+    pub fn inspect_agent_basic_before(
+        &self,
+        uid: AgentUid,
+        deadline: Instant,
+    ) -> Result<Option<AgentInspectorData>, HostAccessError> {
+        self.inspect_agent_basic_with_epoch_before(uid, deadline)
+            .map(|(_, detail)| detail)
+    }
+
+    /// Read the owner epoch together with fixed-size detail, including when the UID is absent.
+    /// Both values come from one synchronous owner boundary, so callers can reject a stale
+    /// epoch without mistaking that source change for the creature's disappearance.
+    pub fn inspect_agent_basic_with_epoch_before(
+        &self,
+        uid: AgentUid,
+        deadline: Instant,
+    ) -> Result<(u64, Option<AgentInspectorData>), HostAccessError> {
+        self.bounded_before_with_error(deadline, HostAccessError::OwnerReadTimeout)?
+            .inspect_agent_with_attribution(uid, None, 0, false)
     }
 
     /// Query the owner's debug rows, preserving the query's filters and limit.
@@ -741,6 +891,22 @@ impl ChannelHostPort {
     }
 
     fn enqueue(&self, message: IngressMessage, started: Instant) -> Result<(), HostAccessError> {
+        self.enqueue_with_error(
+            message,
+            started,
+            Self::protocol_violation(format!(
+                "channel host did not drain ingress within {:?}",
+                self.submit_deadline
+            )),
+        )
+    }
+
+    fn enqueue_with_error(
+        &self,
+        message: IngressMessage,
+        started: Instant,
+        timeout: HostAccessError,
+    ) -> Result<(), HostAccessError> {
         // `SyncSender::send_timeout` is unstable; park briefly between retries inside the
         // caller's original deadline instead of blocking without bound or resetting the budget.
         const RETRY_PARK: Duration = Duration::from_millis(2);
@@ -748,10 +914,7 @@ impl ChannelHostPort {
         loop {
             let remaining = self.remaining_budget(started);
             if remaining.is_zero() {
-                return Err(Self::protocol_violation(format!(
-                    "channel host did not drain ingress within {:?}",
-                    self.submit_deadline
-                )));
+                return Err(timeout);
             }
             let ingress_open = match self.ingress_open.try_lock() {
                 Ok(guard) => guard,
@@ -1336,6 +1499,12 @@ impl ChannelHostDriver {
         let error =
             || ChannelHostPort::protocol_violation("owner handoff refused later queued ingress");
         match message {
+            IngressMessage::GenomeInspection { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            IngressMessage::BrainActivity { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
             IngressMessage::BrainProjection { reply, .. } => {
                 let _ = reply.send(Err(error()));
             }
@@ -1408,13 +1577,53 @@ impl ChannelHostDriver {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match over every IngressMessage variant behind the single handoff gate"
+    )]
     fn process_ingress(&mut self, message: IngressMessage) {
         if self.handoff != HandoffState::Open {
             Self::refuse_handoff_ingress(message);
             return;
         }
         match message {
-            IngressMessage::BrainProjection { request, reply } => {
+            IngressMessage::GenomeInspection {
+                uid,
+                locus_offset,
+                delta_offset,
+                expires_at,
+                reply,
+            } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
+                let _ = reply.send(self.host.core().inspect_genome_page(
+                    uid,
+                    locus_offset,
+                    delta_offset,
+                ));
+            }
+            IngressMessage::BrainActivity {
+                uid,
+                expires_at,
+                reply,
+            } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
+                let _ = reply.send(self.host.core().inspect_brain_activity(uid));
+            }
+            IngressMessage::BrainProjection {
+                request,
+                expires_at,
+                reply,
+            } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
                 let result = self
                     .host
                     .core()
@@ -1425,20 +1634,26 @@ impl ChannelHostDriver {
             IngressMessage::AgentInspection {
                 uid,
                 max_contributors,
+                genome_offset,
+                include_genome,
                 expires_at,
                 reply,
             } => {
                 if Instant::now() >= expires_at {
-                    let _ = reply.send(Err(ChannelHostPort::protocol_violation(
-                        "owner inspection budget elapsed in ingress",
-                    )));
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
                     return;
                 }
-                let _ = reply.send(
-                    self.host
-                        .core()
-                        .inspect_agent_with_attribution(uid, max_contributors),
-                );
+                let core = self.host.core();
+                let epoch = core.world().epoch();
+                let result = core
+                    .inspect_agent_with_attribution(
+                        uid,
+                        max_contributors,
+                        genome_offset,
+                        include_genome,
+                    )
+                    .map(|detail| (epoch, detail));
+                let _ = reply.send(result);
             }
             IngressMessage::DebugAgents { query, reply } => {
                 let _ = reply.send(Ok(self.host.core().world().agent_debug_view(query)));
@@ -1456,31 +1671,14 @@ impl ChannelHostDriver {
                 let _ = reply.send(result);
             }
             IngressMessage::WorldDigests { reply } => {
-                let world = self.host.core().world();
-                let result = world
-                    .characterization_digest_v0()
-                    .and_then(|physical| {
-                        world
-                            .world_digest_v1()
-                            .map(|scientific| (physical, scientific))
-                    })
-                    .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
-                let _ = reply.send(result);
+                self.process_world_digests(&reply);
             }
             IngressMessage::CaptureCheckpoint { reply } => self.capture_or_park(reply),
             IngressMessage::CaptureHostCheckpoint { request } => {
                 self.accept_host_capture(request);
             }
             IngressMessage::Command { envelope, reply } => {
-                let result = self.host.submit(envelope);
-                if let Ok(status) = &result
-                    && let Ok(mut board) = self.statuses.write()
-                {
-                    board.insert(status.clone(), self.status_board_capacity);
-                }
-                // A client that timed out is unreachable; the admission
-                // remains authoritative and mirrored either way.
-                let _ = reply.send(result);
+                self.process_command(envelope, &reply);
             }
             IngressMessage::CommandStatus { command_id, reply } => {
                 let result = self.port.command_status(command_id);
@@ -1494,6 +1692,37 @@ impl ChannelHostDriver {
             #[cfg(test)]
             IngressMessage::Wake => {}
         }
+    }
+
+    fn process_world_digests(
+        &self,
+        reply: &Sender<Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError>>,
+    ) {
+        let world = self.host.core().world();
+        let result = world
+            .characterization_digest_v0()
+            .and_then(|physical| {
+                world
+                    .world_digest_v1()
+                    .map(|scientific| (physical, scientific))
+            })
+            .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
+        let _ = reply.send(result);
+    }
+
+    fn process_command(
+        &mut self,
+        envelope: CommandEnvelope,
+        reply: &Sender<Result<CommandStatus, HostAccessError>>,
+    ) {
+        let result = self.host.submit(envelope);
+        if let Ok(status) = &result
+            && let Ok(mut board) = self.statuses.write()
+        {
+            board.insert(status.clone(), self.status_board_capacity);
+        }
+        // A client that timed out is unreachable; the admission remains authoritative.
+        let _ = reply.send(result);
     }
 
     fn drain_ingress(&mut self) {
@@ -1906,6 +2135,58 @@ mod tests {
     }
 
     #[test]
+    fn expired_inspection_is_a_timeout_not_a_protocol_violation() {
+        let (mut driver, port) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("inspection transport");
+        let (reply, result) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::AgentInspection {
+            uid: AgentUid(1),
+            max_contributors: None,
+            genome_offset: 0,
+            include_genome: true,
+            expires_at: Instant::now(),
+            reply,
+        });
+        assert!(matches!(
+            result.recv().unwrap(),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            port.inspect_agent(AgentUid(1), MAX_INSPECTOR_CONTRIBUTORS + 1),
+            Err(HostAccessError::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
+            port.inspect_agent_for_hud_before(AgentUid(1), Instant::now()),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        for invalid in [1, usize::MAX] {
+            assert!(matches!(
+                port.inspect_agent_for_hud_page_before(
+                    AgentUid(1),
+                    invalid,
+                    Instant::now() + Duration::from_secs(1)
+                ),
+                Err(HostAccessError::ProtocolViolation { .. })
+            ));
+        }
+        let (_stalled_driver, stalled_port) = ChannelHostDriver::new(
+            test_host(true),
+            ChannelHostOptions {
+                ingress_capacity: 1,
+                submit_deadline: Duration::from_millis(25),
+                ..fast_options()
+            },
+        )
+        .expect("stalled inspection transport");
+        assert!(stalled_port.sender.try_send(IngressMessage::Wake).is_ok());
+        assert!(matches!(
+            stalled_port
+                .inspect_agent_for_hud_before(AgentUid(1), Instant::now() + Duration::from_secs(1)),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn owner_inspections_preserve_source_fields_and_scientific_digest() {
         let (ready, receive) = std::sync::mpsc::sync_channel(1);
@@ -1996,6 +2277,28 @@ mod tests {
         assert_eq!(hud.brain_descriptor, detail.brain_descriptor);
         assert_eq!(hud.eye_direction, detail.eye_direction);
         assert_eq!(hud.eye_fov, detail.eye_fov);
+        let basic = port
+            .inspect_agent_basic_before(uid, Instant::now() + Duration::from_secs(1))
+            .expect("bounded browser detail")
+            .expect("living browser subject");
+        assert!(basic.genome_browser.is_none());
+        assert!(basic.sensor_attribution.is_none());
+        assert_eq!(basic.source, detail.source);
+        assert_eq!(basic.epoch, snapshot.world.epoch);
+        assert_eq!(basic.physiology, detail.physiology);
+        assert_eq!(basic.sensors, detail.sensors);
+        assert_eq!(basic.outputs, detail.outputs);
+        assert_eq!(basic.health, snapshot.world.agents[0].health);
+        assert_eq!(basic.age, snapshot.world.agents[0].age);
+        assert_eq!(basic.generation, snapshot.world.agents[0].generation.0);
+        let (missing_epoch, missing) = port
+            .inspect_agent_basic_with_epoch_before(
+                AgentUid(u64::MAX),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("missing subject retains its owner source");
+        assert_eq!(missing_epoch, snapshot.world.epoch);
+        assert!(missing.is_none());
         let physiology = detail.physiology;
         assert_eq!(physiology.energy, 0.73);
         assert_eq!(physiology.food_delta, -0.12);
@@ -3534,6 +3837,8 @@ mod tests {
             }
             IngressMessage::CommandStatus { .. }
             | IngressMessage::Wake
+            | IngressMessage::GenomeInspection { .. }
+            | IngressMessage::BrainActivity { .. }
             | IngressMessage::BrainProjection { .. }
             | IngressMessage::AgentInspection { .. }
             | IngressMessage::DebugAgents { .. }
@@ -3692,10 +3997,27 @@ mod tests {
         ));
         assert!(matches!(
             port.inspect_agent_before(AgentUid(1), 0, expired),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(matches!(
             port.inspect_agent_for_hud_before(AgentUid(1), expired),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            port.inspect_brain_activity_before(AgentUid(1), expired),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            port.inspect_genome_page_before(AgentUid(1), 0, 0, expired),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            port.inspect_genome_page_before(
+                AgentUid(1),
+                1,
+                0,
+                Instant::now() + Duration::from_secs(1)
+            ),
             Err(HostAccessError::ProtocolViolation { .. })
         ));
         let request = BrainProjectionRequest::focused(
@@ -3705,7 +4027,7 @@ mod tests {
         );
         assert!(matches!(
             port.project_brain_before(&request, expired),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(matches!(
             driver.receiver.try_recv(),
@@ -3727,7 +4049,7 @@ mod tests {
         let deadline = started + Duration::from_millis(20);
         assert!(matches!(
             port.inspect_agent_before(AgentUid(1), 0, deadline),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
@@ -3738,20 +4060,174 @@ mod tests {
             IngressMessage::AgentInspection { expires_at, .. }
                 if expires_at <= deadline && expires_at <= Instant::now()
         ));
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(matches!(
+            port.inspect_agent_basic_before(AgentUid(1), deadline),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            driver.receiver.try_recv().expect("basic inspector ingress"),
+            IngressMessage::AgentInspection { include_genome: false, max_contributors: None, expires_at, .. }
+                if expires_at <= deadline && expires_at <= Instant::now()
+        ));
         let request = BrainProjectionRequest::focused(
             crate::ProjectionClientId::new(614),
             crate::ProjectionRequestRevision::new(1),
             AgentUid(1),
         );
         let started = Instant::now();
+        let deadline = started + Duration::from_millis(20);
         assert!(matches!(
-            port.project_brain_before(&request, started + Duration::from_millis(20)),
-            Err(HostAccessError::ProtocolViolation { .. })
+            port.project_brain_before(&request, deadline),
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
             driver.receiver.try_recv().expect("actual brain ingress"),
-            IngressMessage::BrainProjection { .. }
+            IngressMessage::BrainProjection { expires_at, .. }
+                if expires_at <= deadline && expires_at <= Instant::now()
+        ));
+    }
+
+    #[test]
+    fn expired_queued_brain_projection_is_discarded_before_owner_work() {
+        let (mut driver, _) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("driver");
+        let request = BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(615),
+            crate::ProjectionRequestRevision::new(1),
+            AgentUid(u64::MAX),
+        );
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::BrainProjection {
+            request: request.clone(),
+            expires_at: Instant::now(),
+            reply,
+        });
+        assert!(matches!(
+            receive.recv().expect("expired brain reply"),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::BrainProjection {
+            request,
+            expires_at: Instant::now() + Duration::from_secs(1),
+            reply,
+        });
+        assert!(receive.recv().expect("live brain reply").is_ok());
+    }
+
+    #[test]
+    fn browser_brain_activity_expiry_and_absent_epoch_come_from_owner_ingress() {
+        let (mut driver, _) = ChannelHostDriver::new(test_host(true), fast_options()).unwrap();
+        let source = driver.host.core().latest_snapshot();
+        let digest = driver.host.core().scientific_digest_v1().unwrap();
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::BrainActivity {
+            uid: AgentUid(u64::MAX),
+            expires_at: Instant::now(),
+            reply,
+        });
+        assert!(matches!(
+            receive.recv().unwrap(),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::BrainActivity {
+            uid: AgentUid(u64::MAX),
+            expires_at: Instant::now() + Duration::from_secs(1),
+            reply,
+        });
+        let detail = receive.recv().unwrap().unwrap();
+        assert_eq!(detail.source.epoch, source.world.epoch.to_string());
+        assert_eq!(
+            detail.source.session_id,
+            source.session_id.get().to_string()
+        );
+        assert!(matches!(
+            detail.outcome,
+            crate::inspector::BrainActivityOutcome::Unavailable {
+                reason: scriptbots_core::BrainInspectionUnavailable::MissingAgent,
+            }
+        ));
+        assert_eq!(driver.host.core().scientific_digest_v1().unwrap(), digest);
+    }
+
+    #[test]
+    fn browser_genome_expiry_and_absent_epoch_come_from_owner_ingress() {
+        let (mut driver, _) = ChannelHostDriver::new(test_host(true), fast_options()).unwrap();
+        let source = driver.host.core().latest_snapshot();
+        let digest = driver.host.core().scientific_digest_v1().unwrap();
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::GenomeInspection {
+            uid: AgentUid(u64::MAX),
+            locus_offset: 0,
+            delta_offset: 0,
+            expires_at: Instant::now(),
+            reply,
+        });
+        assert!(matches!(
+            receive.recv().unwrap(),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        let (reply, receive) = std::sync::mpsc::channel();
+        driver.process_ingress(IngressMessage::GenomeInspection {
+            uid: AgentUid(u64::MAX),
+            locus_offset: 0,
+            delta_offset: 0,
+            expires_at: Instant::now() + Duration::from_secs(1),
+            reply,
+        });
+        let detail = receive.recv().unwrap().unwrap();
+        assert_eq!(detail.uid, u64::MAX.to_string());
+        assert_eq!(detail.source.epoch, source.world.epoch.to_string());
+        assert_eq!(
+            detail.source.session_id,
+            source.session_id.get().to_string()
+        );
+        assert!(matches!(
+            detail.outcome,
+            crate::inspector::GenomeInspectionOutcome::Unavailable {
+                reason: crate::inspector::GenomeInspectionUnavailable::MissingAgent
+            }
+        ));
+        assert_eq!(driver.host.core().scientific_digest_v1().unwrap(), digest);
+        assert_eq!(
+            driver.host.core().latest_snapshot().revision,
+            source.revision
+        );
+    }
+
+    #[test]
+    fn retained_brain_acknowledgement_survives_caller_deadline() {
+        let (mut driver, port) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("driver");
+        let request = BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(616),
+            crate::ProjectionRequestRevision::new(1),
+            AgentUid(u64::MAX),
+        );
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let receiver = port
+            .begin_brain_projection_before(&request, deadline)
+            .expect("request enqueued");
+        while Instant::now() < deadline {
+            std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let queued = driver.receiver.try_recv().expect("one request queued");
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        driver.process_ingress(queued);
+        assert!(matches!(
+            receiver.recv().expect("owner acknowledgement"),
+            Err(HostAccessError::OwnerReadTimeout)
         ));
     }
 
@@ -3763,23 +4239,26 @@ mod tests {
         driver.process_ingress(IngressMessage::AgentInspection {
             uid: AgentUid(u64::MAX),
             max_contributors: Some(0),
+            genome_offset: 0,
+            include_genome: true,
             expires_at: Instant::now(),
             reply,
         });
         assert!(matches!(
             receive.recv().expect("expired reply"),
-            Err(HostAccessError::ProtocolViolation { message })
-                if message.contains("elapsed in ingress")
+            Err(HostAccessError::OwnerReadTimeout)
         ));
 
         let (reply, receive) = std::sync::mpsc::channel();
         driver.process_ingress(IngressMessage::AgentInspection {
             uid: AgentUid(u64::MAX),
             max_contributors: Some(0),
+            genome_offset: 0,
+            include_genome: true,
             expires_at: Instant::now() + Duration::from_secs(1),
             reply,
         });
-        assert!(matches!(receive.recv().expect("live reply"), Ok(None)));
+        assert!(matches!(receive.recv().expect("live reply"), Ok((0, None))));
     }
 
     #[test]
@@ -3795,7 +4274,7 @@ mod tests {
         }
         assert!(matches!(
             bounded.inspect_agent(AgentUid(1), 0),
-            Err(HostAccessError::ProtocolViolation { .. })
+            Err(HostAccessError::OwnerReadTimeout)
         ));
         assert!(matches!(
             driver.receiver.try_recv(),
@@ -3837,6 +4316,8 @@ mod tests {
             }
             IngressMessage::Command { .. }
             | IngressMessage::Wake
+            | IngressMessage::GenomeInspection { .. }
+            | IngressMessage::BrainActivity { .. }
             | IngressMessage::BrainProjection { .. }
             | IngressMessage::AgentInspection { .. }
             | IngressMessage::DebugAgents { .. }

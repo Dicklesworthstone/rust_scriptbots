@@ -16,9 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use scriptbots_brain::mlp::{MlpBrain, MlpBrainFamily};
 use scriptbots_core::genome_browser::{GenomeBrowserViewModel, MutationDiffStatus};
-use scriptbots_core::genome_diff::{
-    Locus, LocusValue, export_locus_trace_csv, export_locus_trace_png,
-};
+use scriptbots_core::genome_diff::{Locus, export_locus_trace_csv, export_locus_trace_png};
 use scriptbots_core::{
     AgentData, AgentId, AgentUid, BrainFamilyCodec, ScriptBotsConfig, WorldState,
 };
@@ -201,20 +199,20 @@ fn test_genome_browser_e2e_seeded_multigen_db_backed() -> Result<(), Box<dyn std
             let loc = Locus::NodeBias(node.node_index);
             let raw_val = decoded_loci.iter().find(|(l, _)| *l == loc).map(|(_, v)| v);
             assert_eq!(
-                raw_val,
-                Some(&LocusValue::Scalar(bias)),
+                raw_val.and_then(|value| value.scalar()),
+                Some(bias),
                 "Displayed node bias must match raw stored genome"
             );
         }
         for conn in &node.connections {
             let loc = Locus::NodeWeight {
                 node: node.node_index,
-                conn: conn.conn_slot,
+                conn: u8::try_from(conn.conn_slot).expect("legacy connection slot fits u8"),
             };
             let raw_val = decoded_loci.iter().find(|(l, _)| *l == loc).map(|(_, v)| v);
             assert_eq!(
-                raw_val,
-                Some(&LocusValue::Scalar(conn.weight)),
+                raw_val.and_then(|value| value.scalar()),
+                Some(conn.weight),
                 "Displayed connection weight must match raw stored genome"
             );
         }

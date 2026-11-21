@@ -502,8 +502,12 @@ fn assert_materialized_rolling_summary(
     }
 }
 
-/// Materialized JSONL inputs provide a small-fixture aggregation/order oracle.
-/// The multi-page export test checks traversal against independent SQL loaders.
+/// The former JSONL + whole-table strategy is a deliberately independent,
+/// small-fixture oracle for paging, group order, and floating-point operations.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the independent whole-table summary oracle asserts paging, group order, rolling               metrics, lineage, and markdown rendering in one place so it stays a single coherent               cross-check of the production summary"
+)]
 fn assert_summary_matches_materialized(
     reader: &StorageReader,
     epoch_size: u64,
@@ -627,14 +631,20 @@ fn read_columnar_pages(path: &Path, format: AnalyticsExportFormat) -> Vec<Record
                     "Parquet writer must not retain a whole-table row group"
                 );
             }
-            let schema = builder.schema().clone();
+            // arrow-rs strips schema-level metadata from DECODED Parquet batches, but the file's
+            // own schema (from the footer's ARROW:schema) still carries it. Rebuild each page against
+            // the reader's file schema so the test reads the file's preserved provenance -- never an
+            // injected/expected schema.
+            let file_schema = builder.schema().clone();
             builder
                 .with_batch_size(EXPORT_PAGE_ROWS)
                 .build()
                 .unwrap()
-                .map(|batch| batch.and_then(|batch| batch.with_schema(schema.clone())))
-                .collect::<Result<_, _>>()
-                .unwrap()
+                .map(|page| {
+                    RecordBatch::try_new(file_schema.clone(), page.unwrap().columns().to_vec())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
         }
         AnalyticsExportFormat::Arrow => {
             ArrowFileReader::try_new(fs::File::open(path).unwrap(), None)

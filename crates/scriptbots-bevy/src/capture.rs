@@ -127,6 +127,11 @@ pub struct CaptureProvenance {
     /// evidence of anything (bd-2z0.14.3.4).
     #[serde(default)]
     pub world_digest: Option<String>,
+    /// Explicit pose interpolation between two supplied science cuts. Such a
+    /// frame is not itself a scientific state: `world_digest` is absent and
+    /// both actual endpoint identities live here. Other cues use the later cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpolation: Option<CaptureInterpolation>,
     /// Scene name from the manifest.
     pub scene: String,
     /// World RNG seed.
@@ -194,6 +199,24 @@ pub struct CaptureProvenance {
     pub lock_digest: Option<String>,
     /// Whether the alarm-test corruption mode was active.
     pub corrupt: bool,
+}
+
+/// Reproducible presentation inputs; this does not certify that independently
+/// supplied worlds belong to one verified replay or host session.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureInterpolation {
+    /// Versioned presentation rule, distinct from the scientific schema.
+    pub schema: String,
+    /// Earlier completed tick.
+    pub previous_tick: u64,
+    /// Later completed tick whose population, terrain and state cues are shown.
+    pub current_tick: u64,
+    /// Finite interpolation fraction in `[0, 1]`; never extrapolated.
+    pub alpha: f32,
+    /// Exact earlier scientific-state digest.
+    pub previous_world_digest: String,
+    /// Exact later scientific-state digest.
+    pub current_world_digest: String,
 }
 
 /// One captured frame with its provenance.
@@ -807,7 +830,7 @@ fn apply_capture_corruption(
     registry: Res<TerrainChunkRegistry>,
     originals: Query<&CaptureMaterialBeforeCorruption>,
     mut commands: Commands,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<crate::TerrainMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut cached_texture: Local<Option<Handle<Image>>>,
 ) {
@@ -844,6 +867,7 @@ fn apply_capture_corruption(
         let Some(material) = materials.get_mut(&chunk.material) else {
             continue;
         };
+        let material = &mut material.base;
         if let Some(texture) = &texture {
             if originals.get(chunk.entity).is_err() {
                 commands
@@ -1004,6 +1028,7 @@ impl<'a> OffscreenCapture<'a> {
             seed,
             tick,
             world_digest,
+            interpolation: None,
             frontend: "bevy_offscreen".to_string(),
             adapter_name: self.adapter_name.clone(),
             backend: self.backend.clone(),
@@ -1065,7 +1090,7 @@ impl<'a> OffscreenCapture<'a> {
         seed: u64,
         tick: u64,
     ) -> Result<CapturedFrame> {
-        let mut snapshot = WorldSnapshot::from_world(world)
+        let snapshot = WorldSnapshot::from_world(world)
             .ok_or_else(|| anyhow!("world snapshot unavailable at tick {tick}"))?;
         validate_capture_tick(snapshot.tick, tick)?;
         validate_capture_seed(world.agent_substream_protocol_v1().root_seed(), seed)?;
@@ -1081,15 +1106,79 @@ impl<'a> OffscreenCapture<'a> {
                 None
             }
         };
+        self.render_snapshot(snapshot, scene, seed, tick, world_digest, None)
+    }
+
+    /// Render a deterministic pose sample between two observed worlds.
+    ///
+    /// This uses the interactive renderer's stable-UID, shortest-torus and
+    /// discontinuity rules. Terrain, births/deaths and non-positional cues are
+    /// taken from `current`; no scientific state is synthesized or advanced.
+    /// Reduced motion and discontinuous agent paths use the current endpoint.
+    /// The frame records both endpoint digests and the explicit fraction,
+    /// rather than labeling an interpolated image as either endpoint state.
+    ///
+    /// # Errors
+    /// Refuses non-finite/out-of-range fractions, unordered ticks, changed
+    /// seed/configuration/epoch or unavailable scientific identities, as well
+    /// as normal renderer failures.
+    pub fn render_interpolated(
+        &mut self,
+        previous: &WorldState,
+        current: &WorldState,
+        scene: &str,
+        seed: u64,
+        alpha: f32,
+    ) -> Result<CapturedFrame> {
+        let (snapshot, interpolation) =
+            prepare_interpolated_capture(previous, current, seed, alpha)?;
+        self.render_snapshot(
+            snapshot,
+            scene,
+            seed,
+            current.tick().0,
+            None,
+            Some(interpolation),
+        )
+    }
+
+    fn render_snapshot(
+        &mut self,
+        mut snapshot: WorldSnapshot,
+        scene: &str,
+        seed: u64,
+        tick: u64,
+        world_digest: Option<String>,
+        interpolation: Option<CaptureInterpolation>,
+    ) -> Result<CapturedFrame> {
         snapshot.revision = self.next_snapshot_revision;
         self.next_snapshot_revision = self
             .next_snapshot_revision
             .checked_add(1)
             .ok_or_else(|| anyhow!("offscreen capture snapshot revision overflow"))?;
-        self.app.world_mut().resource_mut::<SnapshotState>().latest = Some(snapshot);
+        self.app
+            .world_mut()
+            .resource_mut::<SnapshotState>()
+            .install_snapshot(snapshot);
         self.set_camera_active(true);
         // Frame 1: sync_world applies the snapshot; pipelines compile.
         self.app.update();
+        if let Some(error) = self
+            .app
+            .world()
+            .resource::<crate::AppearanceTable>()
+            .error()
+        {
+            return Err(anyhow!("capture creature appearance failed: {error}"));
+        }
+        if let Some(error) = self
+            .app
+            .world()
+            .resource::<crate::particle_render::ParticleScene>()
+            .error()
+        {
+            return Err(anyhow!("capture visual-event particles failed: {error}"));
+        }
         // Frame 2: draw after scene synchronization. Pipeline compilation is
         // synchronous in this offscreen app; a fixed frame count alone cannot
         // establish that asynchronous compiler tasks finished.
@@ -1206,7 +1295,7 @@ impl<'a> OffscreenCapture<'a> {
         // `Readback` component's completion depends on extraction/plugin
         // wiring, while this path drives the copy, submission, and device
         // poll directly and fails loudly at each step.
-        let data = self.readback_target();
+        let data = ensure_capture_pipelines(self.app).and_then(|()| self.readback_target());
         self.set_camera_active(false);
         let data = data?;
         let (width, height) = self.viewport;
@@ -1221,11 +1310,13 @@ impl<'a> OffscreenCapture<'a> {
         if rgba8_is_visually_blank(&rgba8) {
             return Err(blank_frame_error(self.effective.gpu.as_ref()));
         }
+        let mut provenance = self.provenance(scene, seed, tick, world_digest);
+        provenance.interpolation = interpolation;
         Ok(CapturedFrame {
             width,
             height,
             rgba8,
-            provenance: self.provenance(scene, seed, tick, world_digest),
+            provenance,
         })
     }
 
@@ -1309,6 +1400,72 @@ impl<'a> OffscreenCapture<'a> {
     }
 }
 
+fn prepare_interpolated_capture(
+    previous: &WorldState,
+    current: &WorldState,
+    seed: u64,
+    alpha: f32,
+) -> Result<(WorldSnapshot, CaptureInterpolation)> {
+    if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+        return Err(anyhow!(
+            "capture interpolation alpha must be finite and in [0, 1]"
+        ));
+    }
+    validate_capture_seed(previous.agent_substream_protocol_v1().root_seed(), seed)?;
+    validate_capture_seed(current.agent_substream_protocol_v1().root_seed(), seed)?;
+    let ticks = current
+        .tick()
+        .0
+        .checked_sub(previous.tick().0)
+        .filter(|ticks| *ticks > 0)
+        .ok_or_else(|| anyhow!("capture interpolation requires increasing completed ticks"))?;
+    if previous.epoch() != current.epoch() || previous.config() != current.config() {
+        return Err(anyhow!(
+            "capture interpolation refuses changed epoch or configuration"
+        ));
+    }
+    let previous_digest = previous.world_digest_v1()?.overall;
+    let current_digest = current.world_digest_v1()?.overall;
+    let previous_snapshot = WorldSnapshot::from_world(previous)
+        .ok_or_else(|| anyhow!("previous capture snapshot unavailable"))?;
+    let mut snapshot = WorldSnapshot::from_world(current)
+        .ok_or_else(|| anyhow!("current capture snapshot unavailable"))?;
+    let previous_poses: std::collections::HashMap<_, _> = previous_snapshot
+        .agents
+        .iter()
+        .map(|agent| (agent.uid, crate::MotionPose::from(agent)))
+        .collect();
+    if !snapshot.reduced_motion {
+        for agent in &mut snapshot.agents {
+            let Some(previous) = previous_poses.get(&agent.uid) else {
+                continue;
+            };
+            let pose = crate::interpolate_motion_pose(
+                *previous,
+                crate::MotionPose::from(&*agent),
+                snapshot.world_size,
+                snapshot.agent_radius,
+                ticks,
+                alpha,
+            );
+            agent.position = pose.position;
+            agent.heading = pose.heading;
+            agent.spike_length = pose.spike_length;
+        }
+    }
+    Ok((
+        snapshot,
+        CaptureInterpolation {
+            schema: "scriptbots.pose-interpolation.v1".to_owned(),
+            previous_tick: previous.tick().0,
+            current_tick: current.tick().0,
+            alpha,
+            previous_world_digest: previous_digest,
+            current_world_digest: current_digest,
+        },
+    ))
+}
+
 fn validate_capture_tick(snapshot_tick: u64, requested_tick: u64) -> Result<()> {
     if snapshot_tick != requested_tick {
         return Err(anyhow!(
@@ -1376,6 +1533,9 @@ fn build_capture_app(config: &OffscreenCaptureConfig) -> Result<App> {
                 }),
         ),
     )
+    .add_plugins(crate::TerrainMaterialPlugin)
+    .add_plugins(crate::AppearancePlugin)
+    .add_plugins(crate::particle_render::ParticleRenderPlugin)
     .add_systems(
         Startup,
         (setup_capture_rig, setup_capture_resources).chain(),
@@ -1411,9 +1571,14 @@ fn add_capture_scene_systems(app: &mut App) {
         Update,
         (
             sync_world,
+            crate::sync_far_terrain_color,
+            crate::apply_daynight_lighting,
+            crate::apply_tier_to_fog,
+            crate::conform_selection_ring,
             // Captures use the snapshot pose directly, but the wheel
             // suspension must still match the interactive scene.
             crate::conform_agent_wheels,
+            crate::conform_wheel_joints,
             crate::apply_tier_to_reflection_probes,
             crate::apply_tier_to_terrain_detail,
             apply_capture_corruption,
@@ -1619,6 +1784,44 @@ fn resolve_capture_quality(
     Ok((effective, actual_device_type))
 }
 
+fn terminal_pipeline_error(error: &bevy::shader::PipelineCacheError) -> bool {
+    matches!(
+        error,
+        bevy::shader::PipelineCacheError::ProcessShaderError(_)
+            | bevy::shader::PipelineCacheError::CreateShaderModule(_)
+    )
+}
+
+/// Refuse a partially drawn image when a render or compute shader is broken.
+/// Not-yet-loaded shader imports are transient and are handled by Bevy's retry.
+fn ensure_capture_pipelines(app: &mut App) -> Result<()> {
+    use bevy::render::render_resource::{CachedPipelineState, PipelineCache, PipelineDescriptor};
+    let render = app
+        .get_sub_app_mut(RenderApp)
+        .ok_or_else(|| anyhow!("capture render sub-app unavailable while checking pipelines"))?;
+    let cache = render
+        .world()
+        .get_resource::<PipelineCache>()
+        .ok_or_else(|| anyhow!("capture pipeline cache unavailable"))?;
+    for pipeline in cache.pipelines() {
+        if let CachedPipelineState::Err(error) = &pipeline.state
+            && terminal_pipeline_error(error)
+        {
+            let label = match &pipeline.descriptor {
+                PipelineDescriptor::RenderPipelineDescriptor(descriptor) => {
+                    descriptor.label.as_deref()
+                }
+                PipelineDescriptor::ComputePipelineDescriptor(descriptor) => {
+                    descriptor.label.as_deref()
+                }
+            }
+            .unwrap_or("unlabeled pipeline");
+            return Err(anyhow!("capture GPU pipeline {label} failed: {error}"));
+        }
+    }
+    Ok(())
+}
+
 fn warmup_capture_app(app: &mut App, effective: crate::EffectiveRenderSettings) {
     app.insert_resource(effective);
     app.update();
@@ -1635,6 +1838,7 @@ fn configure_session<'a>(
     reset_capture_scene(app.world_mut());
     app.insert_resource(CaptureCorrupt(config.corrupt));
     app.insert_resource(effective.clone());
+    configure_capture_palette(app.world_mut(), &config.render_settings);
     configure_capture_camera_effects(
         app.world_mut(),
         &config.render_settings,
@@ -1687,6 +1891,10 @@ fn configure_session<'a>(
     })
 }
 
+fn configure_capture_palette(world: &mut World, settings: &RenderSettings) {
+    world.insert_resource(AccessibilityState::from_render_settings(settings));
+}
+
 fn reset_capture_scene(world: &mut World) {
     // Keep the camera, sun and plugin-owned entities. Removing those would
     // prevent ViewTargets from being prepared and return initial-fill pixels.
@@ -1709,6 +1917,12 @@ fn reset_capture_scene(world: &mut World) {
     }
     *world.resource_mut::<SnapshotState>() = SnapshotState::default();
     *world.resource_mut::<AgentRegistry>() = AgentRegistry::default();
+    if let Some(mut appearance) = world.get_resource_mut::<crate::AppearanceTable>() {
+        appearance.reset();
+    }
+    if let Some(mut particles) = world.get_resource_mut::<crate::particle_render::ParticleScene>() {
+        particles.reset();
+    }
 }
 
 fn configure_capture_rig(world: &mut World, target: &Handle<Image>, shadows: bool) {
@@ -1787,7 +2001,16 @@ fn configure_capture_ssao(world: &mut World, requested: bool) {
 /// The app-lifetime rig: HDR capture camera + sun. Spawned once in Startup
 /// (see [`build_capture_app`] for the pre-finish requirement). The camera
 /// starts inactive; sessions toggle it around readbacks.
-fn setup_capture_rig(mut commands: Commands, target: Res<CaptureTarget>) {
+fn setup_capture_rig(
+    mut commands: Commands,
+    target: Res<CaptureTarget>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let sky_image = images.add(crate::sky_backdrop_image());
+    commands.insert_resource(crate::SkyBackdrop {
+        image: sky_image.clone(),
+        daylight_step: 255,
+    });
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -1804,6 +2027,8 @@ fn setup_capture_rig(mut commands: Commands, target: Res<CaptureTarget>) {
         bevy::render::view::ColorGrading::default(),
         bevy::render::view::Hdr,
         CaptureCamera,
+        crate::WorldLightingCamera,
+        crate::sky_backdrop_camera(sky_image),
     ));
 
     let light_transform =
@@ -1814,6 +2039,7 @@ fn setup_capture_rig(mut commands: Commands, target: Res<CaptureTarget>) {
             shadows_enabled: true,
             ..default()
         },
+        crate::TierDrivenSunLight,
         light_transform,
         GlobalTransform::default(),
         Visibility::default(),
@@ -1832,14 +2058,17 @@ fn setup_capture_resources(
     commands.insert_resource(AgentMeshes {
         base_radius: 1.0,
         body: meshes.add(Mesh::from(crate::AGENT_BODY_CAPSULE)),
+        stripe: meshes.add(crate::creature_stripe_mesh()),
+        mouth: meshes.add(crate::creature_mouth_mesh()),
         wheel: meshes.add(Mesh::from(Torus::new(0.3, 0.6))),
+        joint: meshes.add(crate::creature_joint_mesh()),
         spike: meshes.add(Mesh::from(Cone {
             radius: 0.45,
             height: 1.0,
         })),
         sphere: meshes.add(Mesh::from(Sphere::new(0.5))),
         quad: meshes.add(Mesh::from(Rectangle::new(1.0, 1.0))),
-        ring: meshes.add(Mesh::from(Torus::new(0.7, 1.0))),
+        ring: meshes.add(crate::selection_ring_mesh()),
     });
     commands.insert_resource(TerrainChunkRegistry {
         chunk_size: crate::TERRAIN_CHUNK_SIZE,
@@ -1852,6 +2081,99 @@ fn setup_capture_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn interpolation_world(ticks: u32, x: f32, heading: f32, spike: f32) -> WorldState {
+        use scriptbots_core::{AgentData, Position, ScriptBotsConfig, Velocity};
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 256,
+            world_height: 256,
+            food_cell_size: 32,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            ..default()
+        })
+        .unwrap();
+        let id = world.try_inject_agent(AgentData::default()).unwrap();
+        for _ in 0..ticks {
+            world.step().unwrap();
+        }
+        assert!(
+            world
+                .try_update_agent(id, |data, _| {
+                    data.position = Position { x, y: 128.0 };
+                    data.velocity = Velocity { vx: 20.0, vy: 0.0 };
+                    data.heading = heading;
+                    data.spike_length = spike;
+                })
+                .unwrap()
+        );
+        world
+    }
+
+    #[test]
+    fn explicit_capture_fraction_has_exact_endpoints_and_never_changes_either_source() {
+        let previous = interpolation_world(0, 250.0, 350.0_f32.to_radians(), 0.0);
+        let current = interpolation_world(1, 6.0, 10.0_f32.to_radians(), 4.0);
+        let previous_digest = previous.world_digest_v1().unwrap().overall;
+        let current_digest = current.world_digest_v1().unwrap().overall;
+        let previous_snapshot = WorldSnapshot::from_world(&previous).unwrap();
+        let current_snapshot = WorldSnapshot::from_world(&current).unwrap();
+        let mut midpoint = None;
+        for alpha in [0.0, 0.25, 0.5, 1.0, 0.5] {
+            let (snapshot, provenance) =
+                prepare_interpolated_capture(&previous, &current, 42, alpha).unwrap();
+            assert_eq!(snapshot.tick, current.tick().0);
+            assert_eq!(snapshot.agents.len(), current_snapshot.agents.len());
+            let agent = &snapshot.agents[0];
+            assert_eq!(agent.uid, current_snapshot.agents[0].uid);
+            assert_eq!(
+                agent.position,
+                Vec2::new((250.0 + 12.0 * alpha).rem_euclid(256.0), 128.0)
+            );
+            assert_eq!(agent.spike_length, 4.0 * alpha);
+            assert_eq!(agent.health, current_snapshot.agents[0].health);
+            if alpha <= 0.0 {
+                assert_eq!(agent.position, previous_snapshot.agents[0].position);
+                assert_eq!(agent.heading, previous_snapshot.agents[0].heading);
+            } else if alpha >= 1.0 {
+                assert!(snapshot.agents == current_snapshot.agents);
+            } else if (alpha - 0.5).abs() < f32::EPSILON {
+                assert!(Quat::from_rotation_y(agent.heading).angle_between(Quat::IDENTITY) < 0.001);
+                if let Some(ref first_midpoint) = midpoint {
+                    assert!(&snapshot.agents == first_midpoint);
+                } else {
+                    midpoint = Some(snapshot.agents.clone());
+                }
+            }
+            assert_eq!(provenance.previous_tick, 0);
+            assert_eq!(provenance.current_tick, 1);
+            assert_eq!(provenance.alpha, alpha);
+            assert_eq!(provenance.previous_world_digest, previous_digest);
+            assert_eq!(provenance.current_world_digest, current_digest);
+            // The digest includes RNG and all scientific domains; projection
+            // must not step either source, including endpoint captures.
+            assert_eq!(previous.world_digest_v1().unwrap().overall, previous_digest);
+            assert_eq!(current.world_digest_v1().unwrap().overall, current_digest);
+        }
+    }
+
+    #[test]
+    fn explicit_capture_fraction_rejects_unbounded_or_mislabeled_sources() {
+        let previous = interpolation_world(0, 250.0, 0.0, 0.0);
+        let current = interpolation_world(1, 6.0, 0.0, 4.0);
+        for alpha in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
+            assert!(prepare_interpolated_capture(&previous, &current, 42, alpha).is_err());
+        }
+        assert!(prepare_interpolated_capture(&previous, &current, 43, 0.5).is_err());
+        assert!(prepare_interpolated_capture(&current, &previous, 42, 0.5).is_err());
+        assert!(prepare_interpolated_capture(&current, &current, 42, 0.5).is_err());
+        let mut config = current.config().clone();
+        config.world_width = 512;
+        let other_config = WorldState::new(config).unwrap();
+        assert!(prepare_interpolated_capture(&other_config, &current, 42, 0.5).is_err());
+    }
 
     fn corruption_app(corrupt: bool) -> App {
         let mut app = App::new();
@@ -1876,6 +2198,7 @@ mod tests {
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<Image>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(Assets::<crate::TerrainMaterial>::default());
         app.insert_resource(AmbientLight::default());
         app.insert_resource(CaptureTarget(Handle::default()));
         app.insert_resource(CaptureCorrupt(corrupt));
@@ -1889,6 +2212,277 @@ mod tests {
         warmup_capture_app(&mut app, effective);
         configure_capture_rig(app.world_mut(), &Handle::default(), false);
         app
+    }
+
+    #[test]
+    fn capture_uses_the_same_selection_ring_mesh_as_live_rendering() {
+        let app = corruption_app(false);
+        let handle = &app.world().resource::<AgentMeshes>().ring;
+        let actual = app.world().resource::<Assets<Mesh>>().get(handle).unwrap();
+        let expected = crate::selection_ring_mesh();
+        assert_eq!(
+            actual.attribute(Mesh::ATTRIBUTE_POSITION),
+            expected.attribute(Mesh::ATTRIBUTE_POSITION)
+        );
+        assert_eq!(
+            actual.attribute(Mesh::ATTRIBUTE_COLOR),
+            expected.attribute(Mesh::ATTRIBUTE_COLOR)
+        );
+        assert_eq!(actual.indices(), expected.indices());
+        let Some(bevy_mesh::VertexAttributeValues::Float32x3(points)) =
+            actual.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("selection ring positions missing")
+        };
+        assert_eq!(points.len(), 390);
+    }
+
+    #[test]
+    fn capture_camera_uses_the_daylight_sky_backdrop() {
+        let mut app = corruption_app(false);
+        let world = app.world_mut();
+        let skybox = world
+            .query_filtered::<&bevy::core_pipeline::Skybox, With<CaptureCamera>>()
+            .single(world)
+            .expect("capture camera has a sky backdrop");
+        assert_eq!(skybox.image, world.resource::<crate::SkyBackdrop>().image);
+        assert!(
+            world
+                .resource::<Assets<Image>>()
+                .get(&skybox.image)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn capture_shared_appearance_reset_reuses_storage_and_invalidates_old_slots() {
+        let mut app = corruption_app(false);
+        app.init_resource::<crate::AppearanceTable>()
+            .init_resource::<Assets<crate::AppearanceMaterial>>()
+            .init_resource::<Assets<bevy::render::storage::ShaderStorageBuffer>>();
+        let mut previous_slot: Option<crate::appearance::AppearanceSlot> = None;
+        let mut material = None;
+        for _ in 0..3 {
+            reset_capture_scene(app.world_mut());
+            app.world_mut()
+                .run_system_once(setup_capture_resources)
+                .unwrap();
+            let mut snapshot = crate::terrain_tests::sample_world_snapshot();
+            snapshot
+                .agents
+                .push(crate::terrain_tests::sample_agent_visual());
+            app.world_mut().resource_mut::<SnapshotState>().latest = Some(snapshot);
+            app.update();
+            let table = app.world().resource::<crate::AppearanceTable>();
+            assert!(table.error().is_none());
+            let record =
+                &app.world().resource::<AgentRegistry>().records[&scriptbots_core::AgentUid(1)];
+            let appearance = record.body.appearance.as_ref().unwrap();
+            if let Some(previous) = previous_slot {
+                assert_ne!(
+                    appearance.slot, previous,
+                    "a new capture must invalidate old slot ownership"
+                );
+                assert_eq!(appearance.slot.index, previous.index);
+            }
+            if let Some(ref previous) = material {
+                assert_eq!(&appearance.material, previous);
+            }
+            previous_slot = Some(appearance.slot);
+            material = Some(appearance.material.clone());
+            assert_eq!(
+                app.world()
+                    .resource::<Assets<crate::AppearanceMaterial>>()
+                    .len(),
+                4
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<Assets<bevy::render::storage::ShaderStorageBuffer>>()
+                    .len(),
+                1
+            );
+            assert_eq!(app.world().resource::<Assets<StandardMaterial>>().len(), 0);
+        }
+    }
+
+    #[test]
+    fn capture_pipeline_error_classifier_keeps_retryable_imports_distinct() {
+        use bevy::shader::PipelineCacheError;
+        assert!(!terminal_pipeline_error(
+            &PipelineCacheError::ShaderImportNotYetAvailable
+        ));
+        assert!(terminal_pipeline_error(
+            &PipelineCacheError::CreateShaderModule("invalid shader".to_string())
+        ));
+    }
+
+    #[test]
+    fn capture_pipeline_check_fails_closed_without_render_subapp() {
+        let mut app = App::new();
+        let error =
+            ensure_capture_pipelines(&mut app).expect_err("missing renderer must be reported");
+        assert!(error.to_string().contains("render sub-app unavailable"));
+    }
+
+    #[test]
+    fn capture_uses_the_shared_daynight_lighting_system() {
+        let mut app = corruption_app(false);
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.day_night_active = true;
+            snapshot.night_ambient = 0.2;
+            snapshot.terrain_height.daylight = scriptbots_core::visual::DAYLIGHT_NIGHT_FLOOR;
+        }
+        app.update();
+        assert!((app.world().resource::<AmbientLight>().brightness - 160.0).abs() < 1e-4);
+        let world = app.world_mut();
+        let mut lights =
+            world.query_filtered::<&DirectionalLight, With<crate::TierDrivenSunLight>>();
+        assert_eq!(lights.single(world).unwrap().illuminance, 9000.0 * 0.18);
+        let mut cameras = world.query_filtered::<&Camera, With<crate::WorldLightingCamera>>();
+        assert!(
+            matches!(cameras.single(world).unwrap().clear_color, ClearColorConfig::Custom(color) if color != crate::terrain_sky_color())
+        );
+    }
+
+    #[test]
+    fn capture_synchronizes_far_terrain_color_and_respects_palette() {
+        let mut app = corruption_app(false);
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.terrain_height.daylight = 1.0;
+        }
+        app.update();
+        let canonical_pixels = |snapshot: &WorldSnapshot| {
+            crate::far_terrain_color_image(&snapshot.terrain_height)
+                .expect("supported terrain image")
+                .data
+                .expect("terrain image pixels")
+        };
+        let check_materials = |app: &App, enabled: bool| {
+            let world = app.world();
+            let registry = world.resource::<TerrainChunkRegistry>();
+            let materials = world.resource::<Assets<crate::TerrainMaterial>>();
+            let images = world.resource::<Assets<Image>>();
+            let snapshot = world.resource::<SnapshotState>().latest.as_ref().unwrap();
+            let expected = enabled.then(|| {
+                crate::far_terrain_color_image(&snapshot.terrain_height)
+                    .expect("supported terrain image")
+            });
+            assert!(!registry.chunks.is_empty());
+            for chunk in registry.chunks.values() {
+                let extension = &materials.get(&chunk.material).unwrap().extension;
+                assert_eq!(
+                    extension.far_color_mapping.w,
+                    if enabled { 1.0 } else { 0.0 }
+                );
+                if enabled {
+                    let image = extension
+                        .far_color
+                        .as_ref()
+                        .expect("filtered terrain image");
+                    let image = images.get(image).expect("bound image exists");
+                    assert_eq!(image.data, expected.as_ref().unwrap().data);
+                    assert_eq!(
+                        extension.far_color_mapping.truncate(),
+                        Vec3::new(
+                            snapshot.world_size.x * 0.5,
+                            snapshot.world_size.y * 0.5,
+                            snapshot.terrain_height.cell_size.max(1) as f32,
+                        )
+                    );
+                }
+            }
+        };
+
+        check_materials(&app, true);
+        let daylight_pixels = canonical_pixels(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap(),
+        );
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.terrain_height.daylight = scriptbots_core::visual::DAYLIGHT_NIGHT_FLOOR;
+        }
+        app.update();
+        check_materials(&app, true);
+        let night_pixels = canonical_pixels(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap(),
+        );
+        assert_ne!(
+            daylight_pixels, night_pixels,
+            "daylight must change this fixture"
+        );
+        app.world_mut().resource_mut::<AccessibilityState>().cycle();
+        app.update();
+        check_materials(&app, false);
+        for _ in 0..4 {
+            app.world_mut().resource_mut::<AccessibilityState>().cycle();
+        }
+        app.update();
+        check_materials(&app, true);
+
+        let mut snapshot = app
+            .world()
+            .resource::<SnapshotState>()
+            .latest
+            .clone()
+            .unwrap();
+        snapshot.revision += 1;
+        snapshot
+            .terrain_height
+            .kinds
+            .fill(scriptbots_core::TerrainKind::DeepWater);
+        snapshot.terrain_height.water_depth.fill(4.0);
+        assert_ne!(
+            night_pixels,
+            canonical_pixels(&snapshot),
+            "the next capture must exercise a different terrain image"
+        );
+        reset_capture_scene(app.world_mut());
+        app.world_mut()
+            .run_system_once(setup_capture_resources)
+            .unwrap();
+        app.world_mut().resource_mut::<SnapshotState>().latest = Some(snapshot);
+        app.update();
+        check_materials(&app, true);
+    }
+
+    #[test]
+    fn capture_scene_updates_default_fog_with_its_sky() {
+        let mut app = corruption_app(false);
+        app.world_mut()
+            .resource_mut::<crate::EffectiveRenderSettings>()
+            .features
+            .fog = true;
+        {
+            let mut state = app.world_mut().resource_mut::<SnapshotState>();
+            let snapshot = state.latest.as_mut().unwrap();
+            snapshot.day_night_active = true;
+            snapshot.terrain_height.daylight = scriptbots_core::visual::DAYLIGHT_NIGHT_FLOOR;
+        }
+        app.update();
+        let world = app.world_mut();
+        let mut cameras =
+            world.query_filtered::<(&Camera, &crate::DistanceFog), With<CaptureCamera>>();
+        let (camera, fog) = cameras.single(world).unwrap();
+        assert!(
+            matches!(camera.clear_color, ClearColorConfig::Custom(color) if color == fog.color)
+        );
+        assert_ne!(fog.color, crate::terrain_sky_color());
     }
 
     #[test]
@@ -1906,7 +2500,6 @@ mod tests {
                 crate::AgentGroundFootprint {
                     radius: 10.0,
                     spike_extension: 0.0,
-                    spike: None,
                 },
                 crate::AgentDisplayPose {
                     translation: pose.translation,
@@ -1923,11 +2516,24 @@ mod tests {
             ))
             .id();
 
+        let joint = app
+            .world_mut()
+            .spawn((Transform::default(), crate::WheelSuspensionJoint { wheel }))
+            .id();
         app.update();
         let first = *app.world().get::<Transform>(wheel).unwrap();
+        let first_joint = *app.world().get::<Transform>(joint).unwrap();
+        let anchor = Vec3::new(0.0, 0.0, 6.5);
+        assert!(
+            first_joint
+                .translation
+                .distance((anchor + first.translation) * 0.5)
+                < 0.001
+        );
         assert!((first.translation.y - (-4.6 - 6.5)).abs() < 0.001);
         app.update();
         assert_eq!(*app.world().get::<Transform>(wheel).unwrap(), first);
+        assert_eq!(*app.world().get::<Transform>(joint).unwrap(), first_joint);
     }
 
     #[test]
@@ -1966,8 +2572,8 @@ mod tests {
     fn capture_corruption_binds_a_nonuniform_texture_to_real_terrain_materials() {
         let honest = corruption_app(false);
         let corrupt = corruption_app(true);
-        let honest_materials = honest.world().resource::<Assets<StandardMaterial>>();
-        let materials = corrupt.world().resource::<Assets<StandardMaterial>>();
+        let honest_materials = honest.world().resource::<Assets<crate::TerrainMaterial>>();
+        let materials = corrupt.world().resource::<Assets<crate::TerrainMaterial>>();
         let images = corrupt.world().resource::<Assets<Image>>();
         let chunks = corrupt.world().resource::<TerrainChunkRegistry>();
         assert!(
@@ -1976,9 +2582,9 @@ mod tests {
         );
         for (key, chunk) in &chunks.chunks {
             let honest_chunk = &honest.world().resource::<TerrainChunkRegistry>().chunks[key];
-            let original = honest_materials.get(&honest_chunk.material).unwrap();
+            let original = &honest_materials.get(&honest_chunk.material).unwrap().base;
             assert!(original.emissive_texture.is_none());
-            let material = materials.get(&chunk.material).unwrap();
+            let material = &materials.get(&chunk.material).unwrap().base;
             let texture = material
                 .emissive_texture
                 .as_ref()
@@ -2022,8 +2628,10 @@ mod tests {
         // Retain a genuine existing image as a preexisting emission texture,
         // so restoration must preserve Some(handle) as well as None.
         {
-            let mut materials = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
-            let material = materials.get_mut(&handles[0]).unwrap();
+            let mut materials = app
+                .world_mut()
+                .resource_mut::<Assets<crate::TerrainMaterial>>();
+            let material = &mut materials.get_mut(&handles[0]).unwrap().base;
             material.emissive_texture = material.metallic_roughness_texture.clone();
         }
         let originals: Vec<_> = handles
@@ -2031,9 +2639,10 @@ mod tests {
             .map(|handle| {
                 let material = app
                     .world()
-                    .resource::<Assets<StandardMaterial>>()
+                    .resource::<Assets<crate::TerrainMaterial>>()
                     .get(handle)
                     .unwrap();
+                let material = &material.base;
                 (material.emissive, material.emissive_texture.clone())
             })
             .collect();
@@ -2042,9 +2651,10 @@ mod tests {
         app.update();
         let texture = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<crate::TerrainMaterial>>()
             .get(&handles[0])
             .unwrap()
+            .base
             .emissive_texture
             .clone()
             .unwrap();
@@ -2057,9 +2667,10 @@ mod tests {
             for handle in &handles {
                 let material = app
                     .world()
-                    .resource::<Assets<StandardMaterial>>()
+                    .resource::<Assets<crate::TerrainMaterial>>()
                     .get(handle)
                     .unwrap();
+                let material = &material.base;
                 assert_eq!(material.emissive_texture.as_ref(), Some(&texture));
             }
         }
@@ -2068,9 +2679,10 @@ mod tests {
         for (handle, original) in handles.iter().zip(originals) {
             let material = app
                 .world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<crate::TerrainMaterial>>()
                 .get(handle)
                 .unwrap();
+            let material = &material.base;
             assert_eq!(
                 (material.emissive, material.emissive_texture.clone()),
                 original
@@ -2092,9 +2704,10 @@ mod tests {
         );
         assert_eq!(
             app.world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<crate::TerrainMaterial>>()
                 .get(&handles[0])
                 .unwrap()
+                .base
                 .emissive_texture
                 .as_ref(),
             Some(&texture)
@@ -2120,9 +2733,10 @@ mod tests {
         let old_entity = old_chunk.entity;
         let cached = app
             .world()
-            .resource::<Assets<StandardMaterial>>()
+            .resource::<Assets<crate::TerrainMaterial>>()
             .get(&old_chunk.material)
             .unwrap()
+            .base
             .emissive_texture
             .clone()
             .unwrap();
@@ -2143,9 +2757,10 @@ mod tests {
             assert_ne!(chunk.entity, old_entity);
             let material = app
                 .world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<crate::TerrainMaterial>>()
                 .get(&chunk.material)
                 .unwrap();
+            let material = &material.base;
             assert!(material.emissive_texture.is_none());
             assert!(
                 app.world()
@@ -2165,9 +2780,10 @@ mod tests {
         {
             let material = app
                 .world()
-                .resource::<Assets<StandardMaterial>>()
+                .resource::<Assets<crate::TerrainMaterial>>()
                 .get(&chunk.material)
                 .unwrap();
+            let material = &material.base;
             assert_eq!(material.emissive_texture.as_ref(), Some(&cached));
         }
     }
@@ -2183,6 +2799,7 @@ mod tests {
         app.insert_resource(Assets::<Mesh>::default());
         app.insert_resource(Assets::<Image>::default());
         app.insert_resource(Assets::<StandardMaterial>::default());
+        app.insert_resource(Assets::<crate::TerrainMaterial>::default());
         app.add_systems(Startup, setup_capture_resources);
         add_capture_scene_systems(&mut app);
         assert!(
@@ -2280,6 +2897,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn capture_palette_consumes_settings_and_resets_between_sessions() {
+        let mut world = World::new();
+        for palette in [
+            scriptbots_core::AccessibilityPalette::HighContrast,
+            scriptbots_core::AccessibilityPalette::Deuteranopia,
+            scriptbots_core::AccessibilityPalette::Protanopia,
+            scriptbots_core::AccessibilityPalette::Tritanopia,
+            scriptbots_core::AccessibilityPalette::Natural,
+        ] {
+            configure_capture_palette(
+                &mut world,
+                &RenderSettings {
+                    palette: Some(palette),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                world
+                    .resource::<AccessibilityState>()
+                    .palette()
+                    .accessibility(),
+                palette
+            );
+        }
+        configure_capture_palette(
+            &mut world,
+            &RenderSettings {
+                palette: Some(scriptbots_core::AccessibilityPalette::HighContrast),
+                ..Default::default()
+            },
+        );
+        configure_capture_palette(&mut world, &RenderSettings::default());
+        assert_eq!(
+            world
+                .resource::<AccessibilityState>()
+                .palette()
+                .accessibility(),
+            scriptbots_core::AccessibilityPalette::Natural
+        );
     }
 
     #[test]
@@ -2946,6 +3605,7 @@ mod tests {
         let provenance = CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
             world_digest: Some("blake3:deadbeef".to_string()),
+            interpolation: None,
             scene: "unit".to_string(),
             seed: 42,
             tick: 12,
@@ -3276,6 +3936,7 @@ mod tests {
         let mut provenance = CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
             world_digest: None,
+            interpolation: None,
             scene: "unit".to_string(),
             seed: 7,
             tick: 3,
@@ -3430,6 +4091,7 @@ mod tests {
         let provenance = CaptureProvenance {
             schema: PROVENANCE_SCHEMA.to_string(),
             world_digest: None,
+            interpolation: None,
             scene: "unit".to_string(),
             seed: 1,
             tick: 1,

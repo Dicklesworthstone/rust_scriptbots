@@ -1,0 +1,131 @@
+# dsr quality check
+# argv: cargo fmt --check
+# cwd: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate
+# env: PATH=/workspace/scratch/59c449fc313c/tooling/bin:/workspace/scratch/59c449fc313c/tooling/cargo/bin:/home/agent/.codex/tmp/arg0-linux/codex-arg0wyO7Ne:/opt/codex/codex-path:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback
+# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs/rust_scriptbots_candidate_fast/20261115T211913-3G8NPIpq
+# env: DSR_QUALITY_TIMEOUT=180
+# env: DSR_REPOS_FILE=/workspace/scratch/59c449fc313c/tooling/dsr-quality/repos-candidate.yaml
+# env: DSR_CURRENT_CMD=quality
+# env: DSR_CURRENT_HOST=
+# env: DSR_RUN_ID=run-1794795551-2
+# env: CARGO_HOME=/workspace/scratch/59c449fc313c/tooling/cargo
+# env: RUSTUP_TOOLCHAIN=nightly-2026-08-31-x86_64-unknown-linux-gnu
+# env: RUSTUP_HOME=/workspace/scratch/59c449fc313c/tooling/rustup
+# env: DSR_CURRENT_TOOL=
+# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs
+# env: DSR_RUST_NATIVE_ENV_NAMES
+# started_monotonic_ms: 4639726
+# timeout_seconds: 180
+# ----
+Diff in /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate/crates/scriptbots-app/src/terminal/frankentui_shell.rs:645:
+                 self.guide_notice = None;
+             }
+             KeyCode::Up => self.guide_scroll.set(current.saturating_sub(1)),
+-            KeyCode::Down => self.guide_scroll.set(current.saturating_add(1).min(maximum)),
++            KeyCode::Down => self
++                .guide_scroll
++                .set(current.saturating_add(1).min(maximum)),
+             KeyCode::PageUp => self.guide_scroll.set(current.saturating_sub(page)),
+-            KeyCode::PageDown => self.guide_scroll.set(current.saturating_add(page).min(maximum)),
++            KeyCode::PageDown => self
++                .guide_scroll
++                .set(current.saturating_add(page).min(maximum)),
+             KeyCode::Home => self.guide_scroll.set(0),
+             KeyCode::End => self.guide_scroll.set(maximum),
+             _ => {}
+Diff in /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate/crates/scriptbots-app/src/terminal/frankentui_shell.rs:657:
+ 
+     pub(super) fn guide_view_is_current(&self) -> bool {
+         self.guide_view_identity.get()
+-            == self
+-                .guide
+-                .source()
+-                .map(|source| (source.session_id, self.guide.generation(), self.guide.step()))
++            == self.guide.source().map(|source| {
++                (
++                    source.session_id,
++                    self.guide.generation(),
++                    self.guide.step(),
++                )
++            })
+     }
+ 
+     fn guide_lines(&self) -> Vec<String> {
+Diff in /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate/crates/scriptbots-app/src/terminal/frankentui_shell.rs:712:
+         if let Some(draft) = &self.guide_growth_draft {
+             lines.push(String::new());
+             lines.push(format!("Food growth proposal: {draft}_"));
+-            lines.push("Enter submits this value; Esc cancels editing; Backspace removes a character.".into());
++            lines.push(
++                "Enter submits this value; Esc cancels editing; Backspace removes a character."
++                    .into(),
++            );
+         }
+         if let Some(notice) = &self.guide_notice {
+             lines.push(notice.chars().take(1024).collect());
+Diff in /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate/crates/scriptbots-app/src/terminal/frankentui_shell.rs:725:
+             lines.push(format!("Population: {} living agents", source.population));
+             lines.push(format!(
+                 "Seed: {}",
+-                source.seed.map_or_else(|| "unavailable".into(), |seed| seed.to_string())
++                source
++                    .seed
++                    .map_or_else(|| "unavailable".into(), |seed| seed.to_string())
+             ));
+             lines.push(format!("Paused: {}", source.paused));
+             lines.push(format!("Food growth rate: {}", source.food_growth_rate));
+Diff in /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate/crates/scriptbots-app/src/terminal/frankentui_shell.rs:732:
+-            lines.push(format!("Control revision: {}", source.revisions.control.get()));
+-            lines.push(format!("Scientific revision: {}", source.revisions.scientific.get()));
++            lines.push(format!(
++                "Control revision: {}",
++                source.revisions.control.get()
++            ));
++            lines.push(format!(
++                "Scientific revision: {}",
++                source.revisions.scientific.get()
++            ));
+         } else {
+             lines.push("Live source unavailable; waiting for an owner publication.".into());
+         }
+Diff in /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate/crates/scriptbots-app/src/terminal/frankentui_shell.rs:741:
+             lines.push(String::new());
+             lines.push(format!("Guide checkpoint: {}", checkpoint.checkpoint_id));
+             lines.push(format!("Saved tick: {}", checkpoint.tick));
+-            lines.push(format!("Saved scientific digest: {}", checkpoint.world_digest));
++            lines.push(format!(
++                "Saved scientific digest: {}",
++                checkpoint.world_digest
++            ));
+             lines.push(format!("Artifact size: {} bytes", checkpoint.byte_size));
+         }
+         lines.push(String::new());
+Diff in /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate/crates/scriptbots-app/src/terminal/frankentui_shell.rs:748:
+         lines.push("Enter: next when ready | Esc: hide | F1: reopen | R: restart".into());
+-        lines.push("Up/Down, PageUp/PageDown, Home/End scroll all evidence on small screens.".into());
++        lines.push(
++            "Up/Down, PageUp/PageDown, Home/End scroll all evidence on small screens.".into(),
++        );
+         lines
+     }
+ 
+Diff in /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate/crates/scriptbots-app/src/terminal/frankentui_shell.rs:753:
+     fn render_guide(&self, frame: &mut Frame) {
+-        self.guide_view_identity.set(
+-            self.guide
+-                .source()
+-                .map(|source| (source.session_id, self.guide.generation(), self.guide.step())),
+-        );
++        self.guide_view_identity
++            .set(self.guide.source().map(|source| {
++                (
++                    source.session_id,
++                    self.guide.generation(),
++                    self.guide.step(),
++                )
++            }));
+         let width = usize::from(frame.width().saturating_sub(2).max(1));
+         let mut lines = Vec::new();
+         for line in self.guide_lines() {
+
+# exit_code: 0

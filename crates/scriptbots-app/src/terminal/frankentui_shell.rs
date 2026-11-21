@@ -17,7 +17,9 @@ use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
 use ftui::runtime::{Cmd, Model, ProgramSimulator};
 use scriptbots_core::ControlCommand;
 use scriptbots_runtime::{
-    ApplicationState, CommandId, CommandStatus, JournalState, RejectionReason,
+    ApplicationState, CommandId, CommandStatus, HostSessionId, JournalState, RejectionReason,
+    lab_guide::{LabGuide, LabGuideStep},
+    lab_workflows::LabMetric,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -58,13 +60,20 @@ pub enum ShellEffect {
         event: scriptbots_core::narrative::EventRecord,
     },
     BranchCheckpoint {
+        request_id: String,
         checkpoint_id: String,
         branch_name: String,
+        ticks: u64,
+        intervention: Option<crate::branch_study::StudyIntervention>,
     },
+    CancelCheckpointBranch,
     CompareExperiments {
         experiment_id: String,
+        plan_digest: String,
+        status_generation: u64,
         baseline: String,
         challenger: String,
+        metric: LabMetric,
     },
     ExportScreenData {
         format: String,
@@ -329,6 +338,10 @@ impl CommandReceiptEntry {
 
 /// Actions and messages processed by the FrankenTUI Model.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "ShellMessage is a short-lived enum moved by value through the FrankenTUI update               queue; clippy measures it at >=400 bytes, where the largest variant is a screen-data               payload SetExperimentsData(ScreenDataState<ExperimentsViewData>) (>=400 bytes) and               the second-largest is CommandReceipt(CommandReceiptEntry) (>=152 bytes). The               Set*Data(ScreenDataState<_>) screen-data variants are the common update path, so               boxing them would route that hot path through a heap allocation on every screen               refresh and ripple Box/deref across 100+ construct and match sites for no measurable               gain -- the value is stack-moved briefly and never held in bulk, so the transient               size is acceptable"
+)]
 pub enum ShellMessage {
     /// Raw terminal input event.
     Event(Event),
@@ -336,6 +349,8 @@ pub enum ShellMessage {
     Navigate(ShellRoute),
     /// Toggle help overlay.
     ToggleHelp,
+    /// Open or hide the optional, receipt-driven first-run guide.
+    ToggleLabGuide,
     /// Mutating command intent submitted for host transmission.
     SubmitCommand(ControlCommand),
     /// Command receipt update from HostClient.
@@ -395,10 +410,14 @@ pub enum ShellMessage {
     ReviewSelectedCheckpoint,
     /// Replay an out-of-cache narrative event from a source-bound checkpoint.
     ReviewNarrativeEvent(scriptbots_core::narrative::EventRecord),
-    /// Branch simulation from an existing checkpoint.
+    /// Configure an independent future from the selected saved checkpoint.
+    ConfigureCheckpointBranch,
+    /// Run an independent scientific future, preserving the live owner.
     BranchCheckpoint {
         checkpoint_id: String,
         branch_name: String,
+        ticks: u64,
+        intervention: Option<crate::branch_study::StudyIntervention>,
     },
     /// Run statistical comparison between two experiment arms.
     CompareExperiments {
@@ -409,6 +428,10 @@ pub enum ShellMessage {
     PinComparisonBaseline,
     /// Resolve distinct baseline/challenger variants from the experiment selection.
     CompareSelectedExperiments,
+    /// Choose the previous or next final-state endpoint without running a comparison.
+    CycleComparisonMetric {
+        forward: bool,
+    },
     /// Export screen or replay artifact.
     ExportScreenData {
         format: String,
@@ -444,6 +467,13 @@ pub struct FrankenTuiModel {
     pub route: ShellRoute,
     pub previous_route: Option<ShellRoute>,
     pub help_visible: bool,
+    pub(super) guide: LabGuide,
+    pub(super) guide_growth_draft: Option<String>,
+    pub(super) guide_notice: Option<String>,
+    pub(super) guide_selected_uid: Option<u64>,
+    guide_scroll: std::cell::Cell<usize>,
+    guide_layout: std::cell::Cell<(usize, usize)>,
+    guide_view_identity: std::cell::Cell<Option<(HostSessionId, u64, LabGuideStep)>>,
     pub paused: bool,
     pub speed_multiplier: f32,
     pub tick: u64,
@@ -467,6 +497,64 @@ pub struct FrankenTuiModel {
     pub event_feed: TypedEventFeedData,
     pub brain_grid: BrainActivationGridData,
     pub watermark_status: WatermarkStatusData,
+    pub(super) branch_draft: Option<CheckpointBranchDraft>,
+    pub(super) branch_request_pending: bool,
+    pub(super) checkpoint_branch: Option<crate::control::CheckpointBranchStatusDto>,
+}
+
+/// Explicit bounded inputs shown before a branch study is requested.
+#[derive(Debug, Clone)]
+pub(super) struct CheckpointBranchDraft {
+    pub checkpoint_id: String,
+    pub branch_name: String,
+    pub ticks: u64,
+    treatment: BranchTreatment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchTreatment {
+    Unchanged,
+    Drought,
+    FoodBloom,
+    ClosedWorld,
+}
+
+impl BranchTreatment {
+    fn cycle(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Unchanged, true) | (Self::FoodBloom, false) => Self::Drought,
+            (Self::Drought, true) | (Self::ClosedWorld, false) => Self::FoodBloom,
+            (Self::FoodBloom, true) | (Self::Unchanged, false) => Self::ClosedWorld,
+            (Self::ClosedWorld, true) | (Self::Drought, false) => Self::Unchanged,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unchanged => "Unchanged future (one control branch)",
+            Self::Drought => "Drought (halt growth for the horizon) + control",
+            Self::FoodBloom => "Food bloom (+0.5 per cell) + control",
+            Self::ClosedWorld => "Close world (disable restocking) + control",
+        }
+    }
+
+    fn intervention(self, ticks: u64) -> Option<crate::branch_study::StudyIntervention> {
+        use crate::branch_study::StudyIntervention;
+        match self {
+            Self::Unchanged => None,
+            Self::Drought => Some(StudyIntervention::Drought {
+                region: None,
+                duration_ticks: u32::try_from(ticks).unwrap_or(u32::MAX),
+                growth_scale: 0.0,
+            }),
+            Self::FoodBloom => Some(StudyIntervention::ResourceShock {
+                region: None,
+                bloom_amount: 0.5,
+                scorch: 0.0,
+            }),
+            Self::ClosedWorld => Some(StudyIntervention::ClosedWorld { closed: true }),
+        }
+    }
 }
 
 impl Default for FrankenTuiModel {
@@ -475,6 +563,13 @@ impl Default for FrankenTuiModel {
             route: ShellRoute::Dashboard,
             previous_route: None,
             help_visible: false,
+            guide: LabGuide::default(),
+            guide_growth_draft: None,
+            guide_notice: None,
+            guide_selected_uid: None,
+            guide_scroll: std::cell::Cell::new(0),
+            guide_layout: std::cell::Cell::new((0, 1)),
+            guide_view_identity: std::cell::Cell::new(None),
             paused: true,
             speed_multiplier: 1.0,
             tick: 0,
@@ -497,6 +592,9 @@ impl Default for FrankenTuiModel {
             event_feed: TypedEventFeedData::default(),
             brain_grid: BrainActivationGridData::default(),
             watermark_status: WatermarkStatusData::default(),
+            branch_draft: None,
+            branch_request_pending: false,
+            checkpoint_branch: None,
         }
     }
 }
@@ -510,6 +608,194 @@ impl FrankenTuiModel {
         Self {
             route,
             ..Self::default()
+        }
+    }
+
+    /// Guide navigation is presentation-only. Actions are performed with the
+    /// existing controls after hiding this view; the guide keeps observing them.
+    pub(super) fn handle_guide_key(&mut self, key: KeyCode) -> bool {
+        if key == KeyCode::F(1) {
+            self.update(ShellMessage::ToggleLabGuide);
+            return true;
+        }
+        if !self.guide.visible {
+            return false;
+        }
+        let (maximum, page) = self.guide_layout.get();
+        let current = self.guide_scroll.get().min(maximum);
+        match key {
+            KeyCode::Escape => self.guide.visible = false,
+            KeyCode::Enter => {
+                if !self.guide_view_is_current() {
+                    self.guide_notice = Some(
+                        "The live owner or guide step changed; review the refreshed guide first."
+                            .into(),
+                    );
+                    return true;
+                }
+                if self.guide.advance() {
+                    self.guide_scroll.set(0);
+                    self.guide_notice = None;
+                }
+            }
+            KeyCode::Char('r' | 'R') => {
+                self.guide.restart();
+                self.guide_scroll.set(0);
+                self.guide_growth_draft = None;
+                self.guide_notice = None;
+            }
+            KeyCode::Up => self.guide_scroll.set(current.saturating_sub(1)),
+            KeyCode::Down => self.guide_scroll.set(current.saturating_add(1).min(maximum)),
+            KeyCode::PageUp => self.guide_scroll.set(current.saturating_sub(page)),
+            KeyCode::PageDown => self.guide_scroll.set(current.saturating_add(page).min(maximum)),
+            KeyCode::Home => self.guide_scroll.set(0),
+            KeyCode::End => self.guide_scroll.set(maximum),
+            _ => {}
+        }
+        true
+    }
+
+    pub(super) fn guide_view_is_current(&self) -> bool {
+        self.guide_view_identity.get()
+            == self
+                .guide
+                .source()
+                .map(|source| (source.session_id, self.guide.generation(), self.guide.step()))
+    }
+
+    fn guide_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            self.guide.step().title().to_owned(),
+            self.guide.step().instruction().to_owned(),
+            String::new(),
+            format!("Observed: {}", self.guide.status()),
+            if self.guide.finished() {
+                "Guide complete. R starts a new walkthrough; Esc returns to your work.".into()
+            } else if self.guide.ready() {
+                "READY: Enter advances the guide without changing the simulation.".into()
+            } else {
+                "WAITING: Next is locked until this step's evidence is observed.".into()
+            },
+            String::new(),
+        ];
+        if !self.guide.evidence().is_empty() {
+            lines.push(format!("Evidence: {}", self.guide.evidence()));
+            lines.push(String::new());
+        }
+        let controls = match self.guide.step() {
+            LabGuideStep::Identify => {
+                "Confirm the live owner, seed and scientific tick below. Enter continues."
+            }
+            LabGuideStep::Inspect => {
+                "Esc hides this guide. Press 3 for the Inspector; Left/Right selects an agent when the timeline rail is hidden (r toggles the rail). F1 reopens the guide."
+            }
+            LabGuideStep::Pause => {
+                "Esc hides this guide. Open : or Ctrl+P, search Pause and choose Pause. The guide waits for that command's application and journal receipt."
+            }
+            LabGuideStep::Step => {
+                "Esc hides this guide. Press s to request one scientific tick while paused. F1 reopens after the owner publishes the result."
+            }
+            LabGuideStep::Configure => {
+                "E edits only the food growth rate. Type a finite nonnegative value different from the displayed value; Enter submits the explicit proposal through the normal guarded command receipt."
+            }
+            LabGuideStep::Checkpoint => {
+                "Esc hides this guide. Press 7 for Replay, then k to save the current cut. The guide requires a fresh completed save from this owner, not a catalog row."
+            }
+            LabGuideStep::Branch => {
+                "Esc hides this guide. In Replay, select the saved cut below and press N. Choose a treatment with Right and a horizon with Up/Down; Enter starts the study. After completion, B opens Studies; select its row and press Enter, then Enter again to verify its report."
+            }
+            LabGuideStep::Outcome => {
+                "Esc returns to Replay's study detail. Inspect the control and treatment metrics, source and final digests, and first divergence. One saved seed is descriptive evidence, not independent replication or statistical significance."
+            }
+        };
+        lines.push(controls.into());
+        if let Some(draft) = &self.guide_growth_draft {
+            lines.push(String::new());
+            lines.push(format!("Food growth proposal: {draft}_"));
+            lines.push("Enter submits this value; Esc cancels editing; Backspace removes a character.".into());
+        }
+        if let Some(notice) = &self.guide_notice {
+            lines.push(notice.chars().take(1024).collect());
+        }
+        lines.push(String::new());
+        if let Some(source) = self.guide.source() {
+            lines.push(format!("Live owner session: {}", source.session_id.get()));
+            lines.push(format!("Observed publication: {}", source.revision.get()));
+            lines.push(format!("Scientific tick: {}", source.tick));
+            lines.push(format!("Population: {} living agents", source.population));
+            lines.push(format!(
+                "Seed: {}",
+                source.seed.map_or_else(|| "unavailable".into(), |seed| seed.to_string())
+            ));
+            lines.push(format!("Paused: {}", source.paused));
+            lines.push(format!("Food growth rate: {}", source.food_growth_rate));
+            lines.push(format!("Control revision: {}", source.revisions.control.get()));
+            lines.push(format!("Scientific revision: {}", source.revisions.scientific.get()));
+        } else {
+            lines.push("Live source unavailable; waiting for an owner publication.".into());
+        }
+        if let Some(uid) = self.guide_selected_uid {
+            lines.push(format!("Agent shown in Inspector: {uid}"));
+        }
+        if let Some(checkpoint) = self.guide.saved_checkpoint() {
+            lines.push(String::new());
+            lines.push(format!("Guide checkpoint: {}", checkpoint.checkpoint_id));
+            lines.push(format!("Saved tick: {}", checkpoint.tick));
+            lines.push(format!("Saved scientific digest: {}", checkpoint.world_digest));
+            lines.push(format!("Artifact size: {} bytes", checkpoint.byte_size));
+        }
+        lines.push(String::new());
+        lines.push("Enter: next when ready | Esc: hide | F1: reopen | R: restart".into());
+        lines.push("Up/Down, PageUp/PageDown, Home/End scroll all evidence on small screens.".into());
+        lines
+    }
+
+    fn render_guide(&self, frame: &mut Frame) {
+        self.guide_view_identity.set(
+            self.guide
+                .source()
+                .map(|source| (source.session_id, self.guide.generation(), self.guide.step())),
+        );
+        let width = usize::from(frame.width().saturating_sub(2).max(1));
+        let mut lines = Vec::new();
+        for line in self.guide_lines() {
+            let mut row = String::new();
+            let mut columns = 0;
+            for mut ch in line.chars() {
+                if ch.is_control() {
+                    ch = ' ';
+                }
+                let mut bytes = [0_u8; 4];
+                let text: &str = ch.encode_utf8(&mut bytes);
+                let char_width = ftui::core::text_width::display_width(text);
+                if columns + char_width > width && !row.is_empty() {
+                    lines.push(std::mem::take(&mut row));
+                    columns = 0;
+                }
+                row.push(ch);
+                columns += char_width;
+            }
+            lines.push(row);
+        }
+        let end = frame.height().saturating_sub(SHELL_FOOTER_ROWS);
+        let page = usize::from(end.saturating_sub(5)).max(1);
+        let maximum = lines.len().saturating_sub(page);
+        let offset = self.guide_scroll.get().min(maximum);
+        self.guide_scroll.set(offset);
+        self.guide_layout.set((maximum, page));
+        print_to_frame(
+            frame,
+            1,
+            3,
+            &format!(
+                "FIRST-RUN LAB GUIDE {}/{}",
+                self.guide.step().index() + 1,
+                LabGuideStep::ALL.len(),
+            ),
+        );
+        print_to_frame(frame, 1, 4, "Enter: next | Esc: hide | F1: guide");
+        for (row, line) in (5..end).zip(lines.iter().skip(offset)) {
+            print_to_frame(frame, 1, row, line);
         }
     }
 
@@ -685,6 +971,42 @@ impl Model for FrankenTuiModel {
 
     fn update(&mut self, msg: Self::Message) -> Cmd<Self::Message> {
         match msg {
+            ShellMessage::Event(Event::Key(key)) if self.handle_guide_key(key.code) => Cmd::none(),
+            ShellMessage::Event(Event::Key(key)) if self.branch_draft.is_some() => {
+                match key.code {
+                    KeyCode::Escape | KeyCode::Char('x' | 'X' | 'q' | 'Q') => {
+                        self.branch_draft = None;
+                        self.status_message =
+                            Some("Branch draft cancelled; no work submitted".into());
+                    }
+                    KeyCode::Enter => {
+                        let draft = self.branch_draft.take().expect("guarded branch draft");
+                        return self.update(ShellMessage::BranchCheckpoint {
+                            checkpoint_id: draft.checkpoint_id,
+                            branch_name: draft.branch_name,
+                            ticks: draft.ticks,
+                            intervention: draft.treatment.intervention(draft.ticks),
+                        });
+                    }
+                    KeyCode::Left | KeyCode::Right => {
+                        let draft = self.branch_draft.as_mut().expect("guarded branch draft");
+                        draft.treatment = draft.treatment.cycle(key.code == KeyCode::Right);
+                    }
+                    KeyCode::Char('+' | '=') | KeyCode::Up => {
+                        let draft = self.branch_draft.as_mut().expect("guarded branch draft");
+                        draft.ticks = draft
+                            .ticks
+                            .saturating_add(120)
+                            .min(crate::control::MAX_CHECKPOINT_BRANCH_TICKS);
+                    }
+                    KeyCode::Char('-') | KeyCode::Down => {
+                        let draft = self.branch_draft.as_mut().expect("guarded branch draft");
+                        draft.ticks = draft.ticks.saturating_sub(120).max(1);
+                    }
+                    _ => {}
+                }
+                Cmd::none()
+            }
             ShellMessage::Event(Event::Key(key)) => match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') => Cmd::quit(),
                 KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Char('1') => {
@@ -720,25 +1042,15 @@ impl Model for FrankenTuiModel {
                     self.update(ShellMessage::CreateCheckpoint)
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') => {
-                    let cp_id = self
-                        .science
-                        .replay
-                        .data()
-                        .and_then(|r| r.checkpoints.get(r.selected_checkpoint_index))
-                        .map(|c| c.checkpoint_id.clone());
-                    if let Some(checkpoint_id) = cp_id {
-                        self.update(ShellMessage::BranchCheckpoint {
-                            checkpoint_id,
-                            branch_name: format!("branch-rev-{}", self.control_revision),
-                        })
-                    } else {
-                        self.status_message =
-                            Some("Branch unavailable: no checkpoint is selected".into());
-                        Cmd::none()
-                    }
+                    self.update(ShellMessage::ConfigureCheckpointBranch)
                 }
                 KeyCode::Char('c') | KeyCode::Char('C') => {
                     self.update(ShellMessage::CompareSelectedExperiments)
+                }
+                KeyCode::Char('[' | ']') if self.route == ShellRoute::Experiments => {
+                    self.update(ShellMessage::CycleComparisonMetric {
+                        forward: key.code == KeyCode::Char(']'),
+                    })
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.update(ShellMessage::SelectNextItem),
                 KeyCode::Up => self.update(ShellMessage::SelectPreviousItem),
@@ -781,6 +1093,7 @@ impl Model for FrankenTuiModel {
             ShellMessage::Event(_) => Cmd::none(),
             ShellMessage::Navigate(route) => {
                 if self.route != route {
+                    self.branch_draft = None;
                     self.previous_route = Some(self.route);
                     self.route = route;
                 }
@@ -788,6 +1101,15 @@ impl Model for FrankenTuiModel {
             }
             ShellMessage::ToggleHelp => {
                 self.help_visible = !self.help_visible;
+                Cmd::none()
+            }
+            ShellMessage::ToggleLabGuide => {
+                if self.guide.visible {
+                    self.guide.visible = false;
+                } else {
+                    self.guide.open();
+                    self.help_visible = false;
+                }
                 Cmd::none()
             }
             ShellMessage::SubmitCommand(cmd) => {
@@ -940,6 +1262,22 @@ impl Model for FrankenTuiModel {
                 Cmd::none()
             }
             ShellMessage::CancelActiveQuery => {
+                if self.branch_draft.take().is_some() {
+                    self.status_message = Some("Branch draft cancelled; no work submitted".into());
+                    return Cmd::none();
+                }
+                if self.route == ShellRoute::Replay
+                    && (self.branch_request_pending
+                        || self.checkpoint_branch.as_ref().is_some_and(|job| {
+                            matches!(job.status.as_str(), "running" | "cancelling")
+                        }))
+                {
+                    if self.enqueue_effect(ShellEffect::CancelCheckpointBranch) {
+                        self.status_message =
+                            Some("Branch cancellation requested; awaiting worker outcome".into());
+                    }
+                    return Cmd::none();
+                }
                 let mut target_id = None;
                 match self.route {
                     ShellRoute::Lineages => {
@@ -1073,24 +1411,88 @@ impl Model for FrankenTuiModel {
                 }
                 Cmd::none()
             }
+            ShellMessage::ConfigureCheckpointBranch => {
+                if self.branch_request_pending
+                    || self
+                        .checkpoint_branch
+                        .as_ref()
+                        .is_some_and(|job| matches!(job.status.as_str(), "running" | "cancelling"))
+                {
+                    self.status_message =
+                        Some("A branch study is active; X cancels it from Replay".into());
+                    return Cmd::none();
+                }
+                let selected = (self.route == ShellRoute::Replay)
+                    .then(|| self.science.replay.data())
+                    .flatten()
+                    .and_then(|data| data.checkpoints.get(data.selected_checkpoint_index));
+                if let Some(checkpoint) = selected {
+                    self.branch_draft = Some(CheckpointBranchDraft {
+                        checkpoint_id: checkpoint.checkpoint_id.clone(),
+                        branch_name: format!("branch-rev-{}", self.control_revision),
+                        ticks: 240,
+                        treatment: BranchTreatment::Unchanged,
+                    });
+                    self.status_message =
+                        Some("Choose a horizon and treatment; Enter starts the study".into());
+                } else {
+                    self.status_message =
+                        Some("Branch unavailable: select a saved checkpoint in Replay".into());
+                }
+                Cmd::none()
+            }
             ShellMessage::BranchCheckpoint {
                 checkpoint_id,
                 branch_name,
+                ticks,
+                intervention,
             } => {
-                if self.enqueue_effect(ShellEffect::BranchCheckpoint {
+                if self.branch_request_pending
+                    || self
+                        .checkpoint_branch
+                        .as_ref()
+                        .is_some_and(|job| matches!(job.status.as_str(), "running" | "cancelling"))
+                    || !self.has_receipt_capacity()
+                {
+                    self.status_message =
+                        Some("Branch not requested: active study or receipt capacity limit".into());
+                    return Cmd::none();
+                }
+                let Some(next_request) = self.command_counter.checked_add(1) else {
+                    self.status_message = Some("Branch unavailable: request IDs exhausted".into());
+                    return Cmd::none();
+                };
+                let request_id = format!("branch-request-{next_request}");
+                if !self.enqueue_effect(ShellEffect::BranchCheckpoint {
+                    request_id: request_id.clone(),
                     checkpoint_id,
                     branch_name,
+                    ticks,
+                    intervention,
                 }) {
-                    self.status_message =
-                        Some("Pending: branch request awaiting host result".into());
+                    return Cmd::none();
                 }
+                self.command_counter = next_request;
+                self.branch_request_pending = true;
+                self.checkpoint_branch = None;
+                self.update(ShellMessage::CommandReceipt(CommandReceiptEntry {
+                    command_id: request_id,
+                    action: "StartCheckpointBranch".into(),
+                    status: ReceiptStatusKind::Pending,
+                    journal_state: None,
+                    control_revision: self.control_revision,
+                    scientific_revision: self.scientific_revision,
+                    timestamp_tick: self.tick,
+                }));
+                self.status_message =
+                    Some("Pending: branch study awaiting service admission".into());
                 Cmd::none()
             }
             ShellMessage::CompareExperiments {
                 baseline,
                 challenger,
             } => {
-                let experiment_id = self
+                let source = self
                     .science
                     .experiments
                     .data()
@@ -1105,8 +1507,15 @@ impl Model for FrankenTuiModel {
                                 .iter()
                                 .any(|arm| arm.variant_id == challenger)
                     })
-                    .map(|data| data.experiment_id.clone());
-                let Some(experiment_id) = experiment_id else {
+                    .map(|data| {
+                        (
+                            data.experiment_id.clone(),
+                            data.plan_digest.clone(),
+                            data.status_generation,
+                            data.comparison_metric,
+                        )
+                    });
+                let Some((experiment_id, plan_digest, status_generation, metric)) = source else {
                     self.status_message = Some(
                         "Comparison unavailable: select two distinct variants in this experiment"
                             .into(),
@@ -1115,11 +1524,32 @@ impl Model for FrankenTuiModel {
                 };
                 if self.enqueue_effect(ShellEffect::CompareExperiments {
                     experiment_id,
+                    plan_digest,
+                    status_generation,
                     baseline,
                     challenger,
+                    metric,
                 }) {
-                    self.status_message =
-                        Some("Pending: comparison awaiting measured statistical result".into());
+                    self.status_message = Some(format!(
+                        "Pending: {} ({}) comparison awaiting measured result",
+                        metric.label(),
+                        metric.unit()
+                    ));
+                }
+                Cmd::none()
+            }
+            ShellMessage::CycleComparisonMetric { forward } => {
+                if let ScreenDataState::Data(data) = &mut self.science.experiments {
+                    data.cycle_comparison_metric(forward);
+                    self.status_message = Some(format!(
+                        "Endpoint: {} ({}); press C for a new matched-seed comparison",
+                        data.comparison_metric.label(),
+                        data.comparison_metric.unit()
+                    ));
+                } else {
+                    self.status_message = Some(
+                        "Endpoint selection unavailable: load an experiment batch first".into(),
+                    );
                 }
                 Cmd::none()
             }
@@ -1378,9 +1808,12 @@ impl Model for FrankenTuiModel {
         }
 
         // 2. Active Route Display
-        if self.help_visible || self.route == ShellRoute::HelpOverlay {
+        if self.guide.visible {
+            self.render_guide(frame);
+        } else if self.help_visible || self.route == ShellRoute::HelpOverlay {
             if height > 3 {
                 print_to_frame(frame, 2, 3, "KEYBOARD SHORTCUTS:");
+                print_to_frame(frame, 4, 4, "  [F1]     First-run Lab guide (optional)");
                 print_to_frame(frame, 4, 5, "  [Space]  Pause / Resume simulation");
                 print_to_frame(frame, 4, 6, "  [.]      Single step simulation");
                 print_to_frame(frame, 4, 7, "  [+] / [-] Adjust playback speed");
@@ -1394,16 +1827,44 @@ impl Model for FrankenTuiModel {
                 print_to_frame(frame, 4, 15, "  [8]/[V]  Environment & Biomes screen");
                 print_to_frame(frame, 4, 16, "  [9]/[X]  System Diagnostics screen");
                 print_to_frame(frame, 4, 17, "  [K]      Create Checkpoint");
-                print_to_frame(frame, 4, 18, "  [N]      Branch Simulation from Checkpoint");
+                print_to_frame(
+                    frame,
+                    4,
+                    18,
+                    "  [N]      Configure a saved-checkpoint branch study",
+                );
                 print_to_frame(
                     frame,
                     4,
                     19,
-                    "  [C]      Compare matched-seed endpoint populations",
+                    "  [C] compare endpoint; [ / ] choose endpoint (Experiments)",
                 );
                 print_to_frame(frame, 4, 20, "  [Esc]    Cancel In-Flight Query / Dismiss");
                 print_to_frame(frame, 4, 21, "  [?]      Toggle help overlay");
                 print_to_frame(frame, 4, 22, "  [Q]      Quit application");
+            }
+        } else if let Some(draft) = &self.branch_draft {
+            for (row, text) in [
+                "CHECKPOINT BRANCH STUDY".to_owned(),
+                format!("Source: {}", draft.checkpoint_id),
+                format!("Name: {}", draft.branch_name),
+                format!("Horizon: {} ticks after the saved boundary", draft.ticks),
+                format!("Treatment: {}", draft.treatment.label()),
+                "".into(),
+                "Left/Right: treatment    +/- or Up/Down: horizon".into(),
+                "Enter: start    Esc/X: discard draft".into(),
+                "".into(),
+                "Runs an independent scientific future; the live run stays attached.".into(),
+                "Treatments include an unchanged control from the same saved state.".into(),
+                "Reports compare trajectories; one source is not independent replication.".into(),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let y = 3 + row as u16;
+                if y < height.saturating_sub(SHELL_FOOTER_ROWS) {
+                    print_to_frame(frame, 2, y, text);
+                }
             }
         } else {
             match self.route {
@@ -1573,6 +2034,33 @@ impl Model for FrankenTuiModel {
                     if height > 4 {
                         science_screens::render_replay_screen(frame, &self.science.replay, 3);
                     }
+                    if let Some(job) = &self.checkpoint_branch
+                        && height >= 14
+                    {
+                        let rows = [
+                            format!("BRANCH STUDY {}: {}", job.branch_name, job.status),
+                            format!(
+                                "Saved tick {} -> target {} | {}",
+                                job.source_tick, job.target_tick, job.branch_id
+                            ),
+                            format!("Source digest: {}", job.world_digest_v1),
+                            job.artifact_id.as_ref().map_or_else(
+                                || {
+                                    job.error_reason.clone().unwrap_or_else(|| {
+                                        "X cancels this study; live owner is unchanged".into()
+                                    })
+                                },
+                                |id| format!("Completed report artifact: {id}"),
+                            ),
+                        ];
+                        let first_row = height - SHELL_FOOTER_ROWS - rows.len() as u16;
+                        let blank = " ".repeat(usize::from(width));
+                        for (offset, text) in rows.iter().enumerate() {
+                            let row = first_row + offset as u16;
+                            print_to_frame(frame, 0, row, &blank);
+                            print_to_frame(frame, 1, row, text);
+                        }
+                    }
                 }
                 ShellRoute::Environment => {
                     if height > 4 {
@@ -1736,6 +2224,234 @@ impl FrankenTuiSimulatorHarness {
 mod tests {
     use super::*;
 
+    #[test]
+    fn optional_lab_guide_navigation_is_bounded_and_requires_observed_evidence() {
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.init();
+        harness.inject_key(KeyCode::F(1));
+        assert!(harness.model().guide.visible);
+        assert!(!harness.model().guide.ready());
+        for _ in 0..12 {
+            harness.inject_key(KeyCode::Enter);
+        }
+        assert_eq!(harness.model().guide.step(), LabGuideStep::Identify);
+        for (width, height) in [(40, 12), (80, 24)] {
+            harness.inject_key(KeyCode::Home);
+            let mut evidence = String::new();
+            for _ in 0..64 {
+                let frame = harness.capture_frame_str(width, height);
+                evidence.extend(
+                    frame
+                        .lines()
+                        .skip(5)
+                        .take(usize::from(height - 7))
+                        .flat_map(|line| line.chars().filter(|ch| !ch.is_whitespace())),
+                );
+                let before = harness.model().guide_scroll.get();
+                harness.inject_key(KeyCode::PageDown);
+                if harness.model().guide_scroll.get() == before {
+                    break;
+                }
+            }
+            assert!(evidence.contains("WAITING:Nextislocked"));
+            assert!(evidence.contains("Livesourceunavailable"));
+            assert!(evidence.contains("F1:reopen"));
+        }
+        harness.inject_key(KeyCode::Escape);
+        assert!(!harness.model().guide.visible);
+        harness.inject_key(KeyCode::F(1));
+        assert_eq!(harness.model().guide.step(), LabGuideStep::Identify);
+        harness.inject_key(KeyCode::Char('R'));
+        for (width, height) in [(0, 0), (1, 1), (2, 5)] {
+            let _ = harness.capture_frame_str(width, height);
+        }
+        assert_eq!(harness.model().command_counter, 0);
+        assert!(harness.model().receipts.is_empty());
+        assert!(harness.model_mut().drain_effects().next().is_none());
+    }
+
+    fn checkpoint_branch_harness() -> FrankenTuiSimulatorHarness {
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.init();
+        harness.dispatch(ShellMessage::Navigate(ShellRoute::Replay));
+        harness.dispatch(ShellMessage::SetReplayData(ScreenDataState::Data(
+            ReplayViewData {
+                checkpoints: vec![CheckpointViewEntry {
+                    checkpoint_id: "saved-source".into(),
+                    tick: 12,
+                    agent_count: Some(2),
+                    digest: Some("fixture-source-digest".into()),
+                    file_size_bytes: 1024,
+                }],
+                observed_live_tick: Some(20),
+                first_divergence: None,
+                selected_checkpoint_index: 0,
+                export_receipt: None,
+            },
+        )));
+        harness
+    }
+
+    #[test]
+    fn checkpoint_branch_draft_cancellation_never_spends_a_request_or_creates_work() {
+        let mut harness = checkpoint_branch_harness();
+        for key in [
+            KeyCode::Escape,
+            KeyCode::Char('x'),
+            KeyCode::Char('X'),
+            KeyCode::Char('q'),
+            KeyCode::Char('Q'),
+        ] {
+            harness.inject_key(KeyCode::Char('N'));
+            assert!(
+                harness
+                    .capture_frame_str(80, 24)
+                    .contains("CHECKPOINT BRANCH STUDY")
+            );
+            harness.inject_key(KeyCode::Right);
+            harness.inject_key(KeyCode::Up);
+            harness.inject_key(key);
+            assert!(harness.model().branch_draft.is_none());
+            assert_eq!(harness.model().command_counter, 0);
+            assert!(harness.model().receipts.is_empty());
+            assert!(!harness.model().branch_request_pending);
+            assert_eq!(harness.model_mut().drain_effects().count(), 0);
+            assert!(
+                harness.is_running(),
+                "dismissing a draft must keep the live UI open"
+            );
+        }
+        harness.inject_key(KeyCode::Char('n'));
+        harness.dispatch(ShellMessage::Navigate(ShellRoute::Experiments));
+        assert!(harness.model().branch_draft.is_none());
+        assert_eq!(harness.model_mut().drain_effects().count(), 0);
+        assert!(harness.model().receipts.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_branch_draft_bounds_choices_and_retains_pending_intent_until_observation() {
+        use crate::branch_study::StudyIntervention;
+        use crate::control::MAX_CHECKPOINT_BRANCH_TICKS;
+        for (steps_right, expected) in [
+            (0, None),
+            (
+                1,
+                Some(StudyIntervention::Drought {
+                    region: None,
+                    duration_ticks: 1,
+                    growth_scale: 0.0,
+                }),
+            ),
+            (
+                2,
+                Some(StudyIntervention::ResourceShock {
+                    region: None,
+                    bloom_amount: 0.5,
+                    scorch: 0.0,
+                }),
+            ),
+            (3, Some(StudyIntervention::ClosedWorld { closed: true })),
+        ] {
+            let mut harness = checkpoint_branch_harness();
+            harness.inject_key(KeyCode::Char('n'));
+            // Exercise both ends through real draft input, including saturation.
+            for _ in 0..(MAX_CHECKPOINT_BRANCH_TICKS / 120 + 2) {
+                harness.inject_key(KeyCode::Up);
+            }
+            assert_eq!(
+                harness.model().branch_draft.as_ref().unwrap().ticks,
+                MAX_CHECKPOINT_BRANCH_TICKS
+            );
+            for _ in 0..(MAX_CHECKPOINT_BRANCH_TICKS / 120 + 2) {
+                harness.inject_key(KeyCode::Down);
+            }
+            assert_eq!(harness.model().branch_draft.as_ref().unwrap().ticks, 1);
+            // Left then Right must restore the original choice before selecting it.
+            harness.inject_key(KeyCode::Left);
+            harness.inject_key(KeyCode::Right);
+            for _ in 0..steps_right {
+                harness.inject_key(KeyCode::Right);
+            }
+            assert!(harness.model().receipts.is_empty());
+            assert_eq!(harness.model_mut().drain_effects().count(), 0);
+            harness.inject_key(KeyCode::Enter);
+            let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+            let [
+                ShellEffect::BranchCheckpoint {
+                    request_id,
+                    checkpoint_id,
+                    ticks,
+                    intervention,
+                    ..
+                },
+            ] = effects.as_slice()
+            else {
+                panic!("one branch intent: {effects:?}");
+            };
+            assert_eq!(request_id, "branch-request-1");
+            assert_eq!(checkpoint_id, "saved-source");
+            assert_eq!(*ticks, 1);
+            assert_eq!(intervention, &expected);
+            assert!(harness.model().branch_request_pending);
+            assert!(harness.model().checkpoint_branch.is_none());
+            assert_eq!(
+                harness.model().latest_receipt().unwrap().status,
+                ReceiptStatusKind::Pending
+            );
+            harness.dispatch(ShellMessage::ConfigureCheckpointBranch);
+            assert!(harness.model().branch_draft.is_none());
+            assert_eq!(harness.model_mut().drain_effects().count(), 0);
+            harness.dispatch(ShellMessage::Navigate(ShellRoute::Experiments));
+            harness.dispatch(ShellMessage::Navigate(ShellRoute::Replay));
+            harness.dispatch(ShellMessage::CancelActiveQuery);
+            assert!(matches!(
+                harness
+                    .model_mut()
+                    .drain_effects()
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                [ShellEffect::CancelCheckpointBranch]
+            ));
+            assert!(
+                harness.model().branch_request_pending,
+                "requesting cancellation does not fabricate an observed stop"
+            );
+            assert_eq!(harness.model().receipts.len(), 1);
+            assert_eq!(
+                harness.model().latest_receipt().unwrap().status,
+                ReceiptStatusKind::Pending
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_branch_queue_refusal_preserves_the_original_requests_and_identity() {
+        let mut harness = checkpoint_branch_harness();
+        for _ in 0..MAX_PENDING_EFFECTS {
+            harness.dispatch(ShellMessage::SubmitCommand(ControlCommand::Step));
+        }
+        harness.inject_key(KeyCode::Char('n'));
+        harness.inject_key(KeyCode::Enter);
+        assert!(!harness.model().branch_request_pending);
+        assert!(harness.model().receipts.is_empty());
+        assert_eq!(harness.model().command_counter, 0);
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        assert_eq!(effects.len(), MAX_PENDING_EFFECTS);
+        assert!(
+            effects
+                .iter()
+                .all(|effect| matches!(effect, ShellEffect::SubmitCommand(ControlCommand::Step)))
+        );
+        assert!(
+            harness
+                .model()
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("queue is full")
+        );
+    }
+
     fn observed_comparison_fixture(effect: f64, p_value: f64) -> ExperimentComparisonSummary {
         ExperimentComparisonSummary {
             experiment_id: "exp-darwin-01".into(),
@@ -1783,6 +2499,8 @@ mod tests {
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             ExperimentsViewData {
                 experiment_id: "distinct-variants".into(),
+                plan_digest: "fixture-plan".into(),
+                status_generation: 1,
                 batch_status: "completed".into(),
                 active_arms: arms,
                 ..ExperimentsViewData::default()
@@ -1791,7 +2509,7 @@ mod tests {
         harness.inject_key(KeyCode::Char('c'));
         let effects: Vec<_> = harness.model_mut().drain_effects().collect();
         assert!(matches!(effects.as_slice(),
-            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger }]
+            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger, metric: LabMetric::AliveAgents, .. }]
                 if experiment_id == "distinct-variants" && baseline == "baseline" && challenger == "treatment"));
 
         harness.inject_key(KeyCode::Enter);
@@ -1828,7 +2546,7 @@ mod tests {
         assert_eq!(harness.model_mut().drain_effects().count(), 0);
 
         let mut data = harness.model().science.experiments.data().unwrap().clone();
-        data.comparison_summary = Some(Box::new(ExperimentComparisonSummary {
+        data.comparison_summary = Some(ExperimentComparisonSummary {
             experiment_id: data.experiment_id.clone(),
             baseline_variant: "baseline".into(),
             challenger_variant: "third".into(),
@@ -1846,7 +2564,7 @@ mod tests {
             undefined_effect_reason: Some("Paired variance is unavailable".into()),
             plan_digest: "fixture-plan".into(),
             status_generation: 1,
-        }));
+        });
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             data,
         )));
@@ -1856,6 +2574,127 @@ mod tests {
         assert!(frame.contains("Paired variance is unavailable"));
         assert!(!frame.contains("Hedges' g"));
         assert!(!frame.contains("Paired p: 0.0000"));
+    }
+
+    #[test]
+    fn experiment_endpoint_keys_route_every_shared_metric_and_clear_previous_evidence() {
+        let mut harness = FrankenTuiSimulatorHarness::new();
+        harness.dispatch(ShellMessage::Navigate(ShellRoute::Experiments));
+        harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+            ExperimentsViewData {
+                experiment_id: "exp-darwin-01".into(),
+                plan_digest: "fixture-plan".into(),
+                status_generation: 1,
+                active_arms: ["arm-mlp", "arm-dwraon"]
+                    .into_iter()
+                    .map(|variant| ExperimentArmView {
+                        variant_id: variant.into(),
+                        brain_family: "mlp.baseline".into(),
+                        seed: 42,
+                        current_tick: Some(1000),
+                        target_ticks: 1000,
+                        mean_fitness: None,
+                        uncertainty_ci_95: None,
+                        digest: format!("fixture-{variant}"),
+                    })
+                    .collect(),
+                ..ExperimentsViewData::default()
+            },
+        )));
+        for expected in LabMetric::ALL {
+            let data = harness.model().science.experiments.data().unwrap();
+            assert_eq!(data.comparison_metric, expected);
+            assert!(data.comparison_summary.is_none());
+            let encoded = serde_json::to_value(data).unwrap();
+            assert_eq!(encoded["comparison_metric"], expected.key());
+            assert_eq!(
+                serde_json::from_value::<ExperimentsViewData>(encoded).unwrap(),
+                *data
+            );
+            let mut observed = data.clone();
+            let mut comparison = observed_comparison_fixture(0.5, 0.1);
+            comparison.metric = expected.key().into();
+            observed.comparison_summary = Some(comparison);
+            harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                observed,
+            )));
+            let frame = harness.capture_frame_str(120, 28);
+            assert!(frame.contains(&format!(
+                "[ / ] endpoint: {} ({})",
+                expected.label(),
+                expected.unit()
+            )));
+            assert!(frame.contains(&format!(
+                "{} ({}) at tick 1000: paired n=3",
+                expected.label(),
+                expected.unit()
+            )));
+            if matches!(expected, LabMetric::MeanAge | LabMetric::MaxAge) {
+                assert!(frame.contains("age increments"));
+                assert!(!frame.contains("age (ticks)"));
+            }
+            harness.inject_key(KeyCode::Char('c'));
+            let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+            assert!(matches!(effects.as_slice(),
+                [ShellEffect::CompareExperiments { metric, plan_digest, status_generation: 1, .. }]
+                if *metric == expected && plan_digest == "fixture-plan"));
+            harness.inject_key(KeyCode::Char(']'));
+            assert_eq!(harness.model_mut().drain_effects().count(), 0);
+            assert!(
+                harness
+                    .model()
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            harness
+                .model()
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_metric,
+            LabMetric::AliveAgents
+        );
+        harness.inject_key(KeyCode::Char('['));
+        assert_eq!(
+            harness
+                .model()
+                .science
+                .experiments
+                .data()
+                .unwrap()
+                .comparison_metric,
+            LabMetric::TotalFood
+        );
+
+        let mut mismatched = harness.model().science.experiments.data().unwrap().clone();
+        mismatched.comparison_summary = Some(observed_comparison_fixture(0.5, 0.1));
+        harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+            mismatched,
+        )));
+        let frame = harness.capture_frame_str(120, 28);
+        assert!(frame.contains("Total food (food energy units)"));
+        assert!(
+            !frame.contains("paired n="),
+            "a previous endpoint cannot be relabelled as food"
+        );
+
+        let mut wrong_source = harness.model().science.experiments.data().unwrap().clone();
+        wrong_source.comparison_summary.as_mut().unwrap().metric = "total_food".into();
+        wrong_source.status_generation += 1;
+        assert!(wrong_source.current_comparison().is_none());
+        wrong_source.status_generation -= 1;
+        wrong_source.plan_digest = "different-plan".into();
+        assert!(wrong_source.current_comparison().is_none());
+        let mut encoded = serde_json::to_value(wrong_source).unwrap();
+        encoded["comparison_metric"] = serde_json::json!("invented_fitness");
+        assert!(serde_json::from_value::<ExperimentsViewData>(encoded).is_err());
     }
 
     #[test]
@@ -3028,12 +3867,28 @@ mod tests {
         assert!(replay_frame.contains("observed-checkpoint"));
         assert!(replay_frame.contains("Observed live tick: 250"));
 
-        // 2. Branch intent does not create a branch or success receipt.
+        // 2. Configure a saved-cut future before admitting work or adding a receipt.
         harness.inject_key(KeyCode::Char('n'));
+        assert!(harness.model().branch_draft.is_some());
+        assert_eq!(harness.model_mut().drain_effects().count(), 0);
+        let draft_frame = harness.capture_frame_str(80, 24);
+        assert!(draft_frame.contains("240"));
+        assert!(draft_frame.contains("observed-checkpoint"));
+        harness.inject_key(KeyCode::Right);
+        harness.inject_key(KeyCode::Down);
+        harness.inject_key(KeyCode::Enter);
+        assert!(harness.model().branch_draft.is_none());
         let effects: Vec<_> = harness.model_mut().drain_effects().collect();
         assert!(matches!(
             effects.as_slice(),
-            [ShellEffect::BranchCheckpoint { checkpoint_id, .. }]
+            [ShellEffect::BranchCheckpoint {
+                checkpoint_id,
+                ticks: 120,
+                intervention: Some(crate::branch_study::StudyIntervention::Drought {
+                    duration_ticks: 120, growth_scale: 0.0, ..
+                }),
+                ..
+            }]
                 if checkpoint_id == "observed-checkpoint"
         ));
         assert!(
@@ -3042,10 +3897,14 @@ mod tests {
                 .status_message
                 .as_ref()
                 .unwrap()
-                .contains("awaiting host result")
+                .contains("awaiting service admission")
         );
         assert!(harness.model().science.branch_history.is_empty());
-        assert_eq!(harness.model().receipts.len(), 1);
+        assert_eq!(harness.model().receipts.len(), 2);
+        assert_eq!(
+            harness.model().latest_receipt().unwrap().status,
+            ReceiptStatusKind::Pending
+        );
 
         // 3. Experiments Arm Comparison Workflow
         harness.inject_key(KeyCode::Char('6'));
@@ -3053,6 +3912,8 @@ mod tests {
 
         let exp_data = ExperimentsViewData {
             experiment_id: "exp-darwin-01".into(),
+            plan_digest: "fixture-plan".into(),
+            status_generation: 1,
             batch_status: "Running".into(),
             active_arms: vec![
                 ExperimentArmView {
@@ -3078,6 +3939,7 @@ mod tests {
             ],
             selected_arm_index: 0,
             comparison_baseline: None,
+            comparison_metric: LabMetric::AliveAgents,
             comparison_summary: None,
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
@@ -3089,7 +3951,7 @@ mod tests {
         let effects: Vec<_> = harness.model_mut().drain_effects().collect();
         assert!(matches!(
             effects.as_slice(),
-            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger }]
+            [ShellEffect::CompareExperiments { experiment_id, baseline, challenger, metric: LabMetric::AliveAgents, .. }]
                 if experiment_id == "exp-darwin-01" && baseline == "arm-mlp" && challenger == "arm-dwraon"
         ));
         assert!(
@@ -3108,7 +3970,7 @@ mod tests {
 
         let mut observed_experiments = harness.model().science.experiments.data().unwrap().clone();
         observed_experiments.comparison_summary =
-            Some(Box::new(observed_comparison_fixture(0.38, 0.16)));
+            Some(observed_comparison_fixture(0.38, 0.16));
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             observed_experiments,
         )));
@@ -3271,6 +4133,8 @@ mod tests {
         // Screen 3: Experiments Data Golden
         let exp_data = ExperimentsViewData {
             experiment_id: "exp-darwin-01".into(),
+            plan_digest: "fixture-plan".into(),
+            status_generation: 1,
             batch_status: "Running".into(),
             active_arms: vec![
                 ExperimentArmView {
@@ -3296,7 +4160,8 @@ mod tests {
             ],
             selected_arm_index: 0,
             comparison_baseline: None,
-            comparison_summary: Some(Box::new(observed_comparison_fixture(1.88, 0.002))),
+            comparison_metric: LabMetric::AliveAgents,
+            comparison_summary: Some(observed_comparison_fixture(1.88, 0.002)),
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             exp_data,
@@ -3606,13 +4471,15 @@ mod tests {
                 .status_message
                 .as_deref()
                 .unwrap()
-                .contains("no checkpoint is selected")
+                .contains("select a saved checkpoint in Replay")
         );
 
         // Step 5: Compare experiment arms
         harness.inject_key(KeyCode::Char('6')); // Experiments
         let exp_data = ExperimentsViewData {
             experiment_id: "journey-exp".into(),
+            plan_digest: "journey-fixture-plan".into(),
+            status_generation: 1,
             batch_status: "Running".into(),
             active_arms: vec![
                 ExperimentArmView {
@@ -3638,6 +4505,7 @@ mod tests {
             ],
             selected_arm_index: 0,
             comparison_baseline: None,
+            comparison_metric: LabMetric::AliveAgents,
             comparison_summary: None,
         };
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(

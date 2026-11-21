@@ -49,8 +49,16 @@ use scriptbots_core::{
 use scriptbots_runtime::{
     ApplicationState, BrainProjectionRequest, CommandEnvelope, CommandId, CommandStatus,
     ControlRevision, HostAccessError, HostClient, HostCommand, HostCommandMappingError, HostEvent,
-    HostPort, JournalState, ProjectionClientId, ProjectionRequestRevision, ProtocolEventCursor,
-    RenderSnapshot, SnapshotSubscription, channel::ChannelHostPort,
+    HostPort, HostSessionId, JournalState, ProjectionClientId, ProjectionRequestRevision,
+    ProtocolEventCursor, RenderSnapshot, SnapshotSubscription,
+    channel::ChannelHostPort,
+    lab_guide::{LabGuideSource, LabGuideStep},
+    lab_workflows::{
+        LabAction, LabCheckpoint, LabCheckpointSave, LabCheckpointSaveState, LabCheckpointView,
+        LabExperiment, LabExperimentCreationState,
+        LabExperimentDesign, LabExperimentDraft, LabMetric, LabPanel, LabWorkflowRequest,
+        LabWorkflowResponse, LabWorkflowSubmit, LabWorkflows,
+    },
 };
 use scriptbots_storage::{AnalyticsSnapshot, IslandSnapshot, MetricReading};
 #[cfg(test)]
@@ -373,8 +381,925 @@ impl CanvasReviewTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExperimentComparisonTarget {
     experiment_id: String,
+    plan_digest: String,
+    status_generation: u64,
     baseline: String,
     challenger: String,
+    metric: LabMetric,
+}
+
+/// The live terminal consumes the same bounded, source-validated experiment
+/// model as the native GPU frontends. Cursor and scrolling are presentation only.
+#[derive(Default)]
+struct TerminalExperimentLab {
+    workflows: LabWorkflows,
+    enabled: bool,
+    selected_row: Option<String>,
+    scroll: u16,
+    mutation: Option<TerminalLabMutation>,
+    request_namespace: u128,
+    next_request: u64,
+    draft_field: usize,
+    draft_edit: Option<(TerminalLabDraftField, String)>,
+}
+
+/// Read-only saved-source browsing. Checkpoint saves, canvas reviews and branch
+/// mutations still use the terminal's existing presentation and lifecycle rail.
+/// Each shared model retains its occupied worker even after leaving its route.
+#[derive(Default)]
+struct TerminalReplayLab {
+    workflows: LabWorkflows,
+    enabled: bool,
+    selected_row: Option<String>,
+    scroll: u16,
+    refresh_saved: bool,
+}
+
+impl TerminalReplayLab {
+    fn rows(&self) -> Vec<&str> {
+        match self.workflows.checkpoint_view {
+            LabCheckpointView::SavedCuts => {
+                self.workflows
+                    .checkpoints
+                    .as_ref()
+                    .map_or_else(Vec::new, |page| {
+                        page.items
+                            .iter()
+                            .map(|row| row.checkpoint_id.as_str())
+                            .collect()
+                    })
+            }
+            LabCheckpointView::BranchCatalog => self
+                .workflows
+                .checkpoint_branches
+                .as_ref()
+                .map_or_else(Vec::new, |page| {
+                    page.items
+                        .iter()
+                        .map(|row| row.branch_id.as_str())
+                        .collect()
+                }),
+            LabCheckpointView::BranchDetail | LabCheckpointView::BranchComposer => Vec::new(),
+        }
+    }
+
+    fn reconcile_selection(&mut self) {
+        let rows = self.rows();
+        if self
+            .selected_row
+            .as_deref()
+            .is_none_or(|selected| !rows.contains(&selected))
+        {
+            self.selected_row = rows.first().map(|id| (*id).to_owned());
+        }
+        if self.workflows.checkpoint_view == LabCheckpointView::SavedCuts
+            && self.workflows.selected_checkpoint != self.selected_row
+            && let Some(id) = &self.selected_row
+        {
+            self.workflows
+                .dispatch(LabAction::SelectCheckpoint(id.clone()));
+        }
+    }
+
+    fn move_selection(&mut self, forward: bool) {
+        let rows = self.rows();
+        let index = self
+            .selected_row
+            .as_deref()
+            .and_then(|selected| rows.iter().position(|id| *id == selected))
+            .unwrap_or(0);
+        let next = if forward {
+            index.saturating_add(1).min(rows.len().saturating_sub(1))
+        } else {
+            index.saturating_sub(1)
+        };
+        self.selected_row = rows.get(next).map(|id| (*id).to_owned());
+        self.reconcile_selection();
+        self.scroll = 0;
+    }
+
+    /// Return false for the existing save/review/branch controls. In particular,
+    /// X still reaches the original active-study cancellation observer.
+    fn handle_key(&mut self, key: ftui::core::event::KeyCode) -> bool {
+        use ftui::core::event::KeyCode as K;
+        let view = self.workflows.checkpoint_view;
+        let action = match key {
+            K::Up | K::Down => {
+                self.move_selection(key == K::Down);
+                return true;
+            }
+            K::PageUp => {
+                self.scroll = self.scroll.saturating_sub(6);
+                return true;
+            }
+            K::PageDown => {
+                self.scroll = self.scroll.saturating_add(6);
+                return true;
+            }
+            K::Char('r' | 'R') => LabAction::Refresh,
+            K::Char('b' | 'B') => LabAction::CheckpointBranchesPage(None),
+            K::Char('a' | 'A') => LabAction::BackToCheckpoints,
+            K::Escape if view != LabCheckpointView::SavedCuts => LabAction::BackToCheckpoints,
+            K::Char('[') => match view {
+                LabCheckpointView::SavedCuts => LabAction::CheckpointsPage(None),
+                LabCheckpointView::BranchCatalog => LabAction::CheckpointBranchesPage(None),
+                _ => return true,
+            },
+            K::Char(']') => {
+                let cursor = match view {
+                    LabCheckpointView::SavedCuts => self
+                        .workflows
+                        .checkpoints
+                        .as_ref()
+                        .and_then(|page| page.next_cursor.clone()),
+                    LabCheckpointView::BranchCatalog => self
+                        .workflows
+                        .checkpoint_branches
+                        .as_ref()
+                        .and_then(|page| page.next_cursor.clone()),
+                    _ => return true,
+                };
+                let Some(cursor) = cursor else {
+                    self.workflows
+                        .set_notice("This is the last observed catalog page.");
+                    return true;
+                };
+                if view == LabCheckpointView::SavedCuts {
+                    LabAction::CheckpointsPage(Some(cursor))
+                } else {
+                    LabAction::CheckpointBranchesPage(Some(cursor))
+                }
+            }
+            K::Enter if view == LabCheckpointView::BranchCatalog => {
+                let Some(id) = self.selected_row.clone() else {
+                    return true;
+                };
+                LabAction::SelectCheckpointBranch(id)
+            }
+            K::Enter | K::Char('v' | 'V') if view == LabCheckpointView::BranchDetail => {
+                LabAction::ReadCheckpointBranchReport
+            }
+            K::Char('n' | 'N') if view != LabCheckpointView::SavedCuts => {
+                self.workflows.set_notice("A returns to saved checkpoints; select the source before configuring a new study.");
+                return true;
+            }
+            K::Char('x' | 'X') => {
+                self.workflows.dispatch(LabAction::CancelRequest);
+                return false;
+            }
+            K::Char('g' | 'G') => {
+                self.workflows.dispatch(LabAction::ReturnLive);
+                return false;
+            }
+            _ => return false,
+        };
+        self.workflows.dispatch(action);
+        self.reconcile_selection();
+        self.scroll = 0;
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TerminalLabDraftField {
+    Design,
+    Baseline,
+    Challenger,
+    FirstSeed,
+    SeedCount,
+    Ticks,
+    TreatmentParameter,
+    TreatmentPercent,
+    TreatmentTick,
+}
+
+impl TerminalLabDraftField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Design => "Scientific contrast",
+            Self::Baseline => "Baseline brain family",
+            Self::Challenger => "Challenger brain family",
+            Self::FirstSeed => "First independent seed",
+            Self::SeedCount => "Matched seed pairs",
+            Self::Ticks => "Transitions per run",
+            Self::TreatmentParameter => "Ecological coefficient",
+            Self::TreatmentPercent => "Challenger percent of baseline",
+            Self::TreatmentTick => "Assignment after completed tick",
+        }
+    }
+
+    fn number(self, draft: &LabExperimentDraft) -> Option<u64> {
+        match self {
+            Self::FirstSeed => Some(draft.first_seed),
+            Self::SeedCount => u64::try_from(draft.seed_count).ok(),
+            Self::Ticks => Some(draft.ticks_per_run),
+            Self::TreatmentPercent => draft
+                .treatment
+                .map(|treatment| u64::from(treatment.scale_percent)),
+            Self::TreatmentTick => draft.treatment.map(|treatment| treatment.at_tick),
+            _ => None,
+        }
+    }
+
+    fn number_action(self, value: u64) -> Option<LabAction> {
+        match self {
+            Self::FirstSeed => Some(LabAction::FirstSeed(value)),
+            Self::SeedCount => usize::try_from(value).ok().map(LabAction::SeedCount),
+            Self::Ticks => Some(LabAction::TicksPerRun(value)),
+            Self::TreatmentPercent => u16::try_from(value).ok().map(LabAction::TreatmentPercent),
+            Self::TreatmentTick => Some(LabAction::TreatmentTick(value)),
+            _ => None,
+        }
+    }
+}
+
+/// The shared Lab worker still owns execution. This one-shot gate only delays
+/// its provider call until the terminal has actually presented the exact intent.
+#[derive(Default)]
+struct TerminalLabGate {
+    state: std::sync::Mutex<TerminalLabGateState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct TerminalLabGateState {
+    request: Option<TerminalLabPending>,
+    decision: Option<std::result::Result<(), String>>,
+    started: bool,
+    outcome: Option<std::result::Result<TerminalLabObservation, String>>,
+}
+
+#[derive(Clone)]
+struct TerminalLabPending {
+    request_id: String,
+    action: String,
+    request: LabWorkflowRequest,
+}
+
+enum TerminalLabObservation {
+    Batch(LabExperiment),
+    Created {
+        request_id: String,
+        session_id: HostSessionId,
+        experiment: LabExperiment,
+    },
+}
+
+struct TerminalLabMutation {
+    gate: Arc<TerminalLabGate>,
+    session: HostSessionId,
+    selected_experiment: Option<String>,
+    composing: bool,
+    receipt_recorded: bool,
+    final_receipt: Option<frankentui_shell::CommandReceiptEntry>,
+    finished: bool,
+    invalidated: Option<String>,
+}
+
+impl TerminalLabGate {
+    fn pending(&self) -> Option<TerminalLabPending> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request
+            .clone()
+    }
+
+    fn decide(&self, decision: std::result::Result<(), String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.decision.is_none() {
+            state.decision = Some(decision);
+            self.wake.notify_all();
+        }
+    }
+
+    fn run(
+        &self,
+        request: LabWorkflowRequest,
+        provider: &LabWorkflowSubmit,
+        action: &LabAction,
+        local_id: &str,
+        session: HostSessionId,
+        selected_experiment: Option<&str>,
+    ) -> std::result::Result<LabWorkflowResponse, String> {
+        let (request_id, label, matches) = match (&request, action) {
+            (
+                LabWorkflowRequest::CreateExperiment {
+                    request_id,
+                    session_id,
+                    ..
+                },
+                LabAction::CreateExperiment,
+            ) => (
+                request_id.clone(),
+                "CreateExperiment".to_owned(),
+                *session_id == session,
+            ),
+            (
+                LabWorkflowRequest::CancelExperiment { experiment_id },
+                LabAction::CancelExperiment,
+            ) => (
+                local_id.to_owned(),
+                format!("CancelExperiment {experiment_id}"),
+                selected_experiment == Some(experiment_id.as_str()),
+            ),
+            (
+                LabWorkflowRequest::ResumeExperiment { experiment_id },
+                LabAction::ResumeExperiment,
+            ) => (
+                local_id.to_owned(),
+                format!("ResumeExperiment {experiment_id}"),
+                selected_experiment == Some(experiment_id.as_str()),
+            ),
+            _ => (local_id.to_owned(), "Experiment request".to_owned(), false),
+        };
+        let permission = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.request = Some(TerminalLabPending {
+                request_id,
+                action: label,
+                request: request.clone(),
+            });
+            if !matches {
+                state.decision = Some(Err("Experiment request changed before presentation".into()));
+            }
+            while state.decision.is_none() {
+                state = self
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            let permission = state
+                .decision
+                .clone()
+                .expect("gate decision observed under lock");
+            state.started = permission.is_ok();
+            permission
+        };
+        let result = permission.and_then(|()| provider(request));
+        let observation = match &result {
+            Ok(LabWorkflowResponse::Experiment(batch)) => {
+                Ok(TerminalLabObservation::Batch(batch.clone()))
+            }
+            Ok(LabWorkflowResponse::ExperimentCreated {
+                request_id,
+                session_id,
+                experiment,
+            }) => Ok(TerminalLabObservation::Created {
+                request_id: request_id.clone(),
+                session_id: *session_id,
+                experiment: experiment.clone(),
+            }),
+            Ok(_) => Err("Experiment response did not match the requested operation".into()),
+            Err(error) => Err(error.clone()),
+        };
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcome = Some(observation);
+        result
+    }
+}
+
+impl TerminalLabMutation {
+    fn invalidate(&mut self, reason: &str) {
+        if self.invalidated.is_none() {
+            self.invalidated = Some(reason.to_owned());
+        }
+        self.gate.decide(Err(format!("Not submitted: {reason}")));
+    }
+}
+
+impl Drop for TerminalLabMutation {
+    fn drop(&mut self) {
+        self.gate.decide(Err(
+            "Not submitted: terminal request closed before presentation".into(),
+        ));
+    }
+}
+
+impl TerminalExperimentLab {
+    fn draft_fields(&self) -> Vec<TerminalLabDraftField> {
+        use TerminalLabDraftField as F;
+        let mut fields = vec![F::Design, F::Baseline];
+        if self.workflows.experiment_draft.treatment.is_none() {
+            fields.push(F::Challenger);
+        }
+        fields.extend([F::FirstSeed, F::SeedCount, F::Ticks]);
+        if self.workflows.experiment_draft.treatment.is_some() {
+            fields.extend([F::TreatmentParameter, F::TreatmentPercent, F::TreatmentTick]);
+        }
+        fields
+    }
+
+    fn composer_lines(&self) -> Vec<String> {
+        use TerminalLabDraftField as F;
+        let mut lines = vec![
+            "NEW MATCHED-SEED EXPERIMENT".into(),
+            "Up/Down field · Left/Right change · Enter type a number · S submit/retry".into(),
+            "A/Esc catalog · R refresh choices · X discard pending result · F forget an unconfirmed retry".into(),
+        ];
+        let draft = &self.workflows.experiment_draft;
+        if let Some(capabilities) = &self.workflows.experiment_capabilities {
+            lines.push(format!(
+                "Limits: {} seed pairs · {} transitions per run · {} total transitions",
+                capabilities.max_seed_count,
+                capabilities.max_ticks_per_run,
+                capabilities.max_total_ticks
+            ));
+            lines.push(capabilities.launch_description.clone());
+        } else {
+            lines.push("Loading executable brain families and experiment limits…".into());
+        }
+        for (index, field) in self.draft_fields().into_iter().enumerate() {
+            let value = match field {
+                F::Design => match draft.design() {
+                    LabExperimentDesign::BrainFamilies => "Brain-family comparison".to_owned(),
+                    LabExperimentDesign::EcologicalTreatment => {
+                        "Single ecological assignment".to_owned()
+                    }
+                },
+                F::Baseline => draft.baseline_family.clone(),
+                F::Challenger => draft.challenger_family.clone(),
+                F::TreatmentParameter => draft.treatment.map_or_else(
+                    || "unselected".into(),
+                    |treatment| treatment.parameter.label().into(),
+                ),
+                _ => field
+                    .number(draft)
+                    .map_or_else(|| "unavailable".into(), |value| value.to_string()),
+            };
+            let marker = if index == self.draft_field { ">" } else { " " };
+            lines.push(format!("{marker} {}: {value}", field.label()));
+        }
+        lines.extend(draft.question_lines());
+        if let Ok(seeds) = draft.seeds() {
+            lines.push(format!(
+                "Exact consecutive seeds: {} through {} · {} independent pairs · {} runs",
+                seeds.first().copied().unwrap_or_default(),
+                seeds.last().copied().unwrap_or_default(),
+                seeds.len(),
+                seeds.len() * 2
+            ));
+        }
+        if let Some((field, text)) = &self.draft_edit {
+            lines.push(format!(
+                "Editing {}: {text}_ · Enter accepts · Esc discards",
+                field.label()
+            ));
+        }
+        if let Some(capabilities) = &self.workflows.experiment_capabilities
+            && let Err(reason) = draft.validate(capabilities)
+        {
+            lines.push(format!("Cannot submit: {reason}"));
+        }
+        if let Some(creation) = &self.workflows.latest_experiment_creation {
+            match &creation.state {
+                LabExperimentCreationState::Pending => lines.push(format!(
+                    "Request {}: awaiting admission; scientific choices are frozen.",
+                    creation.request_id
+                )),
+                LabExperimentCreationState::Retryable { reason } => lines.push(format!(
+                    "Unconfirmed request {}: {reason} S retries these exact choices and seeds.",
+                    creation.request_id
+                )),
+                LabExperimentCreationState::Created { experiment_id } => {
+                    lines.push(format!("Previous admitted experiment: {experiment_id}"))
+                }
+            }
+        }
+        lines
+    }
+
+    fn change_draft_field(&mut self, forward: bool) {
+        use TerminalLabDraftField as F;
+        if !self.workflows.can_edit_experiment_draft() {
+            self.workflows.set_notice("Scientific choices are frozen until the current request finishes or its retry identity is explicitly forgotten.");
+            return;
+        }
+        let fields = self.draft_fields();
+        let field = fields[self.draft_field.min(fields.len() - 1)];
+        let draft = &self.workflows.experiment_draft;
+        let action = if let Some(value) = field.number(draft) {
+            let step = match field {
+                F::Ticks => 100,
+                F::TreatmentPercent => 10,
+                _ => 1,
+            };
+            let value = if forward {
+                value.checked_add(step)
+            } else {
+                value.checked_sub(step)
+            };
+            value.and_then(|value| field.number_action(value))
+        } else {
+            let choose = |length: usize, index: usize| {
+                if forward {
+                    (index + 1) % length
+                } else {
+                    (index + length - 1) % length
+                }
+            };
+            match field {
+                F::Design => Some(LabAction::ExperimentDesign(match draft.design() {
+                    LabExperimentDesign::BrainFamilies => LabExperimentDesign::EcologicalTreatment,
+                    LabExperimentDesign::EcologicalTreatment => LabExperimentDesign::BrainFamilies,
+                })),
+                F::Baseline | F::Challenger => self
+                    .workflows
+                    .experiment_capabilities
+                    .as_ref()
+                    .filter(|capabilities| !capabilities.families.is_empty())
+                    .map(|capabilities| {
+                        let selected = if matches!(field, F::Baseline) {
+                            &draft.baseline_family
+                        } else {
+                            &draft.challenger_family
+                        };
+                        let index = capabilities
+                            .families
+                            .iter()
+                            .position(|family| family == selected)
+                            .unwrap_or(0);
+                        let family = capabilities.families
+                            [choose(capabilities.families.len(), index)]
+                        .clone();
+                        if matches!(field, F::Baseline) {
+                            LabAction::DraftBaseline(family)
+                        } else {
+                            LabAction::DraftChallenger(family)
+                        }
+                    }),
+                F::TreatmentParameter => self
+                    .workflows
+                    .experiment_capabilities
+                    .as_ref()
+                    .filter(|capabilities| !capabilities.treatment_parameters.is_empty())
+                    .map(|capabilities| {
+                        let index = capabilities
+                            .treatment_parameters
+                            .iter()
+                            .position(|offered| {
+                                draft.treatment.is_some_and(|treatment| {
+                                    treatment.parameter == offered.parameter
+                                })
+                            })
+                            .unwrap_or(0);
+                        LabAction::TreatmentParameter(
+                            capabilities.treatment_parameters
+                                [choose(capabilities.treatment_parameters.len(), index)]
+                            .parameter,
+                        )
+                    }),
+                _ => None,
+            }
+        };
+        if let Some(action) = action {
+            self.workflows.dispatch(action);
+            self.draft_field = self.draft_field.min(self.draft_fields().len() - 1);
+        } else {
+            self.workflows.set_notice(
+                "This choice cannot be changed further; Enter accepts an exact numeric value.",
+            );
+        }
+        self.scroll = 0;
+    }
+
+    fn handle_composer_key(
+        &mut self,
+        key: ftui::core::event::KeyCode,
+        session: HostSessionId,
+    ) -> bool {
+        use ftui::core::event::KeyCode as K;
+        if let Some((field, text)) = &mut self.draft_edit {
+            match key {
+                K::Char(character) if character.is_ascii_digit() && text.len() < 20 => {
+                    text.push(character)
+                }
+                K::Backspace => {
+                    text.pop();
+                }
+                K::Delete => text.clear(),
+                K::Escape => self.draft_edit = None,
+                K::Enter => {
+                    if self.workflows.can_edit_experiment_draft() {
+                        if let Some(action) = text
+                            .parse()
+                            .ok()
+                            .and_then(|value| field.number_action(value))
+                        {
+                            self.workflows.dispatch(action);
+                            self.draft_edit = None;
+                        } else {
+                            self.workflows.set_notice(
+                                "Enter a whole number within this field's integer range.",
+                            );
+                        }
+                    } else {
+                        self.draft_edit = None;
+                        self.workflows.set_notice(
+                            "The source or request changed; reopen the field before editing.",
+                        );
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+        match key {
+            K::Up => {
+                self.draft_field = self.draft_field.saturating_sub(1);
+                self.scroll = 0;
+            }
+            K::Down => {
+                self.draft_field = (self.draft_field + 1).min(self.draft_fields().len() - 1);
+                self.scroll = 0;
+            }
+            K::Left => self.change_draft_field(false),
+            K::Right => self.change_draft_field(true),
+            K::Enter => {
+                let fields = self.draft_fields();
+                let field = fields[self.draft_field.min(fields.len() - 1)];
+                if self.workflows.can_edit_experiment_draft() {
+                    if let Some(value) = field.number(&self.workflows.experiment_draft) {
+                        self.draft_edit = Some((field, value.to_string()));
+                    } else {
+                        self.change_draft_field(true);
+                    }
+                }
+            }
+            K::Char('s' | 'S') => self.begin_mutation(LabAction::CreateExperiment, session),
+            K::Char('f' | 'F') => self.workflows.dispatch(LabAction::AbandonExperimentRequest),
+            K::Char('a' | 'A') | K::Escape => self.workflows.dispatch(LabAction::BackToExperiments),
+            K::Char('r' | 'R') => self.workflows.dispatch(LabAction::Refresh),
+            K::Char('x' | 'X') => {
+                self.cancel_unpresented_mutation("experiment request discarded");
+                self.workflows.dispatch(LabAction::CancelRequest);
+            }
+            K::Char(
+                'b' | 'B' | 'v' | 'V' | 'm' | 'M' | 'c' | 'C' | 'd' | 'D' | 'u' | 'U' | 'n' | 'N'
+                | '[' | ']',
+            ) => {
+                self.workflows.set_notice(
+                    "Use the composer fields to choose the experiment, then S to submit or retry.",
+                );
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn begin_mutation(&mut self, action: LabAction, session: HostSessionId) {
+        if self.mutation.is_some() || self.workflows.is_busy() {
+            self.workflows.set_notice("Wait for the current experiment request and its displayed result before submitting another.");
+            return;
+        }
+        if matches!(action, LabAction::CreateExperiment) && !self.workflows.can_create_experiment()
+        {
+            self.workflows.dispatch(action);
+            return;
+        }
+        let Some(provider) = self.workflows.submit.clone() else {
+            self.workflows
+                .set_notice("Experiment services are unavailable on this source.");
+            return;
+        };
+        let Some(serial) = self.next_request.checked_add(1) else {
+            self.workflows
+                .set_notice("Experiment request identities are exhausted.");
+            return;
+        };
+        self.next_request = serial;
+        let local_id = format!("terminal-lab-{:032x}-{serial}", self.request_namespace);
+        let gate = Arc::new(TerminalLabGate::default());
+        let worker_gate = Arc::clone(&gate);
+        let worker_provider = Arc::clone(&provider);
+        let worker_action = action.clone();
+        let selected_experiment = self.workflows.selected_experiment.clone();
+        let worker_selection = selected_experiment.clone();
+        self.workflows.submit = Some(Arc::new(move |request| {
+            worker_gate.run(
+                request,
+                &worker_provider,
+                &worker_action,
+                &local_id,
+                session,
+                worker_selection.as_deref(),
+            )
+        }));
+        self.workflows.dispatch(action);
+        // start() clones the provider into its one existing worker. Later reads
+        // use the ordinary provider, and refused dispatches leave no held gate.
+        self.workflows.submit = Some(provider);
+        if self.workflows.is_busy() {
+            self.mutation = Some(TerminalLabMutation {
+                gate,
+                session,
+                selected_experiment,
+                composing: self.workflows.composing_experiment,
+                receipt_recorded: false,
+                final_receipt: None,
+                finished: false,
+                invalidated: None,
+            });
+        } else {
+            gate.decide(Err("Not submitted: experiment request was refused".into()));
+        }
+    }
+
+    fn cancel_unpresented_mutation(&mut self, reason: &str) {
+        if let Some(mutation) = &mut self.mutation {
+            mutation.invalidate(reason);
+        }
+    }
+
+    fn rows(&self) -> Vec<&str> {
+        if let Some(batch) = &self.workflows.batch {
+            batch
+                .variants
+                .iter()
+                .map(|row| row.variant_id.as_str())
+                .collect()
+        } else {
+            self.workflows
+                .experiments
+                .as_ref()
+                .map_or_else(Vec::new, |page| {
+                    page.items
+                        .iter()
+                        .map(|row| row.experiment_id.as_str())
+                        .collect()
+                })
+        }
+    }
+
+    fn reconcile_selection(&mut self) {
+        let rows = self.rows();
+        if self
+            .selected_row
+            .as_deref()
+            .is_none_or(|selected| !rows.contains(&selected))
+        {
+            self.selected_row = rows.first().map(|id| (*id).to_owned());
+        }
+    }
+
+    fn move_selection(&mut self, forward: bool) {
+        let rows = self.rows();
+        let index = self
+            .selected_row
+            .as_deref()
+            .and_then(|selected| rows.iter().position(|id| *id == selected))
+            .unwrap_or(0);
+        let next = if forward {
+            index.saturating_add(1).min(rows.len().saturating_sub(1))
+        } else {
+            index.saturating_sub(1)
+        };
+        self.selected_row = rows.get(next).map(|id| (*id).to_owned());
+        self.scroll = 0;
+    }
+
+    fn handle_key(&mut self, key: ftui::core::event::KeyCode, session: HostSessionId) -> bool {
+        use ftui::core::event::KeyCode as K;
+        if self
+            .mutation
+            .as_ref()
+            .is_some_and(|mutation| !mutation.finished)
+            && matches!(
+                key,
+                K::Enter
+                    | K::Char(
+                        'b' | 'B'
+                            | 'v'
+                            | 'V'
+                            | 'm'
+                            | 'M'
+                            | 'c'
+                            | 'C'
+                            | 'd'
+                            | 'D'
+                            | 'u'
+                            | 'U'
+                            | 'n'
+                            | 'N'
+                            | 's'
+                            | 'S'
+                            | 'r'
+                            | 'R'
+                            | '['
+                            | ']'
+                    )
+            )
+        {
+            self.workflows.set_notice("Experiment request pending. X discards its result; navigation leaves the request view.");
+            return true;
+        }
+        if self.workflows.composing_experiment && self.handle_composer_key(key, session) {
+            return true;
+        }
+        let action = match key {
+            K::Up => {
+                self.move_selection(false);
+                return true;
+            }
+            K::Down => {
+                self.move_selection(true);
+                return true;
+            }
+            K::PageUp => {
+                self.scroll = self.scroll.saturating_sub(6);
+                return true;
+            }
+            K::PageDown => {
+                self.scroll = self.scroll.saturating_add(6);
+                return true;
+            }
+            K::Char('r' | 'R') => LabAction::Refresh,
+            K::Char('n' | 'N') => {
+                self.draft_field = 0;
+                self.draft_edit = None;
+                LabAction::NewExperiment
+            }
+            K::Char('a' | 'A') => LabAction::AllExperiments,
+            K::Char('x' | 'X') => {
+                self.cancel_unpresented_mutation("experiment request discarded");
+                LabAction::CancelRequest
+            }
+            K::Escape if self.workflows.selected_experiment.is_some() => LabAction::AllExperiments,
+            K::Char('[') if self.workflows.selected_experiment.is_none() => {
+                LabAction::ExperimentsPage(None)
+            }
+            K::Char(']') if self.workflows.selected_experiment.is_none() => {
+                let Some(cursor) = self
+                    .workflows
+                    .experiments
+                    .as_ref()
+                    .and_then(|page| page.next_cursor.clone())
+                else {
+                    self.workflows
+                        .set_notice("This is the last observed experiment catalog page.");
+                    return true;
+                };
+                LabAction::ExperimentsPage(Some(cursor))
+            }
+            K::Enter if self.workflows.selected_experiment.is_none() => {
+                let Some(id) = self.selected_row.clone() else {
+                    return true;
+                };
+                LabAction::SelectExperiment(id)
+            }
+            K::Enter | K::Char('b' | 'B') if self.workflows.batch.is_some() => {
+                let Some(id) = self.selected_row.clone() else {
+                    return true;
+                };
+                LabAction::Baseline(id)
+            }
+            K::Char('v' | 'V') if self.workflows.batch.is_some() => {
+                let Some(id) = self.selected_row.clone() else {
+                    return true;
+                };
+                LabAction::Challenger(id)
+            }
+            K::Char('m' | 'M' | '[' | ']') if self.workflows.batch.is_some() => {
+                let index = LabMetric::ALL
+                    .iter()
+                    .position(|metric| *metric == self.workflows.metric)
+                    .unwrap_or(0);
+                let step = if key == K::Char('[') {
+                    LabMetric::ALL.len() - 1
+                } else {
+                    1
+                };
+                LabAction::Metric(LabMetric::ALL[(index + step) % LabMetric::ALL.len()])
+            }
+            K::Char('c' | 'C') if self.workflows.batch.is_some() => LabAction::Compare,
+            K::Char('d' | 'D') if self.workflows.batch.is_some() => LabAction::CancelExperiment,
+            K::Char('u' | 'U') if self.workflows.batch.is_some() => LabAction::ResumeExperiment,
+            K::Enter | K::Char('b' | 'B' | 'v' | 'V' | 'm' | 'M' | 'c' | 'C' | '[' | ']') => {
+                self.workflows.set_notice("Select an experiment from the catalog and wait for its details before comparing arms.");
+                return true;
+            }
+            _ => return false,
+        };
+        if matches!(
+            action,
+            LabAction::CancelExperiment | LabAction::ResumeExperiment | LabAction::CreateExperiment
+        ) {
+            self.begin_mutation(action, session);
+        } else {
+            self.workflows.dispatch(action);
+        }
+        self.reconcile_selection();
+        self.scroll = 0;
+        true
+    }
 }
 
 impl ExperimentComparisonTarget {
@@ -387,6 +1312,9 @@ impl ExperimentComparisonTarget {
                 .data()
                 .is_some_and(|data| {
                     data.experiment_id == self.experiment_id
+                        && data.plan_digest == self.plan_digest
+                        && data.status_generation == self.status_generation
+                        && data.comparison_metric == self.metric
                         && data
                             .active_arms
                             .iter()
@@ -410,6 +1338,11 @@ enum LiveTerminalMessage {
     Checkpoint {
         request_id: String,
         result: std::result::Result<crate::control::CheckpointMetadataDto, String>,
+    },
+    CheckpointBranch {
+        request_id: String,
+        admission: bool,
+        result: std::result::Result<crate::control::CheckpointBranchStatusDto, String>,
     },
     CheckpointCanvas {
         request: u64,
@@ -450,11 +1383,63 @@ struct LiveTerminalModel<'a> {
     experiment_comparison_cancelled: bool,
     pending_checkpoints: RefCell<VecDeque<String>>,
     presented_checkpoint: RefCell<Option<String>>,
+    presented_branch: RefCell<Option<String>>,
+    presented_lab: RefCell<Option<String>>,
+    branch_namespace: u128,
+    branch_study: Option<TerminalBranchStudy>,
     active_request: RefCell<Option<PendingTerminalRequest>>,
     presented_shutdown_receipt: RefCell<Option<frankentui_shell::CommandReceiptEntry>>,
     prefer_checkpoint: Cell<bool>,
     last_service_poll: Option<Instant>,
     lineage: LiveLineages,
+}
+
+/// One terminal-owned request; navigation never detaches its lifecycle observer.
+struct TerminalBranchStudy {
+    request_id: String,
+    request: crate::control::CheckpointBranchRequest,
+    branch_id: Option<String>,
+    /// Written before the admission task checks cancellation, so closing while
+    /// its result is queued still reaches the admitted worker.
+    admitted_id: Arc<std::sync::Mutex<Option<String>>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    started: bool,
+    finished: bool,
+    operation_in_flight: bool,
+    last_poll: Option<Instant>,
+}
+
+impl TerminalBranchStudy {
+    fn matches(&self, status: &crate::control::CheckpointBranchStatusDto) -> bool {
+        status.checkpoint_id == self.request.checkpoint_id
+            && status.branch_name == self.request.branch_name
+            && self
+                .branch_id
+                .as_ref()
+                .is_none_or(|id| *id == status.branch_id)
+            && status.target_tick.checked_sub(status.source_tick) == Some(self.request.ticks)
+            && matches!(
+                status.status.as_str(),
+                "running" | "cancelling" | "completed" | "cancelled" | "failed"
+            )
+            && (status.status != "completed" || status.artifact_id.is_some())
+    }
+}
+
+fn checkpoint_branch_message(status: &crate::control::CheckpointBranchStatusDto) -> String {
+    let detail = status.artifact_id.as_ref().map_or_else(
+        || {
+            status.error_reason.as_deref().map_or_else(
+                || "independent future; live owner unchanged".to_owned(),
+                |reason| reason.chars().take(240).collect(),
+            )
+        },
+        |artifact| format!("report artifact {artifact}"),
+    );
+    format!(
+        "Branch {} {} (saved {} -> target {}): {detail}",
+        status.branch_name, status.status, status.source_tick, status.target_tick
+    )
 }
 
 /// Observe the pinned runtime's successful presentation branch. An exhausted
@@ -480,13 +1465,16 @@ struct TerminalPresentation {
 enum PendingTerminalRequest {
     Command(CommandId),
     Checkpoint(String),
+    CheckpointBranch(String),
+    Lab { request_id: String, action: String },
 }
 
 impl PendingTerminalRequest {
     fn receipt_id(&self) -> String {
         match self {
             Self::Command(id) => id.to_string(),
-            Self::Checkpoint(id) => id.clone(),
+            Self::Checkpoint(id) | Self::CheckpointBranch(id) => id.clone(),
+            Self::Lab { request_id, .. } => request_id.clone(),
         }
     }
 }
@@ -507,6 +1495,14 @@ impl FrameTimingSink for TerminalPresentationObserver {
 impl<'a> LiveTerminalModel<'a> {
     fn new(mut app: TerminalApp<'a>) -> Result<Self> {
         app.defer_live_commands = true;
+        app.experiment_lab.workflows.submit = app
+            .control
+            .control_handle()
+            .map(crate::renderer::lab_workflow_submit);
+        app.experiment_lab.enabled = app.experiment_lab.workflows.submit.is_some();
+        app.experiment_lab.request_namespace = rand::random();
+        app.replay_lab.workflows.submit = app.experiment_lab.workflows.submit.clone();
+        app.replay_lab.enabled = app.replay_lab.workflows.submit.is_some();
         app.frankentui
             .update(frankentui_shell::ShellMessage::CapabilityChanged {
                 reduced_color: !app.palette.has_color(),
@@ -536,6 +1532,10 @@ impl<'a> LiveTerminalModel<'a> {
             experiment_comparison_cancelled: false,
             pending_checkpoints: RefCell::new(VecDeque::new()),
             presented_checkpoint: RefCell::new(None),
+            presented_branch: RefCell::new(None),
+            presented_lab: RefCell::new(None),
+            branch_namespace: rand::random(),
+            branch_study: None,
             active_request: RefCell::new(None),
             presented_shutdown_receipt: RefCell::new(None),
             prefer_checkpoint: Cell::new(false),
@@ -545,6 +1545,7 @@ impl<'a> LiveTerminalModel<'a> {
     }
 
     fn fail(&self, error: anyhow::Error) -> Cmd<LiveTerminalMessage> {
+        self.cancel_branch_on_exit();
         self.pointer_frame_presented.set(false);
         let mut app = self.app.borrow_mut();
         app.hit_regions = HitRegionMap::default();
@@ -552,6 +1553,8 @@ impl<'a> LiveTerminalModel<'a> {
         app.pointer_gesture.cancel("terminal runtime failed");
         app.frankentui.on_error(&error.to_string());
         app.cancel_unpresented_commands("terminal runtime failed");
+        app.experiment_lab
+            .cancel_unpresented_mutation("terminal runtime failed");
         for request_id in self.pending_checkpoints.borrow_mut().drain(..) {
             app.record_checkpoint_result(
                 request_id,
@@ -583,10 +1586,25 @@ impl<'a> LiveTerminalModel<'a> {
                     });
             if let Some(receipt) = &presentation.request_receipt
                 && receipt_matches_active
-                && app.frankentui.receipt_for(&receipt.command_id) == Some(receipt)
+                && app.receipt_for_presentation(&receipt.command_id) == Some(receipt)
                 && !receipt.awaits_observation()
             {
                 self.active_request.borrow_mut().take();
+                if app
+                    .experiment_lab
+                    .mutation
+                    .as_ref()
+                    .is_some_and(|mutation| {
+                        mutation.finished
+                            && mutation
+                                .gate
+                                .pending()
+                                .as_ref()
+                                .is_some_and(|pending| pending.request_id == receipt.command_id)
+                    })
+                {
+                    app.experiment_lab.mutation = None;
+                }
                 app.frankentui.presentation_receipt = None;
                 app.checkpoint_presentation_result = None;
                 if app
@@ -618,6 +1636,12 @@ impl<'a> LiveTerminalModel<'a> {
                 Some(PendingTerminalRequest::Checkpoint(id)) => {
                     *self.presented_checkpoint.borrow_mut() = Some(id.clone());
                     self.prefer_checkpoint.set(false);
+                }
+                Some(PendingTerminalRequest::CheckpointBranch(id)) => {
+                    *self.presented_branch.borrow_mut() = Some(id.clone());
+                }
+                Some(PendingTerminalRequest::Lab { request_id, .. }) => {
+                    *self.presented_lab.borrow_mut() = Some(request_id.clone());
                 }
                 None => {}
             }
@@ -660,6 +1684,30 @@ impl<'a> LiveTerminalModel<'a> {
                 })
         }))
     }
+
+    fn cancel_branch_on_exit(&self) {
+        if let Some(study) = &self.branch_study
+            && !study.finished
+        {
+            study
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Admission publishes its identity before reading this flag. If the
+            // result is still queued, this shared slot closes the handoff race.
+            let admitted_id = study.branch_id.clone().or_else(|| {
+                study
+                    .admitted_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            });
+            if let Some(id) = admitted_id
+                && let Some(handle) = self.app.borrow().control.control_handle()
+            {
+                let _ = handle.cancel_checkpoint_branch(&id);
+            }
+        }
+    }
 }
 
 impl Model for LiveTerminalModel<'_> {
@@ -697,6 +1745,7 @@ impl Model for LiveTerminalModel<'_> {
                     if self.experiment_comparison_in_flight.is_some()
                         && !app.palette_open
                         && !app.help_visible
+                        && !app.frankentui.guide.visible
                         && matches!(&event, ftui::core::event::Event::Key(key)
                             if key.kind == ftui::core::event::KeyEventKind::Press
                                 && key.modifiers == ftui::core::event::Modifiers::NONE
@@ -712,12 +1761,16 @@ impl Model for LiveTerminalModel<'_> {
                     if self.checkpoint_review_in_flight.is_some()
                         && !app.palette_open
                         && !app.help_visible
+                        && !app.frankentui.guide.visible
                         && matches!(&event, ftui::core::event::Event::Key(key)
                             if key.kind == ftui::core::event::KeyEventKind::Press
-                                && key.modifiers == ftui::core::event::Modifiers::NONE
-                                && matches!(key.code,
-                                    ftui::core::event::KeyCode::Char('x' | 'g')
-                                        | ftui::core::event::KeyCode::Escape))
+                                && ((key.modifiers == ftui::core::event::Modifiers::NONE
+                                    && matches!(key.code,
+                                        ftui::core::event::KeyCode::Char('x' | 'g' | 'G')
+                                            | ftui::core::event::KeyCode::Escape))
+                                    || (key.modifiers == ftui::core::event::Modifiers::SHIFT
+                                        && matches!(key.code,
+                                            ftui::core::event::KeyCode::Char('g' | 'G')))))
                     {
                         self.checkpoint_review_cancelled = true;
                         app.frankentui.status_message = Some(
@@ -736,6 +1789,7 @@ impl Model for LiveTerminalModel<'_> {
                         && key.modifiers == ftui::core::event::Modifiers::NONE
                         && !app.palette_open
                         && !app.help_visible
+                        && !app.frankentui.guide.visible
                     {
                         if key.code == ftui::core::event::KeyCode::Char('x')
                             && self
@@ -791,6 +1845,43 @@ impl Model for LiveTerminalModel<'_> {
                     app.record_checkpoint_result(request_id, result);
                     Ok(false)
                 }
+                LiveTerminalMessage::CheckpointBranch { request_id, admission, result } => {
+                    if let Some(study) = &mut self.branch_study
+                        && study.request_id == request_id
+                        && study.operation_in_flight
+                    {
+                        study.operation_in_flight = false;
+                        let result = result.and_then(|status| {
+                            if study.matches(&status) {
+                                Ok(status)
+                            } else {
+                                Err("Branch observation does not match its original request".into())
+                            }
+                        });
+                        if admission {
+                            app.record_branch_admission_result(&request_id, &result);
+                        }
+                        match result {
+                            Ok(status) => {
+                                study.branch_id = Some(status.branch_id.clone());
+                                study.finished = matches!(status.status.as_str(), "completed" | "cancelled" | "failed");
+                                let message = checkpoint_branch_message(&status);
+                                if study.finished {
+                                    app.push_toast(message.clone());
+                                }
+                                app.frankentui.checkpoint_branch = Some(status);
+                                app.frankentui.status_message = Some(message);
+                            }
+                            Err(error) => {
+                                // Read errors do not mean the worker stopped. Keep its
+                                // identity and retry bounded status reads or cancellation.
+                                study.finished = admission;
+                                app.frankentui.status_message = Some(format!("Branch status unavailable: {error}"));
+                            }
+                        }
+                    }
+                    Ok(false)
+                }
                 LiveTerminalMessage::CheckpointCanvas {
                     request,
                     target,
@@ -835,18 +1926,21 @@ impl Model for LiveTerminalModel<'_> {
                                 Ok(comparison) if comparison.experiment_id == target.experiment_id
                                     && comparison.baseline_variant == target.baseline
                                     && comparison.challenger_variant == target.challenger
-                                    && comparison.metric == "alive_agents" => {
+                                    && comparison.metric == target.metric.key()
+                                    && comparison.plan_digest == target.plan_digest
+                                    && comparison.status_generation == target.status_generation => {
                                     app.frankentui.status_message = Some(format!(
-                                        "Compared {} / {} across {} matched seeds at tick {}",
+                                        "Compared {} ({}): {} / {}, {} matched seeds at tick {}",
+                                        target.metric.label(), target.metric.unit(),
                                         target.baseline, target.challenger,
                                         comparison.matched_seeds.len(), comparison.endpoint_tick,
                                     ));
                                     if let science_screens::ScreenDataState::Data(data) = &mut app.frankentui.science.experiments {
-                                        data.comparison_summary = Some(Box::new(comparison));
+                                        data.comparison_summary = Some(comparison);
                                     }
                                 }
                                 Ok(_) => app.frankentui.status_message = Some(
-                                    "Comparison refused: result identity does not match this request".into(),
+                                    "Comparison refused: endpoint or batch source changed; refresh and retry".into(),
                                 ),
                                 Err(error) => app.frankentui.status_message = Some(format!(
                                     "Comparison unavailable: {error}"
@@ -864,7 +1958,7 @@ impl Model for LiveTerminalModel<'_> {
                 {
                     self.experiment_comparison_cancelled = true;
                     app.frankentui.status_message = Some(
-                        "Comparison cancelled after the experiment or screen changed".into(),
+                        "Comparison cancelled after the endpoint, batch source or screen changed; wait for the read to finish before retrying".into(),
                     );
                 }
                 if let Some((_, target)) = &self.checkpoint_review_in_flight
@@ -910,18 +2004,39 @@ impl Model for LiveTerminalModel<'_> {
             .front()
             .cloned()
             .map(PendingTerminalRequest::Checkpoint);
+        let pending_branch = self
+            .branch_study
+            .as_ref()
+            .filter(|study| !study.started && !study.finished)
+            .map(|study| PendingTerminalRequest::CheckpointBranch(study.request_id.clone()));
+        let pending_lab = app
+            .experiment_lab
+            .mutation
+            .as_ref()
+            .filter(|mutation| mutation.receipt_recorded)
+            .and_then(|mutation| mutation.gate.pending())
+            .map(|pending| PendingTerminalRequest::Lab {
+                request_id: pending.request_id,
+                action: pending.action,
+            });
         let pending_request = if self.active_request.borrow().is_some() {
             None
         } else if self.prefer_checkpoint.get() {
-            pending_checkpoint.or(pending_command)
+            pending_checkpoint
+                .or(pending_command)
+                .or(pending_branch)
+                .or(pending_lab)
         } else {
-            pending_command.or(pending_checkpoint)
+            pending_command
+                .or(pending_checkpoint)
+                .or(pending_branch)
+                .or(pending_lab)
         };
         let request_receipt = self
             .active_request
             .borrow()
             .as_ref()
-            .and_then(|request| app.frankentui.receipt_for(&request.receipt_id()))
+            .and_then(|request| app.receipt_for_presentation(&request.receipt_id()))
             .cloned();
         let checkpoint_status = app
             .checkpoint_presentation_result
@@ -947,6 +2062,16 @@ impl Model for LiveTerminalModel<'_> {
                     PendingTerminalRequest::Checkpoint(id) => {
                         format!("[PENDING] id={id} CreateCheckpoint")
                     }
+                    PendingTerminalRequest::CheckpointBranch(id) => {
+                        format!("[PENDING] id={id} StartCheckpointBranch")
+                    }
+                    PendingTerminalRequest::Lab { request_id, action } => app
+                        .receipt_for_presentation(request_id)
+                        .filter(|receipt| !receipt.awaits_observation())
+                        .map_or_else(
+                            || format!("[PENDING] id={request_id} {action}"),
+                            frankentui_shell::CommandReceiptEntry::summary,
+                        ),
                 })
             });
         let mut receipt_visible = false;
@@ -1030,11 +2155,14 @@ impl Model for LiveTerminalModel<'_> {
     }
 
     fn on_shutdown(&mut self) -> Cmd<Self::Message> {
+        self.cancel_branch_on_exit();
         if self.failure.borrow().is_none() {
             self.acknowledge_presentation();
         }
         let mut app = self.app.borrow_mut();
         app.cancel_unpresented_commands("terminal closed before submission");
+        app.experiment_lab
+            .cancel_unpresented_mutation("terminal closed before submission");
         for request_id in self.pending_checkpoints.borrow_mut().drain(..) {
             app.record_checkpoint_result(
                 request_id,
@@ -1362,29 +2490,86 @@ impl LiveTerminalModel<'_> {
                     }
                 }
                 ShellEffect::BranchCheckpoint {
+                    request_id,
                     checkpoint_id,
                     branch_name,
+                    ticks,
+                    intervention,
                 } => {
-                    app.frankentui.update(ShellMessage::SetStatus(format!(
-                        "Branch {branch_name} from {checkpoint_id} unavailable: full host/session restore is not implemented"
-                    )));
+                    if self
+                        .branch_study
+                        .as_ref()
+                        .is_some_and(|study| !study.finished)
+                    {
+                        app.record_branch_admission_result(
+                            &request_id,
+                            &Err("Another terminal branch study is active".into()),
+                        );
+                    } else {
+                        let idempotency_key =
+                            format!("terminal-{:032x}-{request_id}", self.branch_namespace);
+                        self.branch_study = Some(TerminalBranchStudy {
+                            request_id,
+                            request: crate::control::CheckpointBranchRequest {
+                                checkpoint_id,
+                                branch_name,
+                                ticks,
+                                intervention,
+                                idempotency_key,
+                            },
+                            branch_id: None,
+                            admitted_id: Arc::new(std::sync::Mutex::new(None)),
+                            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            started: false,
+                            finished: false,
+                            operation_in_flight: false,
+                            last_poll: None,
+                        });
+                    }
+                }
+                ShellEffect::CancelCheckpointBranch => {
+                    if let Some(study) = &mut self.branch_study
+                        && !study.finished
+                    {
+                        study
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        if study.started {
+                            study.last_poll = None;
+                            app.frankentui.status_message = Some(
+                                "Branch cancellation requested; awaiting the worker outcome".into(),
+                            );
+                        } else {
+                            study.finished = true;
+                            app.record_branch_admission_result(
+                                &study.request_id,
+                                &Err("Cancelled before service admission".into()),
+                            );
+                        }
+                    }
                 }
                 ShellEffect::CompareExperiments {
                     experiment_id,
+                    plan_digest,
+                    status_generation,
                     baseline,
                     challenger,
+                    metric,
                 } => {
                     let target = ExperimentComparisonTarget {
                         experiment_id,
+                        plan_digest,
+                        status_generation,
                         baseline,
                         challenger,
+                        metric,
                     };
                     if self.experiment_comparison_in_flight.is_some() {
                         app.frankentui.status_message =
                             Some("A comparison is still running; wait for its result".into());
                     } else if !target.matches(&app) || target.baseline == target.challenger {
                         app.frankentui.status_message = Some(
-                            "Comparison cancelled: two distinct variants from the current batch are required".into(),
+                            "Comparison not submitted: the chosen endpoint and two distinct variants must belong to the current batch observation".into(),
                         );
                     } else if let Some(request) =
                         self.experiment_comparison_generation.checked_add(1)
@@ -1404,7 +2589,7 @@ impl LiveTerminalModel<'_> {
                                         &target.experiment_id,
                                         &target.baseline,
                                         &target.challenger,
-                                        "alive_agents",
+                                        target.metric.key(),
                                     )
                                     .map_err(|error| error.to_string());
                                 LiveTerminalMessage::ExperimentComparison {
@@ -1446,6 +2631,13 @@ impl LiveTerminalModel<'_> {
                 );
             } else if let Some(handle) = app.control.control_handle() {
                 self.checkpoint_in_flight = true;
+                let session_id = app.client.session_id();
+                app.guide_checkpoint_request = Some((request_id.clone(), session_id));
+                app.frankentui.guide.observe_checkpoint_save(&LabCheckpointSave {
+                    request_id: request_id.clone(),
+                    session_id,
+                    state: LabCheckpointSaveState::Pending,
+                });
                 commands.push(Cmd::task(move || {
                     let result = handle
                         .create_checkpoint(crate::control::CheckpointCreateRequest {
@@ -1462,7 +2654,86 @@ impl LiveTerminalModel<'_> {
                 );
             }
         }
+        let presented_branch = self.presented_branch.borrow_mut().take();
+        if let Some(study) = &mut self.branch_study
+            && !study.finished
+            && !study.operation_in_flight
+        {
+            if !study.started && presented_branch.as_deref() == Some(study.request_id.as_str()) {
+                if let Some(handle) = app.control.control_handle() {
+                    study.started = true;
+                    study.operation_in_flight = true;
+                    let request_id = study.request_id.clone();
+                    let request = study.request.clone();
+                    let cancelled = Arc::clone(&study.cancelled);
+                    let admitted_id = Arc::clone(&study.admitted_id);
+                    commands.push(Cmd::task(move || {
+                        let result = handle
+                            .create_checkpoint_branch(request)
+                            .map(|status| {
+                                *admitted_id
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(status.branch_id.clone());
+                                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                                    // Preserve a known admission even if its cancellation read
+                                    // fails. The retained identity permits another cancel attempt.
+                                    handle
+                                        .cancel_checkpoint_branch(&status.branch_id)
+                                        .unwrap_or(status)
+                                } else {
+                                    status
+                                }
+                            })
+                            .map_err(|error| error.to_string());
+                        LiveTerminalMessage::CheckpointBranch {
+                            request_id,
+                            admission: true,
+                            result,
+                        }
+                    }));
+                } else {
+                    study.finished = true;
+                    app.record_branch_admission_result(
+                        &study.request_id,
+                        &Err("Control data services are disabled".into()),
+                    );
+                }
+            } else if study.started
+                && let Some(branch_id) = &study.branch_id
+                && study
+                    .last_poll
+                    .is_none_or(|last| last.elapsed() >= Duration::from_millis(500))
+                && let Some(handle) = app.control.control_handle()
+            {
+                study.operation_in_flight = true;
+                study.last_poll = Some(Instant::now());
+                let request_id = study.request_id.clone();
+                let branch_id = branch_id.clone();
+                let cancel = study.cancelled.load(std::sync::atomic::Ordering::Acquire);
+                commands.push(Cmd::task(move || {
+                    let result = if cancel {
+                        handle.cancel_checkpoint_branch(&branch_id)
+                    } else {
+                        handle.get_checkpoint_branch(&branch_id)
+                    }
+                    .map_err(|error| error.to_string());
+                    LiveTerminalMessage::CheckpointBranch {
+                        request_id,
+                        admission: false,
+                        result,
+                    }
+                }));
+            }
+        }
         let route = app.frankentui.route;
+        if app.experiment_lab.enabled {
+            let presented_lab = self.presented_lab.borrow_mut().take();
+            app.service_experiment_lab(route, presented_lab.as_deref());
+        }
+        if app.replay_lab.enabled {
+            app.service_replay_lab(route);
+        }
         if self.service_in_flight.is_none()
             && self.cancelled_service_route != Some(route)
             && self
@@ -1472,6 +2743,8 @@ impl LiveTerminalModel<'_> {
                 route,
                 ShellRoute::Lineages | ShellRoute::Experiments | ShellRoute::Replay
             )
+            && !(route == ShellRoute::Experiments && app.experiment_lab.enabled)
+            && !(route == ShellRoute::Replay && app.replay_lab.enabled)
         {
             self.last_service_poll = Some(Instant::now());
             self.service_generation = self.service_generation.saturating_add(1);
@@ -1701,8 +2974,12 @@ fn experiment_arms_for_view(
             variant_id: run.variant_id,
             brain_family: run.brain_family,
             seed: run.seed,
-            current_tick: (run.state == "completed").then_some(run.total_ticks),
-            target_ticks: run.total_ticks,
+            current_tick: if run.state == "completed" {
+                Some(run.total_ticks)
+            } else {
+                run.checkpoint_progress.observed_tick()
+            },
+            target_ticks: run.target_ticks,
             mean_fitness: None,
             uncertainty_ci_95: None,
             digest: run.final_digest.unwrap_or_else(|| "unavailable".into()),
@@ -1728,12 +3005,15 @@ fn science_service_messages(
             let data = match result {
                 Ok(Some(batch)) => ScreenDataState::Data(ExperimentsViewData {
                     experiment_id: batch.experiment_id,
+                    plan_digest: batch.plan_digest,
+                    status_generation: batch.generation,
                     batch_status: batch
                         .error_reason
                         .map_or(batch.status, |error| format!("Failed: {error}")),
                     active_arms: experiment_arms_for_view(batch.runs),
                     selected_arm_index: 0,
                     comparison_baseline: None,
+                    comparison_metric: LabMetric::default(),
                     comparison_summary: None,
                 }),
                 Ok(None) => ScreenDataState::empty(
@@ -1945,6 +3225,8 @@ struct TerminalApp<'a> {
     presented_command: Option<CommandId>,
     shutdown_request: Option<CommandId>,
     checkpoint_presentation_result: Option<(String, String)>,
+    guide_checkpoint_request: Option<(String, HostSessionId)>,
+    guide_growth_source: Option<(LabGuideSource, u64)>,
     defer_live_commands: bool,
     pending_selections: VecDeque<PendingTerminalSelection>,
     selection_observation_revision: Option<ControlRevision>,
@@ -2073,6 +3355,8 @@ struct TerminalApp<'a> {
     /// Whether the tiled archipelago view is active instead of the single-world terrain map (bd-16g.5.5.4).
     archipelago_view: bool,
     pub frankentui: frankentui_shell::FrankenTuiModel,
+    experiment_lab: TerminalExperimentLab,
+    replay_lab: TerminalReplayLab,
     receipt_poll_offset: usize,
     /// Cached layout hit regions for O(1) hit testing and picking (bd-2z0.14.2.5).
     pub hit_regions: HitRegionMap,
@@ -2175,6 +3459,8 @@ impl<'a> TerminalApp<'a> {
             presented_command: None,
             shutdown_request: None,
             checkpoint_presentation_result: None,
+            guide_checkpoint_request: None,
+            guide_growth_source: None,
             defer_live_commands: false,
             pending_selections: VecDeque::with_capacity(PENDING_SELECTION_CAPACITY),
             selection_observation_revision: None,
@@ -2243,6 +3529,8 @@ impl<'a> TerminalApp<'a> {
             sub_step: 0,
             archipelago_view: false,
             frankentui: frankentui_shell::FrankenTuiModel::new(),
+            experiment_lab: TerminalExperimentLab::default(),
+            replay_lab: TerminalReplayLab::default(),
             receipt_poll_offset: 0,
             hit_regions: HitRegionMap::default(),
             pointer_gesture: PointerGestureState::default(),
@@ -2326,6 +3614,200 @@ impl<'a> TerminalApp<'a> {
         Ok(envelope)
     }
 
+    fn observe_guide_snapshot(&mut self) {
+        let selected_uid = (self.frankentui.route == frankentui_shell::ShellRoute::Inspector)
+            .then_some(self.snapshot.focused_agent_uid)
+            .flatten()
+            .map(scriptbots_core::AgentUid);
+        self.frankentui.guide_selected_uid = selected_uid.map(|uid| uid.get());
+        self.frankentui
+            .guide
+            .observe_snapshot(&self.retained_render, selected_uid);
+    }
+
+    fn record_guide_command(&mut self, envelope: &CommandEnvelope) {
+        let command = match &envelope.command {
+            HostCommand::Pause => ControlCommand::Pause,
+            HostCommand::Step => ControlCommand::Step,
+            HostCommand::UpdateSimulation(update) => {
+                ControlCommand::UpdateSimulation(update.clone())
+            }
+            HostCommand::UpdateConfig(config) => ControlCommand::UpdateConfig(config.clone()),
+            _ => return,
+        };
+        self.frankentui.guide.record_command(
+            &command,
+            envelope.command_id,
+            &self.retained_render,
+        );
+    }
+
+    fn handle_guide_input(&mut self, key: ftui::core::event::KeyCode) -> bool {
+        use ftui::core::event::KeyCode as K;
+        if key == K::F(1) {
+            self.frankentui.handle_guide_key(key);
+            self.help_visible = false;
+            self.observe_guide_snapshot();
+            self.pointer_gesture.cancel("Lab guide visibility changed");
+            self.hit_regions = HitRegionMap::default();
+            self.map_area = None;
+            return true;
+        }
+        if !self.frankentui.guide.visible {
+            return false;
+        }
+        if key == K::Enter
+            || (self.frankentui.guide_growth_draft.is_none()
+                && matches!(key, K::Char('e' | 'E')))
+        {
+            self.refresh_snapshot();
+        }
+        if self.frankentui.guide_growth_draft.is_some() {
+            match key {
+                K::Escape => {
+                    self.frankentui.guide_growth_draft = None;
+                    self.guide_growth_source = None;
+                    self.frankentui.guide_notice =
+                        Some("Food growth edit cancelled; no command submitted.".into());
+                }
+                K::Backspace => {
+                    if let Some(draft) = &mut self.frankentui.guide_growth_draft {
+                        draft.pop();
+                    }
+                }
+                K::Char(ch) if ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+' | 'e' | 'E') => {
+                    if let Some(draft) = &mut self.frankentui.guide_growth_draft
+                        && draft.len() < 32
+                    {
+                        draft.push(ch);
+                    }
+                }
+                K::Enter => {
+                    let source_matches = self.guide_growth_source.is_some_and(|(source, generation)| {
+                        generation == self.frankentui.guide.generation()
+                            && source.session_id == self.retained_render.session_id
+                            && source.revisions.config == self.retained_render.revisions.config
+                            && source.revisions.scientific
+                                == self.retained_render.revisions.scientific
+                            && source.tick == self.retained_render.world.tick
+                    });
+                    if !source_matches || !self.frankentui.guide_view_is_current() {
+                        self.frankentui.guide_growth_draft = None;
+                        self.guide_growth_source = None;
+                        self.frankentui.guide_notice = Some(
+                            "The displayed source changed. Review the new values and press E to make a fresh proposal. No command was submitted."
+                                .into(),
+                        );
+                        return true;
+                    }
+                    let draft = self
+                        .frankentui
+                        .guide_growth_draft
+                        .as_deref()
+                        .expect("guide edit is present");
+                    let growth = draft.parse::<f32>().ok().filter(|value| {
+                        value.is_finite()
+                            && *value >= 0.0
+                            && *value != self.retained_render.config.food_growth_rate
+                    });
+                    let Some(growth) = growth else {
+                        self.frankentui.guide_notice = Some(
+                            "Enter a finite nonnegative rate different from the observed value."
+                                .into(),
+                        );
+                        return true;
+                    };
+                    if !self.retained_render.playback.paused
+                        || self.frankentui.guide.step() != LabGuideStep::Configure
+                    {
+                        self.frankentui.guide_notice =
+                            Some("Pause the owner and return to the Configure step first.".into());
+                        return true;
+                    }
+                    if self.frankentui.guide.ready() {
+                        self.frankentui.guide_growth_draft = None;
+                        self.guide_growth_source = None;
+                        self.frankentui.guide_notice =
+                            Some("This change is already observed. Enter continues the guide.".into());
+                        return true;
+                    }
+                    if self.frankentui.guide.pending_command_id().is_some()
+                        || self.unpresented_commands.iter().any(|pending| {
+                            matches!(&pending.envelope.command, HostCommand::UpdateConfig(_))
+                        })
+                    {
+                        self.frankentui.guide_notice =
+                            Some("Wait for the existing configuration request's receipt.".into());
+                        return true;
+                    }
+                    let mut config = self.retained_render.config.as_ref().clone();
+                    config.food_growth_rate = growth;
+                    if let Err(error) = config.validate() {
+                        self.frankentui.guide_notice =
+                            Some(format!("Configuration refused before submission: {error}"));
+                        return true;
+                    }
+                    self.frankentui.guide_growth_draft = None;
+                    let source = self
+                        .guide_growth_source
+                        .take()
+                        .expect("guide source matched before submission")
+                        .0;
+                    self.frankentui.guide_notice = Some(
+                        self.submit_with_visible_receipt_guarded(
+                            ControlCommand::UpdateConfig(Box::new(config)),
+                            Instant::now() + Duration::from_millis(5),
+                            Some(source),
+                        )
+                        .map_or_else(
+                            || "Configuration was not submitted; inspect the receipt.".into(),
+                            |id| format!("Configuration request {id}; its receipt reports the outcome."),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+            return true;
+        }
+        if matches!(key, K::Char('e' | 'E'))
+            && self.frankentui.guide.step() == LabGuideStep::Configure
+            && !self.frankentui.guide.finished()
+        {
+            if self.frankentui.guide.ready() {
+                self.frankentui.guide_notice =
+                    Some("This change is already observed. Enter continues the guide.".into());
+                return true;
+            }
+            if self.frankentui.guide.pending_command_id().is_some()
+                || self.unpresented_commands.iter().any(|pending| {
+                    matches!(&pending.envelope.command, HostCommand::UpdateConfig(_))
+                })
+            {
+                self.frankentui.guide_notice =
+                    Some("Wait for the existing configuration request's receipt.".into());
+                return true;
+            }
+            if !self.frankentui.guide_view_is_current() {
+                self.frankentui.guide_notice =
+                    Some("Review the current owner and step before opening an edit.".into());
+                return true;
+            }
+            self.guide_growth_source = self
+                .frankentui
+                .guide
+                .source()
+                .map(|source| (source, self.frankentui.guide.generation()));
+            self.frankentui.guide_growth_draft =
+                Some(self.retained_render.config.food_growth_rate.to_string());
+            self.frankentui.guide_notice =
+                Some("Edit the proposed value; Enter submits and Esc cancels.".into());
+            return true;
+        }
+        self.frankentui.handle_guide_key(key);
+        self.observe_guide_snapshot();
+        true
+    }
+
     pub fn submit_envelope(
         &mut self,
         envelope: CommandEnvelope,
@@ -2360,6 +3842,14 @@ impl<'a> TerminalApp<'a> {
         let start = Instant::now();
         let result = self.client.submit(envelope.clone());
         let latency = start.elapsed();
+        if !matches!(
+            &result,
+            Err(HostAccessError::CommandIdCollision { .. }
+                | HostAccessError::CommandEvidenceBackpressure { .. }
+                | HostAccessError::CommandEvidenceClosed { .. })
+        ) {
+            self.record_guide_command(&envelope);
+        }
         match &result {
             Ok(status) => {
                 self.unresolved_commands
@@ -2373,6 +3863,9 @@ impl<'a> TerminalApp<'a> {
                     latency_micros = latency.as_micros(),
                     "terminal submitted command envelope via HostClient"
                 );
+                self.frankentui
+                    .guide
+                    .observe_status(self.client.session_id(), status);
                 let entry = frankentui_shell::CommandReceiptEntry::from_runtime_status(
                     &command_id,
                     action_name,
@@ -2536,6 +4029,20 @@ impl<'a> TerminalApp<'a> {
         command: ControlCommand,
         deadline: Instant,
     ) -> Option<String> {
+        self.submit_with_visible_receipt_guarded(command, deadline, None)
+    }
+
+    fn submit_with_visible_receipt_guarded(
+        &mut self,
+        command: ControlCommand,
+        deadline: Instant,
+        expected_source: Option<LabGuideSource>,
+    ) -> Option<String> {
+        if expected_source.is_some_and(|source| source.session_id != self.client.session_id()) {
+            self.frankentui.status_message =
+                Some("Configuration not submitted: the displayed owner changed.".into());
+            return None;
+        }
         if self.unresolved_commands.len() + self.unpresented_commands.len()
             >= UNRESOLVED_COMMAND_CAPACITY
         {
@@ -2601,8 +4108,14 @@ impl<'a> TerminalApp<'a> {
             .update(frankentui_shell::ShellMessage::CommandReceipt(
                 receipt.clone(),
             ));
-        let envelope = CommandEnvelope::new(id, host_command)
+        let mut envelope = CommandEnvelope::new(id, host_command)
             .expecting_control_revision(self.retained_render.revisions.control);
+        if let Some(source) = expected_source {
+            envelope = envelope
+                .expecting_control_revision(source.revisions.control)
+                .expecting_config_revision(source.revisions.config)
+                .expecting_scientific_revision(source.revisions.scientific);
+        }
         if let HostCommand::UpdateSelection(update) = &envelope.command {
             self.pending_selections.push_back(PendingTerminalSelection {
                 command_id: id,
@@ -2675,11 +4188,22 @@ impl<'a> TerminalApp<'a> {
         // reply failed. Keep the canonical guard and payload until authority
         // answers, and retry only when the user explicitly requests it.
         let result = self.host.submit_before(envelope.clone(), deadline);
+        if !matches!(
+            &result,
+            Err(HostAccessError::CommandIdCollision { .. }
+                | HostAccessError::CommandEvidenceBackpressure { .. }
+                | HostAccessError::CommandEvidenceClosed { .. })
+        ) {
+            self.record_guide_command(&envelope);
+        }
         match result {
             Ok(status) => {
                 self.unresolved_commands
                     .retain(|pending| pending.envelope.command_id != id);
                 self.observe_selection_status(&status);
+                self.frankentui
+                    .guide
+                    .observe_status(self.client.session_id(), &status);
                 let accepted = matches!(
                     status.application(),
                     ApplicationState::Admitted | ApplicationState::Applied(_)
@@ -2868,6 +4392,11 @@ impl<'a> TerminalApp<'a> {
                 candidates.push((pending.command_id, "UpdateSelection".into()));
             }
         }
+        if let Some(id) = self.frankentui.guide.pending_command_id()
+            && !candidates.iter().any(|(candidate, _)| *candidate == id)
+        {
+            candidates.push((id, "Lab guide command".into()));
+        }
         candidates.retain(|(id, _)| {
             !self
                 .unpresented_commands
@@ -2888,6 +4417,9 @@ impl<'a> TerminalApp<'a> {
                     self.unresolved_commands
                         .retain(|pending| pending.envelope.command_id != id);
                     self.observe_selection_status(&status);
+                    self.frankentui
+                        .guide
+                        .observe_status(self.client.session_id(), &status);
                     let receipt = frankentui_shell::CommandReceiptEntry::from_runtime_status(
                         &id,
                         action,
@@ -3346,13 +4878,15 @@ impl<'a> TerminalApp<'a> {
 
     fn draw_science_route(&mut self, frame: &mut Frame<'_>) -> bool {
         use frankentui_shell::ShellRoute;
-        if matches!(
-            self.frankentui.route,
-            ShellRoute::Dashboard
-                | ShellRoute::WorldCanvas
-                | ShellRoute::Inspector
-                | ShellRoute::HelpOverlay
-        ) {
+        if !self.frankentui.guide.visible
+            && matches!(
+                self.frankentui.route,
+                ShellRoute::Dashboard
+                    | ShellRoute::WorldCanvas
+                    | ShellRoute::Inspector
+                    | ShellRoute::HelpOverlay
+            )
+        {
             return false;
         }
         self.draw_shell_frame(frame, ftui::render::budget::DegradationLevel::Full);
@@ -3431,7 +4965,8 @@ impl<'a> TerminalApp<'a> {
         self.map_area = None;
         self.hover_tooltip = None;
         let area = frame.area();
-        let reduced_legacy = degradation >= ftui::render::budget::DegradationLevel::EssentialOnly
+        let reduced_legacy = !self.frankentui.guide.visible
+            && degradation >= ftui::render::budget::DegradationLevel::EssentialOnly
             && matches!(
                 self.frankentui.route,
                 frankentui_shell::ShellRoute::Dashboard
@@ -3495,6 +5030,31 @@ impl<'a> TerminalApp<'a> {
             self.hit_regions.header_rect = Some(header);
             self.hit_regions.header_targets = self.draw_header(frame, header, &self.snapshot);
         }
+        if self.experiment_lab.enabled
+            && self.frankentui.route == frankentui_shell::ShellRoute::Experiments
+            && !self.frankentui.guide.visible
+        {
+            let theme = self.palette.theme();
+            science_screens::render_live_experiments_screen(
+                frame,
+                &self.experiment_lab,
+                Style::default().fg(theme.text).bg(theme.surface),
+            );
+        }
+        if self.replay_lab.enabled
+            && self.frankentui.route == frankentui_shell::ShellRoute::Replay
+            && self.frankentui.branch_draft.is_none()
+            && !self.frankentui.guide.visible
+        {
+            let theme = self.palette.theme();
+            science_screens::render_live_replay_screen(
+                frame,
+                &self.replay_lab,
+                self.frankentui.checkpoint_branch.as_ref(),
+                self.snapshot.tick,
+                Style::default().fg(theme.text).bg(theme.surface),
+            );
+        }
         if self.help_visible {
             self.hit_regions.help_rect = Some(area);
             self.draw_help(frame);
@@ -3502,7 +5062,11 @@ impl<'a> TerminalApp<'a> {
         if self.palette_open {
             self.draw_command_palette(frame, area);
         }
-        self.draw_toasts(frame, area);
+        if self.frankentui.guide.visible {
+            self.hit_regions.help_rect = Some(area);
+        } else {
+            self.draw_toasts(frame, area);
+        }
     }
 
     fn navigate_route(&mut self, route: frankentui_shell::ShellRoute) {
@@ -3513,6 +5077,7 @@ impl<'a> TerminalApp<'a> {
         self.map_area = None;
         self.hover_tooltip = None;
         self.refresh_science_snapshot();
+        self.observe_guide_snapshot();
     }
 
     fn handle_ftui_event(&mut self, event: ftui::core::event::Event) -> Result<bool> {
@@ -3520,6 +5085,73 @@ impl<'a> TerminalApp<'a> {
         use ftui::core::event::{Event as E, KeyCode as K, KeyEventKind as Kind, Modifiers};
         match event {
             E::Key(key) if key.kind == Kind::Press => {
+                if !self.palette_open
+                    && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
+                    && self.handle_guide_input(key.code)
+                {
+                    return Ok(false);
+                }
+                if self.frankentui.guide.visible && !self.palette_open {
+                    return Ok(false);
+                }
+                if self.frankentui.branch_draft.is_some()
+                    && !self.palette_open
+                    && !self.help_visible
+                {
+                    self.frankentui.update(ShellMessage::Event(E::Key(key)));
+                    return Ok(false);
+                }
+                if !self.palette_open
+                    && !self.help_visible
+                    && self.frankentui.route == ShellRoute::Replay
+                    && self.replay_lab.enabled
+                    && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
+                {
+                    let consumed = self.replay_lab.handle_key(key.code);
+                    // Keep legacy canvas/branch intents bound to the saved cut
+                    // the user can see, never a hidden selection in Studies.
+                    self.project_replay_catalog();
+                    if consumed {
+                        return Ok(false);
+                    }
+                }
+                if !self.palette_open
+                    && !self.help_visible
+                    && self.frankentui.route == ShellRoute::Replay
+                    && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
+                {
+                    let message = match key.code {
+                        K::Char('n' | 'N') => Some(ShellMessage::ConfigureCheckpointBranch),
+                        K::Char('x' | 'X') => Some(ShellMessage::CancelActiveQuery),
+                        _ => None,
+                    };
+                    if let Some(message) = message {
+                        self.frankentui.update(message);
+                        return Ok(false);
+                    }
+                }
+                if !self.palette_open
+                    && !self.help_visible
+                    && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
+                    && self.frankentui.route == ShellRoute::Experiments
+                    && self.experiment_lab.enabled
+                    && self
+                        .experiment_lab
+                        .handle_key(key.code, self.client.session_id())
+                {
+                    return Ok(false);
+                }
+                if !self.palette_open
+                    && !self.help_visible
+                    && !self.experiment_lab.enabled
+                    && self.frankentui.route == ShellRoute::Experiments
+                    && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
+                    && matches!(key.code, K::Char('c' | 'C'))
+                {
+                    self.frankentui
+                        .update(ShellMessage::CompareSelectedExperiments);
+                    return Ok(false);
+                }
                 if !self.palette_open && !self.help_visible && key.modifiers == Modifiers::NONE {
                     if let K::Char(number @ '1'..='9') = key.code {
                         let route = ShellRoute::all_screens()[number as usize - '1' as usize];
@@ -3548,6 +5180,13 @@ impl<'a> TerminalApp<'a> {
                             {
                                 Some(ShellMessage::CompareSelectedExperiments)
                             }
+                            K::Char('[' | ']')
+                                if self.frankentui.route == ShellRoute::Experiments =>
+                            {
+                                Some(ShellMessage::CycleComparisonMetric {
+                                    forward: key.code == K::Char(']'),
+                                })
+                            }
                             K::Char('x') => Some(ShellMessage::CancelActiveQuery),
                             K::Escape => Some(ShellMessage::Navigate(ShellRoute::Dashboard)),
                             _ => None,
@@ -3565,6 +5204,9 @@ impl<'a> TerminalApp<'a> {
                 }
             }
             E::Mouse(mouse) => {
+                if self.frankentui.branch_draft.is_some() || self.frankentui.guide.visible {
+                    return Ok(false);
+                }
                 self.handle_mouse(terminal_mouse(mouse))?;
                 Ok(false)
             }
@@ -3580,12 +5222,285 @@ impl<'a> TerminalApp<'a> {
         }
     }
 
+    fn receipt_for_presentation(
+        &self,
+        request_id: &str,
+    ) -> Option<&frankentui_shell::CommandReceiptEntry> {
+        self.experiment_lab
+            .mutation
+            .as_ref()
+            .and_then(|mutation| mutation.final_receipt.as_ref())
+            .filter(|receipt| receipt.command_id == request_id)
+            .or_else(|| self.frankentui.receipt_for(request_id))
+    }
+
+    fn service_replay_lab(&mut self, route: frankentui_shell::ShellRoute) {
+        let session = self.client.session_id();
+        let active =
+            route == frankentui_shell::ShellRoute::Replay && self.frankentui.branch_draft.is_none();
+        self.replay_lab.workflows.synchronize(
+            session,
+            if active {
+                LabPanel::Checkpoints
+            } else {
+                LabPanel::Inactive
+            },
+        );
+        let reviewed = self.replay_lab.workflows.poll();
+        if let (Some(branch), Some(report)) = (
+            self.replay_lab.workflows.branch.as_ref(),
+            self.replay_lab.workflows.branch_report.as_ref(),
+        ) {
+            self.frankentui
+                .guide
+                .observe_branch_report(session, branch, report);
+        }
+        self.replay_lab.reconcile_selection();
+        if active
+            && self.replay_lab.refresh_saved
+            && self.replay_lab.workflows.checkpoint_view == LabCheckpointView::SavedCuts
+            && !self.replay_lab.workflows.is_busy()
+        {
+            self.replay_lab.refresh_saved = false;
+            self.replay_lab.workflows.dispatch(LabAction::Refresh);
+        }
+        self.replay_lab.workflows.maybe_refresh();
+        if active {
+            self.project_replay_catalog();
+        }
+        // The shared poll contract can return a historical frame. Preserve its
+        // visible-source check and the terminal's normal canvas-review handoff.
+        if let Some((checkpoint_id, snapshot)) = reviewed
+            && active
+            && self.selected_checkpoint_id() == Some(checkpoint_id.as_str())
+        {
+            self.show_canvas_review(&snapshot, Some(checkpoint_id));
+            self.replay_lab
+                .workflows
+                .synchronize(session, LabPanel::Inactive);
+        }
+    }
+
+    fn project_replay_catalog(&mut self) {
+        use science_screens::{CheckpointViewEntry, ReplayViewData, ScreenDataState};
+        let lab = &self.replay_lab;
+        let data = if lab.workflows.checkpoint_view == LabCheckpointView::SavedCuts {
+            lab.workflows.checkpoints.as_ref().map_or_else(
+                || ScreenDataState::empty("No saved checkpoint page is loaded; R refreshes."),
+                |page| {
+                    ScreenDataState::Data(ReplayViewData {
+                        checkpoints: page
+                            .items
+                            .iter()
+                            .map(|row| CheckpointViewEntry {
+                                checkpoint_id: row.checkpoint_id.clone(),
+                                tick: row.tick,
+                                agent_count: Some(row.agent_count),
+                                digest: Some(row.world_digest.clone()),
+                                file_size_bytes: row.byte_size,
+                            })
+                            .collect(),
+                        selected_checkpoint_index: lab
+                            .selected_row
+                            .as_deref()
+                            .and_then(|id| {
+                                page.items.iter().position(|row| row.checkpoint_id == id)
+                            })
+                            .unwrap_or(0),
+                        observed_live_tick: Some(self.snapshot.tick),
+                        ..ReplayViewData::default()
+                    })
+                },
+            )
+        } else {
+            ScreenDataState::empty("A returns to saved checkpoints before review or a new study.")
+        };
+        self.frankentui
+            .update(frankentui_shell::ShellMessage::SetReplayData(data));
+    }
+
+    fn service_experiment_lab(
+        &mut self,
+        route: frankentui_shell::ShellRoute,
+        presented_request: Option<&str>,
+    ) {
+        use frankentui_shell::{CommandReceiptEntry, ReceiptStatusKind, ShellMessage, ShellRoute};
+        let session = self.client.session_id();
+        let panel = if route == ShellRoute::Experiments {
+            LabPanel::Experiments
+        } else {
+            LabPanel::Inactive
+        };
+        let lab = &mut self.experiment_lab;
+        if let Some(mutation) = &mut lab.mutation {
+            if !mutation.finished
+                && (mutation.session != session
+                    || panel != LabPanel::Experiments
+                    || mutation.selected_experiment != lab.workflows.selected_experiment
+                    || mutation.composing != lab.workflows.composing_experiment)
+            {
+                mutation.invalidate("experiment selection or source changed");
+            }
+            if let Some(pending) = mutation.gate.pending() {
+                if !mutation.receipt_recorded {
+                    if self.frankentui.can_record_receipt(&pending.request_id) {
+                        mutation.receipt_recorded =
+                            self.frankentui.record_receipt(CommandReceiptEntry::new(
+                                pending.request_id.clone(),
+                                pending.action.clone(),
+                                ReceiptStatusKind::Pending,
+                            ));
+                    } else {
+                        mutation.invalidate("receipt history is full");
+                    }
+                }
+                if mutation.receipt_recorded
+                    && mutation.invalidated.is_none()
+                    && presented_request == Some(pending.request_id.as_str())
+                {
+                    mutation.gate.decide(Ok(()));
+                }
+            }
+        }
+        lab.workflows.synchronize(session, panel);
+        lab.workflows.poll();
+        let mut completed_receipt = None;
+        let mut clear_unrecorded = false;
+        if !lab.workflows.is_busy()
+            && let Some(mutation) = &mut lab.mutation
+            && !mutation.finished
+        {
+            let mut state = mutation
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(pending) = state.request.clone() {
+                let result = if let Some(reason) = &mutation.invalidated {
+                    Err(if state.started {
+                        format!(
+                            "Result unconfirmed after {reason}; inspect the catalog. Creation retries keep the original request identity."
+                        )
+                    } else {
+                        format!("Not submitted: {reason}")
+                    })
+                } else {
+                    match state.outcome.take().unwrap_or_else(|| Err("Experiment worker finished without an operation receipt".into())) {
+                        Ok(TerminalLabObservation::Batch(batch))
+                            if matches!(&pending.request,
+                                LabWorkflowRequest::CancelExperiment { experiment_id }
+                                | LabWorkflowRequest::ResumeExperiment { experiment_id }
+                                if *experiment_id == batch.summary.experiment_id)
+                                && lab.workflows.batch.as_ref() == Some(&batch) => Ok(batch),
+                        Ok(TerminalLabObservation::Created { request_id, session_id, experiment })
+                            if request_id == pending.request_id && session_id == session
+                                && lab.workflows.batch.as_ref() == Some(&experiment)
+                                && lab.workflows.latest_experiment_creation.as_ref().is_some_and(|creation| {
+                                    creation.request_id == request_id && creation.session_id == session_id
+                                        && matches!(&creation.state, LabExperimentCreationState::Created { experiment_id }
+                                            if *experiment_id == experiment.summary.experiment_id)
+                                }) => Ok(experiment),
+                        Ok(_) => Err("Experiment response was not accepted for this request and source".into()),
+                        Err(error) => Err(error),
+                    }
+                };
+                if mutation.receipt_recorded {
+                    completed_receipt = Some((pending, result));
+                } else {
+                    clear_unrecorded = true;
+                }
+            } else {
+                // A refused spawn never reached the provider and cannot leave
+                // a pending receipt or a gate that blocks subsequent actions.
+                clear_unrecorded = true;
+            }
+            mutation.finished = true;
+        }
+        if clear_unrecorded {
+            lab.mutation = None;
+        }
+        lab.reconcile_selection();
+        lab.workflows.maybe_refresh();
+        if let Some((pending, result)) = completed_receipt {
+            let (status, action, message) = match result {
+                Ok(batch) => (
+                    ReceiptStatusKind::Applied,
+                    format!("{} (observed {})", pending.action, batch.summary.status),
+                    format!(
+                        "{}: experiment {} observed {}; completed {}/{}; failed {}",
+                        pending.action,
+                        batch.summary.experiment_id,
+                        batch.summary.status,
+                        batch.summary.completed_runs,
+                        batch.summary.total_runs,
+                        batch.summary.failed_runs,
+                    ),
+                ),
+                Err(error) => {
+                    let error: String = error.chars().take(240).collect();
+                    (
+                        ReceiptStatusKind::Failed(error.clone()),
+                        pending.action.clone(),
+                        format!("{}: {error}", pending.action),
+                    )
+                }
+            };
+            if self.frankentui.presentation_receipt.as_deref() == Some(pending.request_id.as_str())
+            {
+                self.checkpoint_presentation_result =
+                    Some((pending.request_id.clone(), message.clone()));
+            }
+            let receipt = CommandReceiptEntry {
+                command_id: pending.request_id,
+                action,
+                status,
+                journal_state: None,
+                control_revision: self.retained_render.revisions.control.get(),
+                scientific_revision: self.retained_render.revisions.scientific.get(),
+                timestamp_tick: self.snapshot.tick,
+            };
+            if let Some(mutation) = &mut self.experiment_lab.mutation {
+                // History can evict a final result before its first pending
+                // frame. Keep this exact result until the observer confirms it.
+                mutation.final_receipt = Some(receipt.clone());
+            }
+            self.frankentui
+                .update(ShellMessage::CommandReceipt(receipt));
+            self.frankentui.update(ShellMessage::SetStatus(message));
+        }
+    }
+
     fn record_checkpoint_result(
         &mut self,
         request_id: String,
         result: std::result::Result<crate::control::CheckpointMetadataDto, String>,
     ) {
         use frankentui_shell::{CommandReceiptEntry, ReceiptStatusKind, ShellMessage};
+        if let Some((pending_id, session_id)) = &self.guide_checkpoint_request
+            && *pending_id == request_id
+        {
+            let state = match &result {
+                Ok(checkpoint) => LabCheckpointSaveState::Saved(LabCheckpoint {
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    tick: checkpoint.tick,
+                    agent_count: checkpoint.agent_count,
+                    byte_size: checkpoint.byte_size,
+                    world_digest: checkpoint.world_digest_v1.clone(),
+                }),
+                Err(reason) => LabCheckpointSaveState::Retryable {
+                    reason: reason.chars().take(2048).collect(),
+                },
+            };
+            self.frankentui.guide.observe_checkpoint_save(&LabCheckpointSave {
+                request_id: request_id.clone(),
+                session_id: *session_id,
+                state,
+            });
+            self.guide_checkpoint_request = None;
+        }
+        if result.is_ok() {
+            self.replay_lab.refresh_saved = true;
+        }
         let (status, message) = match result {
             Ok(checkpoint) => (
                 ReceiptStatusKind::Applied,
@@ -3609,6 +5524,43 @@ impl<'a> TerminalApp<'a> {
             .update(ShellMessage::CommandReceipt(CommandReceiptEntry {
                 command_id: request_id,
                 action: "CreateCheckpoint".into(),
+                status,
+                journal_state: None,
+                control_revision: self.retained_render.revisions.control.get(),
+                scientific_revision: self.retained_render.revisions.scientific.get(),
+                timestamp_tick: self.snapshot.tick,
+            }));
+        self.frankentui.update(ShellMessage::SetStatus(message));
+    }
+
+    fn record_branch_admission_result(
+        &mut self,
+        request_id: &str,
+        result: &std::result::Result<crate::control::CheckpointBranchStatusDto, String>,
+    ) {
+        use frankentui_shell::{CommandReceiptEntry, ReceiptStatusKind, ShellMessage};
+        self.frankentui.branch_request_pending = false;
+        let (status, message) = match result {
+            Ok(job) => (
+                ReceiptStatusKind::Applied,
+                format!(
+                    "Branch study {} admitted; execution status: {}",
+                    job.branch_id, job.status
+                ),
+            ),
+            Err(error) => (
+                ReceiptStatusKind::Failed(error.clone()),
+                format!("Branch study was not started: {error}"),
+            ),
+        };
+        if self.frankentui.presentation_receipt.as_deref() == Some(request_id) {
+            self.checkpoint_presentation_result = Some((request_id.to_owned(), message.clone()));
+        }
+        self.frankentui
+            .update(ShellMessage::CommandReceipt(CommandReceiptEntry {
+                command_id: request_id.to_owned(),
+                // This is completion of service admission, not completion of the study.
+                action: "StartCheckpointBranch".into(),
                 status,
                 journal_state: None,
                 control_revision: self.retained_render.revisions.control.get(),
@@ -3758,6 +5710,7 @@ impl<'a> TerminalApp<'a> {
                 if let Some(previous) = self.frankentui.science.experiments.data()
                     && previous.experiment_id == data.experiment_id
                 {
+                    data.comparison_metric = previous.comparison_metric;
                     data.selected_arm_index = previous
                         .selected_arm_index
                         .min(data.active_arms.len().saturating_sub(1));
@@ -3770,10 +5723,12 @@ impl<'a> TerminalApp<'a> {
                     // Selected cohorts can be complete while another variant is
                     // running or failed. Preserve verified evidence for an unchanged
                     // batch observation, and clear it when status or run data changes.
-                    if previous.batch_status == data.batch_status
+                    if previous.plan_digest == data.plan_digest
+                        && previous.status_generation == data.status_generation
+                        && previous.batch_status == data.batch_status
                         && previous.active_arms == data.active_arms
                     {
-                        data.comparison_summary = previous.comparison_summary.clone();
+                        data.comparison_summary = previous.current_comparison().cloned();
                     }
                 }
             }
@@ -6035,6 +7990,7 @@ impl<'a> TerminalApp<'a> {
                 "Controls",
                 self.palette.header_style().add_modifier(Modifier::BOLD),
             )]),
+            Line::raw(" F1       Optional first-run Lab guide (hide/reopen retains progress)"),
             Line::raw(" q        Quit"),
             Line::raw(" space    Toggle pause"),
             Line::raw(" + / -    Adjust speed"),
@@ -6045,11 +8001,23 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" S        Save ASCII screenshot"),
             Line::raw(" e        Toggle emoji mode"),
             Line::raw(" n        Toggle narrow symbols (emoji-compatible alignment)"),
-            Line::raw(" c        Cycle palette (accessibility modes)"),
+            Line::raw(
+                if self.frankentui.route == frankentui_shell::ShellRoute::Experiments {
+                    " c        Compare the chosen final-state endpoint across matched seeds"
+                } else {
+                    " c        Cycle palette (accessibility modes)"
+                },
+            ),
             Line::raw(" b        Toggle metrics baseline (set/clear)"),
             Line::raw(" x        Toggle expanded panels (auto-on on wide terminals)"),
             Line::raw(" a        Toggle tiled archipelago view"),
-            Line::raw(" [ / ]    Cycle brain layers (console view)"),
+            Line::raw(
+                if self.frankentui.route == frankentui_shell::ShellRoute::Experiments {
+                    " [ / ]    Choose experiment endpoint (population, energy, food, age...)"
+                } else {
+                    " [ / ]    Cycle brain layers (console view)"
+                },
+            ),
             Line::raw(" ↑ / ↓    Page brain heatmap rows (console view)"),
             Line::raw(" ← / →    Select rail event / change agent when rail is hidden"),
             Line::raw(" m/t/o    Focus mode: Manual / TopPredator / Oldest"),
@@ -6057,7 +8025,13 @@ impl<'a> TerminalApp<'a> {
             Line::raw(" , / .    Sense probe: cycle one eye cone / all cones"),
             Line::raw(" w        Cycle chart window (30 / 60 / 120 / 300 ticks)"),
             Line::raw(" f        Cycle event filter"),
-            Line::raw(" Enter    Focus the selected event's agent"),
+            Line::raw(
+                if self.frankentui.route == frankentui_shell::ShellRoute::Experiments {
+                    " Enter    Pin the selected variant as the comparison baseline"
+                } else {
+                    " Enter    Focus the selected event's agent"
+                },
+            ),
             Line::raw(" r        Toggle the timeline rail"),
             Line::raw(" v / g    Review selected event's cached canvas / return canvas live"),
             Line::raw(" B        Toggle sub-cell map rendering"),
@@ -6850,6 +8824,14 @@ impl<'a> TerminalApp<'a> {
             CommandPaletteAction::ShowHelp => {
                 self.help_visible = !self.help_visible;
             }
+            CommandPaletteAction::ShowLabGuide => {
+                self.frankentui.guide.open();
+                self.help_visible = false;
+                self.frankentui.help_visible = false;
+                self.observe_guide_snapshot();
+                self.pointer_gesture.cancel("Lab guide opened");
+                self.hit_regions = HitRegionMap::default();
+            }
             CommandPaletteAction::Quit => {
                 self.submit_simulation_command(ControlCommand::Shutdown);
                 self.push_toast("Shutdown requested");
@@ -7112,6 +9094,10 @@ impl<'a> TerminalApp<'a> {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.code == KeyCode::F(1) && !self.palette_open {
+            self.handle_guide_input(ftui::core::event::KeyCode::F(1));
+            return Ok(false);
+        }
         if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
             && key.modifiers == KeyModifiers::CONTROL
         {
@@ -7462,12 +9448,15 @@ impl<'a> TerminalApp<'a> {
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
                 self.review_selected_canvas();
             }
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            (KeyCode::Char('g' | 'G'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 self.canvas_review = None;
                 // Coordinates still describe the historical screen until paint.
                 self.map_area = None;
                 self.hover_tooltip = None;
                 self.pointer_gesture.cancel("canvas returned live");
+                if self.frankentui.route == frankentui_shell::ShellRoute::Replay {
+                    self.navigate_route(frankentui_shell::ShellRoute::WorldCanvas);
+                }
                 self.push_toast("Canvas returned live; simulation playback unchanged");
             }
             (KeyCode::Char('r') | KeyCode::Char('R'), _) => {
@@ -7635,6 +9624,7 @@ impl<'a> TerminalApp<'a> {
             Ok(None) => {}
             Err(error) => {
                 self.simulation_fault = Some(Arc::from(error.to_string()));
+                self.frankentui.guide.observe_unavailable();
                 return;
             }
         }
@@ -7875,6 +9865,7 @@ impl<'a> TerminalApp<'a> {
         );
         self.frankentui.paused = self.paused;
         self.frankentui.speed_multiplier = self.speed_multiplier;
+        self.observe_guide_snapshot();
         self.report_scheduled_patches(&world);
         self.validate_rail_selection();
         self.maybe_log_rail_first_show();
@@ -17772,6 +19763,465 @@ for case in ('panic', 'subscription', 'renderer'):
         model.acknowledge_presentation();
     }
 
+    fn checkpoint_branch_terminal_fixture() -> (
+        TerminalTestHost,
+        ControlRuntime,
+        crate::control::ControlHandle,
+        crate::control::CheckpointMetadataDto,
+        PathBuf,
+    ) {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            closed: true,
+            topography_enabled: false,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let installed = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+        for _ in 0..2 {
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .expect("seed terminal checkpoint branch founder");
+            assert!(
+                world
+                    .bind_agent_brain(id, installed.population()[0])
+                    .unwrap()
+            );
+        }
+        let host = TerminalTestHost::take(Arc::new(std::sync::Mutex::new(world)));
+        let (runtime, _) = ControlRuntime::launch(
+            host.port(),
+            crate::servers::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::servers::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let artifacts = std::env::temp_dir().join(format!(
+            "scriptbots-terminal-branch-{}-{:032x}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(artifacts.clone())
+            .unwrap();
+        let checkpoint = handle
+            .create_checkpoint(crate::control::CheckpointCreateRequest {
+                description: Some("actual terminal branch source".into()),
+                ..crate::control::CheckpointCreateRequest::default()
+            })
+            .unwrap();
+        (host, runtime, handle, checkpoint, artifacts)
+    }
+
+    fn checkpoint_branch_terminal_key(
+        code: ftui::core::event::KeyCode,
+        modifiers: ftui::core::event::Modifiers,
+    ) -> LiveTerminalMessage {
+        let mut key = ftui::core::event::KeyEvent::new(code);
+        key.modifiers = modifiers;
+        LiveTerminalMessage::Event(ftui::core::event::Event::Key(key))
+    }
+
+    fn checkpoint_branch_terminal_task(
+        command: Cmd<LiveTerminalMessage>,
+    ) -> Box<dyn FnOnce() -> LiveTerminalMessage + Send> {
+        match command {
+            Cmd::Task(_, work) => work,
+            Cmd::Batch(mut commands) => {
+                assert_eq!(commands.len(), 1, "one actual branch service operation");
+                checkpoint_branch_terminal_task(commands.pop().unwrap())
+            }
+            _ => panic!("expected the actual branch admission or status task"),
+        }
+    }
+
+    #[test]
+    fn live_checkpoint_branch_requires_presented_intent_and_reports_actual_isolated_future() {
+        use frankentui_shell::{ReceiptStatusKind, ShellRoute};
+        use ftui::core::event::{KeyCode as K, Modifiers as M};
+        let (host, runtime, handle, checkpoint, artifacts) = checkpoint_branch_terminal_fixture();
+        let before = host.port().scientific_digest_v1().unwrap();
+        let retained = host.port().snapshot_hub().latest();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(ShellRoute::Replay);
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        finish_terminal_replay_read(&mut model);
+        assert_eq!(
+            model.app.borrow().selected_checkpoint_id(),
+            Some(checkpoint.checkpoint_id.as_str())
+        );
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+
+        // A request cancelled before presentation never consumes service capacity.
+        for (code, modifiers) in [
+            (K::Char('N'), M::SHIFT),
+            (K::Enter, M::NONE),
+            (K::Char('X'), M::SHIFT),
+        ] {
+            let _ = simulator
+                .model_mut()
+                .update(checkpoint_branch_terminal_key(code, modifiers));
+        }
+        let cancelled = simulator.model().branch_study.as_ref().unwrap();
+        assert!(cancelled.finished && !cancelled.started);
+        assert!(matches!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .frankentui
+                .latest_receipt()
+                .unwrap()
+                .status,
+            ReceiptStatusKind::Failed(_)
+        ));
+        assert!(!artifacts.join("branches").exists());
+
+        // Production Shift+N opens the draft. Select a real one-tick drought pair.
+        for (code, modifiers) in [
+            (K::Char('N'), M::SHIFT),
+            (K::Right, M::NONE),
+            (K::Down, M::NONE),
+            (K::Down, M::NONE),
+            (K::Enter, M::NONE),
+        ] {
+            let _ = simulator
+                .model_mut()
+                .update(checkpoint_branch_terminal_key(code, modifiers));
+        }
+        let study = simulator.model().branch_study.as_ref().unwrap();
+        let request_id = study.request_id.clone();
+        assert_eq!(study.request.checkpoint_id, checkpoint.checkpoint_id);
+        assert_eq!(study.request.ticks, 1);
+        assert!(matches!(
+            &study.request.intervention,
+            Some(crate::branch_study::StudyIntervention::Drought {
+                duration_ticks: 1,
+                ..
+            })
+        ));
+        assert!(!study.started);
+
+        // Neither an unreadable receipt nor a skipped write can authorize admission.
+        for (width, height, present_us) in [(1, 1, 1), (120, 36, 0)] {
+            simulator.capture_frame(width, height);
+            simulator_presentation_callback(simulator.model(), present_us);
+            let _ = simulator.model_mut().update(LiveTerminalMessage::Refresh);
+            assert!(!simulator.model().branch_study.as_ref().unwrap().started);
+            assert!(!artifacts.join("branches").exists());
+        }
+        let pending = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        assert!(pending.contains(&format!("[PENDING] id={request_id}")));
+        assert!(pending.contains("StartCheckpointBranch"));
+        simulator_presentation_callback(simulator.model(), 1);
+        let work = checkpoint_branch_terminal_task(
+            simulator.model_mut().update(LiveTerminalMessage::Refresh),
+        );
+        assert!(simulator.model().branch_study.as_ref().unwrap().started);
+        assert!(
+            simulator
+                .model()
+                .branch_study
+                .as_ref()
+                .unwrap()
+                .branch_id
+                .is_none()
+        );
+        let _ = simulator
+            .model_mut()
+            .update(checkpoint_branch_terminal_key(K::Char('1'), M::NONE));
+        assert_eq!(
+            simulator.model().app.borrow().frankentui.route,
+            ShellRoute::Dashboard
+        );
+        assert_eq!(
+            simulator.model().branch_study.as_ref().unwrap().request_id,
+            request_id
+        );
+
+        // Execute the real service closure, not a fabricated success response.
+        let message = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(work)
+            .unwrap()
+            .join()
+            .unwrap();
+        let LiveTerminalMessage::CheckpointBranch {
+            result: Ok(admitted),
+            admission: true,
+            ..
+        } = &message
+        else {
+            panic!("actual saved-cut branch admission failed");
+        };
+        let branch_id = admitted.branch_id.clone();
+        assert_eq!(admitted.world_digest_v1, checkpoint.world_digest_v1);
+        let mut next = Some(simulator.model_mut().update(message));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !simulator.model().branch_study.as_ref().unwrap().finished {
+            assert!(
+                Instant::now() < deadline,
+                "actual branch worker did not finish"
+            );
+            let command = next.take().unwrap_or_else(|| {
+                simulator
+                    .model_mut()
+                    .branch_study
+                    .as_mut()
+                    .unwrap()
+                    .last_poll = None;
+                simulator.model_mut().service_commands()
+            });
+            let observed = checkpoint_branch_terminal_task(command)();
+            let queued = simulator.model_mut().update(observed);
+            if simulator
+                .model()
+                .branch_study
+                .as_ref()
+                .unwrap()
+                .operation_in_flight
+            {
+                next = Some(queued);
+            }
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        let completed = simulator
+            .model()
+            .app
+            .borrow()
+            .frankentui
+            .checkpoint_branch
+            .clone()
+            .unwrap();
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        assert_eq!(completed.branch_id, branch_id);
+        assert_eq!(completed.target_tick, checkpoint.tick + 1);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .frankentui
+                .receipt_for(&request_id)
+                .unwrap()
+                .status,
+            ReceiptStatusKind::Applied
+        );
+        let (report_artifact, bytes) = handle
+            .read_artifact_bytes(completed.artifact_id.as_deref().unwrap())
+            .unwrap();
+        let report: crate::branch_study::BranchStudyReport =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report.pre_intervention_digest, checkpoint.world_digest_v1);
+        assert!(report.pre_intervention_digest_verified_for_all_branches);
+        assert_eq!(report.branch_reports.len(), 2);
+        assert!(
+            report
+                .branch_reports
+                .iter()
+                .all(|branch| branch.bundle_verified
+                    && branch.terminal_sample.tick == completed.target_tick)
+        );
+        assert!(
+            report
+                .branch_reports
+                .iter()
+                .any(|branch| branch.branch_id == "treatment" && branch.first_divergence.is_some())
+        );
+
+        let _ = simulator
+            .model_mut()
+            .update(checkpoint_branch_terminal_key(K::Char('7'), M::NONE));
+        let frame = frankentui_shell::buffer_to_string(simulator.capture_frame(160, 36));
+        assert!(frame.contains("completed"));
+        assert!(frame.contains("Completed report artifact:"));
+        assert!(frame.contains(completed.artifact_id.as_deref().unwrap()));
+
+        // Discover the admitted study through the shared catalog, then read the
+        // verified report through real terminal keys and the production provider.
+        terminal_lab_key(simulator.model_mut(), K::Char('B'));
+        finish_terminal_replay_read(simulator.model_mut());
+        {
+            let app = simulator.model().app.borrow();
+            let catalog = app
+                .replay_lab
+                .workflows
+                .checkpoint_branches
+                .as_ref()
+                .unwrap();
+            assert_eq!(catalog.total, 1);
+            assert_eq!(catalog.items[0].branch_id, branch_id);
+            assert!(app.selected_checkpoint_id().is_none());
+        }
+        terminal_lab_key(simulator.model_mut(), K::Enter);
+        finish_terminal_replay_read(simulator.model_mut());
+        terminal_lab_key(simulator.model_mut(), K::Enter);
+        finish_terminal_replay_read(simulator.model_mut());
+        {
+            let app = simulator.model().app.borrow();
+            let observed = app.replay_lab.workflows.branch_report.as_ref().unwrap();
+            assert_eq!(observed.branch_id, branch_id);
+            assert_eq!(observed.source_world_digest, checkpoint.world_digest_v1);
+            assert_eq!(observed.source_tick, checkpoint.tick);
+            assert_eq!(observed.target_tick, completed.target_tick);
+            assert_eq!(observed.report_byte_size, bytes.len() as u64);
+            assert_eq!(
+                observed.report_checksum_blake3,
+                report_artifact.checksum_blake3
+            );
+            let control = report
+                .branch_reports
+                .iter()
+                .find(|arm| arm.branch_id == "control")
+                .unwrap();
+            let treatment = report
+                .branch_reports
+                .iter()
+                .find(|arm| arm.branch_id == "treatment")
+                .unwrap();
+            assert_eq!(
+                observed.control.total_food,
+                control.terminal_sample.food_total
+            );
+            assert_eq!(observed.control.final_digest, control.final_digest);
+            assert_eq!(
+                observed.treatment.as_ref().unwrap().total_food,
+                treatment.terminal_sample.food_total
+            );
+            assert_eq!(
+                observed.treatment.as_ref().unwrap().final_digest,
+                treatment.final_digest
+            );
+            assert!(
+                observed
+                    .treatment
+                    .as_ref()
+                    .unwrap()
+                    .first_divergence
+                    .is_some()
+            );
+        }
+        let frame = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 100));
+        assert!(frame.contains("Verified endpoints at tick"));
+        assert!(frame.contains("One saved seed: descriptive outcomes"));
+        assert!(frame.contains("Control:"));
+        assert!(frame.contains("Treatment:"));
+        assert!(frame.contains("First observed divergence:"));
+        assert_eq!(
+            handle.list_checkpoint_branches(None, None).unwrap().total,
+            1,
+            "browsing the report must not recreate a study"
+        );
+
+        // Corrupt actual retained evidence: a fresh read must remove the earlier
+        // verified result and expose failure rather than reusing its endpoints.
+        fs::write(
+            artifacts.join(&report_artifact.relative_path),
+            b"corrupt report",
+        )
+        .unwrap();
+        terminal_lab_key(simulator.model_mut(), K::Char('V'));
+        finish_terminal_replay_read(simulator.model_mut());
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .branch_report
+                .is_none()
+        );
+        let failed = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 60));
+        assert!(failed.contains("Lab request failed:"));
+        assert!(!failed.contains("Verified endpoints at tick"));
+        assert_eq!(host.port().scientific_digest_v1().unwrap(), before);
+        assert!(Arc::ptr_eq(&host.port().snapshot_hub().latest(), &retained));
+        handle.data_services().shutdown_experiments().unwrap();
+    }
+
+    #[test]
+    fn live_checkpoint_branch_shutdown_cancels_both_sides_of_admission_result_handoff() {
+        use frankentui_shell::{ShellMessage, ShellRoute};
+        for close_before_admission in [true, false] {
+            let (host, runtime, handle, checkpoint, _) = checkpoint_branch_terminal_fixture();
+            let before = host.port().scientific_digest_v1().unwrap();
+            let renderer = TerminalRenderer::default();
+            let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+            app.navigate_route(ShellRoute::Replay);
+            app.frankentui.update(ShellMessage::BranchCheckpoint {
+                checkpoint_id: checkpoint.checkpoint_id,
+                branch_name: "close-during-handoff".into(),
+                ticks: crate::control::MAX_CHECKPOINT_BRANCH_TICKS,
+                intervention: None,
+            });
+            let mut model = LiveTerminalModel::new(app).unwrap();
+            model.cancelled_service_route = Some(ShellRoute::Replay);
+            let _ = model.service_commands();
+            let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+            simulator.capture_frame(120, 36);
+            simulator_presentation_callback(simulator.model(), 1);
+            let work = checkpoint_branch_terminal_task(
+                simulator.model_mut().update(LiveTerminalMessage::Refresh),
+            );
+            if close_before_admission {
+                let _ = simulator.model_mut().on_shutdown();
+            }
+            let message = std::thread::Builder::new()
+                .stack_size(32 * 1024 * 1024)
+                .spawn(work)
+                .unwrap()
+                .join()
+                .unwrap();
+            let LiveTerminalMessage::CheckpointBranch {
+                result: Ok(admitted),
+                ..
+            } = message
+            else {
+                panic!("actual admission task failed before shutdown observation");
+            };
+            let study = simulator.model().branch_study.as_ref().unwrap();
+            assert!(
+                study.branch_id.is_none(),
+                "admission result is deliberately still undelivered"
+            );
+            assert_eq!(
+                study.admitted_id.lock().unwrap().as_deref(),
+                Some(admitted.branch_id.as_str())
+            );
+            if !close_before_admission {
+                let _ = simulator.model_mut().on_shutdown();
+            }
+            let observed = handle.get_checkpoint_branch(&admitted.branch_id).unwrap();
+            assert!(
+                matches!(
+                    observed.status.as_str(),
+                    "cancelling" | "cancelled" | "completed"
+                ),
+                "closing must reach the worker even while its result is queued: {observed:?}"
+            );
+            handle.data_services().shutdown_experiments().unwrap();
+            let stopped = handle.get_checkpoint_branch(&admitted.branch_id).unwrap();
+            assert!(
+                matches!(stopped.status.as_str(), "cancelled" | "completed"),
+                "{stopped:?}"
+            );
+            assert_eq!(host.port().scientific_digest_v1().unwrap(), before);
+        }
+    }
+
     #[test]
     fn live_requests_present_each_pending_and_final_before_the_next_request() {
         use frankentui_shell::{ReceiptStatusKind, ShellRoute};
@@ -19009,7 +21459,98 @@ for case in ('panic', 'subscription', 'renderer'):
     }
 
     #[test]
+    fn experiment_projection_uses_sealed_progress_without_inventing_terminal_ticks() {
+        use std::collections::BTreeMap;
+
+        use crate::experiment_runner::{
+            CheckpointProgressRefusal, CheckpointProgressSource, CheckpointProgressUnavailable,
+            ExperimentCheckpointProgress,
+        };
+        let mut runs = Vec::new();
+        for (id, state, total_ticks, checkpoint_progress) in [
+            (
+                "active",
+                "running",
+                0,
+                ExperimentCheckpointProgress::Observed {
+                    tick: 17,
+                    checkpoint_digest: "observed-cut".into(),
+                    source: CheckpointProgressSource::Published,
+                },
+            ),
+            (
+                "stopped",
+                "running",
+                0,
+                ExperimentCheckpointProgress::Observed {
+                    tick: 9,
+                    checkpoint_digest: "recovered-cut".into(),
+                    source: CheckpointProgressSource::Recovered,
+                },
+            ),
+            (
+                "pending",
+                "pending",
+                0,
+                ExperimentCheckpointProgress::Unavailable {
+                    reason: CheckpointProgressUnavailable::NotStarted,
+                },
+            ),
+            (
+                "corrupt",
+                "running",
+                0,
+                ExperimentCheckpointProgress::Refused {
+                    reason: CheckpointProgressRefusal::InvalidCheckpoint,
+                },
+            ),
+            (
+                "done",
+                "completed",
+                100,
+                ExperimentCheckpointProgress::Unavailable {
+                    reason: CheckpointProgressUnavailable::RecoveryPending,
+                },
+            ),
+        ] {
+            runs.push(crate::control::ExperimentRunRecordDto {
+                run_id: id.into(),
+                variant_id: id.into(),
+                brain_family: "mlp.baseline".into(),
+                seed: 7,
+                state: state.into(),
+                total_ticks,
+                target_ticks: 100,
+                checkpoint_progress,
+                final_digest: None,
+                bundle_path: None,
+                error_reason: None,
+            });
+        }
+        let arms = experiment_arms_for_view(runs);
+        let actual = arms
+            .iter()
+            .map(|arm| (arm.variant_id.as_str(), arm.current_tick))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            actual,
+            BTreeMap::from([
+                ("active", Some(17)),
+                ("stopped", Some(9)),
+                ("pending", None),
+                ("corrupt", None),
+                ("done", Some(100)),
+            ])
+        );
+        assert!(arms.iter().all(|arm| arm.target_ticks == 100));
+    }
+
+    #[test]
     fn experiment_projection_keeps_distinct_variants_when_seed_rows_exceed_the_view_bound() {
+        use crate::experiment_runner::{
+            CheckpointProgressUnavailable, ExperimentCheckpointProgress,
+        };
+
         for (variants, seeds) in [(2, 128), (64, 2)] {
             let runs = (0..variants)
                 .flat_map(|variant| {
@@ -19022,6 +21563,10 @@ for case in ('panic', 'subscription', 'renderer'):
                             seed,
                             state: "completed".into(),
                             total_ticks: 2,
+                            target_ticks: 2,
+                            checkpoint_progress: ExperimentCheckpointProgress::Unavailable {
+                                reason: CheckpointProgressUnavailable::NotStarted,
+                            },
                             final_digest: Some(format!("fixture-digest-{variant}-{seed}")),
                             bundle_path: None,
                             error_reason: None,
@@ -19060,6 +21605,1247 @@ for case in ('panic', 'subscription', 'renderer'):
         }
     }
 
+    fn terminal_lab_key(model: &mut LiveTerminalModel<'_>, code: ftui::core::event::KeyCode) {
+        let _ = model.update(LiveTerminalMessage::Event(ftui::core::event::Event::Key(
+            ftui::core::event::KeyEvent::new(code),
+        )));
+    }
+
+    fn finish_terminal_replay_read(model: &mut LiveTerminalModel<'_>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut app = model.app.borrow_mut();
+            let route = app.frankentui.route;
+            app.service_replay_lab(route);
+            if !app.replay_lab.workflows.is_busy() {
+                return;
+            }
+            drop(app);
+            assert!(Instant::now() < deadline, "terminal Replay read deadline");
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    fn poll_terminal_lab(model: &mut LiveTerminalModel<'_>, until_idle: bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = model.service_commands();
+            let done = {
+                let app = model.app.borrow();
+                if until_idle {
+                    !app.experiment_lab.workflows.is_busy()
+                } else {
+                    app.experiment_lab
+                        .mutation
+                        .as_ref()
+                        .is_some_and(|mutation| mutation.receipt_recorded)
+                }
+            };
+            if done {
+                return;
+            }
+            assert!(Instant::now() < deadline, "terminal Lab fixture deadline");
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    fn terminal_lab_fixture_capabilities()
+    -> scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
+        use scriptbots_runtime::lab_workflows::{
+            LabExperimentCapabilities, LabExperimentParameter, LabExperimentParameterCapability,
+        };
+        LabExperimentCapabilities {
+            families: vec!["mlp.baseline".into(), "dwraon.baseline".into()],
+            treatment_parameters: vec![LabExperimentParameterCapability {
+                parameter: LabExperimentParameter::ALL[0],
+                baseline_value: 1.0,
+                min_value: 0.0,
+                max_value: 4.0,
+            }],
+            max_seed_count: 128,
+            max_ticks_per_run: 1000,
+            max_total_ticks: 100_000,
+            launch_description: "Fixture fresh worlds; no scientific execution is claimed.".into(),
+        }
+    }
+
+    fn terminal_lab_fixture_batch(id: String, draft: &LabExperimentDraft) -> LabExperiment {
+        use scriptbots_runtime::lab_workflows::{LabExperimentSummary, LabVariantProgress};
+        LabExperiment {
+            summary: LabExperimentSummary {
+                experiment_id: id,
+                status: "pending".into(),
+                total_runs: draft.seed_count * 2,
+                completed_runs: 0,
+                failed_runs: 0,
+            },
+            plan_digest: "terminal-lifecycle-fixture-plan".into(),
+            generation: 1,
+            variants: [
+                ("baseline", &draft.baseline_family),
+                ("challenger", &draft.challenger_family),
+            ]
+            .into_iter()
+            .map(|(id, family)| LabVariantProgress {
+                variant_id: id.into(),
+                brain_family: family.clone(),
+                total_runs: draft.seed_count,
+                completed_runs: 0,
+                failed_runs: 0,
+                running_runs: 0,
+            })
+            .collect(),
+            error_reason: None,
+        }
+    }
+
+    #[test]
+    fn terminal_lab_presented_creation_retry_cancel_and_resume() {
+        use frankentui_shell::{ReceiptStatusKind, ShellRoute};
+        use ftui::core::event::KeyCode as K;
+        use scriptbots_runtime::lab_workflows::LabExperimentPage;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The fixture records provider calls and preserves admitted identities.
+        // It exercises the production presentation/worker lifecycle, not real
+        // experiment execution, persistence or scientific outcomes.
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let app = TerminalApp::new(&renderer, host.context(&runtime));
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<LabWorkflowRequest>::new()));
+        let batch = Arc::new(std::sync::Mutex::new(None::<LabExperiment>));
+        let fail_first_creation = AtomicBool::new(true);
+        {
+            let mut app = model.app.borrow_mut();
+            let calls = Arc::clone(&calls);
+            let batch = Arc::clone(&batch);
+            app.experiment_lab.enabled = true;
+            app.experiment_lab.workflows.submit = Some(Arc::new(move |request| {
+                match request {
+                    LabWorkflowRequest::ExperimentCapabilities => {
+                        Ok(LabWorkflowResponse::ExperimentCapabilities(
+                            terminal_lab_fixture_capabilities(),
+                        ))
+                    }
+                    LabWorkflowRequest::ListExperiments { .. } => {
+                        let items: Vec<_> = batch
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|batch| batch.summary.clone())
+                            .collect();
+                        Ok(LabWorkflowResponse::Experiments(LabExperimentPage {
+                            total: items.len(),
+                            items,
+                            offset: 0,
+                            next_cursor: None,
+                            reserved_run_slots: 0,
+                            max_run_slots: 4096,
+                        }))
+                    }
+                    LabWorkflowRequest::GetExperiment { experiment_id } => {
+                        let observed = batch.lock().unwrap().as_ref().unwrap().clone();
+                        assert_eq!(observed.summary.experiment_id, experiment_id);
+                        Ok(LabWorkflowResponse::Experiment(observed))
+                    }
+                    LabWorkflowRequest::CreateExperiment {
+                        ref request_id,
+                        session_id,
+                        ref draft,
+                    } => {
+                        calls.lock().unwrap().push(request.clone());
+                        let observed = {
+                            let mut retained = batch.lock().unwrap();
+                            if let Some(previous) = retained.as_ref() {
+                                assert_eq!(
+                                    &previous.summary.experiment_id, request_id,
+                                    "retry must retain the admitted identity"
+                                );
+                            } else {
+                                *retained =
+                                    Some(terminal_lab_fixture_batch(request_id.clone(), draft));
+                            }
+                            retained.as_ref().unwrap().clone()
+                        };
+                        if fail_first_creation.swap(false, Ordering::SeqCst) {
+                            panic!("injected provider disconnect after fixture admission");
+                        }
+                        Ok(LabWorkflowResponse::ExperimentCreated {
+                            request_id: request_id.clone(),
+                            session_id,
+                            experiment: observed,
+                        })
+                    }
+                    LabWorkflowRequest::CancelExperiment { ref experiment_id }
+                    | LabWorkflowRequest::ResumeExperiment { ref experiment_id } => {
+                        calls.lock().unwrap().push(request.clone());
+                        let cancel =
+                            matches!(&request, LabWorkflowRequest::CancelExperiment { .. });
+                        let mut retained = batch.lock().unwrap();
+                        let observed = retained.as_mut().unwrap();
+                        assert_eq!(&observed.summary.experiment_id, experiment_id);
+                        observed.generation += 1;
+                        observed.summary.status =
+                            if cancel { "cancelling" } else { "running" }.into();
+                        let response = observed.clone();
+                        if cancel {
+                            // A later status read observes cancellation, distinct
+                            // from the request acknowledgement returned now.
+                            observed.generation += 1;
+                            observed.summary.status = "cancelled".into();
+                        }
+                        Ok(LabWorkflowResponse::Experiment(response))
+                    }
+                    _ => panic!("unexpected fixture request"),
+                }
+            }));
+            app.navigate_route(ShellRoute::Experiments);
+        }
+        poll_terminal_lab(&mut model, true);
+        terminal_lab_key(&mut model, K::Char('n'));
+        poll_terminal_lab(&mut model, true);
+        // Numeric input consumes route digits, and the exact cohort is shown.
+        for _ in 0..3 {
+            terminal_lab_key(&mut model, K::Down);
+        }
+        terminal_lab_key(&mut model, K::Enter);
+        terminal_lab_key(&mut model, K::Delete);
+        for digit in "900".chars() {
+            terminal_lab_key(&mut model, K::Char(digit));
+        }
+        terminal_lab_key(&mut model, K::Enter);
+        assert_eq!(model.app.borrow().frankentui.route, ShellRoute::Experiments);
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiment_draft
+                .first_seed,
+            900
+        );
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+        let draft_text = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(draft_text.contains("Exact consecutive seeds: 900 through 902"));
+        let composer_catalog = simulator
+            .model()
+            .app
+            .borrow()
+            .experiment_lab
+            .workflows
+            .experiments
+            .clone();
+        terminal_lab_key(simulator.model_mut(), K::Char('['));
+        terminal_lab_key(simulator.model_mut(), K::Char(']'));
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiments,
+            composer_catalog,
+            "detail metric shortcuts must not page the catalog from the composer"
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char('s'));
+        poll_terminal_lab(simulator.model_mut(), false);
+        let creation = simulator
+            .model()
+            .app
+            .borrow()
+            .experiment_lab
+            .workflows
+            .latest_experiment_creation
+            .clone()
+            .unwrap();
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "creating an intent must not call the provider"
+        );
+        simulator.capture_frame(1, 1);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 0);
+        simulator.send(LiveTerminalMessage::Refresh);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "tiny or unpresented frames cannot submit"
+        );
+
+        // A real owner's queued control command is presented first. Its final
+        // frame must also be observed before the Lab intent can occupy the rail.
+        let command = simulator
+            .model()
+            .app
+            .borrow_mut()
+            .submit_with_visible_receipt(ControlCommand::SetSpeed(2.0))
+            .unwrap();
+        let command_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(command_frame.contains(&format!("[PENDING] id={command}")));
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        wait_for_terminal_final_receipt(&mut simulator.model().app.borrow_mut(), &command);
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        assert!(calls.lock().unwrap().is_empty());
+        let pending = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(pending.contains(&format!("[PENDING] id={}", creation.request_id)));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "rendering alone is not presentation"
+        );
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        poll_terminal_lab(simulator.model_mut(), true);
+        {
+            let app = simulator.model().app.borrow();
+            let receipt = app.receipt_for_presentation(&creation.request_id).unwrap();
+            assert!(
+                matches!(&receipt.status, ReceiptStatusKind::Failed(reason) if reason.contains("without an operation receipt"))
+            );
+            let retry = app
+                .experiment_lab
+                .workflows
+                .latest_experiment_creation
+                .as_ref()
+                .unwrap();
+            assert_eq!(retry.request_id, creation.request_id);
+            assert_eq!(retry.draft, creation.draft);
+            assert!(matches!(
+                retry.state,
+                LabExperimentCreationState::Retryable { .. }
+            ));
+        }
+        terminal_lab_key(simulator.model_mut(), K::Char('s'));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "retry waits for the final displayed receipt"
+        );
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        terminal_lab_key(simulator.model_mut(), K::Right);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiment_draft,
+            creation.draft,
+            "unconfirmed scientific choices stay frozen"
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char('s'));
+        poll_terminal_lab(simulator.model_mut(), false);
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        poll_terminal_lab(simulator.model_mut(), true);
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(
+                calls[0], calls[1],
+                "retry sends the exact original source, identity and draft"
+            );
+        }
+        assert!(matches!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .latest_experiment_creation
+                .as_ref()
+                .unwrap()
+                .state,
+            LabExperimentCreationState::Created { .. }
+        ));
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        terminal_lab_key(simulator.model_mut(), K::Char('d'));
+        poll_terminal_lab(simulator.model_mut(), false);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        terminal_lab_key(simulator.model_mut(), K::Char('['));
+        terminal_lab_key(simulator.model_mut(), K::Char(']'));
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        poll_terminal_lab(simulator.model_mut(), true);
+        let cancelled = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(
+            cancelled.contains("observed cancelling"),
+            "request acknowledgement is not completed cancellation"
+        );
+        simulator_presentation_callback(simulator.model(), 1);
+        terminal_lab_key(simulator.model_mut(), K::Char('r'));
+        poll_terminal_lab(simulator.model_mut(), true);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .batch
+                .as_ref()
+                .unwrap()
+                .summary
+                .status,
+            "cancelled"
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char('u'));
+        poll_terminal_lab(simulator.model_mut(), false);
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        poll_terminal_lab(simulator.model_mut(), true);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .batch
+                .as_ref()
+                .unwrap()
+                .summary
+                .status,
+            "running"
+        );
+        simulator.capture_frame(180, 40);
+        simulator_presentation_callback(simulator.model(), 1);
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .mutation
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_lab_unpresented_requests_drain_and_keep_evicted_final_receipts() {
+        use frankentui_shell::{CommandReceiptEntry, MAX_RECEIPTS, ReceiptStatusKind, ShellRoute};
+        use ftui::core::event::KeyCode as K;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for cancellation in ["navigation", "foreign owner", "shutdown"] {
+            let host = TerminalTestHost::take(command_characterization_world());
+            let (runtime, _) = ControlRuntime::dummy();
+            let renderer = TerminalRenderer::default();
+            let app = TerminalApp::new(&renderer, host.context(&runtime));
+            let mut model = LiveTerminalModel::new(app).unwrap();
+            let provider_calls = Arc::new(AtomicUsize::new(0));
+            {
+                let mut app = model.app.borrow_mut();
+                let provider_calls = Arc::clone(&provider_calls);
+                app.experiment_lab.enabled = true;
+                app.experiment_lab.workflows.submit =
+                    Some(Arc::new(move |request| match request {
+                        LabWorkflowRequest::ExperimentCapabilities => {
+                            Ok(LabWorkflowResponse::ExperimentCapabilities(
+                                terminal_lab_fixture_capabilities(),
+                            ))
+                        }
+                        LabWorkflowRequest::ListExperiments { .. } => {
+                            Ok(LabWorkflowResponse::Experiments(
+                                scriptbots_runtime::lab_workflows::LabExperimentPage {
+                                    items: Vec::new(),
+                                    total: 0,
+                                    offset: 0,
+                                    next_cursor: None,
+                                    reserved_run_slots: 0,
+                                    max_run_slots: 4096,
+                                },
+                            ))
+                        }
+                        _ => {
+                            provider_calls.fetch_add(1, Ordering::SeqCst);
+                            Err("unpresented mutation reached the provider".into())
+                        }
+                    }));
+                app.navigate_route(ShellRoute::Experiments);
+            }
+            poll_terminal_lab(&mut model, true);
+            terminal_lab_key(&mut model, K::Char('n'));
+            poll_terminal_lab(&mut model, true);
+            if cancellation == "foreign owner" {
+                model
+                    .app
+                    .borrow_mut()
+                    .experiment_lab
+                    .begin_mutation(LabAction::CreateExperiment, HostSessionId::new(0xF0_12_34));
+            } else {
+                terminal_lab_key(&mut model, K::Char('s'));
+            }
+            poll_terminal_lab(&mut model, false);
+            let id = model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .latest_experiment_creation
+                .as_ref()
+                .unwrap()
+                .request_id
+                .clone();
+            if cancellation == "shutdown" {
+                let _ = model.on_shutdown();
+            } else {
+                terminal_lab_key(&mut model, K::Char('1'));
+            }
+            poll_terminal_lab(&mut model, true);
+            assert_eq!(
+                provider_calls.load(Ordering::SeqCst),
+                0,
+                "{cancellation} must prevent provider admission"
+            );
+            {
+                let mut app = model.app.borrow_mut();
+                assert!(!app.experiment_lab.workflows.is_busy());
+                assert!(matches!(
+                    app.receipt_for_presentation(&id).unwrap().status,
+                    ReceiptStatusKind::Failed(_)
+                ));
+                assert!(matches!(
+                    app.experiment_lab
+                        .workflows
+                        .latest_experiment_creation
+                        .as_ref()
+                        .unwrap()
+                        .state,
+                    LabExperimentCreationState::Retryable { .. }
+                ));
+                for index in 0..MAX_RECEIPTS {
+                    assert!(app.frankentui.record_receipt(CommandReceiptEntry::new(
+                        format!("other-{index}"),
+                        "Fixture pending action",
+                        ReceiptStatusKind::Pending
+                    )));
+                }
+                assert!(
+                    app.frankentui.receipt_for(&id).is_none(),
+                    "full pending history evicts the unpresented final result"
+                );
+                assert!(
+                    app.receipt_for_presentation(&id).is_some(),
+                    "the exact local final result remains retained"
+                );
+            }
+            let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+            let text = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+            assert!(text.contains("Not submitted"));
+            simulator_presentation_callback(simulator.model(), 1);
+            simulator.capture_frame(180, 40);
+            simulator_presentation_callback(simulator.model(), 1);
+            assert!(
+                simulator
+                    .model()
+                    .app
+                    .borrow()
+                    .experiment_lab
+                    .mutation
+                    .is_none()
+            );
+            assert!(simulator.model().active_request.borrow().is_none());
+        }
+    }
+
+    #[test]
+    fn live_experiment_catalog_pages_and_reaches_every_arm() {
+        use frankentui_shell::ShellRoute;
+        use ftui::core::event::{KeyCode as K, KeyEvent, Modifiers};
+        use scriptbots_runtime::lab_workflows::{
+            LAB_MAX_VARIANTS, LAB_PAGE_SIZE, LabExperiment, LabExperimentPage,
+            LabExperimentSummary, LabVariantProgress, LabWorkflowRequest, LabWorkflowResponse,
+        };
+
+        fn key(model: &mut LiveTerminalModel<'_>, code: K) {
+            let mut event = KeyEvent::new(code);
+            if matches!(code, K::Char(character) if character.is_ascii_uppercase()) {
+                event.modifiers = Modifiers::SHIFT;
+            }
+            let _ = model.update(LiveTerminalMessage::Event(ftui::core::event::Event::Key(
+                event,
+            )));
+        }
+        fn finish(model: &mut LiveTerminalModel<'_>) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let _ = model.service_commands();
+                if !model.app.borrow().experiment_lab.workflows.is_busy() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "fixture Lab read deadline");
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+        fn summary(id: String) -> LabExperimentSummary {
+            LabExperimentSummary {
+                experiment_id: id,
+                status: "completed".into(),
+                total_runs: LAB_MAX_VARIANTS,
+                completed_runs: LAB_MAX_VARIANTS,
+                failed_runs: 0,
+            }
+        }
+
+        // These bounded provider fixtures characterize key routing and viewport
+        // reachability, not scientific endpoints or real experiment execution.
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let app = TerminalApp::new(&renderer, host.context(&runtime));
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let mut app = model.app.borrow_mut();
+            let requests = Arc::clone(&requests);
+            app.experiment_lab.enabled = true;
+            app.experiment_lab.workflows.submit = Some(Arc::new(move |request| {
+                requests.lock().unwrap().push(request.clone());
+                match request {
+                    LabWorkflowRequest::ListExperiments { cursor } => {
+                        let offset = cursor.as_deref().unwrap_or("0").parse::<usize>().unwrap();
+                        let total = LAB_PAGE_SIZE + 2;
+                        let end = (offset + LAB_PAGE_SIZE).min(total);
+                        Ok(LabWorkflowResponse::Experiments(LabExperimentPage {
+                            items: (offset..end)
+                                .map(|index| summary(format!("fixture-{index:02}")))
+                                .collect(),
+                            total,
+                            offset,
+                            next_cursor: (end < total).then(|| end.to_string()),
+                            reserved_run_slots: 0,
+                            max_run_slots: 4096,
+                        }))
+                    }
+                    LabWorkflowRequest::GetExperiment { experiment_id } => {
+                        Ok(LabWorkflowResponse::Experiment(LabExperiment {
+                            summary: summary(experiment_id),
+                            plan_digest: "bounded-viewport-fixture".into(),
+                            generation: 7,
+                            variants: (0..LAB_MAX_VARIANTS)
+                                .map(|index| LabVariantProgress {
+                                    variant_id: format!("arm-{index:02}"),
+                                    brain_family: "mlp.baseline".into(),
+                                    total_runs: 1,
+                                    completed_runs: 1,
+                                    failed_runs: 0,
+                                    running_runs: 0,
+                                })
+                                .collect(),
+                            error_reason: None,
+                        }))
+                    }
+                    LabWorkflowRequest::Compare { .. } => {
+                        Err("Fixture has no verified endpoints".into())
+                    }
+                    _ => panic!("read-only terminal dispatched a mutation or unrelated request"),
+                }
+            }));
+            app.navigate_route(ShellRoute::Experiments);
+        }
+        finish(&mut model);
+        assert_eq!(
+            model.app.borrow().experiment_lab.selected_row.as_deref(),
+            Some("fixture-00")
+        );
+        key(&mut model, K::Char(']'));
+        finish(&mut model);
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiments
+                .as_ref()
+                .unwrap()
+                .offset,
+            LAB_PAGE_SIZE
+        );
+        assert_eq!(
+            model.app.borrow().experiment_lab.selected_row.as_deref(),
+            Some("fixture-12")
+        );
+        key(&mut model, K::Down);
+        key(&mut model, K::Enter);
+        finish(&mut model);
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .selected_experiment
+                .as_deref(),
+            Some("fixture-13")
+        );
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .batch
+                .as_ref()
+                .unwrap()
+                .variants
+                .len(),
+            LAB_MAX_VARIANTS
+        );
+        key(&mut model, K::Char('B'));
+        for _ in 1..LAB_MAX_VARIANTS {
+            key(&mut model, K::Down);
+        }
+        key(&mut model, K::Char('V'));
+        {
+            let app = model.app.borrow();
+            assert_eq!(app.experiment_lab.selected_row.as_deref(), Some("arm-63"));
+            assert_eq!(
+                app.experiment_lab.workflows.baseline.as_deref(),
+                Some("arm-00")
+            );
+            assert_eq!(
+                app.experiment_lab.workflows.challenger.as_deref(),
+                Some("arm-63")
+            );
+        }
+        key(&mut model, K::Char('['));
+        assert_eq!(
+            model.app.borrow().experiment_lab.workflows.metric,
+            LabMetric::TotalFood
+        );
+        key(&mut model, K::Char(']'));
+        assert_eq!(
+            model.app.borrow().experiment_lab.workflows.metric,
+            LabMetric::AliveAgents
+        );
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .selected_experiment
+                .as_deref(),
+            Some("fixture-13"),
+            "brackets cycle detail metrics without changing the selected catalog experiment"
+        );
+        for metric in LabMetric::ALL {
+            assert_eq!(model.app.borrow().experiment_lab.workflows.metric, metric);
+            key(&mut model, K::Char('C'));
+            finish(&mut model);
+            let app = model.app.borrow();
+            assert!(app.experiment_lab.workflows.comparison.is_none());
+            assert!(
+                app.experiment_lab
+                    .workflows
+                    .notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Fixture has no verified endpoints")
+            );
+            drop(app);
+            key(&mut model, K::Char('M'));
+        }
+        let metrics = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                LabWorkflowRequest::Compare {
+                    experiment_id,
+                    baseline_variant,
+                    challenger_variant,
+                    metric,
+                } => {
+                    assert_eq!(experiment_id, "fixture-13");
+                    assert_eq!(baseline_variant, "arm-00");
+                    assert_eq!(challenger_variant, "arm-63");
+                    Some(*metric)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metrics, LabMetric::ALL);
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+        let text = frankentui_shell::buffer_to_string(simulator.capture_frame(100, 24));
+        assert!(
+            text.contains("> arm-63"),
+            "last admitted arm must remain visibly reachable"
+        );
+        assert!(text.contains("Baseline: arm-00"));
+        assert!(text.contains("Challenger: arm-63"));
+        key(simulator.model_mut(), K::Escape);
+        finish(simulator.model_mut());
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .selected_experiment
+                .is_none()
+        );
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .experiments
+                .as_ref()
+                .unwrap()
+                .offset,
+            0
+        );
+    }
+
+    fn terminal_replay_fixture_branch(
+        index: usize,
+    ) -> scriptbots_runtime::lab_workflows::LabCheckpointBranch {
+        scriptbots_runtime::lab_workflows::LabCheckpointBranch {
+            branch_id: format!("study-{index:02}"),
+            checkpoint_id: format!("saved-{index:02}"),
+            branch_name: format!("food-{index:02}"),
+            status: "completed".into(),
+            source_tick: index as u64 + 10,
+            target_tick: index as u64 + 12,
+            world_digest: format!("{index:016x}"),
+            artifact_id: Some(format!("report-{index:02}")),
+            error_reason: None,
+        }
+    }
+
+    fn terminal_replay_fixture_report(
+        branch: &scriptbots_runtime::lab_workflows::LabCheckpointBranch,
+    ) -> scriptbots_runtime::lab_workflows::LabBranchReport {
+        use scriptbots_runtime::lab_workflows::{
+            LabBranchDivergence, LabBranchOutcome, LabBranchReport,
+        };
+        let control = LabBranchOutcome {
+            tick: branch.target_tick,
+            population: 2,
+            total_food: 4.0,
+            total_energy: 3.0,
+            average_health: Some(1.0),
+            final_digest: "b".repeat(16),
+            command_applied_tick: None,
+            minimum_population: 2,
+            extinction_tick: None,
+            baseline_population: 2,
+            recovery_ratio: Some(1.0),
+            first_divergence: None,
+        };
+        let treatment = LabBranchOutcome {
+            population: 0,
+            total_food: 8.0,
+            total_energy: 0.0,
+            average_health: None,
+            final_digest: "c".repeat(16),
+            command_applied_tick: Some(branch.source_tick),
+            minimum_population: 0,
+            extinction_tick: Some(branch.target_tick),
+            recovery_ratio: Some(0.0),
+            first_divergence: Some(LabBranchDivergence {
+                tick: branch.source_tick + 1,
+                stage: "food".into(),
+                control_digest: "d".repeat(16),
+                branch_digest: "e".repeat(16),
+                command_applied_tick: branch.source_tick,
+                details: "Fixture food observations differ.".into(),
+            }),
+            ..control.clone()
+        };
+        LabBranchReport {
+            branch_id: branch.branch_id.clone(),
+            artifact_id: branch.artifact_id.clone().unwrap(),
+            base_seed: u64::MAX,
+            source_tick: branch.source_tick,
+            target_tick: branch.target_tick,
+            source_world_digest: branch.world_digest.clone(),
+            source_byte_size: 1024,
+            source_checksum_blake3: "a".repeat(64),
+            report_byte_size: 4096,
+            report_checksum_blake3: "b".repeat(64),
+            report_checksum_sha256: "c".repeat(64),
+            control,
+            treatment: Some(treatment),
+        }
+    }
+
+    #[test]
+    fn live_replay_pages_saved_sources_and_retained_study_results() {
+        use ftui::core::event::KeyCode as K;
+        use scriptbots_runtime::lab_workflows::{
+            LAB_PAGE_SIZE, LabCheckpoint, LabCheckpointBranchPage, LabCheckpointPage,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // These fixtures exercise the production presentation/validation path;
+        // the separate real-service case below supplies scientific evidence.
+        let total = LAB_PAGE_SIZE + 8;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let corrupt = Arc::new(AtomicBool::new(false));
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(frankentui_shell::ShellRoute::Replay);
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        {
+            let mut app = model.app.borrow_mut();
+            let calls = Arc::clone(&calls);
+            let corrupt = Arc::clone(&corrupt);
+            app.replay_lab.enabled = true;
+            app.replay_lab.workflows.submit = Some(Arc::new(move |request| {
+                calls.lock().unwrap().push(request.clone());
+                Ok(match request {
+                    LabWorkflowRequest::ListCheckpoints { cursor } => {
+                        let offset = cursor.map_or(0, |value| value.parse::<usize>().unwrap());
+                        let end = (offset + LAB_PAGE_SIZE).min(total);
+                        LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                            items: (offset..end)
+                                .map(|index| LabCheckpoint {
+                                    checkpoint_id: format!("saved-{index:02}"),
+                                    tick: index as u64 + 10,
+                                    agent_count: 2,
+                                    byte_size: 1024,
+                                    world_digest: format!("{index:016x}"),
+                                })
+                                .collect(),
+                            total,
+                            offset,
+                            next_cursor: (end < total).then(|| end.to_string()),
+                            retained_bytes: total as u64 * 1024,
+                            max_bytes: total as u64 * 2048,
+                        })
+                    }
+                    LabWorkflowRequest::ListCheckpointBranches { cursor } => {
+                        let offset = cursor.map_or(0, |value| value.parse::<usize>().unwrap());
+                        let end = (offset + LAB_PAGE_SIZE).min(total);
+                        LabWorkflowResponse::CheckpointBranches(LabCheckpointBranchPage {
+                            items: (offset..end).map(terminal_replay_fixture_branch).collect(),
+                            total,
+                            offset,
+                            next_cursor: (end < total).then(|| end.to_string()),
+                        })
+                    }
+                    LabWorkflowRequest::GetCheckpointBranch { branch_id } => {
+                        let index = branch_id.strip_prefix("study-").unwrap().parse().unwrap();
+                        LabWorkflowResponse::CheckpointBranch(terminal_replay_fixture_branch(index))
+                    }
+                    LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
+                        let index = branch_id.strip_prefix("study-").unwrap().parse().unwrap();
+                        let mut report =
+                            terminal_replay_fixture_report(&terminal_replay_fixture_branch(index));
+                        if corrupt.load(Ordering::SeqCst) {
+                            report.source_world_digest = "f".repeat(16);
+                        }
+                        LabWorkflowResponse::CheckpointBranchReport(report)
+                    }
+                    _ => panic!("read-only Replay must not create or cancel science"),
+                })
+            }));
+        }
+        finish_terminal_replay_read(&mut model);
+        assert_eq!(
+            model.app.borrow().selected_checkpoint_id(),
+            Some("saved-00")
+        );
+        terminal_lab_key(&mut model, K::Char(']'));
+        finish_terminal_replay_read(&mut model);
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .checkpoints
+                .as_ref()
+                .unwrap()
+                .offset,
+            LAB_PAGE_SIZE
+        );
+        for _ in 0..7 {
+            terminal_lab_key(&mut model, K::Down);
+        }
+        let last_saved = format!("saved-{:02}", total - 1);
+        assert_eq!(
+            model.app.borrow().selected_checkpoint_id(),
+            Some(last_saved.as_str())
+        );
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+        let text = frankentui_shell::buffer_to_string(simulator.capture_frame(100, 24));
+        assert!(
+            text.contains(&format!("> {last_saved}")),
+            "last saved cut stays visible: {text}"
+        );
+
+        terminal_lab_key(simulator.model_mut(), K::Char('N'));
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .frankentui
+                .branch_draft
+                .as_ref()
+                .unwrap()
+                .checkpoint_id,
+            last_saved
+        );
+        let modal = frankentui_shell::buffer_to_string(simulator.capture_frame(120, 36));
+        assert!(
+            !modal.contains("SAVED CHECKPOINTS & BRANCH STUDIES"),
+            "the browser must not cover the existing composer"
+        );
+        terminal_lab_key(simulator.model_mut(), K::Escape);
+        terminal_lab_key(simulator.model_mut(), K::Char('B'));
+        finish_terminal_replay_read(simulator.model_mut());
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .selected_checkpoint_id()
+                .is_none()
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char('N'));
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .frankentui
+                .branch_draft
+                .is_none(),
+            "hidden checkpoint selection cannot create a study"
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char(']'));
+        finish_terminal_replay_read(simulator.model_mut());
+        for _ in 0..7 {
+            terminal_lab_key(simulator.model_mut(), K::Down);
+        }
+        let last_study = format!("study-{:02}", total - 1);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .selected_row
+                .as_deref(),
+            Some(last_study.as_str())
+        );
+        terminal_lab_key(simulator.model_mut(), K::Enter);
+        finish_terminal_replay_read(simulator.model_mut());
+        terminal_lab_key(simulator.model_mut(), K::Char('V'));
+        finish_terminal_replay_read(simulator.model_mut());
+        let text = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 80));
+        assert!(text.contains("One saved seed: descriptive outcomes"));
+        assert!(text.contains("Control: 2 living agents; food 4.000"));
+        assert!(text.contains("Treatment: 0 living agents; food 8.000"));
+        assert!(text.contains("Treatment mean health: unavailable (no living agents)"));
+        assert!(text.contains("food +4.000 food energy units"));
+        assert!(text.contains(&u64::MAX.to_string()));
+        terminal_lab_key(simulator.model_mut(), K::PageDown);
+        assert_eq!(simulator.model().app.borrow().replay_lab.scroll, 6);
+        terminal_lab_key(simulator.model_mut(), K::PageUp);
+        assert_eq!(simulator.model().app.borrow().replay_lab.scroll, 0);
+
+        corrupt.store(true, Ordering::SeqCst);
+        terminal_lab_key(simulator.model_mut(), K::Enter);
+        finish_terminal_replay_read(simulator.model_mut());
+        {
+            let app = simulator.model().app.borrow();
+            assert!(app.replay_lab.workflows.branch_report.is_none());
+            assert!(
+                app.replay_lab
+                    .workflows
+                    .notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("did not match")
+            );
+            assert!(
+                app.frankentui.receipts.is_empty(),
+                "read-only browsing cannot fabricate mutation receipts"
+            );
+        }
+        terminal_lab_key(simulator.model_mut(), K::Escape);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .checkpoint_view,
+            LabCheckpointView::SavedCuts
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char('['));
+        finish_terminal_replay_read(simulator.model_mut());
+        assert_eq!(
+            simulator.model().app.borrow().selected_checkpoint_id(),
+            Some("saved-00")
+        );
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().any(|request| matches!(request,
+            LabWorkflowRequest::ListCheckpoints { cursor: Some(cursor) } if cursor == &LAB_PAGE_SIZE.to_string())));
+        assert!(calls.iter().any(|request| matches!(request,
+            LabWorkflowRequest::ListCheckpointBranches { cursor: Some(cursor) } if cursor == &LAB_PAGE_SIZE.to_string())));
+    }
+
+    #[test]
+    fn live_replay_discards_changed_context_reports_without_releasing_the_worker() {
+        use frankentui_shell::ShellRoute;
+        use ftui::core::event::KeyCode as K;
+        use scriptbots_runtime::lab_workflows::{LabCheckpointBranchPage, LabCheckpointPage};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for change in ["catalog", "route", "source"] {
+            let host = TerminalTestHost::take(command_characterization_world());
+            let (runtime, _) = ControlRuntime::dummy();
+            let renderer = TerminalRenderer::default();
+            let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+            app.navigate_route(ShellRoute::Replay);
+            let mut model = LiveTerminalModel::new(app).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = std::sync::Mutex::new(release_rx);
+            let report_calls = Arc::new(AtomicUsize::new(0));
+            {
+                let mut app = model.app.borrow_mut();
+                let report_calls = Arc::clone(&report_calls);
+                app.replay_lab.enabled = true;
+                app.replay_lab.workflows.submit = Some(Arc::new(move |request| {
+                    Ok(match request {
+                        LabWorkflowRequest::ListCheckpoints { .. } => {
+                            LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                                items: Vec::new(),
+                                total: 0,
+                                offset: 0,
+                                next_cursor: None,
+                                retained_bytes: 0,
+                                max_bytes: 1024,
+                            })
+                        }
+                        LabWorkflowRequest::ListCheckpointBranches { .. } => {
+                            LabWorkflowResponse::CheckpointBranches(LabCheckpointBranchPage {
+                                items: vec![terminal_replay_fixture_branch(0)],
+                                total: 1,
+                                offset: 0,
+                                next_cursor: None,
+                            })
+                        }
+                        LabWorkflowRequest::GetCheckpointBranch { .. } => {
+                            LabWorkflowResponse::CheckpointBranch(terminal_replay_fixture_branch(0))
+                        }
+                        LabWorkflowRequest::GetCheckpointBranchReport { .. } => {
+                            if report_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                entered_tx.send(()).unwrap();
+                                release_rx
+                                    .lock()
+                                    .unwrap()
+                                    .recv_timeout(Duration::from_secs(10))
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            LabWorkflowResponse::CheckpointBranchReport(
+                                terminal_replay_fixture_report(&terminal_replay_fixture_branch(0)),
+                            )
+                        }
+                        _ => panic!("read-only Replay must not submit scientific work"),
+                    })
+                }));
+            }
+            finish_terminal_replay_read(&mut model);
+            terminal_lab_key(&mut model, K::Char('b'));
+            finish_terminal_replay_read(&mut model);
+            terminal_lab_key(&mut model, K::Enter);
+            finish_terminal_replay_read(&mut model);
+            terminal_lab_key(&mut model, K::Char('v'));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            match change {
+                "catalog" => terminal_lab_key(&mut model, K::Char('b')),
+                "route" => {
+                    terminal_lab_key(&mut model, K::Char('2'));
+                    terminal_lab_key(&mut model, K::Char('7'));
+                }
+                "source" => {
+                    let mut app = model.app.borrow_mut();
+                    let foreign = HostSessionId::new(app.client.session_id().get().wrapping_add(1));
+                    app.replay_lab
+                        .workflows
+                        .synchronize(foreign, LabPanel::Checkpoints);
+                    // Returning to the original source cannot resurrect the
+                    // earlier request context even though its session matches.
+                    app.service_replay_lab(ShellRoute::Replay);
+                }
+                _ => unreachable!(),
+            }
+            for _ in 0..3 {
+                terminal_lab_key(&mut model, K::Char('r'));
+            }
+            {
+                let app = model.app.borrow();
+                assert!(
+                    app.replay_lab.workflows.is_busy(),
+                    "{change}: cancelled worker must retain its slot"
+                );
+                assert!(app.replay_lab.workflows.branch_report.is_none());
+                assert!(app.selected_checkpoint_id().is_none());
+                assert!(app.frankentui.branch_draft.is_none());
+                assert!(app.frankentui.receipts.is_empty());
+            }
+            assert_eq!(report_calls.load(Ordering::SeqCst), 1);
+            release_tx.send(()).unwrap();
+            finish_terminal_replay_read(&mut model);
+            assert!(
+                model
+                    .app
+                    .borrow()
+                    .replay_lab
+                    .workflows
+                    .branch_report
+                    .is_none(),
+                "{change}: late report must stay discarded"
+            );
+            terminal_lab_key(&mut model, K::Char('b'));
+            finish_terminal_replay_read(&mut model);
+            terminal_lab_key(&mut model, K::Enter);
+            finish_terminal_replay_read(&mut model);
+            terminal_lab_key(&mut model, K::Enter);
+            finish_terminal_replay_read(&mut model);
+            assert!(
+                model
+                    .app
+                    .borrow()
+                    .replay_lab
+                    .workflows
+                    .branch_report
+                    .is_some(),
+                "{change}: a later explicit read must work after draining"
+            );
+            assert_eq!(report_calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
     #[test]
     fn live_science_provider_records_match_real_checkpoint_and_completed_experiment() {
         use crate::control::{
@@ -19080,10 +22866,22 @@ for case in ('panic', 'subscription', 'renderer'):
                 _ => panic!("C did not dispatch the actual comparison task"),
             }
         }
+
         fn comparison_key(code: ftui::core::event::KeyCode) -> LiveTerminalMessage {
             LiveTerminalMessage::Event(ftui::core::event::Event::Key(
                 ftui::core::event::KeyEvent::new(code),
             ))
+        }
+        fn finish_lab_read(model: &mut LiveTerminalModel<'_>) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let _ = model.service_commands();
+                if !model.app.borrow().experiment_lab.workflows.is_busy() {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "real terminal Lab read deadline");
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
         }
 
         const FOUNDERS: usize = 4;
@@ -19203,7 +23001,12 @@ for case in ('panic', 'subscription', 'renderer'):
             "food_cell_size": 50,
             "population_minimum": 0,
             "population_spawn_interval": 0,
+            "initial_food": 0.0,
+            "food_growth_rate": 0.0,
+            "food_decay_rate": 0.0,
         });
+        let mut challenger_overrides = overrides.clone();
+        challenger_overrides["initial_food"] = serde_json::json!(0.5);
         let created = handle
             .create_experiment(ExperimentCreateRequest {
                 experiment_id: Some(experiment_id.into()),
@@ -19218,7 +23021,7 @@ for case in ('panic', 'subscription', 'renderer'):
                     ExperimentVariantDto {
                         variant_id: "challenger".into(),
                         brain_family: "dwraon".into(),
-                        config_overrides: Some(overrides),
+                        config_overrides: Some(challenger_overrides),
                         interventions: Vec::new(),
                     },
                 ],
@@ -19261,6 +23064,8 @@ for case in ('panic', 'subscription', 'renderer'):
             panic!("completed actual experiment must produce populated arms");
         };
         assert_eq!(experiment.experiment_id, completed.experiment_id);
+        assert_eq!(experiment.plan_digest, completed.plan_digest);
+        assert_eq!(experiment.status_generation, completed.generation);
         assert_eq!(experiment.batch_status, "completed");
         assert_eq!(experiment.active_arms.len(), completed.runs.len());
         assert!(experiment.comparison_summary.is_none());
@@ -19360,69 +23165,214 @@ for case in ('panic', 'subscription', 'renderer'):
             }
         }
 
-        // Exercise the real live C adapter against the independently verified
-        // completed batch. Creating an intent must not fabricate a result, and
-        // its detached read must not mutate the live simulation.
+        // Exercise the production catalog -> detail -> comparison path without
+        // injecting any experiment view data. The provider uses the same actual
+        // service with REST disabled, and never advances the live owner.
         let mut comparison_app = TerminalApp::new(&renderer, host.context(&comparison_runtime));
         comparison_app
             .frankentui
             .update(ShellMessage::Navigate(ShellRoute::Experiments));
-        comparison_app
-            .frankentui
-            .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
-                comparison_view.clone(),
-            )));
         let mut comparison_model = LiveTerminalModel::new(comparison_app).unwrap();
-        // Isolate this worker from the independently covered periodic catalog task.
-        comparison_model.cancelled_service_route = Some(ShellRoute::Experiments);
-        let work = comparison_task(
-            comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+        finish_lab_read(&mut comparison_model);
+        {
+            let app = comparison_model.app.borrow();
+            assert!(app.experiment_lab.enabled);
+            let page = app.experiment_lab.workflows.experiments.as_ref().unwrap();
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].experiment_id, experiment_id);
+            assert_eq!(
+                app.experiment_lab.selected_row.as_deref(),
+                Some(experiment_id)
+            );
+        }
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Enter));
+        finish_lab_read(&mut comparison_model);
+        {
+            let app = comparison_model.app.borrow();
+            let lab = &app.experiment_lab.workflows;
+            let batch = lab.batch.as_ref().unwrap();
+            assert_eq!(batch.summary.experiment_id, experiment_id);
+            assert_eq!(batch.summary.status, "completed");
+            assert_eq!(batch.summary.completed_runs, completed.completed_runs);
+            assert_eq!(batch.variants.len(), 2);
+            for arm in &batch.variants {
+                assert_eq!(arm.total_runs, 1);
+                assert_eq!(arm.completed_runs, 1);
+                assert_eq!(arm.running_runs, 0);
+                assert_eq!(arm.failed_runs, 0);
+            }
+            assert_eq!(lab.baseline.as_deref(), Some("baseline"));
+            assert_eq!(lab.challenger.as_deref(), Some("challenger"));
+        }
+
+        // Hold only the actual comparison read to observe the pending state
+        // deterministically and prove repeated input does not add a worker.
+        use scriptbots_runtime::lab_workflows::LabWorkflowRequest;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let comparison_calls = Arc::new(AtomicUsize::new(0));
+        {
+            let mut app = comparison_model.app.borrow_mut();
+            let provider = app.experiment_lab.workflows.submit.clone().unwrap();
+            let calls = Arc::clone(&comparison_calls);
+            app.experiment_lab.workflows.submit = Some(Arc::new(move |request| {
+                if matches!(&request, LabWorkflowRequest::Compare { .. }) {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered.send(()).map_err(|error| error.to_string())?;
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|error| error.to_string())?;
+                }
+                provider(request)
+            }));
+        }
+        let mut shifted_compare =
+            ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char('C'));
+        shifted_compare.modifiers = ftui::core::event::Modifiers::SHIFT;
+        let _ = comparison_model.update(LiveTerminalMessage::Event(ftui::core::event::Event::Key(
+            shifted_compare,
+        )));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            comparison_model.experiment_comparison_in_flight.is_none(),
+            "live Shift+C must reach the shared Lab provider before the legacy handler"
         );
         assert!(
             comparison_model
                 .app
                 .borrow()
-                .frankentui
-                .science
-                .experiments
-                .data()
-                .unwrap()
-                .comparison_summary
+                .experiment_lab
+                .workflows
+                .comparison
                 .is_none()
         );
-        let request = comparison_model.experiment_comparison_generation;
         let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+        assert_eq!(comparison_calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        finish_lab_read(&mut comparison_model);
+        let observed = comparison_model
+            .app
+            .borrow()
+            .experiment_lab
+            .workflows
+            .comparison
+            .clone()
+            .expect("actual verified matched-seed comparison");
+        assert_eq!(observed.metric, LabMetric::AliveAgents);
+        assert_eq!(observed.mean_difference, 0.0);
+        assert_eq!(observed.matched_seeds, [seed]);
+        assert_eq!(observed.endpoint_tick, ticks);
+        assert!(observed.descriptive_only);
+        assert!(observed.p_value.is_none());
+        assert!(observed.ci_95.is_none());
+
+        // The shared result survives a same-source refresh and is actually
+        // rendered with its units and one-pair inference limitation.
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('r')));
+        finish_lab_read(&mut comparison_model);
         assert_eq!(
-            comparison_model.experiment_comparison_generation, request,
-            "repeated input cannot create concurrent comparison workers"
+            comparison_model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .comparison
+                .as_ref(),
+            Some(&observed)
         );
-        let message = std::thread::spawn(work).join().unwrap();
-        let LiveTerminalMessage::ExperimentComparison {
-            result: Ok(comparison),
-            ..
-        } = &message
-        else {
-            panic!("real verified experiment comparison did not complete");
-        };
-        assert_eq!(comparison.metric, "alive_agents");
-        assert_eq!(comparison.matched_seeds, [seed]);
-        assert_eq!(comparison.endpoint_tick, ticks);
-        assert!(comparison.descriptive_only);
-        assert!(comparison.p_value.is_none());
-        let observed = comparison.clone();
-        let _ = comparison_model.update(message);
+        let mut rendered = ftui::runtime::ProgramSimulator::new(comparison_model);
+        let text = frankentui_shell::buffer_to_string(rendered.capture_frame(180, 40));
+        assert!(text.contains("EXPERIMENT LAB"));
+        assert!(
+            text.contains("Verified Population (agents), endpoint tick 2, 1 matched seed pairs")
+        );
+        assert!(
+            text.contains("Descriptive only: one independent seed pair cannot support inference.")
+        );
+        assert!(text.contains(&observed.plan_digest));
+        assert!(!text.contains("Hedges' g"));
+
+        // Detail brackets choose the actual shared endpoint, not catalog pages.
+        // The retained treatment has equal empty populations but different food.
         {
-            let mut app = comparison_model.app.borrow_mut();
+            let comparison_model = rendered.model_mut();
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('[')));
             assert_eq!(
-                app.frankentui
-                    .science
-                    .experiments
-                    .data()
-                    .unwrap()
-                    .comparison_summary
-                    .as_deref(),
-                Some(&observed)
+                comparison_model
+                    .app
+                    .borrow()
+                    .experiment_lab
+                    .workflows
+                    .metric,
+                LabMetric::TotalFood
             );
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            release.send(()).unwrap();
+            finish_lab_read(comparison_model);
+            {
+                let app = comparison_model.app.borrow();
+                let food = app.experiment_lab.workflows.comparison.as_ref().unwrap();
+                assert_eq!(food.metric, LabMetric::TotalFood);
+                assert!(food.mean_difference > 0.0);
+                assert_eq!(food.plan_digest, completed.plan_digest);
+                assert_eq!(food.status_generation, completed.generation);
+            }
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char(']')));
+            assert_eq!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .experiment_lab
+                    .workflows
+                    .metric,
+                LabMetric::AliveAgents
+            );
+            assert!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .experiment_lab
+                    .workflows
+                    .comparison
+                    .is_none()
+            );
+        }
+
+        // Retain the explicit DTO projection's selection/refresh regression.
+        // This compatibility path has no live provider attached.
+        let observed_dto = {
+            let handle = handle.clone();
+            std::thread::Builder::new()
+                .stack_size(32 * 1024 * 1024)
+                .spawn(move || {
+                    handle.compare_experiment_variants(
+                        experiment_id,
+                        "baseline",
+                        "challenger",
+                        "alive_agents",
+                    )
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(observed_dto.mean_difference, observed.mean_difference);
+        assert_eq!(observed_dto.plan_digest, observed.plan_digest);
+        assert_eq!(observed_dto.status_generation, observed.status_generation);
+        {
+            let mut app = simulator.model().app.borrow_mut();
+            let mut projected = comparison_view.clone();
+            projected.comparison_summary = Some(observed_dto.clone());
+            app.frankentui
+                .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                    projected,
+                )));
             app.frankentui.update(ShellMessage::PinComparisonBaseline);
             app.frankentui.update(ShellMessage::SelectNextItem);
             let mut refresh =
@@ -19433,8 +23383,8 @@ for case in ('panic', 'subscription', 'renderer'):
             assert_eq!(refreshed.selected_arm_index, 1);
             assert_eq!(refreshed.comparison_baseline.as_deref(), Some("baseline"));
             assert_eq!(
-                refreshed.comparison_summary.as_deref(),
-                Some(&observed),
+                refreshed.comparison_summary.as_ref(),
+                Some(&observed_dto),
                 "periodic catalog refresh must preserve the verified comparison"
             );
             // A completed selected pair remains valid when another variant's
@@ -19459,8 +23409,8 @@ for case in ('panic', 'subscription', 'renderer'):
                         .data()
                         .unwrap()
                         .comparison_summary
-                        .as_deref(),
-                    Some(&observed)
+                        .as_ref(),
+                    Some(&observed_dto)
                 );
             }
             let mut changed = comparison_view.clone();
@@ -19475,30 +23425,41 @@ for case in ('panic', 'subscription', 'renderer'):
                 "changed batch evidence clears prior results"
             );
         }
-        let mut rendered = ftui::runtime::ProgramSimulator::new(comparison_model);
-        let text = frankentui_shell::buffer_to_string(rendered.capture_frame(100, 24));
+        let text = frankentui_shell::buffer_to_string(simulator.capture_frame(100, 24));
         assert!(text.contains("Population (agents) at tick 2: paired n=1"));
         assert!(text.contains("Descriptive only; no significance claim"));
         assert!(!text.contains("Hedges' g"));
-        let comparison_model = rendered.model_mut();
-        let work = comparison_task(
-            comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
-        );
-        let (request, target) = comparison_model
-            .experiment_comparison_in_flight
-            .clone()
-            .unwrap();
-        let _ = comparison_model.update(LiveTerminalMessage::ExperimentComparison {
-            request: request - 1,
-            target,
-            result: Ok(observed),
-        });
+
+        // Preserve the explicit legacy message adapter's provenance guards with
+        // the real service. This submodel deliberately disables only the shared
+        // consumer; the production shared key path was exercised above.
+        let mut legacy_app = TerminalApp::new(&renderer, host.context(&comparison_runtime));
+        legacy_app
+            .frankentui
+            .update(ShellMessage::Navigate(ShellRoute::Experiments));
+        legacy_app
+            .frankentui
+            .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                comparison_view.clone(),
+            )));
+        let mut legacy_model = LiveTerminalModel::new(legacy_app).unwrap();
+        legacy_model.app.borrow_mut().experiment_lab.enabled = false;
+        legacy_model.cancelled_service_route = Some(ShellRoute::Experiments);
+        let mut shifted_compare =
+            ftui::core::event::KeyEvent::new(ftui::core::event::KeyCode::Char('C'));
+        shifted_compare.modifiers = ftui::core::event::Modifiers::SHIFT;
+        let work = comparison_task(legacy_model.update(LiveTerminalMessage::Event(
+            ftui::core::event::Event::Key(shifted_compare),
+        )));
         assert!(
-            comparison_model.experiment_comparison_in_flight.is_some(),
-            "a stale completion cannot retire the active worker"
+            legacy_model
+                .experiment_comparison_in_flight
+                .as_ref()
+                .is_some_and(|(_, target)| target.metric == LabMetric::AliveAgents),
+            "the explicit legacy Shift+C path must dispatch its selected endpoint"
         );
         assert!(
-            comparison_model
+            legacy_model
                 .app
                 .borrow()
                 .frankentui
@@ -19509,20 +23470,288 @@ for case in ('panic', 'subscription', 'renderer'):
                 .comparison_summary
                 .is_none()
         );
-        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Escape));
-        assert!(comparison_model.experiment_comparison_cancelled);
-        let _ = comparison_model.update(std::thread::spawn(work).join().unwrap());
-        assert!(comparison_model.experiment_comparison_in_flight.is_none());
-        assert!(
+        let request = legacy_model.experiment_comparison_generation;
+        let _ = legacy_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+        assert_eq!(
+            legacy_model.experiment_comparison_generation, request,
+            "repeated legacy input cannot create concurrent comparison workers"
+        );
+        let message = std::thread::spawn(work).join().unwrap();
+        let LiveTerminalMessage::ExperimentComparison {
+            result: Ok(comparison),
+            ..
+        } = &message
+        else {
+            panic!("real legacy comparison did not complete");
+        };
+        assert_eq!(comparison.metric, "alive_agents");
+        assert_eq!(comparison.mean_difference, 0.0);
+        assert_eq!(comparison.matched_seeds, [seed]);
+        assert_eq!(comparison.endpoint_tick, ticks);
+        assert!(comparison.descriptive_only);
+        assert!(comparison.p_value.is_none());
+        let legacy_observed = comparison.clone();
+        let _ = legacy_model.update(message);
+        let mut legacy_rendered = ftui::runtime::ProgramSimulator::new(legacy_model);
+        {
+            let comparison_model = legacy_rendered.model_mut();
             comparison_model
                 .app
-                .borrow()
+                .borrow_mut()
+                .frankentui
+                .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                    comparison_view.clone(),
+                )));
+            // The legacy key path must ask for food, not relabel the population
+            // result. These actual worlds have equal empty populations and different food.
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('[')));
+            for mismatch in ["metric", "plan", "generation"] {
+                let work = comparison_task(
+                    comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+                );
+                let LiveTerminalMessage::ExperimentComparison {
+                    request,
+                    target,
+                    result: Ok(mut comparison),
+                } = std::thread::spawn(work).join().unwrap()
+                else {
+                    panic!(
+                        "real food endpoint comparison must complete before testing its identity guard"
+                    );
+                };
+                assert_eq!(comparison.metric, "total_food");
+                assert!(
+                    comparison.mean_difference > 0.0,
+                    "food treatment must differ from the zero population delta"
+                );
+                match mismatch {
+                    "metric" => comparison.metric = "alive_agents".into(),
+                    "plan" => comparison.plan_digest = "different-plan".into(),
+                    _ => comparison.status_generation += 1,
+                }
+                let _ = comparison_model.update(LiveTerminalMessage::ExperimentComparison {
+                    request,
+                    target,
+                    result: Ok(comparison),
+                });
+                let app = comparison_model.app.borrow();
+                assert!(
+                    app.frankentui
+                        .science
+                        .experiments
+                        .data()
+                        .unwrap()
+                        .comparison_summary
+                        .is_none()
+                );
+                assert!(
+                    app.frankentui
+                        .status_message
+                        .as_deref()
+                        .unwrap()
+                        .contains("Comparison refused")
+                );
+            }
+            let work = comparison_task(
+                comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+            );
+            let _ = comparison_model.update(std::thread::spawn(work).join().unwrap());
+            let mut app = comparison_model.app.borrow_mut();
+            let food = app
                 .frankentui
                 .science
                 .experiments
                 .data()
                 .unwrap()
-                .comparison_summary
+                .current_comparison()
+                .unwrap()
+                .clone();
+            assert_eq!(food.metric, "total_food");
+            assert!(food.mean_difference > 0.0);
+            assert_eq!(food.plan_digest, completed.plan_digest);
+            assert_eq!(food.status_generation, completed.generation);
+            let mut refresh =
+                ShellMessage::SetExperimentsData(ScreenDataState::Data(comparison_view.clone()));
+            app.preserve_science_selection(&mut refresh);
+            app.frankentui.update(refresh);
+            let refreshed = app.frankentui.science.experiments.data().unwrap();
+            assert_eq!(refreshed.comparison_metric, LabMetric::TotalFood);
+            assert_eq!(refreshed.current_comparison(), Some(&food));
+
+            let mut newer = comparison_view.clone();
+            newer.status_generation += 1;
+            let mut refresh = ShellMessage::SetExperimentsData(ScreenDataState::Data(newer));
+            app.preserve_science_selection(&mut refresh);
+            let ShellMessage::SetExperimentsData(ScreenDataState::Data(newer)) = refresh else {
+                unreachable!("refresh retains its message type");
+            };
+            assert_eq!(newer.comparison_metric, LabMetric::TotalFood);
+            assert!(
+                newer.comparison_summary.is_none(),
+                "identical visible runs do not prove the same source generation"
+            );
+        }
+        let text = frankentui_shell::buffer_to_string(legacy_rendered.capture_frame(120, 28));
+        assert!(text.contains("Total food (food energy units) at tick 2: paired n=1"));
+        assert!(!text.contains("Population (agents) at tick"));
+        {
+            let comparison_model = legacy_rendered.model_mut();
+            let work = comparison_task(
+                comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+            );
+            let generation = comparison_model.experiment_comparison_generation;
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char(']')));
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('[')));
+            assert!(comparison_model.experiment_comparison_cancelled);
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+            assert_eq!(
+                comparison_model.experiment_comparison_generation, generation,
+                "changing the endpoint cannot free an occupied worker"
+            );
+            let _ = comparison_model.update(std::thread::spawn(work).join().unwrap());
+            assert!(comparison_model.experiment_comparison_in_flight.is_none());
+            assert!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none(),
+                "Food -> Population -> Food must not accept the original Food response"
+            );
+
+            // Move from food through population and total energy to mean energy.
+            // The service must refuse this endpoint for the actual empty cohort.
+            for _ in 0..3 {
+                let _ =
+                    comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char(']')));
+            }
+            assert_eq!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_metric,
+                LabMetric::AverageEnergy
+            );
+            let work = comparison_task(
+                comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+            );
+            let message = std::thread::spawn(work).join().unwrap();
+            assert!(
+                matches!(&message, LiveTerminalMessage::ExperimentComparison { result: Err(error), .. } if error.contains("unavailable"))
+            );
+            let _ = comparison_model.update(message);
+            let mut app = comparison_model.app.borrow_mut();
+            assert!(
+                app.frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none()
+            );
+            assert!(
+                app.frankentui
+                    .status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("Comparison unavailable")
+            );
+            app.frankentui
+                .update(ShellMessage::SetExperimentsData(ScreenDataState::Data(
+                    comparison_view.clone(),
+                )));
+        }
+        {
+            let comparison_model = legacy_rendered.model_mut();
+            let work = comparison_task(
+                comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c'))),
+            );
+            let (request, target) = comparison_model
+                .experiment_comparison_in_flight
+                .clone()
+                .unwrap();
+            let _ = comparison_model.update(LiveTerminalMessage::ExperimentComparison {
+                request: request - 1,
+                target,
+                result: Ok(legacy_observed),
+            });
+            assert!(
+                comparison_model.experiment_comparison_in_flight.is_some(),
+                "a stale legacy completion cannot retire the active worker"
+            );
+            assert!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none()
+            );
+            let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Escape));
+            assert!(comparison_model.experiment_comparison_cancelled);
+            let _ = comparison_model.update(std::thread::spawn(work).join().unwrap());
+            assert!(comparison_model.experiment_comparison_in_flight.is_none());
+            assert!(
+                comparison_model
+                    .app
+                    .borrow()
+                    .frankentui
+                    .science
+                    .experiments
+                    .data()
+                    .unwrap()
+                    .comparison_summary
+                    .is_none(),
+                "a navigation-cancelled legacy result must not reappear"
+            );
+        }
+        let comparison_model = rendered.model_mut();
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Char('c')));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(comparison_calls.load(Ordering::SeqCst), 3);
+        let _ = comparison_model.update(comparison_key(ftui::core::event::KeyCode::Escape));
+        assert!(
+            comparison_model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .is_busy(),
+            "discarding a result does not free a running worker"
+        );
+        assert!(
+            comparison_model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .selected_experiment
+                .is_none()
+        );
+        release.send(()).unwrap();
+        finish_lab_read(comparison_model);
+        assert!(
+            comparison_model
+                .app
+                .borrow()
+                .experiment_lab
+                .workflows
+                .comparison
                 .is_none(),
             "a navigation-cancelled result must not reappear"
         );
@@ -20258,6 +24487,216 @@ for case in ('panic', 'subscription', 'renderer'):
         );
         assert_eq!(port.snapshot_hub().latest().revisions.control.get(), 1);
         assert_eq!(port.snapshot_hub().latest().world.tick, 0);
+    }
+
+    fn terminal_guide_press(app: &mut TerminalApp<'_>, code: ftui::core::event::KeyCode) {
+        app.handle_ftui_event(ftui::core::event::Event::Key(
+            ftui::core::event::KeyEvent::new(code),
+        ))
+        .expect("guide key handled");
+    }
+
+    fn terminal_guide_frame(app: &TerminalApp<'_>, width: u16, height: u16) -> String {
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut frame = ftui::render::frame::Frame::new(width, height, &mut pool);
+        app.frankentui.view(&mut frame);
+        frankentui_shell::buffer_to_string(&frame.buffer)
+    }
+
+    fn finish_terminal_guide_command(
+        app: &mut TerminalApp<'_>,
+        driver: &mut scriptbots_runtime::channel::ChannelHostDriver,
+        owner_time: &mut u64,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.frankentui.guide.ready() {
+            driver
+                .step(scriptbots_runtime::ManualInstant::from_nanos(*owner_time))
+                .expect("actual owner boundary");
+            *owner_time += 1;
+            app.refresh_command_receipts();
+            app.refresh_snapshot();
+            assert!(
+                Instant::now() < deadline,
+                "guide still waiting on actual evidence: {}",
+                app.frankentui.guide.status(),
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn terminal_guide_uses_actual_receipts_and_refuses_stale_configuration_proposals() {
+        use ftui::core::event::KeyCode as K;
+        let world = command_characterization_world();
+        {
+            let mut world = world.lock().unwrap();
+            let installed = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .unwrap();
+            assert!(world.bind_agent_brain(id, installed.population()[0]).unwrap());
+        }
+        let (mut driver, port) = terminal_manual_driver(
+            world,
+            scriptbots_runtime::channel::ChannelHostOptions::default().ingress_capacity,
+        );
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(
+            &renderer,
+            TerminalTestHost::port_context(port.clone(), &runtime),
+        );
+        let initial = port.snapshot_hub().latest();
+        let mut owner_time = 0;
+        terminal_guide_press(&mut app, K::F(1));
+        assert!(app.frankentui.guide.visible && app.frankentui.guide.ready());
+        let frame = terminal_guide_frame(&app, 100, 32);
+        assert!(frame.contains("FIRST-RUN LAB GUIDE"));
+        assert!(frame.contains(&format!("Seed: {}", initial.visual_seed)));
+        assert!(Arc::ptr_eq(&initial, &port.snapshot_hub().latest()));
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Inspect);
+        assert!(!app.frankentui.guide.ready());
+
+        terminal_guide_press(&mut app, K::Escape);
+        terminal_guide_press(&mut app, K::Char('3'));
+        terminal_guide_press(&mut app, K::F(1));
+        assert!(app.frankentui.guide.ready());
+        assert_eq!(
+            app.frankentui.guide_selected_uid,
+            initial.world.agents.first().map(|agent| agent.uid.get()),
+        );
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Pause);
+        assert!(!app.frankentui.guide.ready(), "a paused snapshot is not a receipt");
+        terminal_guide_press(&mut app, K::Escape);
+        app.execute_palette_action(CommandPaletteAction::Pause);
+        assert!(!app.frankentui.guide.ready(), "submission is not application");
+        finish_terminal_guide_command(&mut app, &mut driver, &mut owner_time);
+        assert_eq!(app.retained_render.world.tick, initial.world.tick);
+
+        terminal_guide_press(&mut app, K::F(1));
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Step);
+        terminal_guide_press(&mut app, K::Escape);
+        terminal_guide_press(&mut app, K::Char('s'));
+        assert!(!app.frankentui.guide.ready());
+        finish_terminal_guide_command(&mut app, &mut driver, &mut owner_time);
+        assert_eq!(app.retained_render.world.tick, initial.world.tick + 1);
+
+        terminal_guide_press(&mut app, K::F(1));
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Configure);
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Char('e'));
+        for _ in 0..32 {
+            terminal_guide_press(&mut app, K::Backspace);
+        }
+        for ch in "-1".chars() {
+            terminal_guide_press(&mut app, K::Char(ch));
+        }
+        let sequence = app.command_sequence;
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.command_sequence, sequence);
+        assert!(app.frankentui.guide_notice.as_deref().unwrap().contains("finite"));
+        assert!(!app.frankentui.guide.ready());
+        terminal_guide_press(&mut app, K::Escape);
+        terminal_guide_press(&mut app, K::Char('e'));
+
+        // Another client changes the real owner after the editor captured its
+        // source. Enter must refuse that stale proposal before allocating an ID.
+        let mut external_config = app.retained_render.config.as_ref().clone();
+        external_config.food_growth_rate += 0.02;
+        let _ = port.clone().submit_before(
+            CommandEnvelope::new(
+                CommandId::new(u128::MAX),
+                HostCommand::UpdateConfig(Box::new(external_config.clone())),
+            ),
+            Instant::now() + Duration::from_millis(5),
+        );
+        driver
+            .step(scriptbots_runtime::ManualInstant::from_nanos(owner_time))
+            .unwrap();
+        owner_time += 1;
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.command_sequence, sequence);
+        assert!(app.frankentui.guide_growth_draft.is_none());
+        assert!(app.frankentui.guide_notice.as_deref().unwrap().contains("source changed"));
+        assert_eq!(app.retained_render.config.as_ref(), &external_config);
+        assert!(!app.frankentui.guide.ready(), "another client's edit is not our receipt");
+
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Char('e'));
+        for _ in 0..32 {
+            terminal_guide_press(&mut app, K::Backspace);
+        }
+        let mut expected = external_config;
+        expected.food_growth_rate += 0.25;
+        for ch in expected.food_growth_rate.to_string().chars() {
+            terminal_guide_press(&mut app, K::Char(ch));
+        }
+        let before = Arc::clone(&app.retained_render);
+        terminal_guide_press(&mut app, K::Enter);
+        assert!(!app.frankentui.guide.ready());
+        let submitted = &app.unresolved_commands.back().unwrap().envelope;
+        assert_eq!(submitted.expected_config_revision, Some(before.revisions.config));
+        assert_eq!(submitted.expected_scientific_revision, Some(before.revisions.scientific));
+        terminal_guide_press(&mut app, K::Char('e'));
+        assert!(app.frankentui.guide_growth_draft.is_none(), "pending edit cannot reopen");
+        finish_terminal_guide_command(&mut app, &mut driver, &mut owner_time);
+        assert_eq!(app.retained_render.config.as_ref(), &expected);
+        terminal_guide_press(&mut app, K::Char('e'));
+        assert!(app.frankentui.guide_growth_draft.is_none(), "completed edit cannot reopen");
+        assert_eq!(app.retained_render.world.tick, before.world.tick);
+        assert_eq!(app.retained_render.revisions.scientific, before.revisions.scientific);
+        let _ = terminal_guide_frame(&app, 100, 32);
+        terminal_guide_press(&mut app, K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Checkpoint);
+        assert!(!app.frankentui.guide.ready(), "no save has been observed");
+
+        // A key from the old owner/step cannot advance a newly attached source.
+        let _ = terminal_guide_frame(&app, 100, 32);
+        let mut replacement = app.retained_render.as_ref().clone();
+        replacement.session_id = HostSessionId::new(replacement.session_id.get() + 1);
+        app.frankentui.guide.observe_snapshot(&replacement, None);
+        app.frankentui.handle_guide_key(K::Enter);
+        assert_eq!(app.frankentui.guide.step(), LabGuideStep::Identify);
+        assert!(app.frankentui.guide_notice.as_deref().unwrap().contains("changed"));
+    }
+
+    #[test]
+    fn terminal_guide_and_replay_return_keys_preserve_live_science() {
+        use ftui::core::event::{KeyCode as K, Modifiers as M};
+        with_shortcut_app(|app| {
+            let before = Arc::clone(&app.retained_render);
+            app.execute_palette_action(CommandPaletteAction::ShowLabGuide);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let cells: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            assert!(cells.contains("FIRST-RUN LAB GUIDE"));
+            terminal_guide_press(app, K::Escape);
+            assert!(!app.frankentui.guide.visible);
+            for (code, modifiers) in [(K::Char('g'), M::NONE), (K::Char('G'), M::SHIFT)] {
+                app.navigate_route(frankentui_shell::ShellRoute::Replay);
+                let mut key = ftui::core::event::KeyEvent::new(code);
+                key.modifiers = modifiers;
+                app.handle_ftui_event(ftui::core::event::Event::Key(key)).unwrap();
+                assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::WorldCanvas);
+            }
+            assert_eq!(app.command_sequence, 0);
+            assert_eq!(app.retained_render.world.tick, before.world.tick);
+            assert_eq!(app.retained_render.revisions.scientific, before.revisions.scientific);
+        });
     }
 
     fn terminal_manual_driver(
@@ -25453,10 +29892,11 @@ for case in ('panic', 'subscription', 'renderer'):
             .unwrap();
         let live_digest = host.port().scientific_digest_v1().unwrap();
         app.navigate_route(ShellRoute::Replay);
-        for message in science_service_messages(&handle, ShellRoute::Replay, 1) {
-            app.frankentui.update(message);
-        }
-        let selected = app
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        finish_terminal_replay_read(&mut model);
+        let selected = model
+            .app
+            .borrow()
             .frankentui
             .science
             .replay
@@ -25466,13 +29906,9 @@ for case in ('panic', 'subscription', 'renderer'):
             .iter()
             .position(|cut| cut.checkpoint_id == checkpoint.checkpoint_id)
             .unwrap();
-        app.frankentui
-            .science
-            .replay
-            .data_mut()
-            .unwrap()
-            .selected_checkpoint_index = selected;
-        let mut model = LiveTerminalModel::new(app).unwrap();
+        for _ in 0..selected {
+            let _ = model.update(key(KeyCode::Down));
+        }
         model.last_service_poll = Some(Instant::now());
         let work = task(model.update(key(KeyCode::Enter)));
         assert!(
@@ -27035,8 +31471,9 @@ for case in ('panic', 'subscription', 'renderer'):
     fn test_command_palette_fuzzy_matching() {
         let items = all_command_palette_items();
         let matched = fuzzy_match_command_palette(&items, "pause");
-        assert!(!matched.is_empty(), "query 'pause' must match Toggle Pause");
-        assert_eq!(matched[0].action, CommandPaletteAction::TogglePause);
+        assert!(!matched.is_empty(), "query 'pause' must find playback controls");
+        assert_eq!(matched[0].action, CommandPaletteAction::Pause);
+        assert!(matched.iter().any(|item| item.action == CommandPaletteAction::TogglePause));
 
         let matched_cat = fuzzy_match_command_palette(&items, "science");
         assert!(
@@ -27390,6 +31827,7 @@ for case in ('panic', 'subscription', 'renderer'):
             "View",
             "Science",
             "System",
+            "Learning",
         ] {
             assert!(
                 categories.contains(domain),
@@ -27400,7 +31838,7 @@ for case in ('panic', 'subscription', 'renderer'):
         // Remaining hints belong to the preserved widget-specific bindings.
         const HUD_BINDINGS: &[&str] = &[
             "Space", "s", "+", "-", "Shift+S", "a", "r", "t", "o", "i", "w", "f", "Enter",
-            "Ctrl+T", "p / c", "?", "q / Esc", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+            "Ctrl+T", "p / c", "?", "F1", "q / Esc", "1", "2", "3", "4", "5", "6", "7", "8", "9",
         ];
         for item in &items {
             assert!(

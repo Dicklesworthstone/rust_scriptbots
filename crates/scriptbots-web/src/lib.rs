@@ -8,15 +8,25 @@
 #![cfg(any(target_arch = "wasm32", test))]
 //! Browser simulation controls, snapshots, and shareable world configuration.
 
-use std::cell::RefCell;
+mod launch;
+
+pub use launch::LaunchInfo;
+
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use js_sys::Uint8Array;
 use postcard::{from_bytes, to_allocvec};
 use rand::Rng;
-use scriptbots_brain::{MlpBrain, mlp::MlpBrainFamily};
+use scriptbots_brain::{
+    MlpBrain,
+    assembly::{AssemblyBrain, AssemblyFamilyAdapter},
+    dwraon::{DwraonBrain, DwraonFamilyAdapter},
+    mlp::MlpBrainFamily,
+};
 #[cfg(all(
     test,
     any(not(target_arch = "wasm32"), feature = "native-parity-fixture")
@@ -30,20 +40,27 @@ use scriptbots_core::rng_domains::RngDomain;
 use scriptbots_core::{
     AgentData, AgentId, BrainBinding, BrainRunner, DynamicWorldSnapshot as SimulationSnapshot,
     Generation, INPUT_SIZE, OUTPUT_SIZE, Position, ScriptBotsConfig, SmallRngStream, Velocity,
-    WorldState,
+    WorldState, to_canonical_value,
 };
 #[cfg(test)]
 use scriptbots_core::{
     AgentUid, DynamicAgentSnapshot as AgentSnapshot, DynamicSnapshotSummary as SnapshotSummary,
     DynamicSnapshotWorld as SnapshotWorld,
 };
+use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen::{from_value, to_value};
 use wasm_bindgen::prelude::*;
 
 use scriptbots_runtime::remote::{
-    RemoteEventPage, RemoteEventRecord, RemoteFrame, RemoteFrameIdentity, RemoteFramePayload,
-    decode_remote_frame,
+    BrowserInterventionHistory, BrowserInterventionReceipt, BrowserInterventionRequest,
+    RemoteEnvironmentCache, RemoteEnvironmentCell, RemoteEnvironmentSnapshot, RemoteEventPage,
+    RemoteEventRecord, RemoteFrame, RemoteFrameIdentity, RemoteFramePayload,
+    browser_intervention_command_id, decode_remote_frame, validate_browser_intervention_session,
+};
+use scriptbots_runtime::remote_subscription::{
+    REMOTE_SUBSCRIPTION_PROTOCOL_VERSION, RemoteChannel, RemoteResumeRequest, RemoteSubscription,
+    RemoteSubscriptionRequest,
 };
 use scriptbots_runtime::{
     ApplicationState, CommandStatus, DriveReceipt, HostCommand, HostCore, HostCoreOptions,
@@ -54,6 +71,9 @@ use scriptbots_runtime::{
 /// Browser files obey the canonical paired-owner codec's byte bound.
 pub const MAX_BROWSER_CHECKPOINT_BYTES: usize =
     scriptbots_runtime::MAX_VOLATILE_HOST_CHECKPOINT_BYTES;
+
+/// Scientific interchange uses the core codec's independent byte bound.
+pub const MAX_BROWSER_WORLD_CHECKPOINT_BYTES: usize = scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES;
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
@@ -97,10 +117,11 @@ fn ensure_panic_hook_installed() {
 
 /// A row in the parent diff comparison view.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DiffRow {
     /// Dot-separated configuration knob path.
     pub knob: String,
-    /// Value configured in the base scenario.
+    /// Value configured in the original browser launch or gallery base scenario.
     pub parent_value: f64,
     /// Value configured in this permalink world.
     pub this_value: f64,
@@ -116,8 +137,9 @@ struct Simulation {
     core: HostCore,
     controls: NullFrontend<LocalHostPort>,
     spec: SimSpec,
-    mlp_key: Option<u64>,
     now_nanos: u64,
+    environment_cache: RemoteEnvironmentCache,
+    environment_js: Option<(Arc<RemoteEnvironmentSnapshot>, JsValue)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,6 +162,43 @@ enum SeedStrategy {
 #[serde(rename_all = "lowercase")]
 enum BrainPreset {
     Mlp,
+    Dwraon,
+    Assembly,
+}
+
+impl BrainPreset {
+    const ALL: [Self; 3] = [Self::Mlp, Self::Dwraon, Self::Assembly];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Mlp => "mlp",
+            Self::Dwraon => "dwraon",
+            Self::Assembly => "assembly",
+        }
+    }
+
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Mlp => MlpBrain::KIND.as_str(),
+            Self::Dwraon => DwraonBrain::KIND.as_str(),
+            Self::Assembly => AssemblyBrain::KIND.as_str(),
+        }
+    }
+
+    fn from_kind(kind: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| preset.kind() == kind)
+    }
+
+    fn register(self, registry: &mut scriptbots_core::BrainRegistry) -> Result<u64> {
+        let adapter: Box<dyn scriptbots_core::BrainFamilyAdapter> = match self {
+            Self::Mlp => Box::new(MlpBrainFamily::new()),
+            Self::Dwraon => Box::new(DwraonFamilyAdapter::default()),
+            Self::Assembly => Box::new(AssemblyFamilyAdapter::new()?),
+        };
+        registry
+            .register_family(self.kind(), adapter)
+            .with_context(|| format!("failed to register versioned {} brain family", self.name()))
+    }
 }
 
 #[derive(Clone)]
@@ -150,7 +209,15 @@ struct SimSpec {
     snapshot_format: SnapshotFormat,
     seed_strategy: SeedStrategy,
     default_brain: Option<BrainPreset>,
+    mixed_brains: bool,
+    // An imported multi-family owner has no recorded founder distribution.
+    // Keep its registry roster for continuation; only an explicit new-world
+    // preset can replace it with a fresh founder recipe.
+    continuation_brains: Vec<BrainPreset>,
+    // A scientific cut creates a new owner; it is not an old owner continuation.
+    scientific_checkpoint_import: bool,
     permalink: Option<Permalink>,
+    launch: Option<launch::BrowserLaunch>,
     preserve_population_config: bool,
 }
 
@@ -160,7 +227,90 @@ struct SimSpec {
 struct BrowserFrame<'a> {
     schema: &'static str,
     identity: BrowserFrameIdentity,
+    playback: BrowserRemotePlayback,
+    #[serde(serialize_with = "serialize_browser_snapshot")]
     snapshot: &'a SimulationSnapshot,
+    environment: Option<BrowserEnvironment<'a>>,
+}
+
+/// Browser views retain exact creature/brain identities without changing the core codecs.
+fn serialize_browser_snapshot<S>(
+    snapshot: &SimulationSnapshot,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    struct Agents<'a>(&'a [scriptbots_core::DynamicAgentSnapshot]);
+    struct Agent<'a>(&'a scriptbots_core::DynamicAgentSnapshot);
+    impl Serialize for Agents<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.0.iter().map(Agent))
+        }
+    }
+    impl Serialize for Agent<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let value = self.0;
+            let mut agent = serializer.serialize_struct("BrowserAgent", 14)?;
+            agent.serialize_field("id", &value.id.to_string())?;
+            agent.serialize_field("uid", &value.uid.to_string())?;
+            agent.serialize_field("position", &value.position)?;
+            agent.serialize_field("velocity", &value.velocity)?;
+            agent.serialize_field("heading", &value.heading)?;
+            agent.serialize_field("health", &value.health)?;
+            agent.serialize_field("energy", &value.energy)?;
+            agent.serialize_field("color", &value.color)?;
+            agent.serialize_field("spikeLength", &value.spike_length)?;
+            agent.serialize_field("boost", &value.boost)?;
+            agent.serialize_field("age", &value.age)?;
+            agent.serialize_field("generation", &value.generation)?;
+            agent.serialize_field("herbivoreTendency", &value.herbivore_tendency)?;
+            agent.serialize_field("brainKey", &value.brain_key.map(|key| key.to_string()))?;
+            agent.end()
+        }
+    }
+    let mut state = serializer.serialize_struct("BrowserSnapshot", 5)?;
+    state.serialize_field("tick", &snapshot.tick)?;
+    state.serialize_field("epoch", &snapshot.epoch.to_string())?;
+    state.serialize_field("world", &snapshot.world)?;
+    state.serialize_field("summary", &snapshot.summary)?;
+    state.serialize_field("agents", &Agents(&snapshot.agents))?;
+    state.end()
+}
+
+/// The same bounded overview in local and remote frames. Revisions stay exact in JavaScript.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserEnvironment<'a> {
+    width: u32,
+    height: u32,
+    source_width: u32,
+    source_height: u32,
+    cell_size: u32,
+    terrain_revision: String,
+    food_revision: String,
+    hydrology_revision: String,
+    food_max: f32,
+    hydrology_enabled: bool,
+    cells: &'a [RemoteEnvironmentCell],
+}
+
+impl<'a> From<&'a RemoteEnvironmentSnapshot> for BrowserEnvironment<'a> {
+    fn from(value: &'a RemoteEnvironmentSnapshot) -> Self {
+        Self {
+            width: value.width,
+            height: value.height,
+            source_width: value.source_width,
+            source_height: value.source_height,
+            cell_size: value.cell_size,
+            terrain_revision: value.terrain_revision.to_string(),
+            food_revision: value.food_revision.to_string(),
+            hydrology_revision: value.hydrology_revision.to_string(),
+            food_max: value.food_max,
+            hydrology_enabled: value.hydrology_enabled,
+            cells: &value.cells,
+        }
+    }
 }
 
 /// Decimal strings preserve every host identity bit across the JavaScript boundary.
@@ -180,7 +330,12 @@ impl<'a> BrowserFrame<'a> {
         Self {
             schema: "scriptbots.browser-frame.v1",
             identity: RemoteFrameIdentity::from(publication).into(),
+            playback: BrowserRemotePlayback {
+                paused: publication.playback.paused,
+                speed_multiplier: publication.playback.speed_multiplier,
+            },
             snapshot: &publication.world,
+            environment: None,
         }
     }
 }
@@ -206,6 +361,7 @@ struct BrowserRemoteFrame<'a> {
     identity: BrowserFrameIdentity,
     playback: BrowserRemotePlayback,
     coalesced_publications: String,
+    environment: Option<BrowserEnvironment<'a>>,
     payload: BrowserRemotePayload<'a>,
 }
 
@@ -221,7 +377,7 @@ struct BrowserRemotePlayback {
 #[serde(untagged)]
 enum BrowserRemotePayload<'a> {
     Telemetry(&'a scriptbots_core::TickSummaryDto),
-    Canvas(&'a SimulationSnapshot),
+    Canvas(#[serde(serialize_with = "serialize_browser_snapshot")] &'a SimulationSnapshot),
     Events(BrowserRemoteEventPage<'a>),
 }
 
@@ -263,6 +419,41 @@ struct BrowserRemoteEventRecord<'a> {
     score: f64,
     subject: Option<&'a str>,
     human_text: &'a str,
+}
+
+/// Reuse the remote event contract over one immutable local publication. A fresh
+/// reader returns an empty page too, so a client can record which publication it
+/// inspected without installing a subscription or changing the owner.
+fn browser_narrative_page(
+    snapshot: &RenderSnapshot,
+    after_event: &str,
+    expected_session_id: &str,
+) -> Result<RemoteFrame> {
+    // Bound the strings before copying them into the shared request type. The
+    // subscription validator then enforces canonical decimal form and range.
+    ensure!(
+        after_event.len() <= 20,
+        "event cursor exceeds the u64 decimal bound"
+    );
+    ensure!(
+        expected_session_id.len() <= 39,
+        "session identity exceeds the u128 decimal bound"
+    );
+    let request = RemoteSubscriptionRequest {
+        protocol_version: REMOTE_SUBSCRIPTION_PROTOCOL_VERSION,
+        request_id: None,
+        command: "subscribe".to_owned(),
+        channels: vec![RemoteChannel::Events],
+        max_fps: 4,
+        resume: Some(RemoteResumeRequest {
+            session_id: expected_session_id.to_owned(),
+            after_revision: None,
+            after_event: Some(after_event.to_owned()),
+        }),
+    };
+    RemoteSubscription::new(&request, snapshot)?
+        .next_frame(RemoteChannel::Events, snapshot)?
+        .context("initial narrative read did not produce an event page")
 }
 
 impl<'a> From<&'a RemoteEventRecord> for BrowserRemoteEventRecord<'a> {
@@ -320,7 +511,7 @@ impl<'a> From<&'a RemoteFrame> for BrowserRemoteFrame<'a> {
             }
         };
         Self {
-            schema: "scriptbots.remote-frame.v1",
+            schema: "scriptbots.remote-frame.v2",
             kind,
             identity: frame.identity.into(),
             playback: BrowserRemotePlayback {
@@ -328,6 +519,7 @@ impl<'a> From<&'a RemoteFrame> for BrowserRemoteFrame<'a> {
                 speed_multiplier: frame.playback.speed_multiplier,
             },
             coalesced_publications: frame.coalesced_publications.to_string(),
+            environment: frame.environment.as_deref().map(BrowserEnvironment::from),
             payload,
         }
     }
@@ -359,6 +551,9 @@ mod remote_frame_tests {
             identity: RemoteFrameIdentity::from(publication.as_ref()),
             playback: publication.playback,
             coalesced_publications: 0,
+            environment: Some(Arc::new(
+                RemoteEnvironmentSnapshot::capture(&publication).unwrap(),
+            )),
             payload: RemoteFramePayload::Canvas(publication.world.clone()),
         };
         let bytes = encode_remote_frame(&frame).unwrap();
@@ -368,7 +563,14 @@ mod remote_frame_tests {
         assert_eq!(browser["payload"], local["snapshot"]);
         assert_eq!(browser["identity"], local["identity"]);
         assert_eq!(browser["kind"], "canvas");
-        assert_eq!(browser["schema"], "scriptbots.remote-frame.v1");
+        assert_eq!(browser["schema"], "scriptbots.remote-frame.v2");
+        assert_eq!(
+            browser["environment"],
+            serde_json::to_value(BrowserEnvironment::from(
+                frame.environment.as_deref().unwrap()
+            ))
+            .unwrap()
+        );
         assert_eq!(browser["playback"]["paused"], publication.playback.paused);
         assert_eq!(
             browser["playback"]["speedMultiplier"],
@@ -381,6 +583,13 @@ mod remote_frame_tests {
         frame.identity.publication_revision = u64::MAX;
         frame.identity.scientific_revision = u64::MAX - 1;
         frame.coalesced_publications = u64::MAX - 2;
+        if let RemoteFramePayload::Canvas(snapshot) = &mut frame.payload {
+            snapshot.epoch = u64::MAX;
+            snapshot.agents[0].uid = AgentUid(u64::MAX);
+            snapshot.agents[0].id = u64::MAX - 1;
+            snapshot.agents[0].brain_key = Some(u64::MAX - 2);
+        }
+        Arc::make_mut(frame.environment.as_mut().unwrap()).terrain_revision = u64::MAX;
         let decoded = decode_remote_frame(&encode_remote_frame(&frame).unwrap()).unwrap();
         let browser = serde_json::to_value(BrowserRemoteFrame::from(&decoded)).unwrap();
         assert_eq!(browser["identity"]["sessionId"], u128::MAX.to_string());
@@ -393,6 +602,20 @@ mod remote_frame_tests {
             (u64::MAX - 1).to_string()
         );
         assert_eq!(browser["coalescedPublications"], (u64::MAX - 2).to_string());
+        assert_eq!(browser["payload"]["epoch"], u64::MAX.to_string());
+        assert_eq!(browser["payload"]["agents"][0]["uid"], u64::MAX.to_string());
+        assert_eq!(
+            browser["payload"]["agents"][0]["id"],
+            (u64::MAX - 1).to_string()
+        );
+        assert_eq!(
+            browser["payload"]["agents"][0]["brainKey"],
+            (u64::MAX - 2).to_string()
+        );
+        assert_eq!(
+            browser["environment"]["terrainRevision"],
+            u64::MAX.to_string()
+        );
     }
 
     #[test]
@@ -425,6 +648,7 @@ mod remote_frame_tests {
                 speed_multiplier: 2.0,
             },
             coalesced_publications: 0,
+            environment: None,
             payload: RemoteFramePayload::Events(RemoteEventPage {
                 after_event: u64::MAX - 1,
                 earliest_retained: u64::MAX,
@@ -472,7 +696,11 @@ impl SimSpec {
             snapshot_format,
             seed_strategy,
             default_brain,
+            mixed_brains: false,
+            continuation_brains: Vec::new(),
+            scientific_checkpoint_import: false,
             permalink: None,
+            launch: None,
             preserve_population_config: false,
         }
     }
@@ -486,7 +714,11 @@ impl SimSpec {
             snapshot_format: SnapshotFormat::Json,
             seed_strategy: SeedStrategy::None,
             default_brain: None,
+            mixed_brains: false,
+            continuation_brains: Vec::new(),
+            scientific_checkpoint_import: false,
             permalink: Some(permalink),
+            launch: None,
             preserve_population_config: true,
         }
     }
@@ -494,10 +726,19 @@ impl SimSpec {
     fn with_seed(&self, seed: Option<u64>) -> Self {
         let mut next = self.clone();
         next.seed = seed;
-        if let (Some(link), Some(s)) = (&mut next.permalink, seed) {
-            link.seed = s;
-        }
+        next.permalink = None;
+        next.launch = None;
         next
+    }
+
+    fn brain_families(&self) -> &[BrainPreset] {
+        if self.mixed_brains {
+            &BrainPreset::ALL
+        } else if let Some(preset) = &self.default_brain {
+            std::slice::from_ref(preset)
+        } else {
+            &self.continuation_brains
+        }
     }
 
     fn effective_seed(&self) -> Option<u64> {
@@ -515,7 +756,37 @@ impl SimSpec {
     }
 }
 
+std::thread_local! {
+    // Presentation/command identity is deliberately independent of the scientific
+    // RNG. A random namespace plus checked monotonic allocation prevents same-seed
+    // resets or concurrent handles on this browser thread from reusing authority.
+    static BROWSER_SESSION_SEQUENCE: Cell<Option<u64>> =
+        Cell::new(Some(rand::rng().random::<u64>()));
+}
+
+fn fresh_browser_session() -> Result<HostSessionId> {
+    BROWSER_SESSION_SEQUENCE.with(|sequence| {
+        let value = sequence
+            .get()
+            .context("browser session identities are exhausted")?;
+        sequence.set(value.checked_add(1));
+        Ok(HostSessionId::new(value))
+    })
+}
+
 impl Simulation {
+    fn world_checkpoint(&mut self) -> Result<Vec<u8>> {
+        Self::validate_scientific_interchange_world(self.core.world())?;
+        // Settle deferred receipts at the already observed clock boundary. This
+        // never accrues elapsed time or consumes a scientific transition.
+        self.core.drive(ManualInstant::from_nanos(self.now_nanos))?;
+        self.core
+            .capture_checkpoint_v1()
+            .context("browser science is not checkpointable at this boundary")?
+            .encode()
+            .map_err(anyhow::Error::from)
+    }
+
     fn checkpoint(&mut self) -> Result<Vec<u8>> {
         // Complete the previous boundary's deferred volatile-journal receipt.
         // Reusing the exact clock boundary adds no elapsed science time.
@@ -539,29 +810,11 @@ impl Simulation {
         );
         let checkpoint = scriptbots_runtime::VolatileHostCheckpointV1::decode(bytes)?;
         let science = checkpoint.host_checkpoint().world_checkpoint();
-        let required = science.required_brain_registry();
-        let mut registry = scriptbots_core::BrainRegistry::new();
-        let mlp_key = match required.entries.as_slice() {
-            [] => None,
-            [entry] if entry.kind == MlpBrain::KIND.as_str() => Some(
-                registry
-                    .register_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))?,
-            ),
-            _ => anyhow::bail!("checkpoint requires a brain registry unavailable in this browser"),
-        };
+        let (registry, presets) = Self::checkpoint_registry(science)?;
         // The existing owner codec validates complete evaluator/registry identity;
         // browser import must never substitute newly randomized brains.
         let world = checkpoint.host_checkpoint().restore_world(registry)?;
-        let mut spec = SimSpec::new(
-            world.config().clone(),
-            world.agent_count(),
-            world.config().rng_seed,
-            SnapshotFormat::Json,
-            SeedStrategy::None,
-            mlp_key.map(|_| BrainPreset::Mlp),
-        );
-        // This is an observed world configuration, not fresh-demo options.
-        spec.preserve_population_config = true;
+        let spec = Self::continuation_spec(&world, presets);
         let persistence = world.bind_persistence(Box::new(scriptbots_core::NullPersistence))?;
         let core = HostCore::restore_volatile_host_checkpoint_v1(
             &checkpoint,
@@ -585,23 +838,166 @@ impl Simulation {
             core,
             controls,
             spec,
-            mlp_key,
             now_nanos: 0,
+            environment_cache: RemoteEnvironmentCache::default(),
+            environment_js: None,
         })
     }
 
-    fn new(spec: SimSpec) -> Result<Self> {
-        let mut world = WorldState::new(spec.config())
-            .context("failed to initialize ScriptBots world state")?;
-        let mut mlp_key = None;
-        seed_agents(
-            &mut world,
-            spec.initial_population,
-            spec.seed_strategy,
-            spec.default_brain,
-            &mut mlp_key,
-        )?;
-        let session_id = HostSessionId::new(spec.effective_seed().unwrap_or(0));
+    fn from_world_checkpoint(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() <= MAX_BROWSER_WORLD_CHECKPOINT_BYTES,
+            "scientific checkpoint exceeds {MAX_BROWSER_WORLD_CHECKPOINT_BYTES} bytes"
+        );
+        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(bytes)
+            .context("invalid scientific world checkpoint")?;
+        Self::validate_scientific_interchange_config(checkpoint.config())?;
+        let (registry, presets) = Self::checkpoint_registry(&checkpoint)?;
+        // Restoration verifies the complete registry/evaluator identities and
+        // scientific digest. No executable adapter is taken from the file.
+        let world = WorldState::restore_checkpoint_v1(&checkpoint, registry)
+            .context("scientific checkpoint cannot be restored by this browser build")?;
+        Self::validate_scientific_interchange_world(&world)?;
+        ensure!(
+            &world.world_digest_v1()? == checkpoint.source_digest(),
+            "restored science differs from the scientific checkpoint digest"
+        );
+        let mut spec = Self::continuation_spec(&world, presets);
+        spec.scientific_checkpoint_import = true;
+        let mut core = HostCore::new(
+            fresh_browser_session()?,
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..Default::default()
+            },
+        )
+        .context("failed to establish a new browser owner for the scientific cut")?;
+        core.drive(ManualInstant::from_nanos(0))?;
+        let controls = NullFrontend::new(core.local_port(), 1);
+        Ok(Self {
+            core,
+            controls,
+            spec,
+            now_nanos: 0,
+            environment_cache: RemoteEnvironmentCache::default(),
+            environment_js: None,
+        })
+    }
+
+    fn validate_scientific_interchange_config(config: &ScriptBotsConfig) -> Result<()> {
+        // Match the native saved-checkpoint study's supported science. A raw
+        // cut does not carry the auxiliary history in the full owner codec.
+        ensure!(
+            config.selection_mode == scriptbots_core::EvolutionSelectionMode::Fitness,
+            "scientific checkpoint interchange requires Fitness selection; raw cuts omit novelty and curiosity selection history"
+        );
+        ensure!(
+            !config.communication_scramble,
+            "scientific checkpoint interchange requires communication_scramble=false; raw cuts omit the scrambling RNG state"
+        );
+        Ok(())
+    }
+
+    fn validate_scientific_interchange_world(world: &WorldState) -> Result<()> {
+        Self::validate_scientific_interchange_config(world.config())?;
+        ensure!(
+            world.map_metadata().is_none(),
+            "scientific checkpoint interchange refuses imported maps; raw cuts omit map temperature and food profiles"
+        );
+        Ok(())
+    }
+
+    fn checkpoint_registry(
+        science: &scriptbots_core::WorldCheckpointV1,
+    ) -> Result<(scriptbots_core::BrainRegistry, Vec<BrainPreset>)> {
+        launch::validate_config(science.config(), science.agent_count())
+            .map_err(anyhow::Error::msg)
+            .context("checkpoint exceeds browser world limits")?;
+        let required = science.required_brain_registry();
+        ensure!(
+            required.entries.len() <= BrainPreset::ALL.len()
+                && required.next_key == u64::try_from(required.entries.len())?,
+            "checkpoint requires a brain registry layout unavailable in this browser"
+        );
+        let mut registry = scriptbots_core::BrainRegistry::new();
+        let mut presets = Vec::with_capacity(required.entries.len());
+        for entry in &required.entries {
+            let preset = BrainPreset::from_kind(&entry.kind)
+                .context("checkpoint requires a brain registry unavailable in this browser")?;
+            let key = preset.register(&mut registry)?;
+            ensure!(
+                key == entry.key,
+                "checkpoint requires a brain registry layout unavailable in this browser"
+            );
+            presets.push(preset);
+        }
+        Ok((registry, presets))
+    }
+
+    fn continuation_spec(world: &WorldState, presets: Vec<BrainPreset>) -> SimSpec {
+        let default_brain = match presets.as_slice() {
+            [preset] => Some(*preset),
+            _ => None,
+        };
+        let mut spec = SimSpec::new(
+            world.config().clone(),
+            world.agent_count(),
+            world.config().rng_seed,
+            SnapshotFormat::Json,
+            SeedStrategy::None,
+            default_brain,
+        );
+        // This is an observed world configuration, not fresh-demo options.
+        spec.preserve_population_config = true;
+        if presets.len() > 1 {
+            spec.continuation_brains = presets;
+        }
+        spec
+    }
+
+    fn new(mut spec: SimSpec) -> Result<Self> {
+        ensure!(
+            spec.continuation_brains.is_empty(),
+            "this mixed-family continuation has no recorded founder recipe; choose a new-world brain preset before resetting"
+        );
+        ensure!(
+            !spec.mixed_brains
+                || (spec.default_brain.is_none() && spec.seed_strategy == SeedStrategy::None),
+            "mixed founders cannot be combined with a default brain family or Wander strategy"
+        );
+        spec.scientific_checkpoint_import = false;
+        let mut config = spec.config();
+        // Resolve entropy before constructing the world so both its scientific
+        // configuration and launch recipe record the same actual root seed.
+        // Keep the caller's original options in base_config for reset(None).
+        config.rng_seed = Some(config.rng_seed.unwrap_or_else(rand::random));
+        launch::validate_config(&config, spec.initial_population).map_err(anyhow::Error::msg)?;
+        if spec.default_brain.is_some() {
+            spec.seed_strategy = SeedStrategy::None;
+        }
+        let mut world =
+            WorldState::new(config).context("failed to initialize ScriptBots world state")?;
+        if spec.mixed_brains {
+            seed_mixed_agents(&mut world, spec.initial_population)?;
+        } else {
+            let mut brain_key = None;
+            seed_agents(
+                &mut world,
+                spec.initial_population,
+                spec.seed_strategy,
+                spec.default_brain,
+                &mut brain_key,
+            )?;
+        }
+        spec.launch = Some(
+            launch::BrowserLaunch::from_fresh(&spec, world.config().clone())
+                .map_err(anyhow::Error::msg)?,
+        );
+        let session_id = fresh_browser_session()?;
         let options = HostCoreOptions {
             initial_playback: PlaybackSnapshot {
                 paused: false,
@@ -618,39 +1014,16 @@ impl Simulation {
             core,
             controls,
             spec,
-            mlp_key,
             now_nanos: 0,
+            environment_cache: RemoteEnvironmentCache::default(),
+            environment_js: None,
         })
     }
 
     fn reset(&mut self, seed: Option<u64>) -> Result<()> {
-        let spec = self.spec.with_seed(seed);
-        let mut world = WorldState::new(spec.config())
+        let next = Self::new(self.spec.with_seed(seed))
             .context("failed to rebuild ScriptBots world state during reset")?;
-        self.mlp_key = None;
-        seed_agents(
-            &mut world,
-            spec.initial_population,
-            spec.seed_strategy,
-            spec.default_brain,
-            &mut self.mlp_key,
-        )?;
-        let session_id = HostSessionId::new(spec.effective_seed().unwrap_or(0));
-        let options = HostCoreOptions {
-            initial_playback: PlaybackSnapshot {
-                paused: false,
-                speed_multiplier: 1.0,
-            },
-            ..Default::default()
-        };
-        let mut core = HostCore::new(session_id, world, options)
-            .map_err(|e| anyhow::anyhow!("failed to rebuild HostCore for web: {e}"))?;
-        core.drive(ManualInstant::from_nanos(0))
-            .context("failed to establish the reset ScriptBots web time boundary")?;
-        self.controls = NullFrontend::new(core.local_port(), 1);
-        self.core = core;
-        self.spec = spec;
-        self.now_nanos = 0;
+        *self = next;
         Ok(())
     }
 
@@ -718,6 +1091,48 @@ impl Simulation {
         ))
     }
 
+    fn intervene(
+        &mut self,
+        request: &BrowserInterventionRequest,
+    ) -> Result<BrowserInterventionReceipt> {
+        let envelope = request.envelope()?;
+        let snapshot = self.core.latest_snapshot();
+        validate_browser_intervention_session(&snapshot, &request.session_id)?;
+        if self.controls.command_status(envelope.command_id)?.is_none() {
+            request.validate_new_source(&snapshot)?;
+        }
+        // The original guard remains part of the envelope on every retry. The owner
+        // returns its existing receipt first, or refuses a conflicting body.
+        let admitted = self.controls.submit_envelope(envelope)?;
+        let drive_error = self
+            .core
+            .drive(ManualInstant::from_nanos(self.now_nanos))
+            .err();
+        let status = self
+            .controls
+            .command_status(admitted.command_id())?
+            .context("admitted browser intervention has no retained receipt")?;
+        let mut receipt =
+            BrowserInterventionReceipt::from_status(&status, &self.core.latest_snapshot());
+        // A drive can observe a failure after command admission/application. Preserve
+        // the actual receipt rather than erasing that outcome behind a thrown error.
+        receipt.owner_error =
+            drive_error.map(|error| error.to_string().chars().take(1024).collect());
+        Ok(receipt)
+    }
+
+    fn intervention_status(
+        &mut self,
+        command_id: &str,
+        session_id: &str,
+    ) -> Result<Option<BrowserInterventionReceipt>> {
+        let command_id = browser_intervention_command_id(command_id)?;
+        validate_browser_intervention_session(&self.core.latest_snapshot(), session_id)?;
+        Ok(self.controls.command_status(command_id)?.map(|status| {
+            BrowserInterventionReceipt::from_status(&status, &self.core.latest_snapshot())
+        }))
+    }
+
     fn apply_command(&mut self, command: HostCommand) -> Result<CommandStatus> {
         let before = self.core.latest_snapshot().revisions.control;
         let expected = before
@@ -763,6 +1178,8 @@ struct InitOptions {
     seed_strategy: Option<SeedStrategy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_brain: Option<BrainPreset>,
+    #[serde(default)]
+    mixed_brains: bool,
 }
 
 impl Default for InitOptions {
@@ -776,6 +1193,7 @@ impl Default for InitOptions {
             snapshot_format: None,
             seed_strategy: None,
             default_brain: None,
+            mixed_brains: false,
         }
     }
 }
@@ -792,19 +1210,38 @@ impl InitOptions {
         config.population_minimum = 0;
         config.population_spawn_interval = 0;
 
-        SimSpec::new(
+        // Omitting both choices starts an evolvable, checkpointable world.
+        // Explicit legacy `wander` and unbound `none` strategies retain their
+        // existing meaning for callers and the named native/WASM parity cases.
+        let default_brain = self
+            .default_brain
+            .or((!self.mixed_brains && self.seed_strategy.is_none()).then_some(BrainPreset::Mlp));
+
+        let mut spec = SimSpec::new(
             config,
             self.population,
             self.seed,
             self.snapshot_format.unwrap_or_default(),
-            self.seed_strategy.unwrap_or_default(),
-            self.default_brain,
-        )
+            self.seed_strategy.unwrap_or(SeedStrategy::None),
+            default_brain,
+        );
+        spec.mixed_brains = self.mixed_brains;
+        spec
     }
 }
 
 #[wasm_bindgen]
 impl SimHandle {
+    /// Export a canonical scientific cut for native checkpoint tools.
+    ///
+    /// This excludes the owner session, commands, history, schedule and journal.
+    /// Fitness selection, unscrambled communication and no imported map are
+    /// required because the raw core format omits their auxiliary state.
+    #[wasm_bindgen(js_name = worldCheckpoint)]
+    pub fn world_checkpoint_js(&self) -> Result<Vec<u8>, JsValue> {
+        self.inner.borrow_mut().world_checkpoint().map_err(js_error)
+    }
+
     /// Export a complete volatile owner continuation, without claiming disk durability.
     /// Legacy wander evaluators are explicitly refused by the core codec.
     #[wasm_bindgen(js_name = checkpoint)]
@@ -812,18 +1249,54 @@ impl SimHandle {
         self.inner.borrow_mut().checkpoint().map_err(js_error)
     }
 
-    /// Brain preset used when starting a new world from this handle's configuration.
+    /// New-world brain preset, including `mixed` for the three-family founder recipe.
+    /// Imported mixed continuations also report `mixed`; launchInfo distinguishes them.
     #[must_use]
     #[wasm_bindgen(js_name = brainPreset)]
     pub fn brain_preset_js(&self) -> String {
-        if self.inner.borrow().spec.default_brain == Some(BrainPreset::Mlp) {
-            "mlp"
-        } else if self.inner.borrow().spec.seed_strategy == SeedStrategy::Wander {
+        let simulation = self.inner.borrow();
+        if simulation.spec.mixed_brains || !simulation.spec.continuation_brains.is_empty() {
+            "mixed"
+        } else if let Some(preset) = simulation.spec.default_brain {
+            preset.name()
+        } else if simulation.spec.seed_strategy == SeedStrategy::Wander {
             "wander"
         } else {
             "none"
         }
         .to_owned()
+    }
+
+    /// Versioned brain families retained by this owner, in registry key order.
+    /// Empty or extinct families remain present; unbound and Wander owners have none.
+    #[wasm_bindgen(js_name = brainFamilies)]
+    pub fn brain_families_js(&self) -> Result<JsValue, JsValue> {
+        let simulation = self.inner.borrow();
+        simulation
+            .spec
+            .brain_families()
+            .iter()
+            .map(|preset| preset.name())
+            .collect::<Vec<_>>()
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
+    }
+
+    /// Read at most 64 canonical narrative records after an exact session-bound
+    /// cursor. The returned frame reports retained-history gaps and the observed
+    /// publication; this read never advances science or acknowledges a command.
+    #[wasm_bindgen(js_name = narrativePage)]
+    pub fn narrative_page_js(
+        &self,
+        after_event: &str,
+        expected_session_id: &str,
+    ) -> Result<JsValue, JsValue> {
+        let snapshot = self.inner.borrow().core.latest_snapshot();
+        let frame = browser_narrative_page(&snapshot, after_event, expected_session_id)
+            .map_err(js_error)?;
+        BrowserRemoteFrame::from(&frame)
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
     }
 
     /// Advance exactly the requested number of scientific steps and encode the snapshot.
@@ -859,6 +1332,57 @@ impl SimHandle {
         to_value(&status).map_err(js_error)
     }
 
+    /// Stage a bounded intervention through the canonical owner at an observed paused boundary.
+    /// Retain and retry the identical request after an uncertain result; application only queues
+    /// the ecological effect for a later Step or Resume.
+    #[wasm_bindgen(js_name = intervene)]
+    pub fn intervene_js(&self, request: JsValue) -> Result<JsValue, JsValue> {
+        let request: BrowserInterventionRequest = from_value(request).map_err(js_error)?;
+        self.inner
+            .borrow_mut()
+            .intervene(&request)
+            .map_err(js_error)?
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
+    }
+
+    /// Read the actual retained application/journal receipt; null means unknown, never unapplied.
+    #[wasm_bindgen(js_name = interventionStatus)]
+    pub fn intervention_status_js(
+        &self,
+        command_id: &str,
+        session_id: &str,
+    ) -> Result<JsValue, JsValue> {
+        self.inner
+            .borrow_mut()
+            .intervention_status(command_id, session_id)
+            .map_err(js_error)?
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
+    }
+
+    /// Read a bounded page of global observed ecological effects and expiries.
+    /// The ring has no per-command linkage; it cannot prove one request caused an observed row.
+    #[wasm_bindgen(js_name = interventionHistory)]
+    pub fn intervention_history_js(
+        &self,
+        session_id: &str,
+        epoch: &str,
+        after_seq: &str,
+        limit: u32,
+    ) -> Result<JsValue, JsValue> {
+        BrowserInterventionHistory::capture(
+            &self.inner.borrow().core.latest_snapshot(),
+            session_id,
+            epoch,
+            after_seq,
+            usize::try_from(limit).map_err(js_error)?,
+        )
+        .map_err(js_error)?
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(js_error)
+    }
+
     /// Encode the latest snapshot without advancing scientific time.
     #[wasm_bindgen(js_name = snapshot)]
     pub fn snapshot_js(&self) -> Result<JsValue, JsValue> {
@@ -871,9 +1395,92 @@ impl SimHandle {
     /// This does not advance science and is independent of the snapshot codec option.
     #[wasm_bindgen(js_name = frame)]
     pub fn frame_js(&self) -> Result<JsValue, JsValue> {
-        let simulation = self.inner.borrow();
+        let mut simulation = self.inner.borrow_mut();
         let publication = simulation.core.latest_snapshot();
-        to_value(&BrowserFrame::new(&publication)).map_err(js_error)
+        let environment = simulation
+            .environment_cache
+            .snapshot(&publication)
+            .map_err(js_error)?;
+        let environment_js = if let Some((cached, value)) = &simulation.environment_js
+            && Arc::ptr_eq(cached, &environment)
+        {
+            value.clone()
+        } else {
+            let value =
+                to_value(&BrowserEnvironment::from(environment.as_ref())).map_err(js_error)?;
+            // Shared JS layers are immutable; a caller cannot poison later frames by
+            // editing the reusable overview. The dynamic snapshot remains a fresh value.
+            let cells = js_sys::Reflect::get(&value, &JsValue::from_str("cells"))?;
+            for cell in js_sys::Array::from(&cells).iter() {
+                js_sys::Object::freeze(&js_sys::Object::from(cell));
+            }
+            js_sys::Object::freeze(&js_sys::Object::from(cells));
+            js_sys::Object::freeze(&js_sys::Object::from(value.clone()));
+            simulation.environment_js = Some((environment, value.clone()));
+            value
+        };
+        let frame = to_value(&BrowserFrame::new(&publication)).map_err(js_error)?;
+        js_sys::Reflect::set(&frame, &JsValue::from_str("environment"), &environment_js)?;
+        Ok(frame)
+    }
+
+    /// Inspect one stable creature UID without advancing science or changing selection state.
+    /// The result includes its actual owner/session/epoch/revisions; a missing UID yields null.
+    #[wasm_bindgen(js_name = inspectAgent)]
+    pub fn inspect_agent_js(&self, uid: &str) -> Result<JsValue, JsValue> {
+        let uid = scriptbots_runtime::inspector::parse_agent_uid(uid)
+            .ok_or_else(|| js_error("creature UID must be a canonical u64 decimal string"))?;
+        let detail = self
+            .inner
+            .borrow()
+            .core
+            .inspect_agent_basic(uid)
+            .map_err(js_error)?;
+        detail
+            .map(scriptbots_runtime::inspector::AgentInspection::from)
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
+    }
+
+    /// Read bounded brain layers, actual weights and shared output explanations on demand.
+    /// Missing, unbound and unsupported brains remain typed outcomes with exact provenance.
+    #[wasm_bindgen(js_name = inspectBrain)]
+    pub fn inspect_brain_js(&self, uid: &str) -> Result<JsValue, JsValue> {
+        let uid = scriptbots_runtime::inspector::parse_agent_uid(uid)
+            .ok_or_else(|| js_error("creature UID must be a canonical u64 decimal string"))?;
+        self.inner
+            .borrow()
+            .core
+            .inspect_brain_activity(uid)
+            .map_err(js_error)?
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
+    }
+
+    /// Page complete canonical genome values and exact differences from the primary parent.
+    /// Scientific time, evaluator state and persistent selection are untouched.
+    #[wasm_bindgen(js_name = inspectGenome)]
+    pub fn inspect_genome_js(
+        &self,
+        uid: &str,
+        locus_offset: f64,
+        delta_offset: f64,
+    ) -> Result<JsValue, JsValue> {
+        let uid = scriptbots_runtime::inspector::parse_agent_uid(uid)
+            .ok_or_else(|| js_error("creature UID must be a canonical u64 decimal string"))?;
+        let invalid_offset =
+            || js_error("genome page offsets must be bounded nonnegative integers");
+        let locus_offset = bounded_genome_page_offset(locus_offset).ok_or_else(invalid_offset)?;
+        let delta_offset = bounded_genome_page_offset(delta_offset).ok_or_else(invalid_offset)?;
+        scriptbots_runtime::inspector::validate_genome_page_offsets(locus_offset, delta_offset)
+            .map_err(js_error)?;
+        self.inner
+            .borrow()
+            .core
+            .inspect_genome_page(uid, locus_offset, delta_offset)
+            .map_err(js_error)?
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
     }
 
     /// Rebuild the simulation with an optional nonnegative numeric seed.
@@ -884,54 +1491,56 @@ impl SimHandle {
         simulation.reset(seed).map_err(js_error)
     }
 
-    /// Rebuild the simulation using the named MLP, wander, or unbound brain preset.
+    /// Start an MLP, DWRAON, Assembly, mixed-family, or explicit demo founder recipe.
     #[wasm_bindgen(js_name = registerBrain)]
     pub fn register_brain_js(&self, kind: &str) -> Result<(), JsValue> {
         let mut simulation = self.inner.borrow_mut();
+        let mut spec = simulation.spec.clone();
         match kind {
-            "mlp" => {
-                simulation.spec.default_brain = Some(BrainPreset::Mlp);
-                simulation.spec.seed_strategy = SeedStrategy::None;
-                let seed = simulation.spec.seed;
-                simulation.reset(seed).map_err(js_error)?;
-                Ok(())
+            "mlp" | "dwraon" | "assembly" => {
+                spec.default_brain = Some(match kind {
+                    "dwraon" => BrainPreset::Dwraon,
+                    "assembly" => BrainPreset::Assembly,
+                    _ => BrainPreset::Mlp,
+                });
+                spec.seed_strategy = SeedStrategy::None;
+            }
+            "mixed" => {
+                spec.default_brain = None;
+                spec.seed_strategy = SeedStrategy::None;
             }
             "wander" => {
-                simulation.spec.default_brain = None;
-                simulation.spec.seed_strategy = SeedStrategy::Wander;
-                let seed = simulation.spec.seed;
-                simulation.reset(seed).map_err(js_error)?;
-                Ok(())
+                spec.default_brain = None;
+                spec.seed_strategy = SeedStrategy::Wander;
             }
             "none" => {
-                simulation.spec.default_brain = None;
-                simulation.spec.seed_strategy = SeedStrategy::None;
-                let seed = simulation.spec.seed;
-                simulation.reset(seed).map_err(js_error)?;
-                Ok(())
+                spec.default_brain = None;
+                spec.seed_strategy = SeedStrategy::None;
             }
-            other => Err(js_error(format!("unknown brain preset: {other}"))),
+            other => return Err(js_error(format!("unknown brain preset: {other}"))),
         }
+        spec.mixed_brains = kind == "mixed";
+        spec.permalink = None;
+        spec.launch = None;
+        spec.continuation_brains.clear();
+        // Construct before replacing the owner so adapter/configuration failures
+        // cannot change the active world's reset recipe or evaluator family.
+        *simulation = Simulation::new(spec).map_err(js_error)?;
+        Ok(())
     }
 
-    /// Encode the current configured world as a shareable permalink.
+    /// Encode the retained initial recipe, never the current tick or interventions.
     #[wasm_bindgen(js_name = permalinkOf)]
     pub fn permalink_of(&self) -> Result<String, JsValue> {
-        let sim = self.inner.borrow();
-        if let Some(ref link) = sim.spec.permalink {
-            return Ok(link.to_url_string());
-        }
-        let seed = sim.spec.effective_seed().unwrap_or(0);
-        let config_val = serde_json::to_value(sim.spec.config()).map_err(js_error)?;
-        let digest = config_digest_with_diff(&config_val, &[]);
-        let link = Permalink {
-            scenario_id: "default".to_string(),
-            seed,
-            knob_diff: Vec::new(),
-            config_digest: digest,
-            build: canonical_build_link(),
-        };
-        Ok(link.to_url_string())
+        self.permalink_string().map_err(js_error)
+    }
+
+    /// Explain the retained recipe or why an imported continuation cannot share one.
+    #[wasm_bindgen(js_name = launchInfo)]
+    pub fn launch_info_js(&self) -> Result<JsValue, JsValue> {
+        self.launch_info()
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
     }
 
     /// Return a child permalink with validated configuration knob assignments.
@@ -943,52 +1552,87 @@ impl SimHandle {
 }
 
 impl SimHandle {
+    /// Return a bounded initial-conditions link without JavaScript conversion.
+    pub fn permalink_string(&self) -> Result<String, String> {
+        let simulation = self.inner.borrow();
+        if let Some(link) = &simulation.spec.permalink {
+            return Ok(link.to_url_string());
+        }
+        simulation
+            .spec
+            .launch
+            .as_ref()
+            .ok_or_else(|| CONTINUATION_LAUNCH_REASON.to_owned())?
+            .encode()
+    }
+
+    /// Describe exactly which initial conditions this handle can restart.
+    #[must_use]
+    pub fn launch_info(&self) -> LaunchInfo {
+        let simulation = self.inner.borrow();
+        if simulation.spec.scientific_checkpoint_import {
+            return LaunchInfo {
+                kind: "scientific_checkpoint".to_owned(),
+                semantics: "scientific_cut_new_owner".to_owned(),
+                shareable: false,
+                seed: Some(
+                    simulation
+                        .core
+                        .world()
+                        .agent_substream_protocol_v1()
+                        .root_seed()
+                        .to_string(),
+                ),
+                initial_population: None,
+                brain_preset: None,
+                recipe_version: None,
+                reason: Some("A verified scientific cut in a new browser owner. Original commands, journal, history and scheduled inputs are not imported; new receipts are volatile. The source build's future equivalence is not certified. Save a continuation for this owner, or reset explicitly to create new founders.".to_owned()),
+            };
+        }
+        if let Some(link) = &simulation.spec.permalink {
+            return gallery_launch_info(link);
+        }
+        simulation
+            .spec
+            .launch
+            .as_ref()
+            .map_or_else(continuation_launch_info, launch::BrowserLaunch::info)
+    }
+
     /// Advance the simulation and return the strongly-typed snapshot directly.
     pub fn tick_snapshot(&self, steps: u32) -> Result<SimulationSnapshot> {
         let mut simulation = self.inner.borrow_mut();
         simulation.tick(steps)
     }
 
-    /// Fork this world with an explicit slice of knob assignments without converting to `JsValue`.
+    /// Make a link restarting initial conditions with validated knob assignments.
+    /// Current agents, elapsed ticks and live interventions are not part of this recipe.
     pub fn fork_patch(&self, patch: &[(String, f64)]) -> Result<String, String> {
         let sim = self.inner.borrow();
-        let parent_link = if let Some(ref link) = sim.spec.permalink {
-            link.clone()
-        } else {
-            let seed = sim.spec.effective_seed().unwrap_or(0);
-            let config_val = serde_json::to_value(sim.spec.config()).map_err(|e| e.to_string())?;
-            let digest = config_digest_with_diff(&config_val, &[]);
-            Permalink {
-                scenario_id: "default".to_string(),
-                seed,
-                knob_diff: Vec::new(),
-                config_digest: digest,
-                build: canonical_build_link(),
-            }
+        let Some(parent_link) = sim.spec.permalink.clone() else {
+            return sim
+                .spec
+                .launch
+                .as_ref()
+                .ok_or_else(|| CONTINUATION_LAUNCH_REASON.to_owned())?
+                .fork(patch)?
+                .encode();
         };
 
+        let effective = reconstruct_config_from_permalink(&parent_link)?;
+        launch::validate_patch(
+            &serde_json::to_value(effective).map_err(|error| error.to_string())?,
+            patch,
+        )?;
         let mut merged: BTreeMap<String, f64> = parent_link.knob_diff.into_iter().collect();
 
         for (path, value) in patch {
-            if !value.is_finite() {
-                return Err(format!("knob value for '{path}' must be finite"));
-            }
-            let Some(range) = scriptbots_core::knob_range(path) else {
-                return Err(format!("unknown knob id '{path}' not in registry"));
-            };
-            if *value < range.min || *value > range.max {
-                return Err(format!(
-                    "knob '{path}' = {value} is outside [{min}, {max}]",
-                    min = range.min,
-                    max = range.max
-                ));
-            }
             merged.insert(path.clone(), *value);
         }
 
         let child_diff: Vec<(String, f64)> = merged.into_iter().collect();
         let base_config = base_config_for_scenario(&parent_link.scenario_id);
-        let scenario_json = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
+        let scenario_json = to_canonical_value(&base_config).map_err(|e| e.to_string())?;
         let config_digest = config_digest_with_diff(&scenario_json, &child_diff);
 
         let child_link = Permalink {
@@ -999,6 +1643,7 @@ impl SimHandle {
             build: canonical_build_link(),
         };
         child_link.validate_knobs().map_err(|e| e.to_string())?;
+        validate_gallery_config(&reconstruct_config_from_permalink(&child_link)?)?;
 
         Ok(child_link.to_url_string())
     }
@@ -1027,13 +1672,47 @@ pub fn init_sim(config: JsValue) -> Result<SimHandle, JsValue> {
     })
 }
 
+/// Founder recipe v2 registers all three families, then repeats their fixed order.
+/// Registration consumes no population randomness; each founder uses the same
+/// position/genome construction as the unchanged single-family recipe.
+fn seed_mixed_agents(world: &mut WorldState, count: usize) -> Result<()> {
+    let mut keys = [None; BrainPreset::ALL.len()];
+    for (index, preset) in BrainPreset::ALL.into_iter().enumerate() {
+        seed_agents(world, 0, SeedStrategy::None, Some(preset), &mut keys[index])?;
+    }
+    for index in 0..count {
+        let family = index % BrainPreset::ALL.len();
+        seed_agents(
+            world,
+            1,
+            SeedStrategy::None,
+            Some(BrainPreset::ALL[family]),
+            &mut keys[family],
+        )?;
+    }
+    Ok(())
+}
+
 fn seed_agents(
     world: &mut WorldState,
     count: usize,
     strategy: SeedStrategy,
     default_brain: Option<BrainPreset>,
-    mlp_key_cache: &mut Option<u64>,
+    brain_key_cache: &mut Option<u64>,
 ) -> Result<()> {
+    // Retain the chosen family even in an empty or subsequently extinct world;
+    // restoring that checkpoint must preserve the family for a later reset.
+    let brain_key = if let Some(preset) = default_brain {
+        Some(if let Some(key) = brain_key_cache {
+            *key
+        } else {
+            let key = preset.register(world.brain_registry_mut()?)?;
+            *brain_key_cache = Some(key);
+            key
+        })
+    } else {
+        None
+    };
     if count == 0 {
         return Ok(());
     }
@@ -1043,20 +1722,6 @@ fn seed_agents(
     let world_width = world.config().world_width as f32;
     #[allow(clippy::cast_precision_loss)]
     let world_height = world.config().world_height as f32;
-
-    let mlp_key = if matches!(default_brain, Some(BrainPreset::Mlp)) {
-        Some(if let Some(key) = mlp_key_cache {
-            *key
-        } else {
-            let key = world
-                .register_brain_family(MlpBrain::KIND.as_str(), Box::new(MlpBrainFamily::new()))
-                .context("failed to register the versioned MLP brain family")?;
-            *mlp_key_cache = Some(key);
-            key
-        })
-    } else {
-        None
-    };
 
     for _ in 0..count {
         let (agent, wander_seed) = {
@@ -1089,12 +1754,12 @@ fn seed_agents(
         let id = world
             .try_spawn_agent(agent)
             .context("generated web agent must be finite")?;
-        if let Some(key) = mlp_key {
+        if let Some(key) = brain_key {
             ensure!(
-                world
-                    .bind_agent_brain(id, key)
-                    .with_context(|| format!("failed to construct MLP brain for agent {id:?}"))?,
-                "registered MLP brain disappeared before binding agent {id:?}"
+                world.bind_agent_brain(id, key).with_context(|| format!(
+                    "failed to construct versioned brain for agent {id:?}"
+                ))?,
+                "registered brain family disappeared before binding agent {id:?}"
             );
         } else if matches!(strategy, SeedStrategy::Wander) {
             bind_wander_brain(world, id, wander_seed)?;
@@ -1102,6 +1767,21 @@ fn seed_agents(
     }
 
     Ok(())
+}
+
+/// Convert a bounded, integral browser offset without saturating float casts.
+fn bounded_genome_page_offset(offset: f64) -> Option<usize> {
+    let maximum =
+        f64::from(u32::try_from(scriptbots_runtime::inspector::MAX_GENOME_SOURCE_LOCI).ok()?);
+    if !offset.is_finite() || offset.fract() != 0.0 || !(0.0..=maximum).contains(&offset) {
+        return None;
+    }
+    // Rust's unsigned parser does not accept "-0", but both signs of zero are
+    // valid input. Every other admitted value has an exact decimal integer form.
+    if offset == 0.0 {
+        return Some(0);
+    }
+    offset.to_string().parse().ok()
 }
 
 fn normalize_seed(seed: Option<f64>) -> Result<Option<u64>> {
@@ -1166,6 +1846,32 @@ pub fn checkpoint_byte_limit() -> usize {
     MAX_BROWSER_CHECKPOINT_BYTES
 }
 
+/// Maximum scientific interchange file size, checked before reading a selected file.
+#[must_use]
+#[wasm_bindgen]
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "wasm_bindgen rejects const exports; the bound itself is a canonical constant"
+)]
+pub fn world_checkpoint_byte_limit() -> usize {
+    MAX_BROWSER_WORLD_CHECKPOINT_BYTES
+}
+
+/// Import a native scientific checkpoint as a separate, paused browser owner.
+///
+/// This is distinct from [`restore_checkpoint`]: the previous owner identity,
+/// journal, commands, schedule and retained history are not in a science cut.
+/// Only supported, bounded science with matching compiled adapters is admitted.
+/// Refusal leaves all existing handles untouched.
+#[wasm_bindgen]
+pub fn import_world_checkpoint(bytes: &[u8]) -> Result<SimHandle, JsValue> {
+    ensure_panic_hook_installed();
+    let simulation = Simulation::from_world_checkpoint(bytes).map_err(js_error)?;
+    Ok(SimHandle {
+        inner: Rc::new(RefCell::new(simulation)),
+    })
+}
+
 /// Validate a full owner continuation and construct a new browser handle.
 /// Failure leaves every existing handle untouched; offline wall time is discarded.
 #[wasm_bindgen]
@@ -1179,7 +1885,12 @@ pub fn restore_checkpoint(bytes: &[u8]) -> Result<SimHandle, JsValue> {
 /// Encode the default browser initialization options.
 #[wasm_bindgen]
 pub fn default_init_options() -> Result<JsValue, JsValue> {
-    to_value(&InitOptions::default()).map_err(js_error)
+    to_value(&InitOptions {
+        default_brain: Some(BrainPreset::Mlp),
+        seed_strategy: Some(SeedStrategy::None),
+        ..InitOptions::default()
+    })
+    .map_err(js_error)
 }
 
 /// Decode a postcard world snapshot and expose its JavaScript representation.
@@ -1201,7 +1912,7 @@ pub fn decode_remote_frame_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
     to_value(&BrowserRemoteFrame::from(&frame)).map_err(js_error)
 }
 
-/// Initialize a simulation from a shareable permalink string (`sbw1...`).
+/// Initialize from a complete browser launch (`sbb1.`) or core gallery reference (`sbw1.`).
 ///
 /// Guarantees:
 /// - Evaluates using the exact shared config composition path as native runs.
@@ -1212,6 +1923,24 @@ pub fn decode_remote_frame_binary(bytes: &[u8]) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub fn init_from_permalink(link: &str) -> Result<SimHandle, JsValue> {
     ensure_panic_hook_installed();
+    if link.starts_with(launch::PREFIX) {
+        let recipe = launch::BrowserLaunch::decode(link).map_err(js_error)?;
+        let state = recipe
+            .build
+            .comparison(&launch::BrowserBuildInputs::current());
+        info(&format!(
+            "loaded browser initial-conditions recipe: recorded_build={state}"
+        ));
+        if state != "recorded_match" {
+            warn(
+                "browser launch build inputs differ or are unavailable; replay equivalence is not established",
+            );
+        }
+        let simulation = Simulation::new(recipe.into_spec()).map_err(js_error)?;
+        return Ok(SimHandle {
+            inner: Rc::new(RefCell::new(simulation)),
+        });
+    }
     let hex_prefix = hex_first_16(link.as_bytes());
     let permalink = match Permalink::from_url_string(link) {
         Ok(p) => p,
@@ -1234,13 +1963,7 @@ pub fn init_from_permalink(link: &str) -> Result<SimHandle, JsValue> {
         }
     };
 
-    if config.population_minimum > 50_000 {
-        let err = "population_minimum must be 50,000 agents or fewer for browser builds";
-        warn(&format!("rejected permalink: {err}"));
-        return Err(js_error(err));
-    }
-    if config.world_width > 4096 || config.world_height > 4096 {
-        let err = "world dimensions must not exceed 4096 for browser builds";
+    if let Err(err) = validate_gallery_config(&config) {
         warn(&format!("rejected permalink: {err}"));
         return Err(js_error(err));
     }
@@ -1305,14 +2028,17 @@ pub fn permalink_of(handle: &SimHandle) -> Result<String, JsValue> {
     handle.permalink_of()
 }
 
-/// Standalone binding to fork a running world with an inline knob patch.
+/// Standalone binding to restart initial conditions with an inline knob patch.
 #[wasm_bindgen]
 pub fn fork(handle: &SimHandle, knob_patch: JsValue) -> Result<String, JsValue> {
     handle.fork(knob_patch)
 }
 
-/// Strongly-typed rows of a permalink's diff against its base scenario.
+/// Strongly-typed rows against the original browser recipe or gallery base scenario.
 pub fn permalink_diff_rows(link: &str) -> Result<Vec<DiffRow>, String> {
+    if link.starts_with(launch::PREFIX) {
+        return launch::BrowserLaunch::decode(link).map(|launch| launch.changes);
+    }
     let permalink = Permalink::from_url_string(link).map_err(|e| e.to_string())?;
     let base_config = base_config_for_scenario(&permalink.scenario_id);
     let base_json = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
@@ -1331,32 +2057,97 @@ pub fn permalink_diff_rows(link: &str) -> Result<Vec<DiffRow>, String> {
 }
 
 /// Return an array of [`DiffRow`] objects `[{ knob, parent_value, this_value }]`
-/// comparing this permalink's knobs against its base scenario.
+/// comparing this link against its original browser recipe or gallery base scenario.
 #[wasm_bindgen]
 pub fn permalink_diff(link: &str) -> Result<JsValue, JsValue> {
     let rows = permalink_diff_rows(link).map_err(js_error)?;
     to_value(&rows).map_err(js_error)
 }
 
+const CONTINUATION_LAUNCH_REASON: &str = "The imported owner checkpoint does not record its original browser founders. Save the owner checkpoint to continue this world, or reset explicitly to create a new initial recipe.";
+
+fn continuation_launch_info() -> LaunchInfo {
+    LaunchInfo {
+        kind: "checkpoint_continuation".to_owned(),
+        semantics: "saved_owner_continuation".to_owned(),
+        shareable: false,
+        seed: None,
+        initial_population: None,
+        brain_preset: None,
+        recipe_version: None,
+        reason: Some(CONTINUATION_LAUNCH_REASON.to_owned()),
+    }
+}
+
+fn gallery_launch_info(link: &Permalink) -> LaunchInfo {
+    LaunchInfo {
+        kind: "gallery_reference".to_owned(),
+        semantics: "gallery_configuration_restart".to_owned(),
+        shareable: true,
+        seed: Some(link.seed.to_string()),
+        initial_population: None,
+        brain_preset: None,
+        recipe_version: None,
+        reason: Some("This core gallery reference uses the gallery's population policy; it does not encode browser founders or their brain family.".to_owned()),
+    }
+}
+
+fn validate_gallery_config(config: &ScriptBotsConfig) -> Result<(), String> {
+    launch::validate_config(config, 0)?;
+    if config.world_width > 4096 || config.world_height > 4096 {
+        return Err(
+            "world dimensions must not exceed 4096 for legacy browser gallery references"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Inspect a link's replay scope without creating or mutating a world.
+pub fn permalink_info_details(link: &str) -> Result<LaunchInfo, String> {
+    if link.starts_with(launch::PREFIX) {
+        return launch::BrowserLaunch::decode(link).map(|launch| launch.info());
+    }
+    let permalink = Permalink::from_url_string(link).map_err(|error| error.to_string())?;
+    let config = reconstruct_config_from_permalink(&permalink)?;
+    validate_gallery_config(&config)?;
+    Ok(gallery_launch_info(&permalink))
+}
+
+/// Return initial-condition metadata with exact decimal seeds and explicit scope.
+#[wasm_bindgen]
+pub fn permalink_info(link: &str) -> Result<JsValue, JsValue> {
+    permalink_info_details(link)
+        .map_err(js_error)?
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(js_error)
+}
+
 /// Information about the running build identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildIdentityResult {
-    /// Hexadecimal digest of the running toolchain identity.
+    /// Fingerprint of the toolchain file, or `unavailable`.
     pub toolchain_digest: String,
-    /// Hexadecimal digest of the running dependency lockfile.
+    /// Fingerprint of the dependency lockfile, or `unavailable`.
     pub lockfile_digest: String,
-    /// Hexadecimal digest of the running simulation core.
+    /// Fingerprint of the recorded source inventory, or `unavailable`.
     pub core_digest: String,
+    /// Scope of the recorded inputs, distinct from a binary attestation.
+    pub identity_scope: String,
+    /// Qualifications on what a matching input record establishes.
+    pub evidence: String,
 }
 
 /// Return the local running build identity as a JS object.
 #[wasm_bindgen]
 pub fn build_identity() -> Result<JsValue, JsValue> {
-    let build = canonical_build_link();
+    let build = launch::BrowserBuildInputs::current();
     let res = BuildIdentityResult {
-        toolchain_digest: format!("{:#018x}", build.toolchain_digest),
-        lockfile_digest: format!("{:#018x}", build.lockfile_digest),
-        core_digest: format!("{:#018x}", build.core_digest),
+        toolchain_digest: display_fingerprint(build.toolchain_fingerprint),
+        lockfile_digest: display_fingerprint(build.lockfile_fingerprint),
+        core_digest: display_fingerprint(build.source_fingerprint),
+        identity_scope: "recorded_browser_build_inputs".to_owned(),
+        evidence: BROWSER_BUILD_EVIDENCE.to_owned(),
     };
     to_value(&res).map_err(js_error)
 }
@@ -1364,24 +2155,43 @@ pub fn build_identity() -> Result<JsValue, JsValue> {
 /// Structured build match assessment result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildMatchResult {
-    /// Exact, compatible, or mismatched build assessment.
+    /// Browser `recorded_match`/`mismatch`/`unavailable`, or legacy gallery assessment.
     pub status: String,
-    /// Simulation core digest encoded in the permalink.
+    /// Whether this compares captured browser inputs or legacy gallery identifiers.
+    pub identity_scope: String,
+    /// Qualifications on what the recorded comparison establishes.
+    pub evidence: String,
+    /// Source fingerprint or legacy core identifier encoded in the link.
     pub link_core_digest: String,
-    /// Simulation core digest of this module.
+    /// Source fingerprint or legacy core identifier of this module.
     pub local_core_digest: String,
-    /// Toolchain digest encoded in the permalink.
+    /// Toolchain-file fingerprint or legacy identifier encoded in the link.
     pub link_toolchain_digest: String,
-    /// Toolchain digest of this module.
+    /// Toolchain-file fingerprint or legacy identifier of this module.
     pub local_toolchain_digest: String,
-    /// Dependency lockfile digest encoded in the permalink.
+    /// Lockfile fingerprint or legacy identifier encoded in the link.
     pub link_lockfile_digest: String,
-    /// Dependency lockfile digest of this module.
+    /// Lockfile fingerprint or legacy identifier of this module.
     pub local_lockfile_digest: String,
 }
 
 /// Evaluate the build match between a permalink and the local WASM build identity without JS conversions.
 pub fn check_build_match_identity(link: &str) -> Result<BuildMatchResult, String> {
+    if link.starts_with(launch::PREFIX) {
+        let recorded = launch::BrowserLaunch::decode(link)?.build;
+        let local = launch::BrowserBuildInputs::current();
+        return Ok(BuildMatchResult {
+            status: recorded.comparison(&local).to_owned(),
+            identity_scope: "recorded_browser_build_inputs".to_owned(),
+            evidence: BROWSER_BUILD_EVIDENCE.to_owned(),
+            link_core_digest: display_fingerprint(recorded.source_fingerprint),
+            local_core_digest: display_fingerprint(local.source_fingerprint),
+            link_toolchain_digest: display_fingerprint(recorded.toolchain_fingerprint),
+            local_toolchain_digest: display_fingerprint(local.toolchain_fingerprint),
+            link_lockfile_digest: display_fingerprint(recorded.lockfile_fingerprint),
+            local_lockfile_digest: display_fingerprint(local.lockfile_fingerprint),
+        });
+    }
     let permalink = Permalink::from_url_string(link).map_err(|e| e.to_string())?;
     let local = canonical_build_link();
     let match_state = permalink.build_match(&local);
@@ -1393,6 +2203,8 @@ pub fn check_build_match_identity(link: &str) -> Result<BuildMatchResult, String
 
     Ok(BuildMatchResult {
         status: state_str.to_string(),
+        identity_scope: "legacy_gallery_reference".to_owned(),
+        evidence: "Legacy gallery identifiers are fixed reference values, not measured compiler, source or lockfile identity.".to_owned(),
         link_core_digest: format!("{:#018x}", permalink.build.core_digest),
         local_core_digest: format!("{:#018x}", local.core_digest),
         link_toolchain_digest: format!("{:#018x}", permalink.build.toolchain_digest),
@@ -1400,6 +2212,12 @@ pub fn check_build_match_identity(link: &str) -> Result<BuildMatchResult, String
         link_lockfile_digest: format!("{:#018x}", permalink.build.lockfile_digest),
         local_lockfile_digest: format!("{:#018x}", local.lockfile_digest),
     })
+}
+
+const BROWSER_BUILD_EVIDENCE: &str = "Compares the recorded source inventory, compiler, target, flags, profile, core lane and toolchain/lockfile FNV-1a fingerprints. These are noncryptographic input fingerprints, not authorization or proof of bit-exact cross-build replay.";
+
+fn display_fingerprint(value: Option<String>) -> String {
+    value.unwrap_or_else(|| "unavailable".to_owned())
 }
 
 /// Evaluate the build match between a permalink and the local WASM build identity.
@@ -1578,14 +2396,1227 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_default_creates_versioned_mlp_genomes_and_can_continue() {
+        let options: InitOptions = serde_json::from_value(serde_json::json!({
+            "seed": 17,
+            "population": 3,
+            "config": checkpoint_world(None, SeedStrategy::None).spec.base_config,
+        }))
+        .unwrap();
+        let spec = options.into_spec();
+        assert_eq!(spec.default_brain, Some(BrainPreset::Mlp));
+        assert_eq!(spec.seed_strategy, SeedStrategy::None);
+        assert_eq!(
+            InitOptions::default().into_spec().default_brain,
+            spec.default_brain
+        );
+        let mut original = Simulation::new(spec).unwrap();
+        assert_eq!(original.core.world().agent_count(), 3);
+        for id in original.core.world().agents().iter_handles() {
+            assert_eq!(
+                original
+                    .core
+                    .world()
+                    .agent_runtime(id)
+                    .unwrap()
+                    .brain
+                    .kind(),
+                Some(MlpBrain::KIND.as_str())
+            );
+            assert!(original.core.world().agent_brain_genome(id).is_some());
+            assert!(
+                original
+                    .core
+                    .world()
+                    .agent_brain_evaluator_state(id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        original.tick(2).unwrap();
+        let mut restored = Simulation::from_checkpoint(&original.checkpoint().unwrap()).unwrap();
+        original.tick(1).unwrap();
+        restored.tick(1).unwrap();
+        assert_eq!(
+            original.core.scientific_digest_v1().unwrap(),
+            restored.core.scientific_digest_v1().unwrap()
+        );
+
+        for (choice, expected) in [
+            ("wander", SeedStrategy::Wander),
+            ("none", SeedStrategy::None),
+        ] {
+            let explicit: InitOptions =
+                serde_json::from_value(serde_json::json!({"seed_strategy": choice})).unwrap();
+            let spec = explicit.into_spec();
+            assert_eq!(spec.seed_strategy, expected);
+            assert_eq!(spec.default_brain, None);
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_evolutionary_families_bind_offspring_and_restore_their_genomes() {
+        for preset in [BrainPreset::Mlp, BrainPreset::Dwraon, BrainPreset::Assembly] {
+            let mut spec = checkpoint_world(Some(preset), SeedStrategy::None).spec;
+            // A zero threshold disables natural reproduction. Give every diet
+            // one full cooldown per tick so this exercises actual births.
+            spec.base_config.reproduction_energy_threshold = 0.1;
+            spec.base_config.reproduction_energy_cost = 0.0;
+            spec.base_config.reproduction_cooldown = 1;
+            spec.base_config.reproduction_rate_herbivore = 1.0;
+            spec.base_config.reproduction_rate_carnivore = 1.0;
+            spec.base_config.reproduction_attempt_interval = 1;
+            spec.base_config.reproduction_attempt_chance = 1.0;
+            spec.base_config.reproduction_partner_chance = 0.0;
+            spec.base_config.metabolism_drain = 0.0;
+            spec.base_config.movement_drain = 0.0;
+            spec.base_config.spike_damage = 0.0;
+            spec.base_config.spike_energy_cost = 0.0;
+            let mut simulation = Simulation::new(spec).unwrap();
+            let founders = simulation
+                .snapshot()
+                .agents
+                .iter()
+                .map(|agent| agent.uid)
+                .collect::<Vec<_>>();
+            simulation.tick(1).unwrap();
+            let world = simulation.core.world();
+            let children = world
+                .agents()
+                .iter_handles()
+                .filter(|id| !founders.contains(&world.agent_uid(*id).unwrap()))
+                .collect::<Vec<_>>();
+            assert!(
+                !children.is_empty(),
+                "{} must produce real offspring",
+                preset.name()
+            );
+            for id in children {
+                let runtime = world.agent_runtime(id).unwrap();
+                assert_eq!(runtime.brain.kind(), Some(preset.kind()));
+                let genome = world
+                    .agent_brain_genome(id)
+                    .expect("offspring must inherit a versioned genome");
+                assert!(founders.contains(&genome.provenance().parents[0].unwrap()));
+                assert!(world.agent_brain_evaluator_state(id).unwrap().is_some());
+            }
+            let mut restored =
+                Simulation::from_checkpoint(&simulation.checkpoint().unwrap()).unwrap();
+            simulation.tick(1).unwrap();
+            restored.tick(1).unwrap();
+            assert_eq!(
+                simulation.core.scientific_digest_v1().unwrap(),
+                restored.core.scientific_digest_v1().unwrap()
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_refuses_cross_family_registry_substitution() {
+        for preset in [BrainPreset::Mlp, BrainPreset::Dwraon, BrainPreset::Assembly] {
+            let mut original = checkpoint_world(Some(preset), SeedStrategy::None);
+            let bytes = original.checkpoint().unwrap();
+            let checkpoint = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes).unwrap();
+            let wrong_preset = if preset == BrainPreset::Mlp {
+                BrainPreset::Dwraon
+            } else {
+                BrainPreset::Mlp
+            };
+            let mut wrong_registry = scriptbots_core::BrainRegistry::new();
+            wrong_preset.register(&mut wrong_registry).unwrap();
+            assert!(
+                checkpoint
+                    .host_checkpoint()
+                    .restore_world(wrong_registry)
+                    .is_err()
+            );
+            let restored = Simulation::from_checkpoint(&bytes).unwrap();
+            assert_eq!(restored.spec.default_brain, Some(preset));
+            assert_eq!(
+                original.core.scientific_digest_v1().unwrap(),
+                restored.core.scientific_digest_v1().unwrap()
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_roundtrips_core_codec_and_future_transitions() {
+        for preset in [
+            None,
+            Some(BrainPreset::Mlp),
+            Some(BrainPreset::Dwraon),
+            Some(BrainPreset::Assembly),
+        ] {
+            let mut original = checkpoint_world(preset, SeedStrategy::None);
+            original.tick(5).unwrap();
+            let source_session = original.core.latest_snapshot().session_id;
+            let source_command = original
+                .core
+                .latest_snapshot()
+                .last_applied_command
+                .unwrap();
+            let source_digest = original.core.scientific_digest_v1().unwrap();
+            let source_revisions = original.core.latest_snapshot().revisions;
+            let bytes = original.world_checkpoint().unwrap();
+            assert_eq!(original.core.scientific_digest_v1().unwrap(), source_digest);
+            assert_eq!(original.core.latest_snapshot().revisions, source_revisions);
+            let cut = scriptbots_core::WorldCheckpointV1::decode(&bytes).unwrap();
+            assert_eq!(cut.encode().unwrap(), bytes);
+            assert_eq!(cut.source_digest(), &source_digest);
+
+            // The independent core consumer uses the same raw codec as native
+            // checkpoint tools; it never passes through the browser owner codec.
+            let (registry, _) = Simulation::checkpoint_registry(&cut).unwrap();
+            let mut native = WorldState::restore_checkpoint_v1(&cut, registry).unwrap();
+            let imported = import_world_checkpoint(&bytes).unwrap();
+            assert_eq!(imported.launch_info().kind, "scientific_checkpoint");
+            assert_eq!(imported.launch_info().semantics, "scientific_cut_new_owner");
+            assert_eq!(imported.launch_info().seed.as_deref(), Some("17"));
+            assert_eq!(imported.launch_info().initial_population, None);
+            assert!(!imported.launch_info().shareable);
+            assert!(imported.permalink_string().is_err());
+            assert!(imported.fork_patch(&[]).is_err());
+            let mut imported = imported.inner.borrow_mut();
+            let snapshot = imported.core.latest_snapshot();
+            assert_ne!(snapshot.session_id, source_session);
+            assert!(snapshot.playback.paused);
+            assert_eq!(snapshot.last_applied_command, None);
+            assert_eq!(snapshot.revisions.control.get(), 0);
+            assert!(snapshot.summary_history.is_empty());
+            assert!(
+                imported
+                    .controls
+                    .command_status(source_command)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(imported.core.scientific_digest_v1().unwrap(), source_digest);
+            imported.drive(10_000.0).unwrap();
+            assert_eq!(imported.core.world_tick().0, 5, "import starts paused");
+            assert_eq!(imported.world_checkpoint().unwrap(), bytes);
+
+            let full = imported.checkpoint().unwrap();
+            let full = scriptbots_runtime::VolatileHostCheckpointV1::decode(&full).unwrap();
+            assert_eq!(
+                full.host_checkpoint().journal_cut().last_journal_sequence,
+                0
+            );
+            assert_eq!(
+                full.host_checkpoint()
+                    .journal_cut()
+                    .last_scientific_event_sequence,
+                0
+            );
+            for _ in 0..4 {
+                original.tick(1).unwrap();
+                imported.tick(1).unwrap();
+                native.step().unwrap();
+                let expected = native.world_digest_v1().unwrap();
+                assert_eq!(original.core.scientific_digest_v1().unwrap(), expected);
+                assert_eq!(imported.core.scientific_digest_v1().unwrap(), expected);
+            }
+            let continued = Simulation::from_checkpoint(&imported.checkpoint().unwrap()).unwrap();
+            assert_eq!(
+                continued.core.scientific_digest_v1().unwrap(),
+                imported.core.scientific_digest_v1().unwrap()
+            );
+            assert_eq!(
+                continued.core.latest_snapshot().session_id,
+                snapshot.session_id
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn fresh_scientific_imports_can_immediately_save_full_owner_continuations() {
+        let mut sources: Vec<_> = BrainPreset::ALL
+            .into_iter()
+            .map(|preset| checkpoint_world(Some(preset), SeedStrategy::None))
+            .collect();
+        sources.extend([
+            checkpoint_world(None, SeedStrategy::None),
+            mixed_checkpoint_world(&BrainPreset::ALL, 2, false),
+        ]);
+        for mut original in sources {
+            let before = original.core.scientific_digest_v1().unwrap();
+            let science = original.world_checkpoint().unwrap();
+            let mut imported = Simulation::from_world_checkpoint(&science).unwrap();
+            let full = imported.checkpoint().unwrap();
+            let mut continued = Simulation::from_checkpoint(&full).unwrap();
+            assert_eq!(imported.core.world_tick().0, 0);
+            assert_eq!(continued.core.world_tick().0, 0);
+            assert!(imported.core.latest_snapshot().playback.paused);
+            assert_eq!(original.core.scientific_digest_v1().unwrap(), before);
+            assert_eq!(imported.core.scientific_digest_v1().unwrap(), before);
+            assert_eq!(continued.core.scientific_digest_v1().unwrap(), before);
+            assert_eq!(continued.checkpoint().unwrap(), full);
+            for steps in [1, 3] {
+                original.tick(steps).unwrap();
+                imported.tick(steps).unwrap();
+                continued.tick(steps).unwrap();
+                let expected = original.core.scientific_digest_v1().unwrap();
+                assert_eq!(imported.core.scientific_digest_v1().unwrap(), expected);
+                assert_eq!(continued.core.scientific_digest_v1().unwrap(), expected);
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_preserves_mixed_and_extinct_registry_state() {
+        let presets = [BrainPreset::Assembly, BrainPreset::Mlp, BrainPreset::Dwraon];
+        for (founders, dying) in [(0, false), (2, false), (2, true)] {
+            let mut original = mixed_checkpoint_world(&presets, founders, dying);
+            original.tick(1).unwrap();
+            let bytes = original.world_checkpoint().unwrap();
+            let mut imported = Simulation::from_world_checkpoint(&bytes).unwrap();
+            assert_eq!(imported.spec.continuation_brains, presets);
+            assert_eq!(imported.spec.default_brain, None);
+            assert_same_mixed_science(&original, &imported);
+            assert_eq!(imported.world_checkpoint().unwrap(), bytes);
+            if dying || founders == 0 {
+                assert_eq!(imported.core.world().agent_count(), 0);
+            }
+            let before = imported.core.scientific_digest_v1().unwrap();
+            assert!(imported.reset(Some(41)).is_err());
+            assert_eq!(imported.core.scientific_digest_v1().unwrap(), before);
+            for _ in 0..3 {
+                original.tick(1).unwrap();
+                imported.tick(1).unwrap();
+                assert_same_mixed_science(&original, &imported);
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_public_api_returns_an_advanced_core_cut() {
+        let config = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None)
+            .spec
+            .config();
+        let mut native = WorldState::new(config).unwrap();
+        seed_agents(
+            &mut native,
+            3,
+            SeedStrategy::None,
+            Some(BrainPreset::Mlp),
+            &mut None,
+        )
+        .unwrap();
+        for _ in 0..7 {
+            native.step().unwrap();
+        }
+        let bytes = native.checkpoint_v1().unwrap().encode().unwrap();
+        let browser = import_world_checkpoint(&bytes).unwrap();
+        for steps in [0, 1, 3] {
+            for _ in 0..steps {
+                native.step().unwrap();
+            }
+            let snapshot = browser.tick_snapshot(steps).unwrap();
+            assert_eq!(snapshot.tick, native.tick().0);
+            let returned = browser.world_checkpoint_js().unwrap();
+            let cut = scriptbots_core::WorldCheckpointV1::decode(&returned).unwrap();
+            assert_eq!(cut.source_digest(), &native.world_digest_v1().unwrap());
+            let mut registry = scriptbots_core::BrainRegistry::new();
+            BrainPreset::Mlp.register(&mut registry).unwrap();
+            let mut exported = WorldState::restore_checkpoint_v1(&cut, registry).unwrap();
+            native.step().unwrap();
+            exported.step().unwrap();
+            browser.tick_snapshot(1).unwrap();
+            assert_eq!(
+                native.world_digest_v1().unwrap(),
+                exported.world_digest_v1().unwrap()
+            );
+            let browser_cut =
+                scriptbots_core::WorldCheckpointV1::decode(&browser.world_checkpoint_js().unwrap())
+                    .unwrap();
+            assert_eq!(
+                browser_cut.source_digest(),
+                &native.world_digest_v1().unwrap()
+            );
+        }
+        browser.register_brain_js("dwraon").unwrap();
+        assert_eq!(browser.launch_info().kind, "browser_launch");
+        assert!(browser.launch_info().shareable);
+        assert_eq!(browser.tick_snapshot(0).unwrap().tick, 0);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_reports_the_rng_root_after_config_seed_edits() {
+        for configured_seed in [None, Some(991)] {
+            let config = checkpoint_world(None, SeedStrategy::None).spec.config();
+            let mut source = WorldState::new(config).unwrap();
+            seed_agents(
+                &mut source,
+                3,
+                SeedStrategy::None,
+                Some(BrainPreset::Mlp),
+                &mut None,
+            )
+            .unwrap();
+            source.step().unwrap();
+            let mut edited = source.config().clone();
+            edited.rng_seed = configured_seed;
+            source.apply_config_update(edited).unwrap();
+            assert_eq!(source.agent_substream_protocol_v1().root_seed(), 17);
+            let bytes = source.checkpoint_v1().unwrap().encode().unwrap();
+            let browser = import_world_checkpoint(&bytes).unwrap();
+            assert_eq!(browser.launch_info().seed.as_deref(), Some("17"));
+            assert_eq!(
+                browser.inner.borrow().core.world().config().rng_seed,
+                configured_seed
+            );
+            assert_eq!(browser.world_checkpoint_js().unwrap(), bytes);
+            source.step().unwrap();
+            browser.tick_snapshot(1).unwrap();
+            let returned =
+                scriptbots_core::WorldCheckpointV1::decode(&browser.world_checkpoint_js().unwrap())
+                    .unwrap();
+            assert_eq!(returned.source_digest(), &source.world_digest_v1().unwrap());
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_refuses_omitted_auxiliary_state() {
+        use scriptbots_core::EvolutionSelectionMode;
+
+        for (selection_mode, communication_scramble, reason) in [
+            (EvolutionSelectionMode::Novelty, false, "selection history"),
+            (
+                EvolutionSelectionMode::Curiosity { w: 0.5 },
+                false,
+                "selection history",
+            ),
+            (EvolutionSelectionMode::Fitness, true, "scrambling RNG"),
+        ] {
+            let mut spec = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None).spec;
+            spec.base_config.selection_mode = selection_mode;
+            spec.base_config.communication_scramble = communication_scramble;
+            let mut source = Simulation::new(spec).unwrap();
+            let before = source.core.scientific_digest_v1().unwrap();
+            let bytes = source
+                .core
+                .capture_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap();
+            let error = Simulation::from_world_checkpoint(&bytes).err().unwrap();
+            assert!(format!("{error:#}").contains(reason));
+            let error = source.world_checkpoint().unwrap_err();
+            assert!(format!("{error:#}").contains(reason));
+            assert_eq!(source.core.scientific_digest_v1().unwrap(), before);
+
+            // Only raw scientific interchange has this refusal. The complete
+            // owner checkpoint retains the auxiliary state and remains usable.
+            let full = source.checkpoint().unwrap();
+            let continued = Simulation::from_checkpoint(&full).unwrap();
+            assert_eq!(continued.core.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_refuses_maps_even_with_a_matching_digest() {
+        let spec = checkpoint_world(None, SeedStrategy::None).spec;
+        let mut world = WorldState::new(spec.config()).unwrap();
+        let width = world.terrain().width();
+        let height = world.terrain().height();
+        let cells = world.terrain().tiles().len();
+        let artifact = scriptbots_core::MapArtifact::new(
+            world.terrain().clone(),
+            None,
+            Some(scriptbots_core::ScalarField::new(width, height, vec![0.9; cells]).unwrap()),
+            None,
+            None,
+            scriptbots_core::MapArtifactMetadata {
+                generator: scriptbots_core::MapGeneratorKind::RuleBased,
+                tileset_id: "browser-scientific-import".to_owned(),
+                tileset_hash: 1,
+                seed: 17,
+                width,
+                height,
+                attempt_count: 1,
+                succeeded_on: 1,
+                generated_at_epoch_ms: 0,
+            },
+        )
+        .unwrap();
+        world.apply_map_artifact(&artifact).unwrap();
+        let mut source = owner_for_checkpoint_test(world, spec);
+        let cut = source.core.capture_checkpoint_v1().unwrap();
+        let bytes = cut.encode().unwrap();
+        let native =
+            WorldState::restore_checkpoint_v1(&cut, scriptbots_core::BrainRegistry::new()).unwrap();
+        assert_eq!(native.world_digest_v1().unwrap(), *cut.source_digest());
+        assert!(native.map_metadata().is_some());
+        let error = Simulation::from_world_checkpoint(&bytes).err().unwrap();
+        assert!(format!("{error:#}").contains("imported maps"));
+        assert!(
+            source
+                .world_checkpoint()
+                .unwrap_err()
+                .to_string()
+                .contains("imported maps")
+        );
+        assert_eq!(
+            source.core.scientific_digest_v1().unwrap(),
+            *cut.source_digest()
+        );
+        let full = source.checkpoint().unwrap();
+        let continued = Simulation::from_checkpoint(&full).unwrap();
+        assert_eq!(
+            continued.core.scientific_digest_v1().unwrap(),
+            *cut.source_digest()
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_scientific_checkpoint_refusals_preserve_the_existing_owner() {
+        let mut active = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None);
+        active.tick(3).unwrap();
+        let before = active.core.scientific_digest_v1().unwrap();
+        let source_session = active.core.latest_snapshot().session_id;
+        let bytes = active.world_checkpoint().unwrap();
+        for index in [0, bytes.len() / 2, bytes.len() - 1] {
+            let mut damaged = bytes.clone();
+            damaged[index] ^= 1;
+            assert!(Simulation::from_world_checkpoint(&damaged).is_err());
+        }
+        assert!(Simulation::from_world_checkpoint(&[]).is_err());
+        assert!(Simulation::from_world_checkpoint(&bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(Simulation::from_world_checkpoint(&trailing).is_err());
+        assert!(Simulation::from_world_checkpoint(&active.checkpoint().unwrap()).is_err());
+        assert!(Simulation::from_checkpoint(&bytes).is_err());
+        let oversized = vec![0; MAX_BROWSER_WORLD_CHECKPOINT_BYTES + 1];
+        let error = Simulation::from_world_checkpoint(&oversized).err().unwrap();
+        assert!(error.to_string().contains("exceeds"));
+        assert_eq!(active.core.scientific_digest_v1().unwrap(), before);
+        assert_eq!(active.core.latest_snapshot().session_id, source_session);
+        assert_eq!(active.world_checkpoint().unwrap(), bytes);
+        active.tick(1).unwrap();
+        assert_eq!(active.core.world_tick().0, 4);
+
+        // A native core cut can be valid while exceeding browser admission.
+        let mut config = checkpoint_world(None, SeedStrategy::None).spec.config();
+        config.population_spawn_count = u32::from(u16::MAX);
+        let world = WorldState::new(config).unwrap();
+        let native_bytes = world.checkpoint_v1().unwrap().encode().unwrap();
+        let error = Simulation::from_world_checkpoint(&native_bytes)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("browser world limits"));
+        assert_eq!(active.core.world_tick().0, 4);
+    }
+
+    fn owner_for_checkpoint_test(world: WorldState, spec: SimSpec) -> Simulation {
+        let mut core = HostCore::new(
+            fresh_browser_session().unwrap(),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: false,
+                    speed_multiplier: 1.0,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        let controls = NullFrontend::new(core.local_port(), 1);
+        Simulation {
+            core,
+            controls,
+            spec,
+            now_nanos: 0,
+            environment_cache: RemoteEnvironmentCache::default(),
+            environment_js: None,
+        }
+    }
+
+    fn mixed_checkpoint_world(
+        presets: &[BrainPreset],
+        founders_per_family: usize,
+        dying: bool,
+    ) -> Simulation {
+        let mut spec = checkpoint_world(None, SeedStrategy::None).spec;
+        spec.initial_population = presets.len() * founders_per_family;
+        spec.base_config.food_intake_rate = 0.0;
+        spec.base_config.food_sharing_rate = 0.0;
+        spec.base_config.food_transfer_rate = 0.0;
+        spec.base_config.metabolism_drain = 0.0;
+        spec.base_config.movement_drain = 0.0;
+        spec.base_config.spike_damage = 0.0;
+        spec.base_config.spike_energy_cost = 0.0;
+        spec.base_config.temperature_discomfort_rate = 0.0;
+        spec.base_config.aging_health_decay_rate = 0.0;
+        spec.launch = None;
+        spec.continuation_brains = presets.to_vec();
+        let mut world = WorldState::new(spec.config()).unwrap();
+        for &preset in presets {
+            seed_agents(
+                &mut world,
+                founders_per_family,
+                SeedStrategy::None,
+                Some(preset),
+                &mut None,
+            )
+            .unwrap();
+        }
+        if dying {
+            let ids = world.agents().iter_handles().collect::<Vec<_>>();
+            for id in ids {
+                assert!(
+                    world
+                        .try_update_agent(id, |agent, runtime| {
+                            agent.health = 0.0;
+                            runtime.energy = 0.0;
+                        })
+                        .unwrap()
+                );
+            }
+        }
+        owner_for_checkpoint_test(world, spec)
+    }
+
+    fn assert_same_mixed_science(original: &Simulation, restored: &Simulation) {
+        assert_eq!(
+            original.core.scientific_digest_v1().unwrap(),
+            restored.core.scientific_digest_v1().unwrap()
+        );
+        let original = original.core.world();
+        let restored = restored.core.world();
+        assert_eq!(original.agent_count(), restored.agent_count());
+        for id in original.agents().iter_handles() {
+            let uid = original.agent_uid(id).unwrap();
+            let restored_id = restored
+                .agents()
+                .iter_handles()
+                .find(|candidate| restored.agent_uid(*candidate) == Some(uid))
+                .unwrap();
+            assert_eq!(
+                original.agent_runtime(id).unwrap().brain.registry_key(),
+                restored
+                    .agent_runtime(restored_id)
+                    .unwrap()
+                    .brain
+                    .registry_key()
+            );
+            assert_eq!(
+                original.agent_brain_genome(id).unwrap().payload(),
+                restored.agent_brain_genome(restored_id).unwrap().payload()
+            );
+            assert_eq!(
+                original
+                    .agent_brain_evaluator_state(id)
+                    .unwrap()
+                    .unwrap()
+                    .payload(),
+                restored
+                    .agent_brain_evaluator_state(restored_id)
+                    .unwrap()
+                    .unwrap()
+                    .payload()
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_founder_options_refuse_conflicts_and_preserve_default_science() {
+        for (brain, strategy) in [
+            (Some(BrainPreset::Mlp), None),
+            (Some(BrainPreset::Assembly), Some(SeedStrategy::None)),
+            (None, Some(SeedStrategy::Wander)),
+        ] {
+            let options = InitOptions {
+                mixed_brains: true,
+                default_brain: brain,
+                seed_strategy: strategy,
+                ..InitOptions::default()
+            };
+            assert!(Simulation::new(options.into_spec()).is_err());
+        }
+        let config = checkpoint_world(None, SeedStrategy::None).spec.base_config;
+        let mut implicit = Simulation::new(
+            InitOptions {
+                seed: Some(89),
+                population: 4,
+                config: Some(config.clone()),
+                ..InitOptions::default()
+            }
+            .into_spec(),
+        )
+        .unwrap();
+        let mut explicit = Simulation::new(
+            InitOptions {
+                seed: Some(89),
+                population: 4,
+                config: Some(config),
+                default_brain: Some(BrainPreset::Mlp),
+                seed_strategy: Some(SeedStrategy::None),
+                mixed_brains: false,
+                ..InitOptions::default()
+            }
+            .into_spec(),
+        )
+        .unwrap();
+        for steps in [0, 1, 7] {
+            implicit.tick(steps).unwrap();
+            explicit.tick(steps).unwrap();
+            assert_eq!(
+                implicit.core.world().world_digest_v1().unwrap(),
+                explicit.core.world().world_digest_v1().unwrap()
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_founder_choices_replace_only_explicitly_and_clear_old_recipes() {
+        let handle = SimHandle {
+            inner: Rc::new(RefCell::new(checkpoint_world(
+                Some(BrainPreset::Mlp),
+                SeedStrategy::None,
+            ))),
+        };
+        handle.register_brain_js("mixed").unwrap();
+        assert_eq!(handle.brain_preset_js(), "mixed");
+        assert_eq!(
+            handle.inner.borrow().spec.brain_families(),
+            BrainPreset::ALL
+        );
+        assert_eq!(handle.launch_info().recipe_version, Some(2));
+        let bytes = handle.inner.borrow_mut().checkpoint().unwrap();
+        assert!(handle.register_brain_js("unknown").is_err());
+        assert_eq!(handle.inner.borrow_mut().checkpoint().unwrap(), bytes);
+        let continued = SimHandle {
+            inner: Rc::new(RefCell::new(Simulation::from_checkpoint(&bytes).unwrap())),
+        };
+        assert!(!continued.inner.borrow().spec.mixed_brains);
+        continued.register_brain_js("mixed").unwrap();
+        assert!(continued.inner.borrow().spec.mixed_brains);
+        assert!(continued.inner.borrow().spec.continuation_brains.is_empty());
+        assert!(continued.launch_info().shareable);
+        continued.inner.borrow_mut().reset(Some(97)).unwrap();
+        assert_eq!(continued.launch_info().recipe_version, Some(2));
+        for preset in ["mlp", "dwraon", "assembly", "wander", "none"] {
+            continued.register_brain_js("mixed").unwrap();
+            continued.register_brain_js(preset).unwrap();
+            assert!(!continued.inner.borrow().spec.mixed_brains);
+            assert!(continued.inner.borrow().spec.continuation_brains.is_empty());
+            assert_eq!(continued.brain_preset_js(), preset);
+            assert_eq!(continued.launch_info().recipe_version, Some(1));
+        }
+    }
+
+    fn mixed_reproduction_config() -> ScriptBotsConfig {
+        ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            food_intake_rate: 0.0,
+            food_sharing_rate: 0.0,
+            food_transfer_rate: 0.0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            bot_speed: 0.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: 0.5,
+            reproduction_energy_cost: 0.0,
+            reproduction_cooldown: 1,
+            reproduction_attempt_interval: 1,
+            reproduction_attempt_chance: 1.0,
+            reproduction_child_energy: 1.0,
+            reproduction_spawn_jitter: 0.0,
+            reproduction_color_jitter: 0.0,
+            reproduction_spawn_back_distance: 0.0,
+            reproduction_partner_chance: 0.0,
+            reproduction_meta_mutation_chance: 0.0,
+            reproduction_meta_mutation_scale: 0.0,
+            persistence_interval: 0,
+            chart_flush_interval: 0,
+            rng_seed: Some(0xB2CA_2026),
+            ..ScriptBotsConfig::default()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_founders_produce_real_inherited_offspring_and_continue() {
+        let mut spec = SimSpec::new(
+            mixed_reproduction_config(),
+            3,
+            Some(0xB2CA_2026),
+            SnapshotFormat::Json,
+            SeedStrategy::None,
+            None,
+        );
+        spec.continuation_brains = BrainPreset::ALL.to_vec();
+        let mut world = WorldState::new(spec.config()).unwrap();
+        seed_mixed_agents(&mut world, 3).unwrap();
+        let parents = world.agents().iter_handles().collect::<Vec<_>>();
+        for (family, parent) in parents.into_iter().enumerate() {
+            assert_eq!(
+                world.agent_runtime(parent).unwrap().brain.kind(),
+                Some(BrainPreset::ALL[family].kind())
+            );
+            let ids = world.agents().iter_handles().collect::<Vec<_>>();
+            for id in ids {
+                assert!(
+                    world
+                        .try_update_agent(id, |_, runtime| {
+                            runtime.energy = 0.0;
+                            runtime.reproduction_counter = 0.0;
+                        })
+                        .unwrap()
+                );
+            }
+            assert!(
+                world
+                    .try_update_agent(parent, |_, runtime| {
+                        runtime.energy = 5.0;
+                        runtime.reproduction_counter = f32::MAX;
+                        runtime.mutation_rates = scriptbots_core::MutationRates {
+                            primary: 0.0,
+                            secondary: 0.0,
+                        };
+                    })
+                    .unwrap()
+            );
+            let parent_uid = world.agent_uid(parent).unwrap();
+            let completion = world.step_outcome().unwrap();
+            assert!(completion.fault.is_none());
+            let born = completion
+                .outcome
+                .births
+                .iter()
+                .filter(|record| record.origin == scriptbots_core::BirthOrigin::Born)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                born.len(),
+                1,
+                "each actual family must produce a real child"
+            );
+            let birth = born[0];
+            assert_eq!(birth.parent_a, Some(parent_uid));
+            assert_eq!(birth.parent_b, None);
+            assert_eq!(birth.generation, Generation(1));
+            let child = world
+                .agents()
+                .iter_handles()
+                .find(|id| world.agent_uid(*id) == Some(birth.agent_uid))
+                .unwrap();
+            let parent_genome = world.agent_brain_genome(parent).unwrap();
+            let child_genome = world.agent_brain_genome(child).unwrap();
+            assert_eq!(child_genome.family_id(), parent_genome.family_id());
+            assert_eq!(child_genome.payload(), parent_genome.payload());
+            assert_eq!(
+                world.agent_runtime(child).unwrap().brain.registry_key(),
+                world.agent_runtime(parent).unwrap().brain.registry_key()
+            );
+            assert_eq!(
+                world.agent_runtime(child).unwrap().brain.kind(),
+                Some(BrainPreset::ALL[family].kind())
+            );
+            assert!(world.agent_brain_evaluator_state(child).unwrap().is_some());
+        }
+        assert_eq!(world.agent_count(), 6);
+        let mut original = owner_for_checkpoint_test(world, spec);
+        let mut restored = Simulation::from_checkpoint(&original.checkpoint().unwrap()).unwrap();
+        assert_same_mixed_science(&original, &restored);
+        original.tick(3).unwrap();
+        restored.tick(3).unwrap();
+        assert_same_mixed_science(&original, &restored);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_checkpoint_continues_every_family_and_reexports_exact_science() {
+        for presets in [
+            vec![BrainPreset::Assembly, BrainPreset::Mlp],
+            vec![BrainPreset::Dwraon, BrainPreset::Assembly, BrainPreset::Mlp],
+        ] {
+            let mut original = mixed_checkpoint_world(&presets, 2, false);
+            original.tick(5).unwrap();
+            assert_eq!(original.core.world().agent_count(), presets.len() * 2);
+            let bytes = original.checkpoint().unwrap();
+            let decoded = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes).unwrap();
+            let required = decoded
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry();
+            let mut restored = Simulation::from_checkpoint(&bytes).unwrap();
+            assert_eq!(restored.spec.continuation_brains, presets);
+            assert_eq!(restored.spec.default_brain, None);
+            assert!(restored.spec.launch.is_none());
+            assert_same_mixed_science(&original, &restored);
+            for steps in [1, 3, 2] {
+                original.tick(steps).unwrap();
+                restored.tick(steps).unwrap();
+                assert_same_mixed_science(&original, &restored);
+                let continued = restored.checkpoint().unwrap();
+                let decoded =
+                    scriptbots_runtime::VolatileHostCheckpointV1::decode(&continued).unwrap();
+                assert_eq!(
+                    decoded
+                        .host_checkpoint()
+                        .world_checkpoint()
+                        .required_brain_registry(),
+                    required
+                );
+                restored = Simulation::from_checkpoint(&continued).unwrap();
+                assert_eq!(restored.spec.continuation_brains, presets);
+                assert_same_mixed_science(&original, &restored);
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_checkpoint_retains_empty_and_extinct_families() {
+        let presets = [BrainPreset::Assembly, BrainPreset::Mlp, BrainPreset::Dwraon];
+        for (founders, dying) in [(0, false), (2, true)] {
+            let mut original = mixed_checkpoint_world(&presets, founders, dying);
+            if dying {
+                original.tick(1).unwrap();
+            }
+            assert_eq!(original.core.world().agent_count(), 0);
+            let mut restored =
+                Simulation::from_checkpoint(&original.checkpoint().unwrap()).unwrap();
+            assert_eq!(restored.spec.continuation_brains, presets);
+            assert_same_mixed_science(&original, &restored);
+            original.tick(3).unwrap();
+            restored.tick(3).unwrap();
+            assert_same_mixed_science(&original, &restored);
+            let bytes = restored.checkpoint().unwrap();
+            let decoded = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes).unwrap();
+            assert_eq!(
+                decoded
+                    .host_checkpoint()
+                    .world_checkpoint()
+                    .required_brain_registry()
+                    .entries
+                    .len(),
+                presets.len()
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_checkpoint_requires_an_explicit_new_world_before_reset() {
+        let mut original =
+            mixed_checkpoint_world(&[BrainPreset::Dwraon, BrainPreset::Mlp], 2, false);
+        original.tick(3).unwrap();
+        let restored = Simulation::from_checkpoint(&original.checkpoint().unwrap()).unwrap();
+        let handle = SimHandle {
+            inner: Rc::new(RefCell::new(restored)),
+        };
+        assert_eq!(handle.brain_preset_js(), "mixed");
+        assert!(!handle.launch_info().shareable);
+        assert!(handle.permalink_string().is_err());
+        assert!(
+            handle
+                .fork_patch(&[("food_growth_rate".to_owned(), 0.1)])
+                .is_err()
+        );
+        let before = handle.inner.borrow_mut().checkpoint().unwrap();
+        for seed in [None, Some(41)] {
+            let error = handle.inner.borrow_mut().reset(seed).unwrap_err();
+            assert!(format!("{error:#}").contains("choose a new-world brain preset"));
+            assert_eq!(handle.inner.borrow_mut().checkpoint().unwrap(), before);
+        }
+        assert!(handle.register_brain_js("unknown").is_err());
+        assert_eq!(handle.inner.borrow_mut().checkpoint().unwrap(), before);
+        handle.register_brain_js("assembly").unwrap();
+        assert_eq!(handle.brain_preset_js(), "assembly");
+        assert!(handle.launch_info().shareable);
+        assert!(handle.permalink_string().is_ok());
+        let simulation = handle.inner.borrow();
+        assert!(simulation.spec.continuation_brains.is_empty());
+        assert_eq!(simulation.core.world_tick().0, 0);
+        assert_eq!(simulation.core.world().agent_count(), 4);
+        for id in simulation.core.world().agents().iter_handles() {
+            assert_eq!(
+                simulation
+                    .core
+                    .world()
+                    .agent_runtime(id)
+                    .unwrap()
+                    .brain
+                    .kind(),
+                Some(BrainPreset::Assembly.kind())
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_mixed_checkpoint_refuses_unknown_aliases_and_registry_gaps() {
+        for defect in ["unknown", "wrong_adapter", "duplicate_label", "retired_key"] {
+            let spec = checkpoint_world(None, SeedStrategy::None).spec;
+            let mut world = WorldState::new(spec.config()).unwrap();
+            if defect == "retired_key" {
+                let key = BrainPreset::Assembly
+                    .register(world.brain_registry_mut().unwrap())
+                    .unwrap();
+                assert!(world.brain_registry_mut().unwrap().unregister(key));
+            }
+            seed_agents(
+                &mut world,
+                2,
+                SeedStrategy::None,
+                Some(BrainPreset::Mlp),
+                &mut None,
+            )
+            .unwrap();
+            let registry = world.brain_registry_mut().unwrap();
+            match defect {
+                "unknown" => {
+                    registry
+                        .register_family(
+                            "not-compiled-for-browser",
+                            Box::new(DwraonFamilyAdapter::default()),
+                        )
+                        .unwrap();
+                }
+                "wrong_adapter" => {
+                    registry
+                        .register_family(
+                            BrainPreset::Dwraon.kind(),
+                            Box::new(AssemblyFamilyAdapter::new().unwrap()),
+                        )
+                        .unwrap();
+                }
+                "duplicate_label" => {
+                    registry
+                        .register_family(
+                            BrainPreset::Mlp.kind(),
+                            Box::new(DwraonFamilyAdapter::default()),
+                        )
+                        .unwrap();
+                }
+                "retired_key" => {
+                    BrainPreset::Dwraon.register(registry).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let mut source = owner_for_checkpoint_test(world, spec);
+            source.tick(1).unwrap();
+            let before = source.core.scientific_digest_v1().unwrap();
+            let bytes = source.checkpoint().unwrap();
+            assert!(Simulation::from_checkpoint(&bytes).is_err(), "{defect}");
+            let science = source
+                .core
+                .capture_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap();
+            assert!(
+                Simulation::from_world_checkpoint(&science).is_err(),
+                "scientific interchange must refuse {defect}"
+            );
+            assert_eq!(source.core.scientific_digest_v1().unwrap(), before);
+            assert_eq!(source.checkpoint().unwrap(), bytes);
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_saves_fresh_families_without_advancing_science() {
+        for preset in [BrainPreset::Mlp, BrainPreset::Dwraon, BrainPreset::Assembly] {
+            for population in [0, 3] {
+                let mut spec = checkpoint_world(Some(preset), SeedStrategy::None).spec;
+                spec.initial_population = population;
+                let mut original = Simulation::new(spec).unwrap();
+                let before = original.core.scientific_digest_v1().unwrap();
+                let revisions = original.core.latest_snapshot().revisions;
+                let bytes = original.checkpoint().unwrap();
+                assert_eq!(original.core.world_tick().0, 0);
+                assert_eq!(original.core.scientific_digest_v1().unwrap(), before);
+                assert_eq!(original.core.latest_snapshot().revisions, revisions);
+                let decoded = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes).unwrap();
+                assert_eq!(
+                    decoded
+                        .host_checkpoint()
+                        .journal_cut()
+                        .last_journal_sequence,
+                    0
+                );
+                assert_eq!(
+                    decoded
+                        .host_checkpoint()
+                        .journal_cut()
+                        .last_scientific_event_sequence,
+                    0
+                );
+                let mut restored = Simulation::from_checkpoint(&bytes).unwrap();
+                assert_eq!(restored.spec.default_brain, Some(preset));
+                assert_eq!(restored.core.world().agent_count(), population);
+                assert_eq!(restored.checkpoint().unwrap(), bytes);
+                for steps in [1, 4] {
+                    original.tick(steps).unwrap();
+                    restored.tick(steps).unwrap();
+                    assert_eq!(
+                        original.core.scientific_digest_v1().unwrap(),
+                        restored.core.scientific_digest_v1().unwrap(),
+                        "{} with {population} founders must continue exactly",
+                        preset.name()
+                    );
+                }
+            }
+        }
+    }
+
+    fn web_intervention_request(simulation: &Simulation) -> BrowserInterventionRequest {
+        let source = simulation.core.latest_snapshot();
+        BrowserInterventionRequest {
+            request_id: "web-intervention-local-regression".to_owned(),
+            session_id: source.session_id.get().to_string(),
+            epoch: source.world.epoch.to_string(),
+            expected_control_revision: source.revisions.control.get().to_string(),
+            intervention: scriptbots_core::Intervention::Drought {
+                region: scriptbots_core::Region::All,
+                ticks: 5,
+                growth_scale: 0.0,
+            },
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_intervention_stages_paused_retries_and_observes_effect_after_step() {
+        let mut simulation = checkpoint_world(None, SeedStrategy::None);
+        let running_request = web_intervention_request(&simulation);
+        assert!(simulation.intervene(&running_request).is_err());
+        assert_eq!(simulation.core.world_tick().0, 0);
+        simulation.set_speed(0.0).unwrap();
+        let request = web_intervention_request(&simulation);
+        let first = simulation.intervene(&request).unwrap();
+        assert_eq!(first.application_state, "applied");
+        assert_eq!(first.application_boundary.as_ref().unwrap().tick, "0");
+        assert_eq!(first.journal_state, "pending");
+        assert!(
+            simulation
+                .core
+                .latest_snapshot()
+                .applied_interventions
+                .is_empty()
+        );
+        assert!(simulation.core.latest_snapshot().playback.paused);
+
+        let retry = simulation.intervene(&request).unwrap();
+        assert_eq!(retry.command_id, first.command_id);
+        assert_eq!(retry.admission_sequence, first.admission_sequence);
+        assert_eq!(retry.application_boundary, first.application_boundary);
+        assert_eq!(retry.journal_state, "committed_volatile");
+        assert_eq!(simulation.core.world_tick().0, 0);
+        let mut changed = request.clone();
+        changed.intervention = scriptbots_core::Intervention::Bloom {
+            region: scriptbots_core::Region::All,
+            amount: 0.1,
+        };
+        assert!(simulation.intervene(&changed).is_err());
+        assert!(
+            simulation
+                .intervention_status("00000000000000000000000000000000", &request.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        simulation.tick(1).unwrap();
+        let page = BrowserInterventionHistory::capture(
+            &simulation.core.latest_snapshot(),
+            &request.session_id,
+            &request.epoch,
+            "0",
+            32,
+        )
+        .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].kind, "drought");
+        assert_eq!(page.records[0].tick, "1");
+        assert!(simulation.core.latest_snapshot().playback.paused);
+        simulation.set_speed(1.0).unwrap();
+        let running_retry = simulation.intervene(&request).unwrap();
+        assert_eq!(running_retry.command_id, first.command_id);
+        assert_eq!(
+            running_retry.application_boundary,
+            first.application_boundary
+        );
+        assert_eq!(
+            simulation
+                .core
+                .latest_snapshot()
+                .applied_interventions
+                .len(),
+            1
+        );
+        assert!(!simulation.core.latest_snapshot().playback.paused);
+        let mut fresh = web_intervention_request(&simulation);
+        fresh.request_id = "fresh-running-action".to_owned();
+        assert!(simulation.intervene(&fresh).is_err());
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn same_seed_browser_owners_have_distinct_authority_and_identical_science() {
+        let mut first = checkpoint_world(None, SeedStrategy::None);
+        let second = checkpoint_world(None, SeedStrategy::None);
+        let original_session = first.core.latest_snapshot().session_id;
+        let digest = first.core.world().world_digest_v1().unwrap();
+        assert_ne!(original_session, second.core.latest_snapshot().session_id);
+        assert_eq!(digest, second.core.world().world_digest_v1().unwrap());
+        first.set_speed(0.0).unwrap();
+        let request = web_intervention_request(&first);
+        first.intervene(&request).unwrap();
+        first.reset(Some(17)).unwrap();
+        first.set_speed(0.0).unwrap();
+        assert_ne!(original_session, first.core.latest_snapshot().session_id);
+        assert_eq!(digest, first.core.world().world_digest_v1().unwrap());
+        assert!(first.intervene(&request).is_err());
+        assert!(
+            first
+                .core
+                .latest_snapshot()
+                .applied_interventions
+                .is_empty()
+        );
+        assert_eq!(first.core.world().active_effects(), []);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn browser_checkpoint_continues_exact_science_and_fresh_command_namespaces() {
-        for brain in [None, Some(BrainPreset::Mlp)] {
+        for brain in [
+            None,
+            Some(BrainPreset::Mlp),
+            Some(BrainPreset::Dwraon),
+            Some(BrainPreset::Assembly),
+        ] {
             let mut original = checkpoint_world(brain, SeedStrategy::None);
             original.tick(3).unwrap();
             original.set_speed(0.5).unwrap();
             original.drive(8.0).unwrap();
             let bytes = original.checkpoint().unwrap();
             let mut restored = Simulation::from_checkpoint(&bytes).unwrap();
+            assert_eq!(restored.spec.default_brain, brain);
             assert_eq!(original.snapshot(), restored.snapshot());
             assert_eq!(
                 original.core.scientific_digest_v1().unwrap(),
@@ -1631,6 +3662,7 @@ mod tests {
             paused.drive(10_050.0).unwrap();
             assert!(paused.snapshot().tick > tick);
             restored.reset(Some(17)).unwrap();
+            assert_eq!(restored.spec.default_brain, brain);
             assert_eq!(restored.snapshot().tick, 0);
             assert_eq!(restored.snapshot().agents.len(), 3);
             restored.tick(1).unwrap();
@@ -1666,17 +3698,12 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn browser_checkpoint_refuses_legacy_wander_without_changing_defaults() {
+    fn browser_checkpoint_refuses_explicit_legacy_wander_without_changing_science() {
         let mut original = checkpoint_world(None, SeedStrategy::Wander);
         original.tick(2).unwrap();
         let digest = original.core.scientific_digest_v1().unwrap();
         assert!(original.checkpoint().is_err());
         assert_eq!(original.core.scientific_digest_v1().unwrap(), digest);
-        assert!(InitOptions::default().default_brain.is_none());
-        assert_eq!(
-            InitOptions::default().into_spec().seed_strategy,
-            SeedStrategy::Wander
-        );
         original.tick(1).unwrap();
         assert_eq!(original.snapshot().tick, 3);
     }
@@ -1684,23 +3711,26 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn browser_checkpoint_preserves_an_empty_zero_tick_boundary() {
-        let mut spec = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None).spec;
-        spec.initial_population = 0;
-        let mut original = Simulation::new(spec).unwrap();
-        original.set_speed(0.0).unwrap();
-        let digest = original.core.scientific_digest_v1().unwrap();
-        let bytes = original.checkpoint().unwrap();
-        assert_eq!(original.core.scientific_digest_v1().unwrap(), digest);
-        let mut restored = Simulation::from_checkpoint(&bytes).unwrap();
-        assert_eq!(restored.snapshot().tick, 0);
-        assert_eq!(restored.snapshot().agents.len(), 0);
-        restored.tick(1).unwrap();
-        original.tick(1).unwrap();
-        assert_eq!(restored.snapshot().tick, 1);
-        assert_eq!(
-            original.core.scientific_digest_v1().unwrap(),
-            restored.core.scientific_digest_v1().unwrap()
-        );
+        for preset in [BrainPreset::Mlp, BrainPreset::Dwraon, BrainPreset::Assembly] {
+            let mut spec = checkpoint_world(Some(preset), SeedStrategy::None).spec;
+            spec.initial_population = 0;
+            let mut original = Simulation::new(spec).unwrap();
+            original.set_speed(0.0).unwrap();
+            let digest = original.core.scientific_digest_v1().unwrap();
+            let bytes = original.checkpoint().unwrap();
+            assert_eq!(original.core.scientific_digest_v1().unwrap(), digest);
+            let mut restored = Simulation::from_checkpoint(&bytes).unwrap();
+            assert_eq!(restored.spec.default_brain, Some(preset));
+            assert_eq!(restored.snapshot().tick, 0);
+            assert_eq!(restored.snapshot().agents.len(), 0);
+            restored.tick(1).unwrap();
+            original.tick(1).unwrap();
+            assert_eq!(restored.snapshot().tick, 1);
+            assert_eq!(
+                original.core.scientific_digest_v1().unwrap(),
+                restored.core.scientific_digest_v1().unwrap()
+            );
+        }
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -1723,6 +3753,37 @@ mod tests {
             2.0
         );
         assert_eq!(restored.core.scientific_digest_v1().unwrap(), digest);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn genome_page_offsets_convert_exactly_and_reject_invalid_inputs() {
+        let maximum = u32::try_from(scriptbots_runtime::inspector::MAX_GENOME_SOURCE_LOCI)
+            .expect("genome page bound fits u32");
+        for value in 0..=maximum {
+            assert_eq!(
+                bounded_genome_page_offset(f64::from(value)),
+                Some(usize::try_from(value).expect("genome page bound fits usize")),
+                "offset {value}"
+            );
+        }
+        assert_eq!(bounded_genome_page_offset(-0.0), Some(0));
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            -f64::EPSILON,
+            0.5,
+            65_535.5,
+            f64::from(maximum) + 1.0,
+        ] {
+            assert_eq!(
+                bounded_genome_page_offset(invalid),
+                None,
+                "offset {invalid}"
+            );
+        }
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -2212,7 +4273,7 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn nested_config_seed_controls_world_and_host_session_when_top_level_is_omitted() {
+    fn nested_config_seed_controls_world_when_top_level_is_omitted() {
         let simulation = Simulation::new(
             InitOptions {
                 population: 0,
@@ -2227,15 +4288,11 @@ mod tests {
         .expect("nested-seeded web simulation");
 
         assert_eq!(simulation.core.world().config().rng_seed, Some(11));
-        assert_eq!(
-            simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(11)
-        );
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn top_level_seed_overrides_nested_config_for_world_and_host_session() {
+    fn top_level_seed_overrides_nested_config_for_world() {
         let simulation = Simulation::new(
             InitOptions {
                 seed: Some(22),
@@ -2251,15 +4308,11 @@ mod tests {
         .expect("top-level-seeded web simulation");
 
         assert_eq!(simulation.core.world().config().rng_seed, Some(22));
-        assert_eq!(
-            simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(22)
-        );
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn omitted_seeds_keep_entropy_config_with_zero_host_session_sentinel() {
+    fn omitted_seeds_record_the_actual_entropy_seed() {
         let simulation = Simulation::new(
             InitOptions {
                 population: 0,
@@ -2269,10 +4322,28 @@ mod tests {
         )
         .expect("entropy-seeded web simulation");
 
-        assert_eq!(simulation.core.world().config().rng_seed, None);
+        let seed = simulation
+            .core
+            .world()
+            .config()
+            .rng_seed
+            .expect("resolved seed");
         assert_eq!(
-            simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(0)
+            simulation
+                .core
+                .world()
+                .agent_substream_protocol_v1()
+                .root_seed(),
+            seed
+        );
+        assert_eq!(
+            simulation.spec.launch.as_ref().unwrap().info().seed,
+            Some(seed.to_string())
+        );
+        assert_eq!(
+            simulation.spec.effective_seed(),
+            None,
+            "reset options retain entropy semantics"
         );
     }
 
@@ -2297,19 +4368,19 @@ mod tests {
             .world()
             .world_digest_v1()
             .expect("nested-seed digest");
+        let nested_session = simulation.core.latest_snapshot().session_id;
 
         simulation.reset(Some(22)).expect("explicit-seed web reset");
         assert_eq!(simulation.core.world().config().rng_seed, Some(22));
-        assert_eq!(
-            simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(22)
-        );
+        let explicit_session = simulation.core.latest_snapshot().session_id;
+        assert_ne!(explicit_session, nested_session);
 
         simulation.reset(None).expect("nested-seed web reset");
         assert_eq!(simulation.core.world().config().rng_seed, Some(11));
-        assert_eq!(
+        assert_ne!(simulation.core.latest_snapshot().session_id, nested_session);
+        assert_ne!(
             simulation.core.latest_snapshot().session_id,
-            HostSessionId::new(11)
+            explicit_session
         );
         assert_eq!(
             simulation
@@ -2319,6 +4390,41 @@ mod tests {
                 .expect("repeated nested-seed digest"),
             nested_seed_digest,
             "reset without an explicit seed must reproduce the nested seeded world"
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn reset_rebuilds_environment_when_owner_revisions_and_seed_repeat() {
+        let mut simulation = Simulation::new(
+            InitOptions {
+                population: 0,
+                seed: Some(11),
+                config: Some(ScriptBotsConfig {
+                    world_width: 80,
+                    world_height: 80,
+                    food_cell_size: 40,
+                    initial_food: 0.25,
+                    ..ScriptBotsConfig::default()
+                }),
+                ..InitOptions::default()
+            }
+            .into_spec(),
+        )
+        .unwrap();
+        let initial = simulation.core.latest_snapshot();
+        let first = simulation.environment_cache.snapshot(&initial).unwrap();
+        assert_eq!(first.cells[0].food.to_bits(), 0.25_f32.to_bits());
+        simulation.spec.base_config.initial_food = 0.0;
+        simulation.reset(Some(11)).unwrap();
+        let replacement = simulation.core.latest_snapshot();
+        assert_ne!(replacement.session_id, initial.session_id);
+        assert_eq!(replacement.layers.revisions, initial.layers.revisions);
+        let next = simulation.environment_cache.snapshot(&replacement).unwrap();
+        assert_eq!(next.cells[0].food.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(
+            *next,
+            RemoteEnvironmentSnapshot::capture(&replacement).unwrap()
         );
     }
 
@@ -2368,6 +4474,154 @@ mod tests {
         .expect("seeded nonempty browser host")
     }
 
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn browser_inspector_exposes_null_parents_and_absent_subject_without_science() {
+        let simulation = browser_clock_simulation();
+        let uid = simulation.core.latest_snapshot().world.agents[0]
+            .uid
+            .to_string();
+        let before = simulation.core.scientific_digest_v1().unwrap();
+        let handle = SimHandle {
+            inner: Rc::new(RefCell::new(simulation)),
+        };
+        let inspected = handle.inspect_agent_js(&uid).unwrap();
+        let observed_uid = js_sys::Reflect::get(&inspected, &JsValue::from_str("uid")).unwrap();
+        assert_eq!(observed_uid.as_string(), Some(uid));
+        let lineage = js_sys::Reflect::get(&inspected, &JsValue::from_str("lineage")).unwrap();
+        let parents = js_sys::Array::from(&lineage);
+        assert_eq!(parents.length(), 2);
+        assert!(parents.get(0).is_null());
+        assert!(parents.get(1).is_null());
+        assert!(
+            handle
+                .inspect_agent_js(&u64::MAX.to_string())
+                .unwrap()
+                .is_null()
+        );
+        let brain = handle
+            .inspect_brain_js(&observed_uid.as_string().unwrap())
+            .unwrap();
+        assert_eq!(
+            js_sys::Reflect::get(&brain, &JsValue::from_str("schema"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("scriptbots.brain-activity.v1")
+        );
+        assert_eq!(
+            js_sys::Reflect::get(&brain, &JsValue::from_str("status"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("ready")
+        );
+        let missing_brain = handle.inspect_brain_js(&u64::MAX.to_string()).unwrap();
+        assert_eq!(
+            js_sys::Reflect::get(&missing_brain, &JsValue::from_str("reason"))
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("missing_agent")
+        );
+        assert_eq!(
+            handle.inner.borrow().core.scientific_digest_v1().unwrap(),
+            before
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_brain_activity_matches_real_mlp_and_preserves_continuation() {
+        let mut observed = browser_clock_simulation();
+        let mut twin = browser_clock_simulation();
+        for _ in 0..4 {
+            observed.tick(1).unwrap();
+            twin.tick(1).unwrap();
+            let uid = observed.core.latest_snapshot().world.agents[0].uid;
+            let digest = observed.core.scientific_digest_v1().unwrap();
+            let detail = observed.core.inspect_brain_activity(uid).unwrap();
+            let scriptbots_runtime::inspector::BrainActivityOutcome::Ready {
+                activations,
+                build,
+                outputs,
+                ..
+            } = detail.outcome
+            else {
+                panic!("real MLP activity must be available");
+            };
+            assert_ne!(
+                activations.layers,
+                [] as [scriptbots_core::ActivationLayer; 0]
+            );
+            assert_ne!(
+                activations.connections,
+                [] as [scriptbots_core::ActivationEdge; 0]
+            );
+            assert_eq!(outputs.len(), scriptbots_core::OUTPUT_SIZE);
+            assert_eq!(
+                build.retained_values,
+                activations
+                    .layers
+                    .iter()
+                    .map(|layer| layer.values.len())
+                    .sum::<usize>()
+            );
+            assert_eq!(build.retained_edges, activations.connections.len());
+            assert_eq!(observed.core.scientific_digest_v1().unwrap(), digest);
+            assert_eq!(digest, twin.core.scientific_digest_v1().unwrap());
+        }
+        observed.tick(1).unwrap();
+        twin.tick(1).unwrap();
+        assert_eq!(
+            observed.core.scientific_digest_v1().unwrap(),
+            twin.core.scientific_digest_v1().unwrap()
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_genome_pages_preserve_real_mlp_material_and_continuation() {
+        use scriptbots_runtime::inspector::{GenomeInspectionOutcome, GenomeParentDiff};
+        let mut observed = browser_clock_simulation();
+        let mut twin = browser_clock_simulation();
+        observed.tick(1).unwrap();
+        twin.tick(1).unwrap();
+        let uid = observed.core.latest_snapshot().world.agents[0].uid;
+        let before = observed.core.scientific_digest_v1().unwrap();
+        let mut offset = 0;
+        let mut digest = None;
+        let mut indices = Vec::new();
+        loop {
+            let page = observed.core.inspect_genome_page(uid, offset, 0).unwrap();
+            assert_eq!(page.uid, uid.get().to_string());
+            let GenomeInspectionOutcome::Ready { genome } = page.outcome else {
+                panic!("real registered MLP must expose bounded canonical loci");
+            };
+            assert_eq!(genome.family_id, "mlp-baseline");
+            assert!(matches!(genome.parent_diff, GenomeParentDiff::Founder));
+            if let Some(expected) = &digest {
+                assert_eq!(&genome.genome_digest, expected);
+            } else {
+                digest = Some(genome.genome_digest);
+            }
+            indices.extend(genome.loci.iter().map(|row| row.index));
+            assert_eq!(observed.core.scientific_digest_v1().unwrap(), before);
+            if !genome.paging.has_more {
+                assert_eq!(indices, (0..genome.paging.total).collect::<Vec<_>>());
+                break;
+            }
+            offset += genome.paging.limit;
+        }
+        assert!(indices.len() > scriptbots_runtime::inspector::GENOME_LOCUS_PAGE_SIZE);
+        observed.tick(1).unwrap();
+        twin.tick(1).unwrap();
+        assert_eq!(
+            observed.core.scientific_digest_v1().unwrap(),
+            twin.core.scientific_digest_v1().unwrap()
+        );
+    }
+
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn browser_clock_observers_do_not_authorize_science() {
@@ -2385,10 +4639,28 @@ mod tests {
                 let publication = observed.core.latest_snapshot();
                 let frame = BrowserFrame::new(&publication);
                 assert_eq!(frame.identity.tick, observed.snapshot().tick.to_string());
+                let mut expected =
+                    serde_json::to_value(observed.snapshot()).expect("existing projection JSON");
+                expected["epoch"] = publication.world.epoch.to_string().into();
+                for agent in expected["agents"].as_array_mut().unwrap() {
+                    for field in ["id", "uid", "brainKey"] {
+                        if let Some(value) = agent[field].as_u64() {
+                            agent[field] = value.to_string().into();
+                        }
+                    }
+                }
                 assert_eq!(
                     serde_json::to_value(&frame).expect("browser frame JSON")["snapshot"],
-                    serde_json::to_value(observed.snapshot()).expect("existing projection JSON")
+                    expected
                 );
+                let selected = publication.world.agents[0].uid;
+                let detail = observed
+                    .core
+                    .inspect_agent_basic(selected)
+                    .unwrap()
+                    .unwrap();
+                assert!(detail.source.matches_snapshot(&publication));
+                assert_eq!(detail.uid, selected);
             }
             assert_eq!(
                 observed.core.scientific_digest_v1().expect("after reads"),
@@ -3867,6 +6139,217 @@ mod tests {
             lush, arid,
             "web terrain evaluation must distinguish lush vs arid"
         );
+    }
+}
+
+#[cfg(test)]
+mod narrative_tests {
+    use super::*;
+    use scriptbots_core::narrative::{EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord};
+    use scriptbots_core::{Intervention, Region, Tick};
+    use scriptbots_runtime::remote::REMOTE_MAX_EVENTS;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn narrative_simulation() -> Simulation {
+        Simulation::new(SimSpec::new(
+            ScriptBotsConfig {
+                world_width: 160,
+                world_height: 160,
+                food_cell_size: 40,
+                closed: true,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                temperature_discomfort_rate: 0.0,
+                aging_health_decay_rate: 0.0,
+                spike_damage: 0.0,
+                spike_energy_cost: 0.0,
+                reproduction_energy_threshold: f32::MAX,
+                narrative_interval: 8,
+                narrative_capacity: 8,
+                history_capacity: 128,
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            },
+            12,
+            Some(291),
+            SnapshotFormat::Json,
+            SeedStrategy::None,
+            Some(BrainPreset::Mlp),
+        ))
+        .expect("small real browser owner")
+    }
+
+    fn events(frame: &RemoteFrame) -> &RemoteEventPage {
+        let RemoteFramePayload::Events(page) = &frame.payload else {
+            panic!("narrative reads must return events")
+        };
+        page
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn local_narrative_reads_real_extinction_without_changing_owner_or_continuation() {
+        let mut simulation = narrative_simulation();
+        simulation.tick(96).unwrap();
+        assert_eq!(simulation.snapshot().agents.len(), 12);
+        simulation
+            .apply_command(HostCommand::Intervention(Box::new(
+                scriptbots_core::interventions::InterventionCommand::new(
+                    Intervention::Meteor {
+                        region: Region::All,
+                        lethality: 10.0,
+                        scorch: 0.0,
+                    },
+                    scriptbots_core::interventions::InterventionSurface::Script,
+                    "narrative test",
+                ),
+            )))
+            .unwrap();
+        simulation.tick(8).unwrap();
+        assert_eq!(
+            simulation.snapshot().agents,
+            [] as [scriptbots_core::DynamicAgentSnapshot; 0]
+        );
+        simulation.set_speed(0.0).unwrap();
+        let before_bytes = simulation.checkpoint().unwrap();
+        let before_digest = simulation.core.scientific_digest_v1().unwrap();
+        let snapshot = simulation.core.latest_snapshot();
+        let session = snapshot.session_id.get().to_string();
+        let frame = browser_narrative_page(&snapshot, "0", &session).unwrap();
+        assert_eq!(frame.identity, RemoteFrameIdentity::from(snapshot.as_ref()));
+        let page = events(&frame);
+        let extinction = page
+            .events
+            .iter()
+            .find(|event| event.record.kind == EventKind::Extinction)
+            .expect("real owner must narrate the intervention's extinction");
+        assert_eq!(extinction.record.tick, 97);
+        assert_eq!(extinction.record.human_text, "population reached zero");
+        assert_eq!(extinction.record.before, 12.0);
+        assert_eq!(extinction.record.after, 0.0);
+        assert_eq!(page.events.len(), snapshot.narrative_events.len());
+        let repeated = browser_narrative_page(&snapshot, "0", &session).unwrap();
+        assert_eq!(frame, repeated);
+        let cursor = page.latest_event.to_string();
+        let empty = browser_narrative_page(&snapshot, &cursor, &session).unwrap();
+        assert_eq!(
+            events(&empty).events,
+            [] as [scriptbots_runtime::remote::RemoteSequencedEvent; 0]
+        );
+        assert_eq!(events(&empty).after_event, page.latest_event);
+        assert_eq!(
+            simulation.core.scientific_digest_v1().unwrap(),
+            before_digest
+        );
+        assert_eq!(
+            simulation.core.latest_snapshot().revisions,
+            snapshot.revisions
+        );
+        assert_eq!(
+            simulation.core.latest_snapshot().playback,
+            snapshot.playback
+        );
+        assert_eq!(simulation.checkpoint().unwrap(), before_bytes);
+        let restored = Simulation::from_checkpoint(&before_bytes).unwrap();
+        let resumed = browser_narrative_page(&restored.core.latest_snapshot(), "0", &session)
+            .expect("continuation retains canonical narrative history and session");
+        assert_eq!(events(&resumed), page);
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn local_narrative_pages_bound_rows_and_preserve_large_ordinals_and_gaps() {
+        let simulation = narrative_simulation();
+        let mut snapshot = simulation.core.latest_snapshot().as_ref().clone();
+        let dropped = (1_u64 << 53) + 11;
+        snapshot.narrative_dropped_events = dropped;
+        snapshot.narrative_events = Arc::new(vec![
+            EventRecord {
+                schema_version: EVENT_RECORD_SCHEMA_VERSION,
+                tick: Tick(0),
+                kind: EventKind::PopulationBoom,
+                severity: 0.5,
+                magnitude: 5.0,
+                window: (0, 0),
+                metric: "population".to_owned(),
+                before: 1.0,
+                after: 6.0,
+                score: 0.75,
+                subject: None,
+                human_text: "population increased".to_owned(),
+            };
+            REMOTE_MAX_EVENTS + 1
+        ]);
+        let session = snapshot.session_id.get().to_string();
+        let first = browser_narrative_page(&snapshot, "0", &session).unwrap();
+        let page = events(&first);
+        assert_eq!(page.events.len(), REMOTE_MAX_EVENTS);
+        let gap = page.gap.unwrap();
+        assert_eq!((gap.first_missing, gap.last_missing), (1, dropped));
+        assert_eq!(page.events[0].sequence, dropped + 1);
+        let cursor = page.events.last().unwrap().sequence;
+        let second = browser_narrative_page(&snapshot, &cursor.to_string(), &session).unwrap();
+        assert!(events(&second).gap.is_none());
+        assert_eq!(events(&second).events.len(), 1);
+        assert_eq!(events(&second).events[0].sequence, cursor + 1);
+        assert_eq!(events(&second).latest_event, cursor + 1);
+        let json = serde_json::to_value(BrowserRemoteFrame::from(&first)).unwrap();
+        assert_eq!(json["payload"]["gap"]["lastMissing"], dropped.to_string());
+        assert_eq!(
+            json["payload"]["events"][0]["sequence"],
+            (dropped + 1).to_string()
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn local_narrative_refuses_foreign_future_noncanonical_and_exhausted_cursors() {
+        let mut simulation = narrative_simulation();
+        let snapshot = simulation.core.latest_snapshot();
+        let session = snapshot.session_id.get().to_string();
+        for cursor in ["1", "01", "-1", "", "18446744073709551616"] {
+            assert!(browser_narrative_page(&snapshot, cursor, &session).is_err());
+        }
+        for identity in ["", "01", "-1", "340282366920938463463374607431768211456"] {
+            assert!(browser_narrative_page(&snapshot, "0", identity).is_err());
+        }
+        simulation.reset(Some(291)).unwrap();
+        assert!(browser_narrative_page(&simulation.core.latest_snapshot(), "0", &session).is_err());
+        let mut exhausted = snapshot.as_ref().clone();
+        exhausted.narrative_dropped_events = u64::MAX;
+        assert!(browser_narrative_page(&exhausted, "0", &session).is_err());
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn local_narrative_binding_returns_the_canonical_browser_event_shape() {
+        let simulation = narrative_simulation();
+        let session = simulation
+            .core
+            .latest_snapshot()
+            .session_id
+            .get()
+            .to_string();
+        let handle = SimHandle {
+            inner: Rc::new(RefCell::new(simulation)),
+        };
+        let page = handle.narrative_page_js("0", &session).unwrap();
+        let get = |object: &JsValue, key: &str| {
+            js_sys::Reflect::get(object, &JsValue::from_str(key)).unwrap()
+        };
+        assert_eq!(get(&page, "kind").as_string().as_deref(), Some("events"));
+        assert_eq!(
+            get(&get(&page, "identity"), "sessionId").as_string(),
+            Some(session)
+        );
+        let payload = get(&page, "payload");
+        assert_eq!(
+            get(&payload, "afterEvent").as_string().as_deref(),
+            Some("0")
+        );
+        assert!(get(&payload, "gap").is_null());
+        assert_eq!(js_sys::Array::from(&get(&payload, "events")).length(), 0);
     }
 }
 

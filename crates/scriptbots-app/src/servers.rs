@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::Engine as _;
 use fastmcp_rust::{
     Content, Cx, JsonRpcRequest, McpError, McpErrorCode, McpResult, NotificationSender,
     PendingRequests, RequestSender, Session, ToolHandler,
@@ -37,15 +38,19 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::command::CommandSubmit;
 use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
-    CheckpointCreateRequest, CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto,
-    ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
-    ExperimentBatchStatusDto, ExperimentComparisonDto, ExperimentCreateRequest,
-    ExperimentExecutionCapacityDto, ExperimentRunRecordDto, ExperimentSummaryDto,
-    ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody, InterventionsPollDto, KnobEntry,
-    KnobUpdate, MAX_STEP_BATCH, MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody,
-    PaginatedArtifactsResponse, PaginatedCheckpointsResponse, PaginatedExperimentsResponse,
-    Scoreboard, SelectionModeDto, SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto,
-    SpeedRequest, parse_intervention_command, parse_map_artifact,
+    CheckpointBranchRequest, CheckpointBranchStatusDto, CheckpointCreateRequest,
+    CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto, ConfigSnapshot, ControlError,
+    ControlHandle, DietClassDto, EventEntry, EventKind, ExperimentBatchStatusDto,
+    ExperimentComparisonDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
+    ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot,
+    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate,
+    MAX_CHECKPOINT_BRANCH_ID_BYTES, MAX_CHECKPOINT_BRANCH_KEY_BYTES,
+    MAX_CHECKPOINT_BRANCH_NAME_BYTES, MAX_CHECKPOINT_BRANCH_REQUEST_BYTES,
+    MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH, MapApplyAgentPolicy, MapApplyRequestBody,
+    MapGenerateRequestBody, PaginatedArtifactsResponse, PaginatedCheckpointBranchesResponse,
+    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
+    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
+    parse_intervention_command, parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
@@ -53,14 +58,27 @@ use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentDebugSort, ConfigAuditEntry, Position, SelectionUpdate,
     Tick, TickSummaryDto,
 };
-use scriptbots_runtime::RenderSnapshot;
 use scriptbots_runtime::channel::ChannelHostPort;
 use scriptbots_runtime::remote::{REMOTE_PROTOCOL_VERSION, RemoteFrame, encode_remote_frame};
 use scriptbots_runtime::remote_subscription::{
     REMOTE_MAX_REQUEST_BYTES, RemoteChannel, RemoteDeliveryWindow, RemoteFrameAck,
     RemoteSubscription, RemoteSubscriptionError, RemoteSubscriptionRequest,
 };
+use scriptbots_runtime::{RenderSnapshot, SnapshotWatcher};
 // keep image out of servers unless needed
+
+/// Application-owned configuration submission with exact owner revision guards.
+///
+/// Both receipt axes are retained so native clients can distinguish admission,
+/// rejection, application, and journal commitment without inferring success.
+pub type ConfigUpdateSubmit = Arc<
+    dyn Fn(
+            Box<scriptbots_core::ScriptBotsConfig>,
+            scriptbots_runtime::HostRevisions,
+        ) -> std::result::Result<scriptbots_runtime::CommandStatus, String>
+        + Send
+        + Sync,
+>;
 
 /// Default loopback address for the REST control surface.
 pub const DEFAULT_CONTROL_REST_ADDRESS: SocketAddr =
@@ -78,6 +96,13 @@ const CONTROL_RUNTIME_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const WS_CONTROL_PROTOCOL_VERSION: u16 = 1;
 const MAX_WS_CONTROL_MESSAGE_BYTES: usize = REMOTE_MAX_REQUEST_BYTES;
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const LAB_SESSION_HEADER: &str = "x-scriptbots-session";
+const CHECKPOINT_CANVAS_SCHEMA: &str = "scriptbots.checkpoint-canvas.v1";
+const MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
+const CHECKPOINT_CANVAS_TIMEOUT: Duration = Duration::from_secs(30);
+// Reconstruction owns a separate world and can outlive a disconnected HTTP
+// request. Keep its permit inside the blocking worker until encoding finishes.
+static CHECKPOINT_CANVAS_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Return the control CLI's default REST base URL from the server's socket authority.
 #[must_use]
@@ -532,7 +557,7 @@ async fn enforce_control_http_policy(
                 headers.split(',').all(|name| {
                     matches!(
                         name.trim().to_ascii_lowercase().as_str(),
-                        "accept" | "content-type" | "mcp-protocol-version"
+                        "accept" | "content-type" | "mcp-protocol-version" | LAB_SESSION_HEADER
                     )
                 })
             }),
@@ -555,7 +580,9 @@ async fn enforce_control_http_policy(
         );
         response.headers_mut().insert(
             axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-            axum::http::HeaderValue::from_static("Accept, Content-Type, Mcp-Protocol-Version"),
+            axum::http::HeaderValue::from_static(
+                "Accept, Content-Type, Mcp-Protocol-Version, X-ScriptBots-Session",
+            ),
         );
         response
     } else {
@@ -571,6 +598,52 @@ async fn enforce_control_http_policy(
         );
     }
     response
+}
+
+/// Bind browser lab requests to the immutable owner negotiated by their stream.
+/// Missing headers retain the existing CLI contract; an explicit expectation is
+/// never silently ignored, and no owner request or artifact access precedes it.
+fn require_lab_session(
+    headers: &HeaderMap,
+    session: scriptbots_runtime::HostSessionId,
+) -> Result<(), AppError> {
+    let mut values = headers.get_all(LAB_SESSION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err(AppError::bad_request(
+            "X-ScriptBots-Session accepts exactly one session identity",
+        ));
+    }
+    let expected = value
+        .to_str()
+        .ok()
+        .and_then(|text| {
+            text.parse::<u64>()
+                .ok()
+                .filter(|value| value.to_string() == text)
+        })
+        .ok_or_else(|| {
+            AppError::bad_request("X-ScriptBots-Session must be a canonical u64 decimal string")
+        })?;
+    if expected != session.get() {
+        return Err(AppError::conflict(
+            "lab host session changed; reconnect to the intended owner before retrying",
+        ));
+    }
+    Ok(())
+}
+
+async fn enforce_lab_session(
+    State(session): State<scriptbots_runtime::HostSessionId>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(error) = require_lab_session(request.headers(), session) {
+        return error.into_response();
+    }
+    next.run(request).await
 }
 
 fn read_control_environment(name: &str, errors: &mut Vec<String>) -> Option<String> {
@@ -919,6 +992,19 @@ impl ControlRuntime {
     #[must_use]
     pub fn control_handle(&self) -> Option<ControlHandle> {
         self.control_handle.clone()
+    }
+
+    /// Build a guarded configuration adapter using the live control client's identity.
+    ///
+    /// No adapter is available for a runtime without an owner control handle.
+    #[must_use]
+    pub fn config_update_submit(&self) -> Option<ConfigUpdateSubmit> {
+        let handle = self.control_handle.clone()?;
+        Some(Arc::new(move |config, expected| {
+            handle
+                .submit_config_update(config, expected)
+                .map_err(|error| error.to_string())
+        }))
     }
 
     /// The slot a frontend publishes its presented frames into.
@@ -1486,8 +1572,12 @@ fn parse_step_count(bytes: &[u8]) -> Result<u64, AppError> {
     let Some(first) = bytes.iter().find(|byte| !byte.is_ascii_whitespace()) else {
         return Ok(default_step_count());
     };
+    // Serde accepts sequences for structs, so `[]` otherwise becomes the
+    // default one-step request. Only an empty body or a JSON object is valid.
     if *first != b'{' {
-        return Err(AppError::bad_request("step request must be a JSON object"));
+        return Err(AppError::bad_request(
+            "invalid step request payload: expected a JSON object",
+        ));
     }
     // Decode the original object so duplicate fields cannot collapse in Value.
     let body: StepRequestBody = serde_json::from_slice(bytes)
@@ -1500,8 +1590,71 @@ pub struct SpeedRequestBody {
     pub speed: f32,
 }
 
+/// Fills empty OpenAPI response descriptions so the emitted 3.1 document keeps the
+/// required `Response.description`. utoipa 6 omits an empty description
+/// (`utoipa::openapi::response`: `skip_serializing_if = "String::is_empty"`); this
+/// fills each empty one with the HTTP reason phrase and never overwrites a
+/// non-empty description.
+struct FillEmptyResponseDescriptions;
+
+impl FillEmptyResponseDescriptions {
+    fn reason(code: &str) -> String {
+        if code == "default" {
+            return "Default response".to_string();
+        }
+        code.parse::<u16>()
+            .ok()
+            .and_then(|c| axum::http::StatusCode::from_u16(c).ok())
+            .and_then(|status| status.canonical_reason())
+            .unwrap_or("Response")
+            .to_string()
+    }
+
+    fn fill(
+        responses: &mut std::collections::BTreeMap<
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::Response>,
+        >,
+    ) {
+        for (code, response) in responses.iter_mut() {
+            if let utoipa::openapi::RefOr::T(response) = response
+                && response.description.is_empty()
+            {
+                response.description = Self::reason(code);
+            }
+        }
+    }
+}
+
+impl utoipa::Modify for FillEmptyResponseDescriptions {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        for item in openapi.paths.paths.values_mut() {
+            let operations = [
+                item.get.as_mut(),
+                item.put.as_mut(),
+                item.post.as_mut(),
+                item.delete.as_mut(),
+                item.options.as_mut(),
+                item.head.as_mut(),
+                item.patch.as_mut(),
+                item.trace.as_mut(),
+            ];
+            for operation in operations.into_iter().flatten() {
+                Self::fill(&mut operation.responses.responses);
+            }
+            for operation in item.additional_operations.values_mut() {
+                Self::fill(&mut operation.responses.responses);
+            }
+        }
+        if let Some(components) = openapi.components.as_mut() {
+            Self::fill(&mut components.responses);
+        }
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
+    modifiers(&FillEmptyResponseDescriptions),
     paths(
         get_knobs,
         get_config,
@@ -1519,6 +1672,9 @@ pub struct SpeedRequestBody {
         get_narrative_around,
         get_scoreboard,
         get_agents_debug,
+        get_agent_inspection,
+        get_brain_activity,
+        get_genome_inspection,
         get_config_audit,
         get_scenario,
         list_presets,
@@ -1540,6 +1696,9 @@ pub struct SpeedRequestBody {
         post_map_generate,
         post_map_apply,
         post_control_intervene,
+        post_browser_intervention,
+        get_browser_intervention_status,
+        get_browser_intervention_history,
         get_version,
         get_v1_version,
         get_schema,
@@ -1553,6 +1712,12 @@ pub struct SpeedRequestBody {
         post_v1_checkpoints,
         get_v1_checkpoints,
         get_v1_checkpoint_by_id,
+        get_v1_checkpoint_canvas,
+        post_v1_checkpoint_branches,
+        get_v1_checkpoint_branches,
+        get_v1_checkpoint_branch,
+        get_v1_checkpoint_branch_artifacts,
+        post_v1_checkpoint_branch_cancel,
         get_v1_artifacts,
         get_v1_artifact_by_id,
         get_v1_artifact_download
@@ -1607,14 +1772,18 @@ pub struct SpeedRequestBody {
             ExperimentSummaryDto,
             CheckpointCreateRequest,
             CheckpointMetadataDto,
+            CheckpointCanvasResponse,
             CheckpointRetentionDto,
+            CheckpointBranchRequest,
+            CheckpointBranchStatusDto,
+            PaginatedCheckpointBranchesResponse,
             ArtifactMetadataDto,
             PaginatedExperimentsResponse,
             PaginatedCheckpointsResponse,
             PaginatedArtifactsResponse
         )
     ),
-    info(title = "ScriptBots Control API", version = "0.0.0", description = "HTTP requests require the bound listener's IP/localhost authority or SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES. Browser Origin must match a configured authority or SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS. CLI clients may omit Origin. Forwarded headers are refused; this targeting policy does not authenticate callers."),
+    info(title = "ScriptBots Control API", version = "0.0.0", description = "HTTP requests require the bound listener's IP/localhost authority or SCRIPTBOTS_CONTROL_ALLOWED_AUTHORITIES. Browser Origin must match a configured authority or SCRIPTBOTS_CONTROL_ALLOWED_ORIGINS. CLI clients may omit Origin. Checkpoint, experiment and artifact routes accept an optional X-ScriptBots-Session header containing the exact canonical decimal host session negotiated by the remote stream; mismatches are refused before any action. Forwarded headers are refused; this targeting policy does not authenticate callers."),
     tags(
         (name = "control", description = "Runtime configuration controls"),
         (name = "map", description = "Procedural map generation and application controls"),
@@ -1932,7 +2101,8 @@ impl StreamResumeQuery {
             return Ok(None);
         };
         let request = RemoteSubscriptionRequest {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
+            protocol_version:
+                scriptbots_runtime::remote_subscription::REMOTE_SUBSCRIPTION_PROTOCOL_VERSION,
             request_id: None,
             command: "subscribe".to_owned(),
             channels: vec![RemoteChannel::Telemetry],
@@ -2487,19 +2657,21 @@ struct PreparedRemoteFrame {
     delivered_subscription: RemoteSubscription,
 }
 
+/// Cancel queued blocking work when its requesting connection closes. Running
+/// work retains its own resource permit until it reaches its bounded completion.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn prepare_remote_frames(
     mut subscription: RemoteSubscription,
     snapshot: Arc<RenderSnapshot>,
     awaiting_channels: Vec<RemoteChannel>,
 ) -> Result<Vec<PreparedRemoteFrame>, AppError> {
-    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-    impl<T> Drop for AbortOnDrop<T> {
-        fn drop(&mut self) {
-            // Cancels queued blocking work if this connection closes or times
-            // out. A job already running has only the bounded projection to finish.
-            self.0.abort();
-        }
-    }
     let mut projection = AbortOnDrop(tokio::task::spawn_blocking(move || {
         let mut frames = Vec::with_capacity(subscription.channels().len());
         for channel in subscription.channels().to_vec() {
@@ -2573,6 +2745,41 @@ impl WsStreamCadence {
     }
 }
 
+/// One coalesced request for projection, with no recurring wake while idle or
+/// while every channel is awaiting acknowledgement. Publications and returned
+/// credits request work; neither postpones an already eligible dispatch.
+#[derive(Debug, Default)]
+struct WsStreamSchedule {
+    requested: bool,
+    last_started: Option<Duration>,
+}
+
+impl WsStreamSchedule {
+    fn request(&mut self) {
+        self.requested = true;
+    }
+
+    fn remaining(&self, now: Duration, cadence: Duration, has_credit: bool) -> Option<Duration> {
+        (self.requested && has_credit).then(|| {
+            self.last_started.map_or(Duration::ZERO, |started| {
+                started.saturating_add(cadence).saturating_sub(now)
+            })
+        })
+    }
+
+    fn start(&mut self, now: Duration) {
+        self.requested = false;
+        self.last_started = Some(now);
+    }
+}
+
+async fn wait_ws_deadline(remaining: Option<Duration>) {
+    match remaining {
+        Some(remaining) => tokio::time::sleep(remaining).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn ws_interval(period: Duration) -> tokio::time::Interval {
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2603,9 +2810,11 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     static NEXT_CONNECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let connection_id = NEXT_CONNECTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let handle = state.handle.clone();
-    let mut interval = ws_interval(Duration::from_millis(50));
+    let mut legacy_interval = ws_interval(Duration::from_millis(50));
     let mut subscription: Option<RemoteSubscription> = None;
     let mut delivery: Option<RemoteDeliveryWindow> = None;
+    let mut publications: Option<SnapshotWatcher> = None;
+    let mut schedule = WsStreamSchedule::default();
     // Owner admission may wait longer than a presentation acknowledgement's
     // deadline. Poll one retained request alongside socket reads, with no
     // command queue, so that wait never prevents returning stream credit.
@@ -2615,6 +2824,16 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     let connected_at = tokio::time::Instant::now();
     debug!(connection_id, "WebSocket connected");
     loop {
+        let now = connected_at.elapsed();
+        let acknowledgement_deadline = delivery
+            .as_ref()
+            .and_then(|window| window.acknowledgement_timeout_remaining(now));
+        let has_credit = subscription.as_ref().is_some_and(|stream| {
+            delivery
+                .as_ref()
+                .is_some_and(|window| window.awaiting_channels().len() < stream.channels().len())
+        });
+        let dispatch_deadline = schedule.remaining(now, cadence.current, has_credit);
         tokio::select! {
             reply = async {
                 match pending_control.as_mut() {
@@ -2630,9 +2849,27 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                     break;
                 }
             }
-            _ = interval.tick() => {
+            _ = wait_ws_deadline(acknowledgement_deadline) => {
+                send_ws_error(&mut socket, None, AppError::service_unavailable(
+                    "remote frame acknowledgement deadline exceeded; reconnect with the last consumed cursors",
+                )).await;
+                break;
+            }
+            _ = async {
+                match publications.as_mut() {
+                    Some(watcher) => { let _ = watcher.changed().await; }
+                    None => std::future::pending().await,
+                }
+            }, if !schedule.requested => {
+                // After a throttled dispatch, the watcher can observe the same
+                // newer revision that read_snapshot already projected. That
+                // causes at most one bounded empty attempt, never an idle timer.
+                schedule.request();
+            }
+            _ = wait_ws_deadline(dispatch_deadline) => {
                 if let Some(stream) = &mut subscription {
                     let started = tokio::time::Instant::now();
+                    schedule.start(connected_at.elapsed());
                     let window = delivery.as_mut().expect("negotiation installs a delivery window");
                     if window.expired(connected_at.elapsed()) {
                         send_ws_error(&mut socket, None, AppError::service_unavailable(
@@ -2687,13 +2924,15 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                         debug!(connection_id, "remote stream closed after failed or timed-out write");
                         break;
                     }
-                    if let Some(reason) = cadence.observe(started.elapsed()) {
-                        interval = ws_interval(cadence.current);
-                        if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await {
-                            break;
-                        }
+                    if let Some(reason) = cadence.observe(started.elapsed())
+                        && !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await
+                    {
+                        break;
                     }
-                } else if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
+                }
+            }
+            _ = legacy_interval.tick(), if subscription.is_none() => {
+                if let Ok(summary) = read_latest_tick_summary(handle.clone()).await {
                     let dto = TickSummaryDto::from(summary);
                     if let Ok(bytes) = postcard::to_stdvec(&dto)
                         && !send_ws_message(&mut socket, WsMessage::Binary(bytes.into())).await
@@ -2720,9 +2959,14 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                             })();
                             match consumed {
                                 Ok(elapsed) => {
-                                    if let Some(reason) = cadence.observe(elapsed) {
-                                        interval = ws_interval(cadence.current);
-                                        if !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await { break; }
+                                    // A retained event page can share its publication
+                                    // with the previous page. Credit itself must wake
+                                    // projection even when the owner stays paused.
+                                    schedule.request();
+                                    if let Some(reason) = cadence.observe(elapsed)
+                                        && !send_ws_cadence(&mut socket, &cadence, reason, connection_id).await
+                                    {
+                                        break;
                                     }
                                 }
                                 Err(error) => {
@@ -2745,6 +2989,15 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                                 }
                                 let snapshot = handle.read_snapshot().map_err(AppError::from)?;
                                 let stream = RemoteSubscription::new(&request, &snapshot).map_err(remote_subscription_error)?;
+                                // Validate the request first, and reuse an existing
+                                // bounded observer for replacement subscriptions.
+                                let watcher = if publications.is_none() {
+                                    Some(handle.snapshot_hub().watch().map_err(|error| {
+                                        AppError::service_unavailable(format!("remote publication subscription unavailable: {error}"))
+                                    })?)
+                                } else {
+                                    None
+                                };
                                 let window = RemoteDeliveryWindow::new(u128::from(snapshot.session_id.get()), WS_WRITE_TIMEOUT);
                                 let ack = json!({
                                     "type": "subscribed", "protocol_version": WS_CONTROL_PROTOCOL_VERSION,
@@ -2753,16 +3006,23 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                                     "session_id": snapshot.session_id.get().to_string(),
                                     "channels": request.channels, "max_fps": request.max_fps,
                                 });
-                                Ok::<_, AppError>((stream, window, ack))
+                                Ok::<_, AppError>((stream, window, watcher, ack))
                             })();
                             match prepared {
-                                Ok((stream, window, ack)) => {
+                                Ok((stream, window, watcher, ack)) => {
                                     if !send_ws_message(&mut socket, WsMessage::Text(ack.to_string().into())).await {
                                         break;
                                     }
                                     debug!(connection_id, channels = ?stream.channels(), "remote subscription accepted");
                                     cadence = WsStreamCadence::new(stream.interval());
-                                    interval = ws_interval(cadence.current);
+                                    schedule = WsStreamSchedule::default();
+                                    if let Some(watcher) = watcher {
+                                        // The watcher's first change yields the current
+                                        // publication immediately after this acknowledgement.
+                                        publications = Some(watcher);
+                                    } else {
+                                        schedule.request();
+                                    }
                                     subscription = Some(stream);
                                     delivery = Some(window);
                                 }
@@ -3015,6 +3275,8 @@ pub struct NarrativeSearchQueryParams {
     pub to: Option<u64>,
     /// Optional maximum number of hits (capped at 4096, default 32)
     pub limit: Option<usize>,
+    /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+    pub run_id: Option<String>,
 }
 
 #[utoipa::path(
@@ -3038,6 +3300,7 @@ async fn get_narrative_search(
         from_tick: params.from,
         to_tick: params.to,
         limit: params.limit,
+        run_id: params.run_id,
     };
     let hits = run_control(move || state.handle.narrative_search(query)).await?;
     Ok(Json(hits))
@@ -3047,6 +3310,8 @@ async fn get_narrative_search(
 pub struct NarrativeAroundQueryParams {
     /// Half-window size in ticks (capped at 10000, default 100)
     pub window: Option<u64>,
+    /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+    pub run_id: Option<String>,
 }
 
 #[utoipa::path(
@@ -3071,6 +3336,7 @@ async fn get_narrative_around(
     let query = NarrativeAroundQuery {
         tick,
         window: params.window,
+        run_id: params.run_id,
     };
     let hits = run_control(move || state.handle.narrative_around(query)).await?;
     Ok(Json(hits))
@@ -3175,6 +3441,141 @@ async fn get_agents_debug(
         }),
     }
     Ok(Json(AgentDebugResponse { agents }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentInspectionParams {
+    uid: String,
+    session_id: String,
+    epoch: String,
+}
+
+impl AgentInspectionParams {
+    fn identities(&self) -> Result<(scriptbots_core::AgentUid, u64, u64), AppError> {
+        let parse = |value: &str| {
+            scriptbots_runtime::inspector::parse_agent_uid(value).ok_or_else(|| {
+                AppError::bad_request("inspector identities must be canonical u64 decimal strings")
+            })
+        };
+        Ok((
+            parse(&self.uid)?,
+            parse(&self.session_id)?.get(),
+            parse(&self.epoch)?.get(),
+        ))
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agents/inspect",
+    tag = "control",
+    params(
+        ("uid" = String, Query, description = "Exact canonical decimal stable creature UID"),
+        ("session_id" = String, Query, description = "Exact host session from the displayed frame"),
+        ("epoch" = String, Query, description = "Exact evolution epoch from the displayed frame")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Bounded scriptbots.agent-inspection.v1 owner observation; all identities are decimal strings"),
+        (status = 400, body = ErrorResponse),
+        (status = 404, body = ErrorResponse, description = "Creature is no longer present"),
+        (status = 409, body = ErrorResponse, description = "Host session or epoch changed"),
+        (status = 503, body = ErrorResponse, description = "Owner read deadline or availability failure")
+    )
+)]
+async fn get_agent_inspection(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<AgentInspectionParams>,
+) -> Result<Json<scriptbots_runtime::inspector::AgentInspection>, AppError> {
+    let (uid, session_id, epoch) = params.identities()?;
+    let detail = run_control(move || state.handle.inspect_agent(uid, session_id, epoch)).await?;
+    detail
+        .map(Json)
+        .ok_or_else(|| AppError::not_found("creature is no longer present in this host"))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agents/brain",
+    tag = "control",
+    params(
+        ("uid" = String, Query, description = "Exact canonical decimal stable creature UID"),
+        ("session_id" = String, Query, description = "Exact host session from the displayed frame"),
+        ("epoch" = String, Query, description = "Exact evolution epoch from the displayed frame")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Bounded scriptbots.brain-activity.v1 observation, including typed missing/unbound/unsupported outcomes; no persistent probe is installed"),
+        (status = 400, body = ErrorResponse),
+        (status = 409, body = ErrorResponse, description = "Host session or epoch changed"),
+        (status = 503, body = ErrorResponse, description = "Owner read deadline or availability failure")
+    )
+)]
+async fn get_brain_activity(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<AgentInspectionParams>,
+) -> Result<Json<scriptbots_runtime::inspector::BrainActivityInspection>, AppError> {
+    let (uid, session_id, epoch) = params.identities()?;
+    run_control(move || state.handle.inspect_brain_activity(uid, session_id, epoch))
+        .await
+        .map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenomeInspectionParams {
+    uid: String,
+    session_id: String,
+    epoch: String,
+    #[serde(default)]
+    locus_offset: usize,
+    #[serde(default)]
+    delta_offset: usize,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agents/genome",
+    tag = "control",
+    params(
+        ("uid" = String, Query, description = "Exact canonical decimal creature UID"),
+        ("session_id" = String, Query, description = "Exact host session from the displayed frame"),
+        ("epoch" = String, Query, description = "Exact evolution epoch from the displayed frame"),
+        ("locus_offset" = Option<usize>, Query, description = "Canonical locus offset, a multiple of 64 up to 65536"),
+        ("delta_offset" = Option<usize>, Query, description = "Parent difference offset, a multiple of 32 up to 65536")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Bounded scriptbots.genome-inspection.v2 exact f32/f64 locus and parent-difference pages; unavailable source material is typed"),
+        (status = 400, body = ErrorResponse),
+        (status = 409, body = ErrorResponse, description = "Host session or epoch changed"),
+        (status = 503, body = ErrorResponse, description = "Owner read deadline or availability failure")
+    )
+)]
+async fn get_genome_inspection(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<GenomeInspectionParams>,
+) -> Result<Json<scriptbots_runtime::inspector::GenomeInspection>, AppError> {
+    scriptbots_runtime::inspector::validate_genome_page_offsets(
+        params.locus_offset,
+        params.delta_offset,
+    )
+    .map_err(|_| AppError::bad_request("invalid bounded genome locus or difference page offset"))?;
+    let identities = AgentInspectionParams {
+        uid: params.uid,
+        session_id: params.session_id,
+        epoch: params.epoch,
+    };
+    let (uid, session_id, epoch) = identities.identities()?;
+    run_control(move || {
+        state.handle.inspect_genome_page(
+            uid,
+            session_id,
+            epoch,
+            params.locus_offset,
+            params.delta_offset,
+        )
+    })
+    .await
+    .map(Json)
 }
 
 #[utoipa::path(
@@ -3573,6 +3974,104 @@ async fn post_control_intervene(
     Ok(Json(status))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/control/browser-intervention",
+    tag = "control",
+    request_body = Object,
+    responses(
+        (status = 200, body = Object, description = "Exact two-axis owner receipt; applied means queued for the next scientific tick"),
+        (status = 400, body = ErrorResponse),
+        (status = 409, body = ErrorResponse, description = "Source changed, owner is not paused, or retry payload conflicts"),
+        (status = 503, body = ErrorResponse, description = "Admission outcome may be unknown; retain and retry the identical request")
+    )
+)]
+async fn post_browser_intervention(
+    State(state): State<ApiState>,
+    Json(request): Json<scriptbots_runtime::remote::BrowserInterventionRequest>,
+) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionReceipt>, AppError> {
+    run_control(move || state.handle.browser_intervene(&request))
+        .await
+        .map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserInterventionStatusQuery {
+    session_id: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/control/browser-intervention/{command_id}",
+    tag = "control",
+    params(
+        ("command_id" = String, Path, description = "Exact command identity returned by submission"),
+        ("session_id" = String, Query, description = "Exact immutable host session")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Retained canonical application and journal status"),
+        (status = 404, body = ErrorResponse, description = "No retained receipt; absence does not prove non-admission"),
+        (status = 409, body = ErrorResponse),
+        (status = 503, body = ErrorResponse)
+    )
+)]
+async fn get_browser_intervention_status(
+    State(state): State<ApiState>,
+    axum::extract::Path(command_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<BrowserInterventionStatusQuery>,
+) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionReceipt>, AppError> {
+    run_control(move || {
+        state
+            .handle
+            .browser_intervention_status(&command_id, &query.session_id)
+    })
+    .await?
+    .map(Json)
+    .ok_or_else(|| AppError::not_found("no retained command receipt; admission remains unknown"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserInterventionHistoryQuery {
+    session_id: String,
+    epoch: String,
+    after_seq: String,
+    limit: usize,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/interventions/browser",
+    tag = "control",
+    params(
+        ("session_id" = String, Query, description = "Exact displayed host session"),
+        ("epoch" = String, Query, description = "Exact displayed evolution epoch"),
+        ("after_seq" = String, Query, description = "Exclusive exact audit cursor, initially 0"),
+        ("limit" = usize, Query, description = "Page size from 1 through 64")
+    ),
+    responses(
+        (status = 200, body = Object, description = "Bounded global observed effects and exact retention gap; no per-command attribution"),
+        (status = 400, body = ErrorResponse),
+        (status = 409, body = ErrorResponse)
+    )
+)]
+async fn get_browser_intervention_history(
+    State(state): State<ApiState>,
+    axum::extract::Query(query): axum::extract::Query<BrowserInterventionHistoryQuery>,
+) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionHistory>, AppError> {
+    run_control(move || {
+        state.handle.browser_intervention_history(
+            &query.session_id,
+            &query.epoch,
+            &query.after_seq,
+            query.limit,
+        )
+    })
+    .await
+    .map(Json)
+}
+
 /// The client-supplied idempotency key from an MCP tool call, if any.
 ///
 /// Same absent-is-absent rule as the HTTP header: a blank string is not a key.
@@ -3939,6 +4438,312 @@ async fn get_v1_checkpoint_by_id(
     Ok(Json(meta))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCanvasQuery {
+    session_id: String,
+}
+
+impl CheckpointCanvasQuery {
+    fn session(&self) -> Result<scriptbots_runtime::HostSessionId, AppError> {
+        self.session_id
+            .parse::<u64>()
+            .ok()
+            .filter(|value| value.to_string() == self.session_id)
+            .map(scriptbots_runtime::HostSessionId::new)
+            .ok_or_else(|| {
+                AppError::bad_request(
+                    "checkpoint canvas session_id must be a canonical u64 decimal string",
+                )
+            })
+    }
+}
+
+/// A verified saved scientific cut, distinct from a live owner publication.
+/// The binary payload retains exact integer identities through the existing
+/// browser decoder; its environment and agents share the saved boundary.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CheckpointCanvasResponse {
+    schema: String,
+    source_session_id: String,
+    checkpoint: CheckpointMetadataDto,
+    frame_base64: String,
+}
+
+fn checkpoint_canvas_protocol_error(
+    error: scriptbots_runtime::remote::RemoteProtocolError,
+) -> AppError {
+    use scriptbots_runtime::remote::RemoteProtocolError;
+    match error {
+        bound @ (RemoteProtocolError::FrameTooLarge(_)
+        | RemoteProtocolError::LimitExceeded { .. }) => {
+            AppError::payload_too_large(bound.to_string())
+        }
+        error => AppError::internal(format!("checkpoint canvas projection failed: {error}")),
+    }
+}
+
+fn checkpoint_canvas_response(
+    handle: &ControlHandle,
+    checkpoint_id: &str,
+    expected_session: scriptbots_runtime::HostSessionId,
+) -> Result<CheckpointCanvasResponse, AppError> {
+    use scriptbots_runtime::remote::{RemoteEnvironmentSnapshot, RemoteFramePayload};
+
+    if handle.session_id() != expected_session {
+        return Err(AppError::conflict(
+            "checkpoint canvas host session changed; reconnect before reviewing saved worlds",
+        ));
+    }
+    let (checkpoint, snapshot) = handle
+        .checkpoint_canvas_bounded(checkpoint_id)
+        .map_err(AppError::from)?;
+    if snapshot.session_id != expected_session
+        || snapshot.world.tick != checkpoint.tick
+        || snapshot.world.agents.len() != checkpoint.agent_count
+    {
+        return Err(AppError::conflict(
+            "checkpoint canvas does not match its requested owner and saved scientific cut",
+        ));
+    }
+    let environment = RemoteEnvironmentSnapshot::capture(&snapshot)
+        .map_err(checkpoint_canvas_protocol_error)?;
+    let frame = RemoteFrame {
+        identity: snapshot.as_ref().into(),
+        playback: snapshot.playback,
+        coalesced_publications: 0,
+        environment: Some(Arc::new(environment)),
+        payload: RemoteFramePayload::Canvas(snapshot.world.clone()),
+    };
+    let bytes = encode_remote_frame(&frame).map_err(checkpoint_canvas_protocol_error)?;
+    if handle.session_id() != expected_session {
+        return Err(AppError::conflict(
+            "checkpoint canvas host session changed during reconstruction",
+        ));
+    }
+    Ok(CheckpointCanvasResponse {
+        schema: CHECKPOINT_CANVAS_SCHEMA.to_owned(),
+        source_session_id: expected_session.get().to_string(),
+        checkpoint,
+        frame_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints/{checkpoint_id}/canvas",
+    tag = "checkpoints",
+    params(
+        ("checkpoint_id" = String, Path, description = "Unique saved checkpoint identifier"),
+        ("session_id" = String, Query, description = "Required exact canonical decimal session of the connected live owner"),
+        ("X-ScriptBots-Session" = Option<String>, Header, description = "Exact canonical decimal host session negotiated by the remote stream")
+    ),
+    responses(
+        (status = 200, description = "Read-only reconstructed science and bounded environment in a base64 SBWS canvas frame; not an original host publication or a live-owner replacement", body = CheckpointCanvasResponse),
+        (status = 400, description = "Invalid identity or corrupt saved artifact"),
+        (status = 404, description = "Checkpoint unavailable"),
+        (status = 409, description = "Owner or saved-source identity changed"),
+        (status = 413, description = "Source or canvas exceeds reconstruction or transport bounds"),
+        (status = 500, description = "Saved science could not be projected or encoded"),
+        (status = 503, description = "Reconstruction capacity or deadline unavailable")
+    )
+)]
+async fn get_v1_checkpoint_canvas(
+    State(state): State<ApiState>,
+    axum::extract::Path(checkpoint_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<CheckpointCanvasQuery>,
+) -> Result<Response, AppError> {
+    let expected_session = query.session()?;
+    if state.handle.session_id() != expected_session {
+        return Err(AppError::conflict(
+            "checkpoint canvas host session changed; reconnect before reviewing saved worlds",
+        ));
+    }
+    // Reject overload before queueing a blocking task. A cancelled request must
+    // not release capacity while its non-cancellable reconstruction still runs.
+    let permit = CHECKPOINT_CANVAS_SLOTS.try_acquire().map_err(|_| {
+        AppError::service_unavailable(
+            "a checkpoint canvas is still being reconstructed; retry when it completes",
+        )
+    })?;
+    let mut reconstruction = AbortOnDrop(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let response =
+            checkpoint_canvas_response(&state.handle, &checkpoint_id, expected_session)?;
+        let bytes = serde_json::to_vec(&response)
+            .map_err(|error| AppError::internal(format!("checkpoint canvas encoding: {error}")))?;
+        if bytes.len() > MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES {
+            return Err(AppError::payload_too_large(
+                "checkpoint canvas response exceeds its 12 MiB transport bound",
+            ));
+        }
+        Ok(bytes)
+    }));
+    let bytes = tokio::time::timeout(CHECKPOINT_CANVAS_TIMEOUT, &mut reconstruction.0)
+        .await
+        .map_err(|_| {
+            AppError::service_unavailable(
+                "checkpoint canvas deadline exceeded; running reconstruction retains its slot until it finishes",
+            )
+        })?
+        .map_err(|error| AppError::internal(format!("checkpoint canvas worker failed: {error}")))??;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints/branches",
+    tag = "checkpoints",
+    params(PaginationQueryParams),
+    responses(
+        (status = 200, description = "Bounded admitted-study history, including recovered terminal receipts; this does not resume a study or reverify its artifacts", body = PaginatedCheckpointBranchesResponse),
+        (status = 400, description = "Invalid pagination cursor"),
+        (status = 409, description = "Retained study identities conflict")
+    )
+)]
+async fn get_v1_checkpoint_branches(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
+) -> Result<Json<PaginatedCheckpointBranchesResponse>, AppError> {
+    let page = run_control(move || {
+        state
+            .handle
+            .list_checkpoint_branches(params.limit, params.cursor.as_deref())
+    })
+    .await?;
+    Ok(Json(page))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/checkpoints/branches",
+    tag = "checkpoints",
+    request_body = CheckpointBranchRequest,
+    responses(
+        (status = 202, description = "Observed branch job state; admission does not prove completion", body = CheckpointBranchStatusDto),
+        (status = 400, description = "Malformed or out-of-bounds request"),
+        (status = 404, description = "Source checkpoint not found"),
+        (status = 409, description = "Retry identity conflicts with its original request"),
+        (status = 413, description = "Request exceeds the branch byte limit"),
+        (status = 503, description = "Execution capacity unavailable")
+    )
+)]
+async fn post_v1_checkpoint_branches(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Result<(StatusCode, Json<CheckpointBranchStatusDto>), AppError> {
+    require_json_content_type(&headers, &bytes)?;
+    if bytes.len() > MAX_CHECKPOINT_BRANCH_REQUEST_BYTES {
+        return Err(AppError::payload_too_large(format!(
+            "checkpoint branch request exceeds {MAX_CHECKPOINT_BRANCH_REQUEST_BYTES} bytes"
+        )));
+    }
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(AppError::bad_request(
+            "checkpoint branch request must be a JSON object",
+        ));
+    }
+    let body: CheckpointBranchRequest = serde_json::from_slice(&bytes).map_err(|error| {
+        AppError::bad_request(format!("invalid checkpoint branch request: {error}"))
+    })?;
+    let header_keys = headers.get_all("Idempotency-Key");
+    let mut keys = header_keys.iter();
+    if let Some(key) = keys.next() {
+        if keys.next().is_some() {
+            return Err(AppError::bad_request(
+                "checkpoint branch requests accept only one Idempotency-Key header",
+            ));
+        }
+        let key = key
+            .to_str()
+            .map_err(|_| AppError::bad_request("Idempotency-Key header must contain valid text"))?;
+        if key != body.idempotency_key {
+            return Err(AppError::bad_request(
+                "Idempotency-Key header differs from the checkpoint branch request key",
+            ));
+        }
+    }
+    let status = run_control(move || state.handle.create_checkpoint_branch(body)).await?;
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints/branches/{branch_id}",
+    tag = "checkpoints",
+    params(("branch_id" = String, Path, description = "Managed checkpoint branch job identifier")),
+    responses(
+        (status = 200, body = CheckpointBranchStatusDto),
+        (status = 404, description = "Branch job not found")
+    )
+)]
+async fn get_v1_checkpoint_branch(
+    State(state): State<ApiState>,
+    axum::extract::Path(branch_id): axum::extract::Path<String>,
+) -> Result<Json<CheckpointBranchStatusDto>, AppError> {
+    let status = run_control(move || state.handle.get_checkpoint_branch(&branch_id)).await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints/branches/{branch_id}/artifacts",
+    tag = "checkpoints",
+    params(
+        ("branch_id" = String, Path, description = "Completed managed checkpoint branch job"),
+        PaginationQueryParams,
+        ("X-ScriptBots-Session" = Option<String>, Header, description = "Exact canonical decimal host session negotiated by the remote stream")
+    ),
+    responses(
+        (status = 200, body = PaginatedArtifactsResponse, description = "Actual retained study files published after every branch bundle verifies"),
+        (status = 400, body = ErrorResponse),
+        (status = 404, body = ErrorResponse, description = "Branch job not found"),
+        (status = 409, body = ErrorResponse, description = "Branch is not complete or the requested host session changed")
+    )
+)]
+async fn get_v1_checkpoint_branch_artifacts(
+    State(state): State<ApiState>,
+    axum::extract::Path(branch_id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
+) -> Result<Json<PaginatedArtifactsResponse>, AppError> {
+    let artifacts = run_control(move || {
+        state.handle.list_checkpoint_branch_artifacts(
+            &branch_id,
+            params.limit,
+            params.cursor.as_deref(),
+        )
+    })
+    .await?;
+    Ok(Json(artifacts))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/checkpoints/branches/{branch_id}/cancel",
+    tag = "checkpoints",
+    params(("branch_id" = String, Path, description = "Managed checkpoint branch job identifier")),
+    responses(
+        (status = 200, description = "Observed state; cancelling is a request, cancelled is an observed stop", body = CheckpointBranchStatusDto),
+        (status = 404, description = "Branch job not found")
+    )
+)]
+async fn post_v1_checkpoint_branch_cancel(
+    State(state): State<ApiState>,
+    axum::extract::Path(branch_id): axum::extract::Path<String>,
+) -> Result<Json<CheckpointBranchStatusDto>, AppError> {
+    let status = run_control(move || state.handle.cancel_checkpoint_branch(&branch_id)).await?;
+    Ok(Json(status))
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/artifacts",
@@ -4015,6 +4820,74 @@ fn prepare_rest_server(
     let mut openapi = ApiDoc::openapi();
     openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
 
+    // Every browser Lab operation shares the owner-session fence before its
+    // handler can admit work, cancel a worker, read artifacts or run analysis.
+    let lab_router = Router::new()
+        // Experiments lifecycle
+        .route(
+            "/api/v1/experiments",
+            post(post_v1_experiments).get(get_v1_experiments),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}",
+            get(get_v1_experiment_by_id),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/compare",
+            post(post_v1_experiment_compare).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/cancel",
+            post(post_v1_experiment_cancel),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/resume",
+            post(post_v1_experiment_resume),
+        )
+        .route(
+            "/api/v1/checkpoints",
+            post(post_v1_checkpoints).get(get_v1_checkpoints),
+        )
+        .route(
+            "/api/v1/checkpoints/{checkpoint_id}",
+            get(get_v1_checkpoint_by_id),
+        )
+        .route(
+            "/api/v1/checkpoints/{checkpoint_id}/canvas",
+            get(get_v1_checkpoint_canvas),
+        )
+        .route(
+            "/api/v1/checkpoints/branches",
+            post(post_v1_checkpoint_branches)
+                .get(get_v1_checkpoint_branches)
+                .layer(DefaultBodyLimit::max(MAX_CHECKPOINT_BRANCH_REQUEST_BYTES)),
+        )
+        .route(
+            "/api/v1/checkpoints/branches/{branch_id}",
+            get(get_v1_checkpoint_branch),
+        )
+        .route(
+            "/api/v1/checkpoints/branches/{branch_id}/artifacts",
+            get(get_v1_checkpoint_branch_artifacts),
+        )
+        .route(
+            "/api/v1/checkpoints/branches/{branch_id}/cancel",
+            post(post_v1_checkpoint_branch_cancel),
+        )
+        .route("/api/v1/artifacts", get(get_v1_artifacts))
+        .route(
+            "/api/v1/artifacts/{artifact_id}",
+            get(get_v1_artifact_by_id),
+        )
+        .route(
+            "/api/v1/artifacts/{artifact_id}/download",
+            get(get_v1_artifact_download),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.handle.session_id(),
+            enforce_lab_session,
+        ));
+
     let api_router = Router::new()
         .route("/api/knobs", get(get_knobs))
         .route("/api/config", get(get_config).patch(patch_config))
@@ -4034,6 +4907,9 @@ fn prepare_rest_server(
         .route("/api/narrative/around/{tick}", get(get_narrative_around))
         .route("/api/scoreboard", get(get_scoreboard))
         .route("/api/agents/debug", get(get_agents_debug))
+        .route("/api/agents/inspect", get(get_agent_inspection))
+        .route("/api/agents/brain", get(get_brain_activity))
+        .route("/api/agents/genome", get(get_genome_inspection))
         .route("/api/selection", post(post_selection).get(get_selection))
         .route("/api/interventions", get(get_interventions))
         // Scenario identity and presets
@@ -4062,52 +4938,25 @@ fn prepare_rest_server(
         )
         // Interventions control commands
         .route("/api/control/intervene", post(post_control_intervene))
+        .route(
+            "/api/control/browser-intervention",
+            post(post_browser_intervention).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/control/browser-intervention/{command_id}",
+            get(get_browser_intervention_status),
+        )
+        .route(
+            "/api/interventions/browser",
+            get(get_browser_intervention_history),
+        )
         .route("/api/interventions", post(post_control_intervene))
         // Version and schema discovery
         .route("/api/version", get(get_version))
         .route("/api/v1/version", get(get_v1_version))
         .route("/api/schema", get(get_schema))
         .route("/api/v1/schema", get(get_v1_schema))
-        // Experiments lifecycle
-        .route(
-            "/api/v1/experiments",
-            post(post_v1_experiments).get(get_v1_experiments),
-        )
-        .route(
-            "/api/v1/experiments/{experiment_id}",
-            get(get_v1_experiment_by_id),
-        )
-        .route(
-            "/api/v1/experiments/{experiment_id}/compare",
-            post(post_v1_experiment_compare).layer(DefaultBodyLimit::max(4096)),
-        )
-        .route(
-            "/api/v1/experiments/{experiment_id}/cancel",
-            post(post_v1_experiment_cancel),
-        )
-        .route(
-            "/api/v1/experiments/{experiment_id}/resume",
-            post(post_v1_experiment_resume),
-        )
-        // Checkpoints lifecycle
-        .route(
-            "/api/v1/checkpoints",
-            post(post_v1_checkpoints).get(get_v1_checkpoints),
-        )
-        .route(
-            "/api/v1/checkpoints/{checkpoint_id}",
-            get(get_v1_checkpoint_by_id),
-        )
-        // Artifacts discovery and download
-        .route("/api/v1/artifacts", get(get_v1_artifacts))
-        .route(
-            "/api/v1/artifacts/{artifact_id}",
-            get(get_v1_artifact_by_id),
-        )
-        .route(
-            "/api/v1/artifacts/{artifact_id}/download",
-            get(get_v1_artifact_download),
-        )
+        .merge(lab_router)
         .with_state(state);
 
     let swagger_router: Router<_> = SwaggerUi::new(config.swagger_path.clone())
@@ -4479,6 +5328,11 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                     "type": "string",
                     "description": "Full-text query string (e.g. population, extinction, drought)"
                 },
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$",
+                    "description": "Stored run ID; required for multi-run databases. Explicit selection never uses live memory."
+                },
                 "from_tick": {
                     "type": "integer",
                     "minimum": 0,
@@ -4491,7 +5345,7 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                 },
                 "limit": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": 4096,
                     "description": "Max events to return (default 32, max 4096)"
                 }
@@ -4515,9 +5369,14 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                     "minimum": 0,
                     "description": "Center tick to retrieve events around"
                 },
+                "run_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$",
+                    "description": "Stored run ID; required for multi-run databases. Explicit selection never uses live memory."
+                },
                 "window": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 0,
                     "maximum": 10000,
                     "description": "Half-window size in ticks (default 100, max 10000)"
                 }
@@ -4745,6 +5604,108 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
         ControlToolKind::CheckpointStatus,
         handle.clone(),
     );
+
+    builder = register_tool(
+        builder,
+        "checkpoint_branch_list",
+        "Discover admitted checkpoint studies, including recovered completed and stopped receipts, with bounded pagination. Reading history never resumes science or reconstructs a treatment request; download artifacts separately to verify retained bytes.",
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "cursor": {"type": "string"}
+            },
+            "additionalProperties": false
+        }),
+        ControlToolKind::CheckpointBranchList,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "checkpoint_branch_create",
+        "Run a bounded independent future from a saved checkpoint, preserving the live owner. With an intervention, compare matched control and treatment futures. Reuse the exact idempotency key and payload after an uncertain response. Admission is not completion; poll checkpoint_branch_status and download artifact_id only after completion.",
+        json!({
+            "type": "object",
+            "properties": {
+                "checkpoint_id": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": MAX_CHECKPOINT_BRANCH_ID_BYTES,
+                    "pattern": "^[A-Za-z0-9_-]+$"
+                },
+                "branch_name": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": MAX_CHECKPOINT_BRANCH_NAME_BYTES,
+                    "pattern": "^[A-Za-z0-9_-]+$"
+                },
+                "ticks": {
+                    "type": "integer", "minimum": 1,
+                    "maximum": MAX_CHECKPOINT_BRANCH_TICKS,
+                    "description": "Additional scientific ticks from the saved cut"
+                },
+                "intervention": {
+                    "description": "Optional existing StudyIntervention; ConfigPatch uses its config object as params. Service validates parameters against the actual saved world.",
+                    "anyOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": [
+                                    "Drought", "ResourceShock", "TemperatureShift",
+                                    "ClosedWorld", "Cooperation", "Core", "ConfigPatch"
+                                ]},
+                                "params": {"type": "object"}
+                            },
+                            "required": ["type", "params"],
+                            "additionalProperties": false
+                        }
+                    ]
+                },
+                "idempotency_key": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": MAX_CHECKPOINT_BRANCH_KEY_BYTES
+                }
+            },
+            "required": ["checkpoint_id", "branch_name", "ticks", "idempotency_key"],
+            "additionalProperties": false,
+            "description": format!("Serialized request must fit {MAX_CHECKPOINT_BRANCH_REQUEST_BYTES} bytes; identifier/key limits are UTF-8 byte limits.")
+        }),
+        ControlToolKind::CheckpointBranchCreate,
+        handle.clone(),
+    );
+
+    for (name, description, kind) in [
+        (
+            "checkpoint_branch_status",
+            "Read observed managed checkpoint branch state. world_digest_v1 identifies the source checkpoint; only completed jobs expose their report artifact.",
+            ControlToolKind::CheckpointBranchStatus,
+        ),
+        (
+            "checkpoint_branch_cancel",
+            "Request cooperative cancellation of a managed checkpoint branch. Cancelling is not proof that it has stopped; poll the observed status.",
+            ControlToolKind::CheckpointBranchCancel,
+        ),
+    ] {
+        builder = register_tool(
+            builder,
+            name,
+            description,
+            json!({
+                "type": "object",
+                "properties": {
+                    "branch_id": {
+                        "type": "string", "minLength": 1,
+                        "maxLength": MAX_CHECKPOINT_BRANCH_ID_BYTES,
+                        "pattern": "^[A-Za-z0-9_-]+$"
+                    }
+                },
+                "required": ["branch_id"],
+                "additionalProperties": false
+            }),
+            kind,
+            handle.clone(),
+        );
+    }
 
     builder = register_tool(
         builder,
@@ -4990,6 +5951,19 @@ struct ControlTool {
     schema: Value,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpCheckpointBranchPageRequest {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpCheckpointBranchIdRequest {
+    branch_id: String,
+}
+
 #[derive(Clone, Copy)]
 enum ControlToolKind {
     ListPresets,
@@ -5021,6 +5995,10 @@ enum ControlToolKind {
     CheckpointCreate,
     CheckpointList,
     CheckpointStatus,
+    CheckpointBranchCreate,
+    CheckpointBranchList,
+    CheckpointBranchStatus,
+    CheckpointBranchCancel,
     ArtifactList,
     ArtifactGet,
 }
@@ -5042,7 +6020,12 @@ impl ToolHandler for ControlTool {
     fn call(&self, _ctx: &fastmcp_rust::McpContext, arguments: Value) -> McpResult<Vec<Content>> {
         if matches!(
             self.kind,
-            ControlToolKind::Step | ControlToolKind::ExperimentCompare
+            ControlToolKind::Step
+                | ControlToolKind::ExperimentCompare
+                | ControlToolKind::CheckpointBranchCreate
+                | ControlToolKind::CheckpointBranchList
+                | ControlToolKind::CheckpointBranchStatus
+                | ControlToolKind::CheckpointBranchCancel
         ) && !arguments.is_object()
         {
             return Err(McpError::new(
@@ -5310,38 +6293,25 @@ impl ToolHandler for ControlTool {
                 make_tool_result(status)
             }
             ControlToolKind::NarrativeSearch => {
-                let query_str =
-                    arguments
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            McpError::new(McpErrorCode::InvalidParams, "missing 'query' field")
-                        })?;
-                let from_tick = arguments.get("from_tick").and_then(|v| v.as_u64());
-                let to_tick = arguments.get("to_tick").and_then(|v| v.as_u64());
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize);
-                let query = NarrativeSearchQuery {
-                    query: query_str.to_string(),
-                    from_tick,
-                    to_tick,
-                    limit,
-                };
+                let query: NarrativeSearchQuery = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid narrative_search parameters: {error}"),
+                        )
+                    })?;
                 let handle = self.handle.clone();
                 let hits = run_control_mcp_sync(move || handle.narrative_search(query))?;
                 make_tool_result(hits)
             }
             ControlToolKind::NarrativeAround => {
-                let tick = arguments
-                    .get("tick")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        McpError::new(McpErrorCode::InvalidParams, "missing 'tick' field")
+                let query: NarrativeAroundQuery = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid narrative_around parameters: {error}"),
+                        )
                     })?;
-                let window = arguments.get("window").and_then(|v| v.as_u64());
-                let query = NarrativeAroundQuery { tick, window };
                 let handle = self.handle.clone();
                 let hits = run_control_mcp_sync(move || handle.narrative_around(query))?;
                 make_tool_result(hits)
@@ -5477,6 +6447,52 @@ impl ToolHandler for ControlTool {
                 let res = run_control_mcp_sync(move || handle.get_checkpoint(&checkpoint_id))?;
                 make_tool_result(res)
             }
+            ControlToolKind::CheckpointBranchList => {
+                let request: McpCheckpointBranchPageRequest =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid checkpoint_branch_list parameters: {error}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let page = run_control_mcp_sync(move || {
+                    handle.list_checkpoint_branches(request.limit, request.cursor.as_deref())
+                })?;
+                make_tool_result(page)
+            }
+            ControlToolKind::CheckpointBranchCreate => {
+                let request: CheckpointBranchRequest =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid checkpoint_branch_create parameters: {error}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let status =
+                    run_control_mcp_sync(move || handle.create_checkpoint_branch(request))?;
+                make_tool_result(status)
+            }
+            ControlToolKind::CheckpointBranchStatus | ControlToolKind::CheckpointBranchCancel => {
+                let request: McpCheckpointBranchIdRequest =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid checkpoint branch identity: {error}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let cancel = matches!(self.kind, ControlToolKind::CheckpointBranchCancel);
+                let status = run_control_mcp_sync(move || {
+                    if cancel {
+                        handle.cancel_checkpoint_branch(&request.branch_id)
+                    } else {
+                        handle.get_checkpoint_branch(&request.branch_id)
+                    }
+                })?;
+                make_tool_result(status)
+            }
             ControlToolKind::ArtifactList => {
                 let limit = arguments
                     .get("limit")
@@ -5595,7 +6611,11 @@ fn map_control_error(err: ControlError) -> McpError {
         ControlError::NotFound(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::BadRequest(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
         ControlError::PayloadTooLarge(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
-        ControlError::Conflict(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
+        // The request decoded and satisfied the tool schema, but conflicts with
+        // retained application state (for example an admitted retry identity).
+        // MCP reports this business-logic refusal as an actionable tool result;
+        // malformed arguments still use the protocol error above.
+        ControlError::Conflict(msg) => McpError::new(McpErrorCode::ToolExecutionError, msg),
         ControlError::UnknownPath(path) => McpError::new(
             McpErrorCode::InvalidParams,
             format!("unknown knob path: {path}"),
@@ -5674,24 +6694,21 @@ mod tests {
             .iter()
             .map(|opener| format!("let status = {opener}"))
             .collect();
-        // Rustfmt can wrap a bound call after `=`. Join only that continuation
-        // before classifying statements; the receipt is still actually bound.
-        let normalize_bindings = |candidate: &str| {
-            candidate
-                .lines()
-                .map(str::trim)
-                .collect::<Vec<_>>()
-                .join("\n")
-                .replace("=\n", "= ")
-        };
         let receipt_forms = |candidate: &str| {
-            let candidate = normalize_bindings(candidate);
-            let bound = candidate
-                .lines()
-                .map(str::trim)
-                .any(|line| bound_openers.iter().any(|opener| line.starts_with(opener)));
-            let discarded = candidate.lines().map(str::trim).any(|line| {
-                openers.iter().any(|opener| line.starts_with(opener)) && line.ends_with(';')
+            let lines: Vec<&str> = candidate.lines().map(str::trim).collect();
+            let bound_continuation = |index: usize, line: &str| {
+                index > 0
+                    && lines[index - 1] == "let status ="
+                    && openers.iter().any(|opener| line.starts_with(opener))
+            };
+            let bound = lines.iter().enumerate().any(|(index, line)| {
+                bound_openers.iter().any(|opener| line.starts_with(opener))
+                    || bound_continuation(index, line)
+            });
+            let discarded = lines.iter().enumerate().any(|(index, line)| {
+                openers.iter().any(|opener| line.starts_with(opener))
+                    && line.ends_with(';')
+                    && !bound_continuation(index, line)
             });
             (bound, discarded)
         };
@@ -5704,13 +6721,22 @@ mod tests {
 
         // Deleting every observed binding must invalidate the positive control.
         // The test module is excluded, so its own assertions cannot keep it green.
-        let deleted = normalize_bindings(source)
-            .lines()
-            .filter(|line| {
-                !bound_openers
-                    .iter()
-                    .any(|opener| line.trim().starts_with(opener))
+        let source_lines: Vec<&str> = source.lines().collect();
+        let deleted = source_lines
+            .iter()
+            .enumerate()
+            .filter(|(index, line)| {
+                let line = line.trim();
+                let next_is_call = source_lines.get(*index + 1).is_some_and(|next| {
+                    openers.iter().any(|opener| next.trim().starts_with(opener))
+                });
+                let follows_binding =
+                    *index > 0 && source_lines[*index - 1].trim() == "let status =";
+                !bound_openers.iter().any(|opener| line.starts_with(opener))
+                    && !(line == "let status =" && next_is_call)
+                    && !(follows_binding && openers.iter().any(|opener| line.starts_with(opener)))
             })
+            .map(|(_, line)| *line)
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(receipt_forms(&deleted), (false, false));
@@ -5726,6 +6752,10 @@ mod tests {
         for opener in &openers {
             let discarded = format!("{source}\n{opener}pause(None));");
             assert_eq!(receipt_forms(&discarded), (true, true));
+            let split_binding = format!("let status =\n    {opener}pause(None))?;");
+            assert_eq!(receipt_forms(&split_binding), (true, false));
+            let split_discard = format!("let status = unrelated();\n{opener}pause(None))?;");
+            assert_eq!(receipt_forms(&split_discard), (false, true));
         }
         assert_eq!(
             receipt_forms(""),
@@ -5829,6 +6859,296 @@ mod tests {
             .read_to_string(&mut response)
             .expect("read HTTP test response");
         response
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real HTTP experiment distinguishes admission, queue application, effect, retry and source refusal"
+    )]
+    fn browser_intervention_http_retains_identity_and_observes_later_ecological_effect() {
+        let host = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 80,
+                world_height: 80,
+                food_cell_size: 40,
+                closed: true,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                rng_seed: Some(17),
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let source = host.handle().read_snapshot().unwrap();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_enabled: true,
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            allowed_origins: vec!["https://lab.example".to_owned()],
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (runtime, _) = reservation.launch(host.port.clone(), false).unwrap();
+        let post = |body: &Value, origin: &str| {
+            let body = serde_json::to_string(body).unwrap();
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(stream, "POST /api/control/browser-intervention HTTP/1.1\r\nHost: {address}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let decode = |response: &str| -> Value {
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let request = serde_json::json!({
+            "requestId": "web-intervention-http-regression",
+            "sessionId": source.session_id.get().to_string(),
+            "epoch": source.world.epoch.to_string(),
+            "expectedControlRevision": source.revisions.control.get().to_string(),
+            "intervention": {"kind": "drought", "region": {"shape": "all"}, "ticks": 5, "growth_scale": 0.0}
+        });
+        let before = host.port.scientific_digest_v1().unwrap();
+        assert!(post(&request, "https://unlisted.example").starts_with("HTTP/1.1 403"));
+        let mut wrong_source = request.clone();
+        wrong_source["sessionId"] = Value::from("0");
+        assert!(post(&wrong_source, "https://lab.example").starts_with("HTTP/1.1 409"));
+        let mut oversized = request.clone();
+        oversized["requestId"] = Value::from("x".repeat(4097));
+        assert!(post(&oversized, "https://lab.example").starts_with("HTTP/1.1 413"));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(
+            host.handle().read_snapshot().unwrap().revisions,
+            source.revisions
+        );
+
+        let admitted = post(&request, "https://lab.example");
+        assert!(admitted.starts_with("HTTP/1.1 200"), "{admitted}");
+        let admitted = decode(&admitted);
+        let command_id = admitted["commandId"].as_str().unwrap();
+        let queued = host.wait_finished(command_id);
+        assert_eq!(queued.application_state, "applied");
+        assert_eq!(queued.journal_state, "committed_volatile");
+        let status_path = format!(
+            "/api/control/browser-intervention/{command_id}?session_id={}",
+            source.session_id.get()
+        );
+        let observed = decode(&http_get(address, &status_path));
+        assert_eq!(observed["applicationState"], "applied");
+        assert_eq!(observed["applicationBoundary"]["tick"], "0");
+        assert_eq!(observed["journalState"], "committed_volatile");
+        let history_path = format!(
+            "/api/interventions/browser?session_id={}&epoch=0&after_seq=0&limit=32",
+            source.session_id.get()
+        );
+        let before_step = decode(&http_get(address, &history_path));
+        assert!(before_step["records"].as_array().unwrap().is_empty());
+
+        host.wait_applied(&host.handle().step().unwrap());
+        let after_step = decode(&http_get(address, &history_path));
+        assert_eq!(after_step["records"].as_array().unwrap().len(), 1);
+        assert_eq!(after_step["records"][0]["kind"], "drought");
+        assert_eq!(after_step["records"][0]["tick"], "1");
+        assert_eq!(after_step["records"][0]["cellsAffected"], "4");
+        let retry = decode(&post(&request, "https://lab.example"));
+        assert_eq!(retry["commandId"], admitted["commandId"]);
+        assert_eq!(retry["admissionSequence"], admitted["admissionSequence"]);
+        assert_eq!(
+            retry["applicationBoundary"],
+            observed["applicationBoundary"]
+        );
+        let mut conflict = request;
+        conflict["intervention"]["ticks"] = Value::from(7);
+        assert!(post(&conflict, "https://lab.example").starts_with("HTTP/1.1 409"));
+        assert_eq!(host.handle().read_snapshot().unwrap().world.tick, 1);
+        assert_eq!(
+            host.handle()
+                .read_snapshot()
+                .unwrap()
+                .applied_interventions
+                .len(),
+            1
+        );
+        let unknown = http_get(
+            address,
+            &format!(
+                "/api/control/browser-intervention/00000000000000000000000000000000?session_id={}",
+                source.session_id.get()
+            ),
+        );
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+        assert!(unknown.contains("admission remains unknown"));
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one HTTP owner observation covers source binding, CORS refusals and unchanged science"
+    )]
+    fn creature_inspection_http_reads_owner_and_enforces_source_and_origin() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(91),
+            persistence_interval: 0,
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let id = world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let uid = world.agent_uid(id).unwrap();
+        let host = crate::control::tests::TestHost::spawn(world);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let source = host.handle().read_snapshot().unwrap();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_enabled: true,
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            allowed_origins: vec!["https://lab.example".to_owned()],
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (runtime, _) = reservation.launch(host.port.clone(), false).unwrap();
+        let request = |endpoint: &str, query: &str, origin: &str| {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(stream, "GET /api/agents/{endpoint}?{query} HTTP/1.1\r\nHost: {address}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let query = format!(
+            "uid={uid}&session_id={}&epoch={}",
+            source.session_id.get(),
+            source.world.epoch
+        );
+        let response = request("inspect", &query, "https://lab.example");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin: https://lab.example")
+        );
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let detail: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(detail["schema"], "scriptbots.agent-inspection.v1");
+        assert_eq!(detail["uid"], uid.to_string());
+        assert_eq!(
+            detail["source"]["sessionId"],
+            source.session_id.get().to_string()
+        );
+        assert_eq!(detail["source"]["epoch"], source.world.epoch.to_string());
+        assert_eq!(detail["source"]["tick"], source.world.tick.to_string());
+        assert_eq!(
+            detail["sensors"].as_array().unwrap().len(),
+            scriptbots_core::INPUT_SIZE
+        );
+        assert_eq!(detail["outputs"][6]["name"], "boost");
+        assert!(!detail.as_object().unwrap().contains_key("foodDelta"));
+        for (query, code) in [
+            (format!("uid={uid}&session_id=0&epoch=0"), "409"),
+            (
+                format!("uid={uid}&session_id={}&epoch=1", source.session_id.get()),
+                "409",
+            ),
+            (
+                format!(
+                    "uid={}&session_id={}&epoch=1",
+                    u64::MAX,
+                    source.session_id.get()
+                ),
+                "409",
+            ),
+            (
+                format!(
+                    "uid={}&session_id={}&epoch=0",
+                    u64::MAX,
+                    source.session_id.get()
+                ),
+                "404",
+            ),
+            (
+                format!("uid=01&session_id={}&epoch=0", source.session_id.get()),
+                "400",
+            ),
+        ] {
+            let refusal = request("inspect", &query, "https://lab.example");
+            assert!(
+                refusal.starts_with(&format!("HTTP/1.1 {code}")),
+                "{refusal}"
+            );
+            assert!(
+                refusal
+                    .to_ascii_lowercase()
+                    .contains("access-control-allow-origin: https://lab.example")
+            );
+        }
+        let forbidden = request("inspect", &query, "https://unlisted.example");
+        assert!(forbidden.starts_with("HTTP/1.1 403"), "{forbidden}");
+        let activity = request("brain", &query, "https://lab.example");
+        assert!(activity.starts_with("HTTP/1.1 200"), "{activity}");
+        let activity: Value =
+            serde_json::from_str(activity.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(activity["schema"], "scriptbots.brain-activity.v1");
+        assert_eq!(activity["status"], "unavailable");
+        assert_eq!(activity["reason"], "unbound_brain");
+        assert_eq!(activity["source"], detail["source"]);
+        for (query, code) in [
+            (
+                format!(
+                    "uid={}&session_id={}&epoch=1",
+                    u64::MAX,
+                    source.session_id.get()
+                ),
+                "409",
+            ),
+            (
+                format!("uid=01&session_id={}&epoch=0", source.session_id.get()),
+                "400",
+            ),
+            (
+                format!(
+                    "uid={}&session_id={}&epoch=0",
+                    u64::MAX,
+                    source.session_id.get()
+                ),
+                "200",
+            ),
+        ] {
+            let reply = request("brain", &query, "https://lab.example");
+            assert!(reply.starts_with(&format!("HTTP/1.1 {code}")), "{reply}");
+            assert!(
+                reply
+                    .to_ascii_lowercase()
+                    .contains("access-control-allow-origin: https://lab.example")
+            );
+            if code == "200" {
+                let absent: Value =
+                    serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(absent["reason"], "missing_agent");
+                assert_eq!(absent["uid"], u64::MAX.to_string());
+            }
+        }
+        assert!(request("brain", &query, "https://unlisted.example").starts_with("HTTP/1.1 403"));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(
+            host.handle().read_snapshot().unwrap().revision,
+            source.revision
+        );
+        runtime.shutdown().unwrap();
     }
 
     fn http_post_json(address: SocketAddr, path: &str, body: &Value) -> String {
@@ -5989,6 +7309,448 @@ mod tests {
             .check(&headers, &h2_uri, Version::HTTP_2)
             .expect("HTTP/2 authority without Host");
         assert!(policy.check(&headers, &uri, Version::HTTP_11).is_err());
+    }
+
+    #[tokio::test]
+    #[serial(checkpoint_canvas)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real saved world crosses the HTTP response codec and corruption refusal"
+    )]
+    async fn checkpoint_canvas_endpoint_preserves_saved_science_and_live_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 10,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+        for _ in 0..2 {
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .unwrap();
+            assert!(world.bind_agent_brain(id, brains.population()[0]).unwrap());
+        }
+        let host = crate::control::tests::TestHost::spawn(world);
+        let root = directory.path().join("artifacts");
+        let handle = host.handle().with_artifacts_dir(root.clone()).unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let saved_publication = host.port.snapshot_hub().latest();
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest {
+                description: Some("saved canvas transport source".into()),
+                idempotency_key: Some("canvas-source".into()),
+            })
+            .unwrap();
+        let (artifact, _) = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let live = host.port.snapshot_hub().latest();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        assert_ne!(saved.tick, live.world.tick);
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let query = || {
+            axum::extract::Query(CheckpointCanvasQuery {
+                session_id: handle.session_id().get().to_string(),
+            })
+        };
+        let response = get_v1_checkpoint_canvas(
+            State(state.clone()),
+            axum::extract::Path(saved.checkpoint_id.clone()),
+            query(),
+        )
+        .await
+        .expect("real saved source projects through the endpoint");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(
+            response.into_body(),
+            MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES,
+        )
+        .await
+        .unwrap();
+        let response: CheckpointCanvasResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.schema, CHECKPOINT_CANVAS_SCHEMA);
+        assert_eq!(response.source_session_id, handle.session_id().get().to_string());
+        assert_eq!(response.checkpoint, saved);
+        let binary = base64::engine::general_purpose::STANDARD
+            .decode(&response.frame_base64)
+            .unwrap();
+        let frame = scriptbots_runtime::remote::decode_remote_frame(&binary).unwrap();
+        assert_eq!(frame.identity.session_id, u128::from(handle.session_id().get()));
+        assert_eq!(frame.identity.tick, saved.tick);
+        assert!(frame.playback.paused);
+        assert_eq!(frame.coalesced_publications, 0);
+        let expected_environment =
+            scriptbots_runtime::remote::RemoteEnvironmentSnapshot::capture(&saved_publication)
+                .unwrap();
+        let environment = frame.environment.as_deref().expect("saved environment");
+        assert_eq!(environment.width, expected_environment.width);
+        assert_eq!(environment.height, expected_environment.height);
+        assert_eq!(environment.source_width, expected_environment.source_width);
+        assert_eq!(environment.source_height, expected_environment.source_height);
+        assert_eq!(environment.cell_size, expected_environment.cell_size);
+        assert_eq!(
+            environment.food_max.to_bits(),
+            expected_environment.food_max.to_bits()
+        );
+        assert_eq!(
+            environment.hydrology_enabled,
+            expected_environment.hydrology_enabled
+        );
+        assert_eq!(environment.cells, expected_environment.cells);
+        // Layer revisions belong to the fresh presentation owner; they cannot
+        // be presented as the saved live host's publication history.
+        assert_eq!(environment.terrain_revision, 1);
+        assert_eq!(environment.food_revision, 1);
+        assert_eq!(
+            environment.hydrology_revision,
+            u64::from(environment.hydrology_enabled)
+        );
+        let scriptbots_runtime::remote::RemoteFramePayload::Canvas(canvas) = frame.payload else {
+            panic!("saved-world endpoint must return a canvas");
+        };
+        assert_eq!(canvas.agents.len(), saved.agent_count);
+        // A science checkpoint does not retain arena slots or the preceding
+        // tick's mortality counter. Every other dynamic field must survive.
+        let logical = |mut value: Value| {
+            for agent in value["agents"].as_array_mut().unwrap() {
+                agent.as_object_mut().unwrap().remove("id").unwrap();
+            }
+            value["summary"]
+                .as_object_mut()
+                .unwrap()
+                .remove("deaths")
+                .unwrap();
+            value
+        };
+        assert_eq!(
+            logical(serde_json::to_value(&canvas).unwrap()),
+            logical(serde_json::to_value(&saved_publication.world).unwrap())
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &live));
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(&artifact.relative_path))
+            .unwrap()
+            .write_all(&[0xff])
+            .unwrap();
+        let refusal = get_v1_checkpoint_canvas(
+            State(state),
+            axum::extract::Path(saved.checkpoint_id),
+            query(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.status, StatusCode::BAD_REQUEST);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &live));
+    }
+
+    #[tokio::test]
+    #[serial(checkpoint_canvas)]
+    async fn checkpoint_canvas_refuses_foreign_sources_and_busy_work_before_artifact_reads() {
+        let host = test_host();
+        let handle = host.handle();
+        let before = host.port.scientific_digest_v1().unwrap();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let permit = CHECKPOINT_CANVAS_SLOTS.acquire().await.unwrap();
+        for (session, status) in [
+            ("01".to_owned(), StatusCode::BAD_REQUEST),
+            (
+                handle.session_id().get().wrapping_add(1).to_string(),
+                StatusCode::CONFLICT,
+            ),
+            (
+                handle.session_id().get().to_string(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let refusal = get_v1_checkpoint_canvas(
+                State(state.clone()),
+                axum::extract::Path("missing-checkpoint".into()),
+                axum::extract::Query(CheckpointCanvasQuery { session_id: session }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refusal.status, status);
+        }
+        drop(permit);
+        let missing = get_v1_checkpoint_canvas(
+            State(state),
+            axum::extract::Path("missing-checkpoint".into()),
+            axum::extract::Query(CheckpointCanvasQuery {
+                session_id: handle.session_id().get().to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        assert_eq!(
+            CheckpointCanvasQuery {
+                session_id: u64::MAX.to_string(),
+            }
+            .session()
+            .unwrap()
+            .get(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn lab_session_header_requires_one_exact_canonical_owner_identity() {
+        let session = scriptbots_runtime::HostSessionId::new(u64::MAX);
+        let mut headers = HeaderMap::new();
+        require_lab_session(&headers, session).expect("CLI without an expected session");
+        headers.insert(LAB_SESSION_HEADER, u64::MAX.to_string().parse().unwrap());
+        require_lab_session(&headers, session).expect("exact full-width identity");
+        headers.insert(LAB_SESSION_HEADER, "0".parse().unwrap());
+        assert_eq!(
+            require_lab_session(&headers, session).unwrap_err().status,
+            StatusCode::CONFLICT
+        );
+        require_lab_session(&headers, scriptbots_runtime::HostSessionId::new(0))
+            .expect("zero has one canonical representation");
+        for value in [
+            "",
+            "01",
+            "+1",
+            "-1",
+            "1.0",
+            "1e3",
+            "1,1",
+            " 1",
+            "1 ",
+            "18446744073709551616",
+        ] {
+            headers.insert(LAB_SESSION_HEADER, value.parse().unwrap());
+            assert_eq!(
+                require_lab_session(&headers, session).unwrap_err().status,
+                StatusCode::BAD_REQUEST,
+                "{value:?}"
+            );
+        }
+        headers.insert(LAB_SESSION_HEADER, u64::MAX.to_string().parse().unwrap());
+        headers.append(LAB_SESSION_HEADER, u64::MAX.to_string().parse().unwrap());
+        assert_eq!(
+            require_lab_session(&headers, session).unwrap_err().status,
+            StatusCode::BAD_REQUEST,
+            "repeated headers cannot select an arbitrary owner"
+        );
+        headers.insert(
+            LAB_SESSION_HEADER,
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        assert_eq!(
+            require_lab_session(&headers, session).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real HTTP listener proves all guarded routes, browser preflight and no-admission state"
+    )]
+    async fn lab_http_session_guard_precedes_checkpoint_experiment_and_artifact_actions() {
+        let owner = test_host();
+        let before = owner.port.scientific_digest_v1().unwrap();
+        let browser_origin = "https://checkpoint-lab.example";
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            allowed_origins: vec![browser_origin.to_owned()],
+            // A valid create can reach the owner without admitting a worker.
+            experiment_run_slots: 0,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let session = handle.session_id().get().to_string();
+        let stale = handle.session_id().get().wrapping_add(1).to_string();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        for (method, path) in [
+            (reqwest::Method::POST, "/api/v1/experiments"),
+            (reqwest::Method::GET, "/api/v1/experiments"),
+            (reqwest::Method::GET, "/api/v1/experiments/missing"),
+            (reqwest::Method::POST, "/api/v1/experiments/missing/compare"),
+            (reqwest::Method::POST, "/api/v1/experiments/missing/cancel"),
+            (reqwest::Method::POST, "/api/v1/experiments/missing/resume"),
+            (reqwest::Method::POST, "/api/v1/checkpoints"),
+            (reqwest::Method::GET, "/api/v1/checkpoints"),
+            (reqwest::Method::GET, "/api/v1/checkpoints/missing"),
+            (
+                reqwest::Method::GET,
+                "/api/v1/checkpoints/missing/canvas?session_id=0",
+            ),
+            (reqwest::Method::POST, "/api/v1/checkpoints/branches"),
+            (reqwest::Method::GET, "/api/v1/checkpoints/branches"),
+            (reqwest::Method::GET, "/api/v1/checkpoints/branches/missing"),
+            (
+                reqwest::Method::POST,
+                "/api/v1/checkpoints/branches/missing/cancel",
+            ),
+            (
+                reqwest::Method::GET,
+                "/api/v1/checkpoints/branches/missing/artifacts",
+            ),
+            (reqwest::Method::GET, "/api/v1/artifacts"),
+            (reqwest::Method::GET, "/api/v1/artifacts/missing"),
+            (reqwest::Method::GET, "/api/v1/artifacts/missing/download"),
+        ] {
+            let response = client
+                .request(method, format!("http://{address}{path}"))
+                .header(LAB_SESSION_HEADER, &stale)
+                .header("Origin", browser_origin)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 409, "{path}");
+            let error: Value = response.json().await.unwrap();
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("host session changed")
+            );
+        }
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        assert_eq!(handle.list_artifacts(None, None).unwrap().total, 0);
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+
+        let url = format!("http://{address}/api/v1/checkpoints");
+        let preflight = client
+            .request(reqwest::Method::OPTIONS, &url)
+            .header("Origin", browser_origin)
+            .header("Access-Control-Request-Method", "POST")
+            .header(
+                "Access-Control-Request-Headers",
+                "content-type, x-scriptbots-session",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status().as_u16(), 204);
+        assert_eq!(
+            preflight.headers()["Access-Control-Allow-Origin"],
+            browser_origin
+        );
+        assert!(
+            preflight.headers()["Access-Control-Allow-Headers"]
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains(LAB_SESSION_HEADER)
+        );
+        let rejected_preflight = client
+            .request(reqwest::Method::OPTIONS, &url)
+            .header("Origin", browser_origin)
+            .header("Access-Control-Request-Method", "POST")
+            .header(
+                "Access-Control-Request-Headers",
+                "x-scriptbots-session, x-unconfigured-lab-header",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected_preflight.status().as_u16(), 403);
+        for path in ["/api/v1/checkpoints", "/api/v1/experiments"] {
+            for expected_session in [None, Some(session.as_str())] {
+                let mut request = client.get(format!("http://{address}{path}"));
+                if let Some(value) = expected_session {
+                    request = request.header(LAB_SESSION_HEADER, value);
+                }
+                assert_eq!(
+                    request.send().await.unwrap().status().as_u16(),
+                    200,
+                    "{path}"
+                );
+            }
+        }
+        let experiment_url = format!("http://{address}/api/v1/experiments");
+        let experiment = json!({
+            "experiment_id": "session-guard-cohort",
+            "variants": [{
+                "variant_id": "baseline", "brain_family": "mlp",
+                "config_overrides": {
+                    "world_width": 40, "world_height": 40, "food_cell_size": 10,
+                    "population_minimum": 2, "population_spawn_interval": 0
+                }
+            }],
+            "seeds": [7], "ticks_per_run": 2, "max_concurrency": 1,
+            "idempotency_key": "session-guard-cohort"
+        });
+        for (expected_session, expected_status) in [
+            (Some(stale.as_str()), 409),
+            (Some("01"), 400),
+            (Some(session.as_str()), 503),
+            (None, 503),
+        ] {
+            let mut request = client.post(&experiment_url).json(&experiment);
+            if let Some(value) = expected_session {
+                request = request.header(LAB_SESSION_HEADER, value);
+            }
+            assert_eq!(
+                request.send().await.unwrap().status().as_u16(),
+                expected_status,
+                "valid experiment admission with session {expected_session:?}"
+            );
+        }
+        let experiments = handle.list_experiments(None, None).unwrap();
+        assert_eq!(experiments.total, 0);
+        assert_eq!(experiments.execution_capacity.reserved_run_slots, 0);
+        assert_eq!(experiments.execution_capacity.reserved_batches, 0);
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        let malformed = client
+            .post(&url)
+            .header(LAB_SESSION_HEADER, "01")
+            .json(&json!({"idempotency_key": "session-negative"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status().as_u16(), 400);
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        let accepted = client
+            .post(&url)
+            .header(LAB_SESSION_HEADER, &session)
+            .header("Origin", browser_origin)
+            .json(&json!({"idempotency_key": "session-positive"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status().as_u16(), 201);
+        let saved: CheckpointMetadataDto = accepted.json().await.unwrap();
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 1);
+        assert_eq!(
+            handle.get_checkpoint(&saved.checkpoint_id).unwrap().tick,
+            saved.tick
+        );
+        assert_eq!(handle.status().unwrap().tick, 0);
+        server.shutdown().unwrap();
     }
 
     #[test]
@@ -7263,6 +9025,475 @@ mod tests {
                 "missing {status}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_branch_rest_rejects_ambiguous_and_unbounded_requests_before_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let (handle, host) = handle();
+        let handle = handle
+            .with_artifacts_dir(temp.path().join("artifacts"))
+            .unwrap();
+        let before = host.port.scientific_digest_v1().unwrap();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        let input = json!({
+            "checkpoint_id": "missing-source", "branch_name": "branch", "ticks": 2,
+            "idempotency_key": "branch-retry"
+        });
+        let mut invalid_inputs = vec![
+            b"null".to_vec(), b"[]".to_vec(),
+            br#"{"checkpoint_id":"source","branch_name":"branch","ticks":2}"#.to_vec(),
+            br#"{"checkpoint_id":"source","branch_name":"branch","ticks":2,"idempotency_key":"one","idempotency_key":"two"}"#.to_vec(),
+        ];
+        for (field, invalid) in [
+            ("ticks", json!(0)),
+            ("ticks", json!(MAX_CHECKPOINT_BRANCH_TICKS + 1)),
+            ("branch_name", json!("../escape")),
+            ("idempotency_key", json!(" ")),
+            (
+                "idempotency_key",
+                json!("k".repeat(MAX_CHECKPOINT_BRANCH_KEY_BYTES + 1)),
+            ),
+            ("interventon", json!({})),
+        ] {
+            let mut request = input.clone();
+            request[field] = invalid;
+            invalid_inputs.push(serde_json::to_vec(&request).unwrap());
+        }
+        for bytes in invalid_inputs {
+            let refused =
+                post_v1_checkpoint_branches(State(state.clone()), headers.clone(), bytes.into())
+                    .await
+                    .expect_err("reject before missing source lookup or worker admission");
+            assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{refused:?}");
+        }
+        let refused = post_v1_checkpoint_branches(
+            State(state.clone()),
+            headers.clone(),
+            vec![b' '; MAX_CHECKPOINT_BRANCH_REQUEST_BYTES + 1].into(),
+        )
+        .await
+        .expect_err("oversized body");
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = serde_json::to_vec(&input).unwrap();
+        headers.insert("Idempotency-Key", "different-key".parse().unwrap());
+        assert_eq!(
+            post_v1_checkpoint_branches(
+                State(state.clone()),
+                headers.clone(),
+                bytes.clone().into(),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        headers.insert("Idempotency-Key", "branch-retry".parse().unwrap());
+        headers.append("Idempotency-Key", "branch-retry".parse().unwrap());
+        assert_eq!(
+            post_v1_checkpoint_branches(State(state), headers, bytes.into(),)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real saved cut establishes cross-transport retry identity and observed lifecycle"
+    )]
+    async fn checkpoint_branch_rest_and_mcp_share_identity_schema_and_observed_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let brains = crate::brains::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+        for _ in 0..2 {
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .unwrap();
+            assert!(world.bind_agent_brain(id, brains.population()[0]).unwrap());
+        }
+        let host = crate::control::tests::TestHost::spawn(world);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let handle = host
+            .handle()
+            .with_artifacts_dir(temp.path().join("artifacts"))
+            .unwrap();
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest {
+                description: Some("transport branch source".into()),
+                idempotency_key: Some("transport-source".into()),
+            })
+            .unwrap();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let input = json!({
+            "checkpoint_id": saved.checkpoint_id, "branch_name": "transport-future", "ticks": 2,
+            "idempotency_key": "transport-branch-retry"
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert("Idempotency-Key", "transport-branch-retry".parse().unwrap());
+        let (code, Json(created)) = post_v1_checkpoint_branches(
+            State(state.clone()),
+            headers,
+            serde_json::to_vec(&input).unwrap().into(),
+        )
+        .await
+        .expect("REST admits real independent future");
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(created.source_tick, saved.tick);
+        assert_eq!(created.target_tick, saved.tick + 2);
+        assert_eq!(created.world_digest_v1, before.overall);
+        if created.status == "running" {
+            assert!(created.artifact_id.is_none());
+        }
+
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("checkpoint-branch", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "checkpoint-branch", "version": "0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let listed = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/list"
+            }),
+        )
+        .await;
+        let tools = listed["result"]["tools"]
+            .as_array()
+            .expect("registered tools");
+        for name in [
+            "checkpoint_branch_create",
+            "checkpoint_branch_list",
+            "checkpoint_branch_status",
+            "checkpoint_branch_cancel",
+        ] {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == name),
+                "missing {name}"
+            );
+        }
+        let schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "checkpoint_branch_create")
+            .unwrap()["inputSchema"];
+        assert_eq!(
+            schema["properties"]["ticks"]["maximum"],
+            MAX_CHECKPOINT_BRANCH_TICKS
+        );
+        assert_eq!(
+            schema["properties"]["idempotency_key"]["maxLength"],
+            MAX_CHECKPOINT_BRANCH_KEY_BYTES
+        );
+        assert_eq!(
+            schema["required"],
+            json!(["checkpoint_id", "branch_name", "ticks", "idempotency_key"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert_eq!(
+            openapi["paths"]["/api/v1/checkpoints/branches"]["post"]["responses"]["202"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/CheckpointBranchStatusDto"
+        );
+        assert_eq!(
+            openapi["paths"]["/api/v1/checkpoints/branches"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/PaginatedCheckpointBranchesResponse"
+        );
+        for (path, method) in [
+            ("/api/v1/checkpoints/branches", "get"),
+            ("/api/v1/checkpoints/branches/{branch_id}", "get"),
+            ("/api/v1/checkpoints/branches/{branch_id}/cancel", "post"),
+            ("/api/v1/checkpoints/branches/{branch_id}/artifacts", "get"),
+        ] {
+            assert!(openapi["paths"][path][method].is_object());
+        }
+        let retry = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "checkpoint_branch_create", "arguments": input}
+            }),
+        )
+        .await;
+        let retried: CheckpointBranchStatusDto = serde_json::from_str(
+            retry["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP status"),
+        )
+        .expect("exact retry admitted once across REST and MCP");
+        assert_eq!(retried.branch_id, created.branch_id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let completed = loop {
+            let Json(status) = get_v1_checkpoint_branch(
+                State(state.clone()),
+                axum::extract::Path(created.branch_id.clone()),
+            )
+            .await
+            .unwrap();
+            if status.status == "completed" {
+                break status;
+            }
+            assert_eq!(status.status, "running", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let artifact = handle
+            .get_artifact(completed.artifact_id.as_ref().unwrap())
+            .unwrap();
+        assert!(artifact.byte_size > 0);
+        let Json(inventory) = get_v1_checkpoint_branch_artifacts(
+            State(state.clone()),
+            axum::extract::Path(created.branch_id.clone()),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(100),
+                cursor: None,
+            }),
+        )
+        .await
+        .expect("completed study exposes its actual artifact inventory");
+        assert!(!inventory.has_more);
+        assert!(
+            inventory
+                .items
+                .iter()
+                .any(|item| item.artifact_id == artifact.artifact_id)
+        );
+        assert!(inventory.items.iter().all(|item| {
+            item.relative_path
+                .starts_with(&format!("branches/{}/", created.branch_id))
+        }));
+        for name in ["checkpoint_branch_status", "checkpoint_branch_cancel"] {
+            let observed = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": name, "arguments": {"branch_id": created.branch_id}}
+                }),
+            )
+            .await;
+            let status: CheckpointBranchStatusDto = serde_json::from_str(
+                observed["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("observed branch status"),
+            )
+            .unwrap();
+            assert_eq!(status, completed);
+        }
+        let mut changed = input;
+        changed["ticks"] = json!(3);
+        for (name, arguments, schema_error) in [
+            ("checkpoint_branch_create", changed, false),
+            ("checkpoint_branch_create", json!([]), true),
+            (
+                "checkpoint_branch_status",
+                json!({"branch_id": created.branch_id, "ignored": true}),
+                true,
+            ),
+            (
+                "checkpoint_branch_cancel",
+                json!({"branch_id": "../outside"}),
+                true,
+            ),
+        ] {
+            let refused = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}
+                }),
+            )
+            .await;
+            if schema_error {
+                assert_eq!(
+                    refused["error"]["code"],
+                    i32::from(McpErrorCode::InvalidParams),
+                    "{refused}"
+                );
+            } else {
+                assert!(
+                    refused.get("error").is_none(),
+                    "a retained retry conflict is a tool execution result: {refused}"
+                );
+                assert_eq!(refused["result"]["isError"], true, "{refused}");
+                assert!(
+                    refused["result"]["content"][0]["text"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("idempotency")),
+                    "{refused}"
+                );
+            }
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+
+        let second = handle
+            .create_checkpoint_branch(CheckpointBranchRequest {
+                checkpoint_id: saved.checkpoint_id.clone(),
+                branch_name: "transport-second".to_owned(),
+                ticks: 1,
+                intervention: None,
+                idempotency_key: "transport-second-retry".to_owned(),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let second = loop {
+            let status = handle.get_checkpoint_branch(&second.branch_id).unwrap();
+            if status.status == "completed" {
+                break status;
+            }
+            assert_eq!(status.status, "running", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        handle.data_services().shutdown_experiments().unwrap();
+        drop(state);
+        drop(mcp);
+        drop(handle);
+
+        // A new service has neither the original request objects nor a live job
+        // map. Both transports must discover the same durable receipts.
+        let cold = host
+            .handle()
+            .with_artifacts_dir(temp.path().join("artifacts"))
+            .unwrap();
+        let state = ApiState {
+            handle: cold.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let mut expected = [completed, second];
+        expected.sort_by(|left, right| left.branch_id.cmp(&right.branch_id));
+        let Json(first_page) = get_v1_checkpoint_branches(
+            State(state.clone()),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(1),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_page.total, 2);
+        assert_eq!(first_page.limit, 1);
+        assert_eq!(first_page.offset, 0);
+        assert_eq!(first_page.items, vec![expected[0].clone()]);
+        assert!(first_page.has_more);
+        assert_eq!(first_page.next_cursor.as_deref(), Some("1"));
+        let Json(second_page) = get_v1_checkpoint_branches(
+            State(state.clone()),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(1),
+                cursor: first_page.next_cursor,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page.total, 2);
+        assert_eq!(second_page.offset, 1);
+        assert_eq!(second_page.items, vec![expected[1].clone()]);
+        assert!(!second_page.has_more);
+        assert!(second_page.next_cursor.is_none());
+        let Json(past_end) = get_v1_checkpoint_branches(
+            State(state.clone()),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(1),
+                cursor: Some("2".to_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(past_end.total, 2);
+        assert!(past_end.items.is_empty());
+        assert!(!past_end.has_more);
+        assert!(past_end.next_cursor.is_none());
+        let refused = get_v1_checkpoint_branches(
+            State(state),
+            axum::extract::Query(PaginationQueryParams {
+                limit: Some(1),
+                cursor: Some("not-an-offset".to_owned()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+        let mcp = mcp_http_test_state(cold, ServerBuilder::new("checkpoint-history", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 10, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "checkpoint-history", "version": "0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let history = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                "params": {"name": "checkpoint_branch_list",
+                    "arguments": {"limit": 1, "cursor": "1"}}
+            }),
+        )
+        .await;
+        let history: Value = serde_json::from_str(
+            history["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP recovered history"),
+        )
+        .unwrap();
+        assert_eq!(history, serde_json::to_value(second_page).unwrap());
+        for arguments in [
+            json!([]),
+            json!({"limit": "one"}),
+            json!({"cursor": 1}),
+            json!({"limit": 1, "unknown": true}),
+        ] {
+            let refused = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                    "params": {"name": "checkpoint_branch_list", "arguments": arguments}
+                }),
+            )
+            .await;
+            assert_eq!(
+                refused["error"]["code"],
+                i32::from(McpErrorCode::InvalidParams),
+                "{refused}"
+            );
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
 
     #[tokio::test]
@@ -8815,6 +11046,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rest_step_requires_object_without_changing_empty_or_batch_behavior() {
+        let (handle, host) = handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let before = handle.read_snapshot().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        for value in [
+            json!([]),
+            json!([1]),
+            json!(null),
+            json!(true),
+            json!("step"),
+        ] {
+            let body = axum::body::Bytes::from(serde_json::to_vec(&value).unwrap());
+            let canonical = post_control_step(State(state.clone()), headers.clone(), body.clone())
+                .await
+                .expect_err("non-object canonical request must be refused");
+            assert_eq!(canonical.status, StatusCode::BAD_REQUEST, "{value}");
+            let alias = post_step(State(state.clone()), headers.clone(), body)
+                .await
+                .expect_err("non-object legacy request must be refused");
+            assert_eq!(alias.status, StatusCode::BAD_REQUEST, "{value}");
+        }
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+        assert_eq!(after.command_queue_depth, 0);
+
+        let Json(single) = post_control_step(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("empty-body step refused: {}", error.message));
+        host.wait_applied(&single);
+        let Json(batch) = post_step(
+            State(state),
+            headers,
+            axum::body::Bytes::from_static(br#"{"count":2}"#),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("unkeyed batch refused: {}", error.message));
+        host.wait_applied(&batch);
+        assert_eq!(handle.status().unwrap().tick, before.world.tick + 3);
+    }
+
+    #[tokio::test]
     async fn step_requests_refuse_malformed_counts_without_admission() {
         let (handle, host) = handle();
         let state = ApiState {
@@ -8918,7 +11202,9 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            assert!(tool.call(&ctx, arguments.clone()).is_err(), "{arguments}");
+            let direct = tool
+                .call(&ctx, arguments.clone())
+                .expect_err("invalid step must be refused directly");
             let response = map_policy_mcp_request(
                 &mcp,
                 json!({
@@ -8928,6 +11214,7 @@ mod tests {
             )
             .await;
             if let Some(diagnostic) = handler_diagnostic {
+                assert_eq!(direct.message, diagnostic, "{arguments}");
                 assert_mcp_handler_refusal(&response, diagnostic);
             } else {
                 assert!(response.get("result").is_none(), "{arguments}: {response}");
@@ -9045,6 +11332,10 @@ mod tests {
             "checkpoint_create",
             "checkpoint_list",
             "checkpoint_status",
+            "checkpoint_branch_create",
+            "checkpoint_branch_list",
+            "checkpoint_branch_status",
+            "checkpoint_branch_cancel",
             "artifact_list",
             "artifact_get",
         ]
@@ -9130,6 +11421,63 @@ mod tests {
             }
         }
         found
+    }
+
+    #[test]
+    fn every_response_has_a_nonempty_description() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).expect("serialize OpenAPI");
+        fn resolve(openapi: &serde_json::Value, response: &serde_json::Value) -> serde_json::Value {
+            if let Some(reference) = response.get("$ref").and_then(|value| value.as_str())
+                && let Some(name) = reference.strip_prefix("#/components/responses/")
+            {
+                return openapi["components"]["responses"][name].clone();
+            }
+            response.clone()
+        }
+        fn has_description(resolved: &serde_json::Value) -> bool {
+            resolved
+                .get("description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| !text.is_empty())
+        }
+        let methods = [
+            "get", "put", "post", "delete", "options", "head", "patch", "trace",
+        ];
+        let mut misses: Vec<String> = Vec::new();
+        if let Some(paths) = openapi["paths"].as_object() {
+            for (path, item) in paths {
+                let Some(item) = item.as_object() else {
+                    continue;
+                };
+                for (method, operation) in item {
+                    if !methods.contains(&method.as_str()) {
+                        continue;
+                    }
+                    if let Some(responses) = operation
+                        .get("responses")
+                        .and_then(|value| value.as_object())
+                    {
+                        for (code, response) in responses {
+                            if !has_description(&resolve(&openapi, response)) {
+                                misses.push(format!("{method} {path} {code}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(component_responses) = openapi["components"]["responses"].as_object() {
+            for (name, response) in component_responses {
+                if !has_description(&resolve(&openapi, response)) {
+                    misses.push(format!("components/responses/{name}"));
+                }
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{} response(s) missing a non-empty description: {misses:?}",
+            misses.len()
+        );
     }
 
     /// The Swagger UI and `/api-docs/openapi.json` are the advertised control-API
@@ -10021,7 +12369,7 @@ mod tests {
             assert_eq!(ack["type"], "subscribed");
             assert_eq!(ack["request_id"], id);
             assert_eq!(ack["channels"], channels);
-            assert_eq!(ack["stream_protocol_version"], 1);
+            assert_eq!(ack["stream_protocol_version"], REMOTE_PROTOCOL_VERSION);
             assert_eq!(ack["session_id"], initial.session_id.get().to_string());
         }
         send_websocket_text(
@@ -10037,6 +12385,12 @@ mod tests {
             panic!("canvas channel")
         };
         assert_eq!(world, initial.world);
+        assert_eq!(
+            image.environment.as_deref(),
+            Some(
+                &scriptbots_runtime::remote::RemoteEnvironmentSnapshot::capture(&initial).unwrap()
+            )
+        );
         let events = read_remote_binary(&mut canvas);
         let RemoteFramePayload::Events(page) = events.payload else {
             panic!("events channel")
@@ -10170,6 +12524,374 @@ mod tests {
         drop(reconnected);
         drop(canvas);
         drop(stalled);
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn websocket_publication_schedule_has_no_idle_or_credit_blocked_timer() {
+        let mut schedule = WsStreamSchedule::default();
+        let cadence = Duration::from_millis(20);
+        let first = Duration::from_millis(10);
+        assert_eq!(schedule.remaining(first, cadence, true), None);
+
+        schedule.request();
+        assert_eq!(schedule.remaining(first, cadence, false), None);
+        assert_eq!(
+            schedule.remaining(first, cadence, true),
+            Some(Duration::ZERO)
+        );
+        schedule.start(first);
+        assert_eq!(schedule.remaining(first, cadence, true), None);
+
+        // A publication or an ACK requests one attempt. The production select
+        // stops awaiting publications while this bit is set, coalescing their
+        // wakes as well as their frames. Repeated requests never move the deadline.
+        schedule.request();
+        let later = Duration::from_millis(15);
+        assert_eq!(
+            schedule.remaining(later, cadence, true),
+            Some(Duration::from_millis(15))
+        );
+        schedule.request();
+        assert_eq!(
+            schedule.remaining(Duration::from_millis(25), cadence, true),
+            Some(Duration::from_millis(5))
+        );
+        assert_eq!(
+            schedule.remaining(Duration::from_secs(2), cadence, false),
+            None
+        );
+        assert_eq!(
+            schedule.remaining(Duration::from_secs(2), cadence, true),
+            Some(Duration::ZERO),
+            "returned credit catches up even without another publication"
+        );
+
+        // Adaptive backoff changes the next allowed instant, not a polling rate.
+        assert_eq!(
+            schedule.remaining(later, Duration::from_millis(80), true),
+            Some(Duration::from_millis(75))
+        );
+        schedule.start(Duration::from_secs(2));
+        assert_eq!(
+            schedule.remaining(Duration::from_secs(9), cadence, true),
+            None
+        );
+    }
+
+    #[test]
+    fn websocket_publication_capacity_is_explicit_and_replacements_reuse_the_watcher() {
+        let owner = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                persistence_interval: 0,
+                rng_seed: Some(42),
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let hub = handle.snapshot_hub();
+        let mut occupied = (0..scriptbots_runtime::MAX_SNAPSHOT_WATCHERS)
+            .map(|_| {
+                hub.watch()
+                    .expect("fill the actual bounded observer registry")
+            })
+            .collect::<Vec<_>>();
+        let mut socket = connect_websocket(address);
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":2,"command":"subscribe","request_id":"invalid-before-capacity","channels":["canvas"]}"#,
+        );
+        assert_eq!(read_remote_json(&mut socket, false)["status"], 400);
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","request_id":"full","channels":["canvas"]}"#,
+        );
+        let refused = read_remote_json(&mut socket, false);
+        assert_eq!(refused["status"], 503);
+        assert_eq!(refused["request_id"], "full");
+        let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+        assert_eq!(opcode, 2);
+        postcard::from_bytes::<TickSummaryDto>(&bytes)
+            .expect("capacity refusal preserves the unnegotiated legacy format");
+
+        drop(occupied.pop().expect("release one observer slot"));
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","request_id":"admitted","channels":["canvas"],"max_fps":60}"#,
+        );
+        assert_eq!(read_remote_json(&mut socket, false)["type"], "subscribed");
+        let initial = read_remote_binary(&mut socket);
+        assert!(
+            hub.watch().is_err(),
+            "the socket owns the final available slot"
+        );
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","request_id":"replacement","channels":["events"],"max_fps":60}"#,
+        );
+        let replacement = read_remote_json(&mut socket, true);
+        assert_eq!(replacement["type"], "subscribed");
+        assert_eq!(replacement["request_id"], "replacement");
+        let events = read_remote_binary(&mut socket);
+        assert_eq!(events.identity, initial.identity);
+        assert!(matches!(
+            events.payload,
+            scriptbots_runtime::remote::RemoteFramePayload::Events(_)
+        ));
+        assert!(
+            hub.watch().is_err(),
+            "replacement reuses its existing observer"
+        );
+
+        drop(socket);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let released = loop {
+            if let Ok(watcher) = hub.watch() {
+                break watcher;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disconnect leaked a publication observer"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(handle.status().unwrap().tick, 0);
+        drop(released);
+        drop(occupied);
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn websocket_unacknowledged_frame_expires_without_publications_or_dispatch_credit() {
+        let owner = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                persistence_interval: 0,
+                rng_seed: Some(42),
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let mut socket = connect_websocket(address);
+        socket
+            .set_read_timeout(Some(WS_WRITE_TIMEOUT + Duration::from_secs(2)))
+            .unwrap();
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","channels":["canvas"],"max_fps":60}"#,
+        );
+        assert_eq!(read_remote_json(&mut socket, false)["type"], "subscribed");
+        let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+        assert_eq!(opcode, 2);
+        let withheld = scriptbots_runtime::remote::decode_remote_frame(&bytes).unwrap();
+        let before = handle.read_snapshot().unwrap();
+        assert_eq!(
+            withheld.identity.publication_revision,
+            before.revision.get()
+        );
+        // There is no owner command, subsequent publication, or returned credit
+        // to drive this timeout. The independent acknowledgement deadline must.
+        let mut timeout_reply = None;
+        for _ in 0..16 {
+            let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+            assert_eq!(opcode, 1, "withheld credit must not admit another frame");
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            if reply["type"] != "stream_rate" {
+                timeout_reply = Some(reply);
+                break;
+            }
+        }
+        let reply = timeout_reply.expect("idle acknowledgement deadline must fire");
+        assert_eq!(reply["type"], "error");
+        assert_eq!(reply["status"], 503);
+        assert!(
+            reply["message"]
+                .as_str()
+                .unwrap()
+                .contains("acknowledgement deadline exceeded")
+        );
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.world, before.world);
+        drop(socket);
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn websocket_acknowledgements_drain_real_narrative_pages_from_one_paused_publication() {
+        use scriptbots_core::{AgentData, Intervention, Region};
+        use scriptbots_runtime::remote::{REMOTE_MAX_EVENTS, RemoteFramePayload};
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            reproduction_energy_threshold: f32::MAX,
+            food_growth_rate: 0.0,
+            history_capacity: 16,
+            narrative_interval: 8,
+            narrative_capacity: REMOTE_MAX_EVENTS + 1,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        // Actual extinction detection produces the backlog. Each cycle is
+        // longer than the detector's cooldown; no narrative rows are fabricated.
+        let cooldown = scriptbots_core::narrative::NarrativePolicy::default().cooldown_ticks;
+        for _ in 0..=REMOTE_MAX_EVENTS {
+            world
+                .try_spawn_agent(AgentData {
+                    health: 2.0,
+                    ..AgentData::default()
+                })
+                .unwrap();
+            for _ in 0..8 {
+                world.step().unwrap();
+            }
+            world
+                .enqueue_intervention(Intervention::Meteor {
+                    region: Region::All,
+                    lethality: 10.0,
+                    scorch: 0.0,
+                })
+                .unwrap();
+            for _ in 0..cooldown {
+                world.step().unwrap();
+            }
+            if world.narrative_events().len() > REMOTE_MAX_EVENTS {
+                break;
+            }
+        }
+        assert_eq!(world.narrative_events().len(), REMOTE_MAX_EVENTS + 1);
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let before = owner.port.scientific_digest_v1().unwrap();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let snapshot = handle.read_snapshot().unwrap();
+        let mut socket = connect_websocket(address);
+        send_websocket_text(
+            &mut socket,
+            r#"{"protocol_version":1,"command":"subscribe","channels":["events"],"max_fps":120}"#,
+        );
+        assert_eq!(read_remote_json(&mut socket, false)["type"], "subscribed");
+        let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+        assert_eq!(opcode, 2);
+        let first = scriptbots_runtime::remote::decode_remote_frame(&bytes).unwrap();
+        let RemoteFramePayload::Events(first_page) = &first.payload else {
+            panic!("events channel")
+        };
+        assert_eq!(first_page.events.len(), REMOTE_MAX_EVENTS);
+        assert_eq!(
+            first_page.earliest_retained,
+            snapshot.narrative_dropped_events + 1
+        );
+        assert_eq!(first_page.events[0].sequence, first_page.earliest_retained);
+        assert_eq!(
+            first_page.gap.is_some(),
+            snapshot.narrative_dropped_events != 0
+        );
+
+        // A parsing refusal is an ordered socket barrier and creates no owner
+        // publication. A second page before its ACK would violate channel credit.
+        send_websocket_text(&mut socket, r#"{"command":"speed","speed":-1}"#);
+        let mut refusal = None;
+        for _ in 0..16 {
+            let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+            assert_eq!(opcode, 1, "unacknowledged event pages must not queue");
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            if reply["type"] != "stream_rate" {
+                refusal = Some(reply);
+                break;
+            }
+        }
+        assert_eq!(refusal.expect("invalid control reply")["status"], 400);
+        acknowledge_remote_frame(&mut socket, &first);
+        let second = read_remote_binary(&mut socket);
+        assert_eq!(
+            second.identity, first.identity,
+            "ACK must drain the same publication"
+        );
+        let RemoteFramePayload::Events(second_page) = &second.payload else {
+            panic!("events channel")
+        };
+        assert_eq!(second_page.events.len(), 1);
+        assert_eq!(second_page.after_event, first_page.next_after_event());
+        assert_eq!(second_page.gap, None);
+        let records = first_page
+            .events
+            .iter()
+            .chain(&second_page.events)
+            .map(|event| event.record.to_event_record().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records, *snapshot.narrative_events);
+
+        let mut resumed = connect_websocket(address);
+        send_websocket_text(
+            &mut resumed,
+            &json!({
+                "protocol_version":1,"command":"subscribe","channels":["events"],"max_fps":120,
+                "resume":{"session_id":first.identity.session_id.to_string(),
+                    "after_revision":first.identity.publication_revision.to_string(),
+                    "after_event":second_page.next_after_event().to_string()},
+            })
+            .to_string(),
+        );
+        assert_eq!(read_remote_json(&mut resumed, false)["type"], "subscribed");
+        let confirmation = read_remote_binary(&mut resumed);
+        let RemoteFramePayload::Events(page) = confirmation.payload else {
+            panic!("events channel")
+        };
+        assert!(
+            page.events.is_empty(),
+            "reconnect must not duplicate consumed narrative"
+        );
+        assert_eq!(page.after_event, second_page.next_after_event());
+        assert_eq!(handle.read_snapshot().unwrap().revision, snapshot.revision);
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        drop(resumed);
+        drop(socket);
         server.shutdown().unwrap();
     }
 
@@ -10716,21 +13438,15 @@ mod tests {
                 .as_u16(),
             413
         );
-        assert_eq!(
-            client
-                .post(&url)
-                .headers(HeaderMap::from_iter([(
-                    reqwest::header::CONTENT_TYPE,
-                    reqwest::header::HeaderValue::from_static("text/plain"),
-                )]))
-                .body(valid.to_string())
-                .send()
-                .await
-                .unwrap()
-                .status()
-                .as_u16(),
-            415
-        );
+        let plain_request = client
+            .post(&url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("text/plain"),
+            )
+            .body(valid.to_string());
+        let plain_response = plain_request.send().await.unwrap();
+        assert_eq!(plain_response.status().as_u16(), 415);
         assert_eq!(
             handle.status().unwrap().tick,
             0,

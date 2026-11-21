@@ -1,611 +1,541 @@
-//! Native Lab consumers of application-owned experiment and checkpoint services.
+//! GPUI widgets for application-owned Lab services.
 //!
-//! These projections contain observations only. The application verifies retained
-//! artifacts and performs analysis; this module never opens a database or owns a world.
+//! The renderer-neutral model owns bounded background requests and validation;
+//! this module only renders its observations and applies presentation intents.
 
 use super::*;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use scriptbots_runtime::lab_workflows::{
+    LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction, LabBranchCreationState,
+    LabBranchTreatment, LabCheckpointSaveState, LabCheckpointView, LabExperimentCapabilities,
+    LabExperimentCreationState, LabExperimentDesign, LabExperimentTreatment, LabMetric, LabPanel,
+    VARIANTS_PER_PAGE, branch_report_lines, comparison_lines,
+};
+#[cfg(test)]
+use scriptbots_runtime::lab_workflows::{
+    LabBranchCapabilities, LabBranchDivergence, LabBranchDraft, LabBranchOutcome, LabBranchReport,
+    LabCheckpoint, LabCheckpointBranch, LabCheckpointBranchPage, LabCheckpointPage, LabComparison,
+    LabExperiment, LabExperimentDraft, LabExperimentPage, LabExperimentParameter,
+    LabExperimentParameterCapability, LabExperimentSummary, LabVariantProgress, LabWorkflowRequest,
+    LabWorkflowResponse,
+};
 
-pub const LAB_PAGE_SIZE: usize = 12;
-pub const LAB_MAX_VARIANTS: usize = 64;
-const VARIANTS_PER_PAGE: usize = 8;
-const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-// Retained experiment verification can read FrankenSQLite on this worker. Match
-// the application's control worker stack rather than the unsafe 2 MiB default.
-const LAB_WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LabWorkflowRequest {
-    ListExperiments {
-        cursor: Option<String>,
-    },
-    GetExperiment {
-        experiment_id: String,
-    },
-    CancelExperiment {
-        experiment_id: String,
-    },
-    ResumeExperiment {
-        experiment_id: String,
-    },
-    Compare {
-        experiment_id: String,
-        baseline_variant: String,
-        challenger_variant: String,
-    },
-    ListCheckpoints {
-        cursor: Option<String>,
-    },
-    ReviewCheckpoint {
-        checkpoint_id: String,
-    },
+#[derive(Clone, Copy)]
+enum LabGuideAction {
+    Open,
+    Hide,
+    Restart,
+    Next(LabGuideBoundary),
+    Perform(LabGuideBoundary),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LabExperimentSummary {
-    pub experiment_id: String,
-    pub status: String,
-    pub total_runs: usize,
-    pub completed_runs: usize,
-    pub failed_runs: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LabExperimentPage {
-    pub items: Vec<LabExperimentSummary>,
-    pub total: usize,
-    pub offset: usize,
-    pub next_cursor: Option<String>,
-    pub reserved_run_slots: usize,
-    pub max_run_slots: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LabVariantProgress {
-    pub variant_id: String,
-    pub brain_family: String,
-    pub total_runs: usize,
-    pub completed_runs: usize,
-    pub failed_runs: usize,
-    pub running_runs: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LabExperiment {
-    pub summary: LabExperimentSummary,
-    pub plan_digest: String,
-    pub generation: u64,
-    /// All variants are retained, independently of the number of seed/run rows.
-    pub variants: Vec<LabVariantProgress>,
-    pub error_reason: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct LabComparison {
-    pub experiment_id: String,
-    pub baseline_variant: String,
-    pub challenger_variant: String,
-    pub endpoint_tick: u64,
-    pub matched_seeds: Vec<u64>,
-    pub mean_difference: f64,
-    pub ci_95: Option<(f64, f64)>,
-    pub standardized_effect: Option<f64>,
-    pub p_value: Option<f64>,
-    pub adjusted_p_value: Option<f64>,
-    pub descriptive_only: bool,
-    pub underpowered_reason: Option<String>,
-    pub undefined_effect_reason: Option<String>,
-    pub plan_digest: String,
-    pub status_generation: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LabCheckpoint {
-    pub checkpoint_id: String,
-    pub tick: u64,
-    pub agent_count: usize,
-    pub byte_size: u64,
-    pub world_digest: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LabCheckpointPage {
-    pub items: Vec<LabCheckpoint>,
-    pub total: usize,
-    pub offset: usize,
-    pub next_cursor: Option<String>,
-    pub retained_bytes: u64,
-    pub max_bytes: u64,
-}
-
-pub enum LabWorkflowResponse {
-    Experiments(LabExperimentPage),
-    Experiment(LabExperiment),
-    Comparison(LabComparison),
-    Checkpoints(LabCheckpointPage),
-    CheckpointFrame {
-        checkpoint_id: String,
-        snapshot: Arc<RenderSnapshot>,
-    },
-}
-
-pub type LabWorkflowSubmit = Arc<
-    dyn Fn(LabWorkflowRequest) -> std::result::Result<LabWorkflowResponse, String> + Send + Sync,
->;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum LabPanel {
-    #[default]
-    Inactive,
-    Experiments,
-    Checkpoints,
-}
-
-struct LabJob {
-    request: LabWorkflowRequest,
+#[derive(Clone, Copy)]
+struct LabGuideBoundary {
     generation: u64,
-    context: u64,
-    session: scriptbots_runtime::HostSessionId,
-    result: Receiver<std::result::Result<LabWorkflowResponse, String>>,
+    step: LabGuideStep,
+    session_id: scriptbots_runtime::HostSessionId,
+    config_revision: scriptbots_runtime::ConfigRevision,
+    growth_proposal: Option<f32>,
 }
 
-#[derive(Default)]
-pub(super) struct LabWorkflows {
-    pub(super) submit: Option<LabWorkflowSubmit>,
-    job: Option<LabJob>,
-    generation: u64,
-    context: u64,
-    session: Option<scriptbots_runtime::HostSessionId>,
-    panel: LabPanel,
-    experiments: Option<LabExperimentPage>,
-    experiment_cursor: Option<String>,
-    selected_experiment: Option<String>,
-    batch: Option<LabExperiment>,
-    baseline: Option<String>,
-    challenger: Option<String>,
-    variant_offset: usize,
-    comparison: Option<LabComparison>,
-    checkpoints: Option<LabCheckpointPage>,
-    checkpoint_cursor: Option<String>,
-    selected_checkpoint: Option<String>,
-    notice: Option<String>,
-    last_refresh: Option<Instant>,
-}
-
-fn bounded_message(message: &str) -> String {
-    message.chars().take(2048).collect()
-}
-
-fn identity_is_bounded(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
-}
-
-fn page_is_bounded<T>(items: &[T], offset: usize, total: usize, next: &Option<String>) -> bool {
-    items.len() <= LAB_PAGE_SIZE
-        && offset <= total
-        && items.len() <= total.saturating_sub(offset)
-        && next
-            .as_ref()
-            .map_or(offset + items.len() == total, |cursor| {
-                cursor.len() <= 20
-                    && cursor.parse::<usize>().is_ok_and(|next| {
-                        next == offset + items.len() && next > offset && next < total
-                    })
-            })
-}
-
-fn summary_is_bounded(summary: &LabExperimentSummary) -> bool {
-    identity_is_bounded(&summary.experiment_id)
-        && summary.status.len() <= 64
-        && summary.total_runs <= 4096
-        && summary.completed_runs <= summary.total_runs
-        && summary.failed_runs <= summary.total_runs - summary.completed_runs
-}
-
-fn batch_is_bounded(batch: &LabExperiment) -> bool {
-    summary_is_bounded(&batch.summary)
-        && identity_is_bounded(&batch.plan_digest)
-        && !batch.variants.is_empty()
-        && batch.variants.len() <= LAB_MAX_VARIANTS
-        && batch.variants.iter().all(|row| {
-            identity_is_bounded(&row.variant_id)
-                && row.brain_family.len() <= 256
-                && row.total_runs <= 128
-                && row.completed_runs <= row.total_runs
-                && row.failed_runs <= row.total_runs - row.completed_runs
-                && row.running_runs <= row.total_runs - row.completed_runs - row.failed_runs
-        })
-        && batch
-            .variants
-            .iter()
-            .map(|row| row.total_runs)
-            .sum::<usize>()
-            == batch.summary.total_runs
-        && batch
-            .variants
-            .iter()
-            .map(|row| row.completed_runs)
-            .sum::<usize>()
-            == batch.summary.completed_runs
-        && batch
-            .variants
-            .iter()
-            .map(|row| row.failed_runs)
-            .sum::<usize>()
-            == batch.summary.failed_runs
-        && batch
-            .variants
-            .iter()
-            .map(|row| &row.variant_id)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            == batch.variants.len()
-}
-
-impl LabWorkflows {
-    pub(super) fn invalidate(&mut self) {
-        // Saturation cannot resurrect an old generation: request admission also
-        // refuses when this counter is exhausted.
-        self.context = self.context.saturating_add(1);
-        self.last_refresh = None;
+/// A disclosed one-coefficient proposal; no scientific state is changed here.
+fn guide_growth_proposal(snapshot: &RenderSnapshot) -> Option<f32> {
+    let current = snapshot.config.food_growth_rate;
+    let proposed = if current == 0.0 {
+        0.0005
+    } else {
+        current * 0.75
+    };
+    if !proposed.is_finite() || proposed.to_bits() == current.to_bits() {
+        return None;
     }
-
-    fn synchronize(&mut self, session: scriptbots_runtime::HostSessionId, panel: LabPanel) {
-        if self.session != Some(session) {
-            self.invalidate();
-            self.session = Some(session);
-            self.experiments = None;
-            self.experiment_cursor = None;
-            self.selected_experiment = None;
-            self.batch = None;
-            self.baseline = None;
-            self.challenger = None;
-            self.comparison = None;
-            self.checkpoints = None;
-            self.checkpoint_cursor = None;
-            self.selected_checkpoint = None;
-            self.notice = None;
-        }
-        if self.panel != panel {
-            self.invalidate();
-            self.panel = panel;
-        }
-    }
-
-    fn start(&mut self, request: LabWorkflowRequest) {
-        if self.job.is_some() {
-            self.notice =
-                Some("A Lab request is still running; its worker slot remains occupied.".into());
-            return;
-        }
-        let Some(submit) = self.submit.clone() else {
-            self.notice =
-                Some("Application experiment and checkpoint services are unavailable.".into());
-            self.last_refresh = Some(Instant::now());
-            return;
-        };
-        let Some(session) = self.session else { return };
-        let Some(generation) = self
-            .generation
-            .checked_add(1)
-            .filter(|_| self.context < u64::MAX)
-        else {
-            self.notice = Some("Lab request identities are exhausted.".into());
-            return;
-        };
-        let (send, result) = std::sync::mpsc::sync_channel(1);
-        let worker_request = request.clone();
-        match std::thread::Builder::new()
-            .name("scriptbots-gui-lab".into())
-            .stack_size(LAB_WORKER_STACK_BYTES)
-            .spawn(move || {
-                let _ = send.send(submit(worker_request));
-            }) {
-            Ok(_) => {
-                self.generation = generation;
-                self.job = Some(LabJob {
-                    request,
-                    generation,
-                    context: self.context,
-                    session,
-                    result,
-                });
-                self.notice = Some("Loading application evidence…".into());
-                self.last_refresh = Some(Instant::now());
-            }
-            Err(error) => {
-                self.notice = Some(format!("Lab worker unavailable: {error}"));
-                self.last_refresh = Some(Instant::now());
-            }
-        }
-    }
-
-    fn selected_checkpoint_metadata(&self) -> Option<&LabCheckpoint> {
-        let selected = self.selected_checkpoint.as_deref()?;
-        self.checkpoints
-            .as_ref()?
-            .items
-            .iter()
-            .find(|row| row.checkpoint_id == selected)
-    }
-
-    fn comparison_request(&self) -> Option<LabWorkflowRequest> {
-        let batch = self.batch.as_ref()?;
-        let baseline = self.baseline.as_ref()?;
-        let challenger = self.challenger.as_ref()?;
-        if baseline == challenger {
-            return None;
-        }
-        Some(LabWorkflowRequest::Compare {
-            experiment_id: batch.summary.experiment_id.clone(),
-            baseline_variant: baseline.clone(),
-            challenger_variant: challenger.clone(),
-        })
-    }
-
-    fn poll(&mut self) -> Option<(String, Arc<RenderSnapshot>)> {
-        let job = self.job.as_ref()?;
-        let result = match job.result.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => Err("Lab worker disconnected".to_owned()),
-        };
-        let job = self.job.take()?;
-        if job.generation != self.generation
-            || job.context != self.context
-            || self.session != Some(job.session)
-        {
-            self.notice = Some(
-                "Lab request finished after its selection or session changed; result discarded."
-                    .into(),
-            );
-            return None;
-        }
-        let response = match result {
-            Ok(response) => response,
-            Err(error) => {
-                if matches!(
-                    &job.request,
-                    LabWorkflowRequest::GetExperiment { .. }
-                        | LabWorkflowRequest::CancelExperiment { .. }
-                        | LabWorkflowRequest::ResumeExperiment { .. }
-                        | LabWorkflowRequest::Compare { .. }
-                ) {
-                    self.comparison = None;
-                }
-                self.notice = Some(format!("Lab request failed: {}", bounded_message(&error)));
-                return None;
-            }
-        };
-        let accepted = match (&job.request, response) {
-            (
-                LabWorkflowRequest::ListExperiments { cursor },
-                LabWorkflowResponse::Experiments(page),
-            ) if cursor == &self.experiment_cursor
-                && page.offset == cursor.as_ref().and_then(|v| v.parse().ok()).unwrap_or(0)
-                && page_is_bounded(&page.items, page.offset, page.total, &page.next_cursor)
-                && page.items.iter().all(summary_is_bounded) =>
-            {
-                self.experiments = Some(page);
-                true
-            }
-            (
-                LabWorkflowRequest::GetExperiment { experiment_id }
-                | LabWorkflowRequest::CancelExperiment { experiment_id }
-                | LabWorkflowRequest::ResumeExperiment { experiment_id },
-                LabWorkflowResponse::Experiment(mut batch),
-            ) if self.selected_experiment.as_ref() == Some(experiment_id)
-                && batch.summary.experiment_id == *experiment_id
-                && batch_is_bounded(&batch) =>
-            {
-                batch.error_reason = batch.error_reason.as_deref().map(bounded_message);
-                if self.comparison.as_ref().is_some_and(|comparison| {
-                    comparison.plan_digest != batch.plan_digest
-                        || comparison.status_generation != batch.generation
-                }) {
-                    self.comparison = None;
-                }
-                if self
-                    .baseline
-                    .as_ref()
-                    .is_none_or(|id| !batch.variants.iter().any(|row| &row.variant_id == id))
-                {
-                    self.baseline = batch.variants.first().map(|row| row.variant_id.clone());
-                }
-                if self
-                    .challenger
-                    .as_ref()
-                    .is_none_or(|id| !batch.variants.iter().any(|row| &row.variant_id == id))
-                {
-                    self.challenger = batch
-                        .variants
-                        .iter()
-                        .find(|row| Some(&row.variant_id) != self.baseline.as_ref())
-                        .map(|row| row.variant_id.clone());
-                }
-                self.variant_offset = self.variant_offset.min(
-                    batch.variants.len().saturating_sub(1) / VARIANTS_PER_PAGE * VARIANTS_PER_PAGE,
-                );
-                self.batch = Some(batch);
-                true
-            }
-            (
-                LabWorkflowRequest::Compare {
-                    experiment_id,
-                    baseline_variant,
-                    challenger_variant,
-                },
-                LabWorkflowResponse::Comparison(comparison),
-            ) if self.comparison_request().as_ref() == Some(&job.request)
-                && comparison.experiment_id == *experiment_id
-                && comparison.baseline_variant == *baseline_variant
-                && comparison.challenger_variant == *challenger_variant
-                && self.batch.as_ref().is_some_and(|batch| {
-                    batch.plan_digest == comparison.plan_digest
-                        && batch.generation == comparison.status_generation
-                })
-                && !comparison.matched_seeds.is_empty()
-                && comparison.matched_seeds.len() <= 128
-                && comparison
-                    .matched_seeds
-                    .windows(2)
-                    .all(|pair| pair[0] < pair[1])
-                && comparison.mean_difference.is_finite()
-                && comparison.ci_95.is_none_or(|(low, high)| {
-                    low.is_finite() && high.is_finite() && low <= high
-                })
-                && comparison.standardized_effect.is_none_or(f64::is_finite)
-                && comparison
-                    .p_value
-                    .is_none_or(|p| p.is_finite() && (0.0..=1.0).contains(&p))
-                && comparison
-                    .adjusted_p_value
-                    .is_none_or(|p| p.is_finite() && (0.0..=1.0).contains(&p))
-                && (comparison.matched_seeds.len() > 1
-                    || (comparison.descriptive_only
-                        && comparison.ci_95.is_none()
-                        && comparison.standardized_effect.is_none()
-                        && comparison.p_value.is_none()
-                        && comparison.adjusted_p_value.is_none())) =>
-            {
-                self.comparison = Some(comparison);
-                true
-            }
-            (
-                LabWorkflowRequest::ListCheckpoints { cursor },
-                LabWorkflowResponse::Checkpoints(page),
-            ) if cursor == &self.checkpoint_cursor
-                && page.offset == cursor.as_ref().and_then(|v| v.parse().ok()).unwrap_or(0)
-                && page_is_bounded(&page.items, page.offset, page.total, &page.next_cursor)
-                && page.items.iter().all(|row| {
-                    identity_is_bounded(&row.checkpoint_id) && row.world_digest.len() <= 128
-                }) =>
-            {
-                if self
-                    .selected_checkpoint
-                    .as_ref()
-                    .is_some_and(|id| !page.items.iter().any(|row| &row.checkpoint_id == id))
-                {
-                    self.selected_checkpoint = None;
-                }
-                self.checkpoints = Some(page);
-                true
-            }
-            (
-                LabWorkflowRequest::ReviewCheckpoint { checkpoint_id },
-                LabWorkflowResponse::CheckpointFrame {
-                    checkpoint_id: returned_id,
-                    snapshot,
-                },
-            ) if self.panel == LabPanel::Checkpoints
-                && checkpoint_id == &returned_id
-                && self.selected_checkpoint_metadata().is_some_and(|row| {
-                    row.checkpoint_id == returned_id && row.tick == snapshot.world.tick
-                }) =>
-            {
-                self.notice = Some(format!(
-                    "Verified checkpoint {returned_id} at tick {}.",
-                    snapshot.world.tick
-                ));
-                return Some((returned_id, snapshot));
-            }
-            _ => false,
-        };
-        if !accepted
-            && matches!(
-                &job.request,
-                LabWorkflowRequest::GetExperiment { .. }
-                    | LabWorkflowRequest::CancelExperiment { .. }
-                    | LabWorkflowRequest::ResumeExperiment { .. }
-                    | LabWorkflowRequest::Compare { .. }
-            )
-        {
-            self.comparison = None;
-        }
-        self.notice = Some(if accepted {
-            "Application evidence refreshed.".into()
-        } else {
-            "Lab response changed, exceeded its bounds, or did not match the request; refresh before retrying.".into()
-        });
-        None
-    }
-
-    fn refresh_request(&self) -> Option<LabWorkflowRequest> {
-        match self.panel {
-            LabPanel::Inactive => None,
-            LabPanel::Experiments => Some(match &self.selected_experiment {
-                Some(id) => LabWorkflowRequest::GetExperiment {
-                    experiment_id: id.clone(),
-                },
-                None => LabWorkflowRequest::ListExperiments {
-                    cursor: self.experiment_cursor.clone(),
-                },
-            }),
-            LabPanel::Checkpoints => Some(LabWorkflowRequest::ListCheckpoints {
-                cursor: self.checkpoint_cursor.clone(),
-            }),
-        }
-    }
-
-    fn maybe_refresh(&mut self) {
-        if self.job.is_some()
-            || self.submit.is_none()
-            || self
-                .last_refresh
-                .is_some_and(|last| last.elapsed() < REFRESH_INTERVAL)
-        {
-            return;
-        }
-        let needs_refresh = match self.panel {
-            LabPanel::Inactive => false,
-            LabPanel::Checkpoints => self.checkpoints.is_none(),
-            LabPanel::Experiments => {
-                self.selected_experiment.is_none()
-                    || self.batch.as_ref().is_none_or(|batch| {
-                        matches!(
-                            batch.summary.status.as_str(),
-                            "running" | "pending" | "cancelling"
-                        )
-                    })
-            }
-        };
-        if needs_refresh && let Some(request) = self.refresh_request() {
-            self.start(request);
-        }
-    }
-}
-
-#[derive(Clone)]
-enum LabAction {
-    Refresh,
-    ExperimentsPage(Option<String>),
-    SelectExperiment(String),
-    AllExperiments,
-    Baseline(String),
-    Challenger(String),
-    VariantsPage(usize),
-    Compare,
-    CancelExperiment,
-    ResumeExperiment,
-    CheckpointsPage(Option<String>),
-    SelectCheckpoint(String),
-    ReviewCheckpoint,
-    CancelRequest,
-    ReturnLive,
+    let mut config = snapshot.config.as_ref().clone();
+    config.food_growth_rate = proposed;
+    config.validate().ok().map(|()| proposed)
 }
 
 impl SimulationView {
-    pub(super) fn poll_lab_workflows(&mut self, cx: &mut Context<Self>) {
-        if self.minimal_canvas_mode {
-            return;
+    /// Both windows observe the same owner and guide; neither advances science.
+    fn observe_lab_guide(&self) {
+        let snapshot = self.host.snapshot_hub().latest();
+        let focused = self.focused_agent();
+        let selected = focused.and_then(|id| {
+            snapshot
+                .world
+                .agents
+                .iter()
+                .find(|agent| agent.id == id.raw())
+                .map(|agent| agent.uid)
+        });
+        let pending = if let Ok(mut guide) = self.lab_guide.lock() {
+            guide.observe_snapshot(&snapshot, selected);
+            // Pending is observed only at actual save dispatch below. Repainting
+            // a request started before this learning step must not adopt it.
+            if let Some(save) = &self.lab_workflows.latest_checkpoint_save
+                && !matches!(&save.state, LabCheckpointSaveState::Pending)
+            {
+                guide.observe_checkpoint_save(save);
+            }
+            if let (Some(branch), Some(report)) = (
+                &self.lab_workflows.branch,
+                &self.lab_workflows.branch_report,
+            ) {
+                guide.observe_branch_report(snapshot.session_id, branch, report);
+            }
+            guide.pending_command_id()
+        } else {
+            None
+        };
+        if let Some(id) = pending
+            && let Ok(Some(status)) = self.host.try_published_command_status(id)
+            && let Ok(mut guide) = self.lab_guide.lock()
+        {
+            guide.observe_status(snapshot.session_id, &status);
         }
+    }
+
+    fn guide_navigate(&mut self, tab: DashboardTab) {
+        if self.dashboard_tab != tab {
+            self.timeline_cancelled.store(true, AtomicOrdering::Release);
+            self.lab_workflows.invalidate();
+            self.dashboard_tab = tab;
+        }
+        self.synchronize_lab_source();
+    }
+
+    fn guide_action(&mut self, action: LabGuideAction, cx: &mut Context<Self>) {
+        match action {
+            LabGuideAction::Open | LabGuideAction::Hide | LabGuideAction::Restart => {
+                if let Ok(mut guide) = self.lab_guide.lock() {
+                    match action {
+                        LabGuideAction::Open => guide.open(),
+                        LabGuideAction::Hide => guide.visible = false,
+                        LabGuideAction::Restart => guide.restart(),
+                        _ => unreachable!("guide visibility action"),
+                    }
+                }
+                self.observe_lab_guide();
+            }
+            LabGuideAction::Next(expected) => {
+                self.observe_lab_guide();
+                if self.host.snapshot_hub().latest().session_id == expected.session_id
+                    && let Ok(mut guide) = self.lab_guide.lock()
+                    && guide.generation() == expected.generation
+                    && guide.step() == expected.step
+                {
+                    guide.advance();
+                }
+                self.observe_lab_guide();
+            }
+            LabGuideAction::Perform(expected) => {
+                self.observe_lab_guide();
+                let snapshot = self.host.snapshot_hub().latest();
+                if snapshot.session_id != expected.session_id {
+                    return;
+                }
+                let current = self.lab_guide.lock().ok().map(|guide| {
+                    (
+                        guide.generation(),
+                        guide.step(),
+                        guide.finished(),
+                        guide.ready(),
+                        guide.pending_command_id().is_some(),
+                        guide
+                            .saved_checkpoint()
+                            .map(|saved| saved.checkpoint_id.clone()),
+                    )
+                });
+                let Some((generation, step, finished, ready, pending, saved)) = current else {
+                    return;
+                };
+                let navigation = matches!(
+                    step,
+                    LabGuideStep::Identify | LabGuideStep::Inspect | LabGuideStep::Outcome
+                );
+                if generation != expected.generation
+                    || step != expected.step
+                    || finished
+                    || pending
+                    || (ready && !navigation)
+                {
+                    return;
+                }
+                if matches!(
+                    step,
+                    LabGuideStep::Pause
+                        | LabGuideStep::Step
+                        | LabGuideStep::Configure
+                        | LabGuideStep::Checkpoint
+                ) && !self.lab_world_is_live(cx)
+                {
+                    self.lab_workflows.set_notice(
+                        "Return the World window to live before this guide action. Historical views do not control their saved past.",
+                    );
+                    cx.notify();
+                    return;
+                }
+                if matches!(
+                    step,
+                    LabGuideStep::Step | LabGuideStep::Configure | LabGuideStep::Checkpoint
+                ) && !snapshot.playback.paused
+                {
+                    self.lab_workflows
+                        .set_notice("Pause the live world before continuing this guide step.");
+                    cx.notify();
+                    return;
+                }
+                match step {
+                    LabGuideStep::Identify => self.guide_navigate(DashboardTab::Overview),
+                    LabGuideStep::Inspect => self.guide_navigate(DashboardTab::Inspect),
+                    LabGuideStep::Pause => {
+                        self.submit_control_command(ControlCommand::Pause);
+                    }
+                    LabGuideStep::Step => {
+                        self.submit_control_command(ControlCommand::Step);
+                    }
+                    LabGuideStep::Configure => {
+                        if snapshot.revisions.config != expected.config_revision {
+                            self.lab_workflows.set_notice(
+                                "Configuration changed after this proposal was displayed. Review the updated value before retrying.",
+                            );
+                        } else if let Some(value) = expected.growth_proposal {
+                            let mut config = snapshot.config.as_ref().clone();
+                            config.food_growth_rate = value;
+                            if let Some(submit) = self.config_update_submit.clone() {
+                                let command = ControlCommand::UpdateConfig(Box::new(config.clone()));
+                                match submit(Box::new(config), snapshot.revisions) {
+                                    Ok(status) => {
+                                        let id = status.command_id();
+                                        if let Ok(mut guide) = self.lab_guide.lock() {
+                                            guide.observe_snapshot(&snapshot, None);
+                                            guide.record_command(&command, id, &snapshot);
+                                            guide.observe_status(snapshot.session_id, &status);
+                                        }
+                                        self.record_gui_command(
+                                            "Configuration",
+                                            GuiCommandSubmission::Enqueued(id),
+                                        );
+                                    }
+                                    Err(error) => self.lab_workflows.set_notice(format!(
+                                        "Configuration submission could not be confirmed: {error}"
+                                    )),
+                                }
+                            } else {
+                                self.lab_workflows.set_notice(
+                                    "Guarded configuration updates are unavailable in this view.",
+                                );
+                            }
+                        } else {
+                            self.lab_workflows.set_notice(
+                                "No distinct valid food-regrowth proposal is available for this configuration.",
+                            );
+                        }
+                    }
+                    LabGuideStep::Checkpoint => {
+                        self.guide_navigate(DashboardTab::Checkpoints);
+                        self.lab_action(LabAction::CreateCheckpoint, cx);
+                    }
+                    LabGuideStep::Branch => {
+                        self.guide_navigate(DashboardTab::Checkpoints);
+                        if let Some(id) = saved {
+                            if self.lab_workflows.is_busy() {
+                                self.lab_workflows.set_notice(
+                                    "Wait for the current Lab request before choosing this saved source.",
+                                );
+                            } else if self
+                                .lab_workflows
+                                .branch
+                                .as_ref()
+                                .is_some_and(|branch| branch.checkpoint_id == id)
+                            {
+                                let action = if self.lab_workflows.can_read_branch_report() {
+                                    LabAction::ReadCheckpointBranchReport
+                                } else {
+                                    LabAction::Refresh
+                                };
+                                self.lab_action(action, cx);
+                            } else {
+                                self.lab_workflows.dispatch(LabAction::BackToCheckpoints);
+                                self.lab_workflows
+                                    .dispatch(LabAction::SelectCheckpoint(id.clone()));
+                                if self
+                                    .lab_workflows
+                                    .selected_checkpoint_metadata()
+                                    .is_some_and(|checkpoint| checkpoint.checkpoint_id == id)
+                                {
+                                    self.lab_action(LabAction::NewCheckpointBranch, cx);
+                                } else {
+                                    self.lab_workflows.set_notice(
+                                        "The walkthrough's saved cut is unavailable in this catalog. Refresh or return to its retained save receipt.",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    LabGuideStep::Outcome => {
+                        self.guide_navigate(DashboardTab::Checkpoints);
+                        if self.lab_workflows.branch_report.is_none()
+                            && self.lab_workflows.can_read_branch_report()
+                        {
+                            self.lab_action(LabAction::ReadCheckpointBranchReport, cx);
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn guide_button(
+        &self,
+        id: &'static str,
+        label: String,
+        action: LabGuideAction,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(label.clone())
+            .rounded_md()
+            .border_1()
+            .border_color(chrome::border())
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(if enabled {
+                chrome::text_primary()
+            } else {
+                chrome::text_muted()
+            })
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if enabled {
+                        this.guide_action(action, cx);
+                    }
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
+                    if enabled && !event.is_held {
+                        this.guide_action(action, cx);
+                    }
+                    cx.stop_propagation();
+                }
+            }))
+    }
+
+    pub(super) fn render_lab_guide_launcher(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        self.guide_button(
+            "lab-guide-open",
+            "First-run guide".into(),
+            LabGuideAction::Open,
+            true,
+            cx,
+        )
+    }
+
+    pub(super) fn render_lab_guide(&self, cx: &mut Context<Self>) -> Div {
+        let state = self.lab_guide.lock().ok().and_then(|guide| {
+            guide.visible.then(|| {
+                (
+                    guide.generation(),
+                    guide.step(),
+                    guide.ready(),
+                    guide.finished(),
+                    guide.pending_command_id().is_some(),
+                    guide.status().to_owned(),
+                    guide.evidence().to_owned(),
+                )
+            })
+        });
+        let Some((generation, step, ready, finished, pending, status, evidence)) = state else {
+            return div();
+        };
+        let snapshot = self.host.snapshot_hub().latest();
+        let growth_proposal = (step == LabGuideStep::Configure)
+            .then(|| guide_growth_proposal(&snapshot))
+            .flatten();
+        let boundary = LabGuideBoundary {
+            generation,
+            step,
+            session_id: snapshot.session_id,
+            config_revision: snapshot.revisions.config,
+            growth_proposal,
+        };
+        let label = match step {
+            LabGuideStep::Identify => "Open run overview".to_owned(),
+            LabGuideStep::Inspect => "Open organism inspector".to_owned(),
+            LabGuideStep::Pause => "Pause this run".to_owned(),
+            LabGuideStep::Step => "Advance exactly one tick".to_owned(),
+            LabGuideStep::Configure => growth_proposal.map_or_else(
+                || "Food regrowth change unavailable".into(),
+                |value| {
+                    format!(
+                        "Set food regrowth: {} → {value}",
+                        snapshot.config.food_growth_rate,
+                    )
+                },
+            ),
+            LabGuideStep::Checkpoint => "Save live checkpoint".to_owned(),
+            LabGuideStep::Branch => "Configure or inspect the saved-source study".to_owned(),
+            LabGuideStep::Outcome => "Show verified study outcome".to_owned(),
+        };
+        let navigation = matches!(
+            step,
+            LabGuideStep::Identify | LabGuideStep::Inspect | LabGuideStep::Outcome
+        );
+        let available = !pending
+            && (navigation || !ready)
+            && !finished
+            && (step != LabGuideStep::Configure
+                || (growth_proposal.is_some() && self.config_update_submit.is_some()))
+            && (!matches!(
+                step,
+                LabGuideStep::Step | LabGuideStep::Configure | LabGuideStep::Checkpoint
+            ) || snapshot.playback.paused)
+            && (!matches!(
+                step,
+                LabGuideStep::Checkpoint | LabGuideStep::Branch | LabGuideStep::Outcome
+            ) || self.lab_workflows.submit.is_some());
+        let mut panel = div()
+            .id("lab-guide-panel")
+            .debug_selector(|| "lab-guide-panel".to_owned())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .mb_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(chrome::accent())
+            .bg(chrome::surface())
+            .child(div().text_sm().child(if finished {
+                "Walkthrough observations complete".to_owned()
+            } else {
+                format!(
+                    "{} / {} · {}",
+                    step.index() + 1,
+                    LabGuideStep::ALL.len(),
+                    step.title(),
+                )
+            }))
+            .child(div().text_xs().child(format!(
+                "Live owner {} · seed {} · tick {} · {} agents",
+                snapshot.session_id.get(),
+                snapshot.visual_seed,
+                snapshot.world.tick,
+                snapshot.world.agents.len(),
+            )))
+            .child(div().text_xs().child(step.instruction()))
+            .child(div().text_xs().child(status));
+        if !evidence.is_empty() {
+            panel = panel.child(div().text_xs().child(evidence));
+        }
+        if matches!(
+            step,
+            LabGuideStep::Step | LabGuideStep::Configure | LabGuideStep::Checkpoint
+        ) && !snapshot.playback.paused
+        {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .child("Pause the live world before continuing this guide step."),
+            );
+        }
+        if step == LabGuideStep::Configure && self.config_update_submit.is_none() {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .child("Guarded configuration updates are unavailable in this view."),
+            );
+        }
+        if self.lab_workflows.submit.is_none() {
+            panel = panel.child(div().text_xs().child(
+                "Checkpoint and study services are unavailable in this view.",
+            ));
+        }
+        if let Some(notice) = &self.lab_workflows.notice {
+            panel = panel.child(div().text_xs().child(notice.clone()));
+        }
+        div().child(panel.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(self.guide_button(
+                    "lab-guide-perform",
+                    label,
+                    LabGuideAction::Perform(boundary),
+                    available,
+                    cx,
+                ))
+                .child(self.guide_button(
+                    "lab-guide-next",
+                    if step == LabGuideStep::Outcome {
+                        "Finish".into()
+                    } else {
+                        "Next".into()
+                    },
+                    LabGuideAction::Next(boundary),
+                    ready && !finished,
+                    cx,
+                ))
+                .child(self.guide_button(
+                    "lab-guide-hide",
+                    "Hide; keep progress".into(),
+                    LabGuideAction::Hide,
+                    true,
+                    cx,
+                ))
+                .child(self.guide_button(
+                    "lab-guide-restart",
+                    "Restart guide".into(),
+                    LabGuideAction::Restart,
+                    true,
+                    cx,
+                )),
+        ))
+    }
+
+    fn synchronize_lab_source(&mut self) {
         let panel = match self.dashboard_tab {
             DashboardTab::Experiments => LabPanel::Experiments,
             DashboardTab::Checkpoints => LabPanel::Checkpoints,
             _ => LabPanel::Inactive,
         };
-        self.lab_workflows
-            .synchronize(self.host.snapshot_hub().latest().session_id, panel);
+        let source = self.host.snapshot_hub().latest();
+        self.lab_workflows.synchronize(source.session_id, panel);
+    }
+
+    fn lab_world_is_live(&self, cx: &Context<Self>) -> bool {
+        let session = self.host.snapshot_hub().latest().session_id;
+        self.world_view.as_ref().is_some_and(|world| {
+            world
+                .read_with(cx, |view, _| {
+                    view.host.snapshot_hub().latest().session_id == session
+                        && view.playback.mode() == PlaybackMode::Live
+                        && !view.playback.displaying_history
+                        && view.playback.reconstructed.is_none()
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    pub(super) fn poll_lab_workflows(&mut self, cx: &mut Context<Self>) {
+        if self.minimal_canvas_mode {
+            self.observe_lab_guide();
+            return;
+        }
+        self.synchronize_lab_source();
         if let Some((id, snapshot)) = self.lab_workflows.poll() {
             // World toolbar actions share this token with Timeline. A later
             // live/seek/step intent must supersede a pending Lab reconstruction,
@@ -646,105 +576,54 @@ impl SimulationView {
             });
         }
         self.lab_workflows.maybe_refresh();
+        self.observe_lab_guide();
     }
 
     fn lab_action(&mut self, action: LabAction, cx: &mut Context<Self>) {
-        match action {
-            LabAction::ReturnLive => {
-                self.lab_workflows.invalidate();
-                self.return_world_to_live(cx);
-                self.lab_workflows.notice = self.world_review_feedback.clone();
-            }
-            LabAction::CancelRequest => {
-                self.lab_workflows.invalidate();
-                self.lab_workflows.notice = Some("Result cancelled. The worker remains occupied until it finishes; already submitted cancel/resume actions still take effect.".into());
-            }
-            LabAction::SelectExperiment(id) => {
-                self.lab_workflows.invalidate();
-                self.lab_workflows.selected_experiment = Some(id.clone());
-                self.lab_workflows.batch = None;
-                self.lab_workflows.baseline = None;
-                self.lab_workflows.challenger = None;
-                self.lab_workflows.comparison = None;
-                self.lab_workflows.variant_offset = 0;
-                if self.lab_workflows.job.is_none() {
-                    self.lab_workflows
-                        .start(LabWorkflowRequest::GetExperiment { experiment_id: id });
-                }
-            }
-            LabAction::AllExperiments => {
-                self.lab_workflows.invalidate();
-                self.lab_workflows.selected_experiment = None;
-                self.lab_workflows.batch = None;
-                self.lab_workflows.comparison = None;
-            }
-            LabAction::ExperimentsPage(cursor) => {
-                self.lab_workflows.invalidate();
-                self.lab_workflows.experiment_cursor = cursor;
-                self.lab_workflows.experiments = None;
-            }
-            LabAction::CheckpointsPage(cursor) => {
-                self.lab_workflows.invalidate();
-                self.lab_workflows.checkpoint_cursor = cursor;
-                self.lab_workflows.checkpoints = None;
-                self.lab_workflows.selected_checkpoint = None;
-            }
-            LabAction::SelectCheckpoint(id) => {
-                self.lab_workflows.invalidate();
-                self.lab_workflows.selected_checkpoint = Some(id);
-            }
-            LabAction::Baseline(ref id) | LabAction::Challenger(ref id) => {
-                let baseline = matches!(&action, LabAction::Baseline(_));
-                if self
-                    .lab_workflows
-                    .batch
-                    .as_ref()
-                    .is_some_and(|batch| batch.variants.iter().any(|row| &row.variant_id == id))
-                {
-                    self.lab_workflows.invalidate();
-                    if baseline {
-                        self.lab_workflows.baseline = Some(id.clone());
-                    } else {
-                        self.lab_workflows.challenger = Some(id.clone());
-                    }
-                    self.lab_workflows.comparison = None;
-                }
-            }
-            LabAction::VariantsPage(offset) => self.lab_workflows.variant_offset = offset,
-            LabAction::Compare => {
-                if let Some(request) = self.lab_workflows.comparison_request() {
-                    self.lab_workflows.comparison = None;
-                    self.lab_workflows.start(request);
-                }
-            }
-            LabAction::CancelExperiment | LabAction::ResumeExperiment => {
-                if let Some(id) = self.lab_workflows.selected_experiment.clone() {
-                    let request = if matches!(action, LabAction::CancelExperiment) {
-                        LabWorkflowRequest::CancelExperiment { experiment_id: id }
-                    } else {
-                        LabWorkflowRequest::ResumeExperiment { experiment_id: id }
-                    };
-                    self.lab_workflows.start(request);
-                }
-            }
-            LabAction::ReviewCheckpoint => {
-                if let Some(id) = self.lab_workflows.selected_checkpoint.clone() {
-                    if self.lab_workflows.job.is_none() {
-                        // Old Timeline work also checks its active tab/selection;
-                        // this new Checkpoints intent can now observe subsequent
-                        // cross-window cancellation without reviving that work.
-                        self.timeline_cancelled
-                            .store(false, AtomicOrdering::Release);
-                    }
-                    self.lab_workflows
-                        .start(LabWorkflowRequest::ReviewCheckpoint { checkpoint_id: id });
-                }
-            }
-            LabAction::Refresh => {
-                if let Some(request) = self.lab_workflows.refresh_request() {
-                    self.lab_workflows.start(request);
-                }
-            }
+        self.synchronize_lab_source();
+        // The World window can enter history after this button was painted.
+        // Check its actual presentation, not the companion Lab's live cache.
+        if action == LabAction::CreateCheckpoint && !self.lab_world_is_live(cx) {
+            self.lab_workflows
+                .set_notice("Show the live World window before saving or retrying a checkpoint.");
+            cx.notify();
+            return;
+        }
+        let return_live = action == LabAction::ReturnLive;
+        if action == LabAction::ReviewCheckpoint
+            && !self.lab_workflows.is_busy()
+            && self.lab_workflows.selected_checkpoint_metadata().is_some()
+        {
+            // A later World-window intent must supersede this reconstruction.
+            self.timeline_cancelled
+                .store(false, AtomicOrdering::Release);
+        }
+        let creating_checkpoint = action == LabAction::CreateCheckpoint;
+        let previous_pending = self
+            .lab_workflows
+            .latest_checkpoint_save
+            .as_ref()
+            .filter(|save| matches!(&save.state, LabCheckpointSaveState::Pending))
+            .map(|save| (save.session_id, save.request_id.clone()));
+        self.lab_workflows.dispatch(action);
+        // Observe only an actual transition into Pending for this save action,
+        // including a retry. A cached old Pending or Saved cannot join a guide
+        // that reached Checkpoint after that request began.
+        if creating_checkpoint
+            && let Some(save) = &self.lab_workflows.latest_checkpoint_save
+            && matches!(&save.state, LabCheckpointSaveState::Pending)
+            && previous_pending
+                .as_ref()
+                .is_none_or(|(session, request)| {
+                    *session != save.session_id || request != &save.request_id
+                })
+            && let Ok(mut guide) = self.lab_guide.lock()
+        {
+            guide.observe_checkpoint_save(save);
+        }
+        if return_live {
+            self.return_world_to_live(cx);
+            self.lab_workflows.notice = self.world_review_feedback.clone();
         }
         cx.notify();
     }
@@ -787,7 +666,7 @@ impl SimulationView {
             )
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                 if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
-                    if enabled {
+                    if enabled && !event.is_held {
                         this.lab_action(action.clone(), cx);
                     }
                     cx.stop_propagation();
@@ -796,7 +675,7 @@ impl SimulationView {
     }
 
     fn lab_panel_header(&self, title: &str, cx: &mut Context<Self>) -> Div {
-        let idle = self.lab_workflows.job.is_none();
+        let idle = !self.lab_workflows.is_busy();
         let mut header = div()
             .flex()
             .flex_col()
@@ -840,14 +719,573 @@ impl SimulationView {
         header
     }
 
+    fn render_lab_experiment_treatment(
+        &self,
+        treatment: &LabExperimentTreatment,
+        capabilities: &LabExperimentCapabilities,
+        horizon: u64,
+        editing: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut parameters = div().flex().flex_wrap().gap_2();
+        for offered in &capabilities.treatment_parameters {
+            parameters = parameters.child(self.lab_button(
+                format!("lab-experiment-parameter-{}", offered.parameter.key()),
+                format!(
+                    "{}{}",
+                    if treatment.parameter == offered.parameter {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                    offered.parameter.label(),
+                ),
+                LabAction::TreatmentParameter(offered.parameter),
+                editing,
+                cx,
+            ));
+        }
+        let mut scales = div().flex().flex_wrap().gap_2().child(
+            self.lab_button(
+                "lab-experiment-percent-prev".into(),
+                "10 percentage points less".into(),
+                LabAction::TreatmentPercent(
+                    treatment
+                        .scale_percent
+                        .checked_sub(10)
+                        .unwrap_or(treatment.scale_percent),
+                ),
+                editing && treatment.scale_percent >= 10,
+                cx,
+            ),
+        );
+        for percent in [0, 50, 100, 200, LAB_MAX_TREATMENT_PERCENT] {
+            scales = scales.child(self.lab_button(
+                format!("lab-experiment-percent-{percent}"),
+                format!(
+                    "{}{percent}% of baseline{}",
+                    if treatment.scale_percent == percent {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                    if percent == 100 {
+                        " (unchanged-value control)"
+                    } else {
+                        ""
+                    },
+                ),
+                LabAction::TreatmentPercent(percent),
+                editing,
+                cx,
+            ));
+        }
+        scales = scales.child(
+            self.lab_button(
+                "lab-experiment-percent-next".into(),
+                "10 percentage points more".into(),
+                LabAction::TreatmentPercent(
+                    treatment
+                        .scale_percent
+                        .checked_add(10)
+                        .unwrap_or(treatment.scale_percent),
+                ),
+                editing
+                    && treatment
+                        .scale_percent
+                        .checked_add(10)
+                        .is_some_and(|percent| percent <= LAB_MAX_TREATMENT_PERCENT),
+                cx,
+            ),
+        );
+        let mut boundaries = div().flex().flex_wrap().gap_2().child(
+            self.lab_button(
+                "lab-experiment-treatment-tick-prev".into(),
+                "One boundary earlier".into(),
+                LabAction::TreatmentTick(
+                    treatment
+                        .at_tick
+                        .checked_sub(1)
+                        .unwrap_or(treatment.at_tick),
+                ),
+                editing && treatment.at_tick > 0,
+                cx,
+            ),
+        );
+        for tick in [0, 10, 100] {
+            if tick < horizon {
+                boundaries = boundaries.child(self.lab_button(
+                    format!("lab-experiment-treatment-tick-{tick}"),
+                    format!(
+                        "{}At completed tick {tick}",
+                        if treatment.at_tick == tick {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                    ),
+                    LabAction::TreatmentTick(tick),
+                    editing,
+                    cx,
+                ));
+            }
+        }
+        boundaries = boundaries.child(
+            self.lab_button(
+                "lab-experiment-treatment-tick-next".into(),
+                "One boundary later".into(),
+                LabAction::TreatmentTick(
+                    treatment
+                        .at_tick
+                        .checked_add(1)
+                        .unwrap_or(treatment.at_tick),
+                ),
+                editing
+                    && treatment
+                        .at_tick
+                        .checked_add(1)
+                        .is_some_and(|tick| tick < horizon),
+                cx,
+            ),
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(parameters)
+            .child(div().text_sm().child(format!(
+                "Challenger value: {}% of the disclosed baseline (0–{LAB_MAX_TREATMENT_PERCENT}%).",
+                treatment.scale_percent,
+            )))
+            .child(scales)
+            .child(div().text_sm().child(format!(
+                "Apply after completed tick {} and before the next transition; boundary must be earlier than horizon {horizon}.",
+                treatment.at_tick,
+            )))
+            .child(boundaries)
+    }
+
+    fn render_lab_experiment_creation(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.lab_workflows;
+        let editing = state.can_edit_experiment_draft();
+        let draft = state
+            .latest_experiment_creation
+            .as_ref()
+            .filter(|creation| {
+                !matches!(&creation.state, LabExperimentCreationState::Created { .. })
+            })
+            .map(|creation| &creation.draft)
+            .unwrap_or(&state.experiment_draft);
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.lab_button(
+                "lab-experiment-back".into(),
+                "Back to experiments".into(),
+                LabAction::BackToExperiments,
+                true,
+                cx,
+            ))
+            .child(div().text_lg().child("Experiment in fresh worlds"))
+            .child(div().text_xs().child(format!(
+                "Application source session {}.",
+                self.host.snapshot_hub().latest().session_id.get(),
+            )));
+        if let Some(creation) = &state.latest_experiment_creation {
+            let current_source =
+                self.host.snapshot_hub().latest().session_id == creation.session_id;
+            section = section.child(div().text_xs().child(format!(
+                "{}creation request {} · source session {}",
+                if current_source {
+                    ""
+                } else {
+                    "Previous-source "
+                },
+                creation.request_id,
+                creation.session_id.get(),
+            )));
+            match &creation.state {
+                LabExperimentCreationState::Pending => {
+                    section = section.child(
+                        div()
+                            .text_xs()
+                            .child("Awaiting the application's experiment receipt."),
+                    );
+                }
+                LabExperimentCreationState::Retryable { reason } => {
+                    section = section.child(
+                        div()
+                            .text_xs()
+                            .child(format!("Creation is unconfirmed: {reason}")),
+                    );
+                }
+                LabExperimentCreationState::Created { experiment_id } => {
+                    section = section.child(div().text_xs().child(format!(
+                        "Experiment receipt: {experiment_id}. Inspect its observed run status in the catalog.",
+                    )));
+                }
+            }
+            if !matches!(&creation.state, LabExperimentCreationState::Created { .. }) {
+                section = section
+                    .child(div().text_xs().child(format!(
+                        "Retained plan: {} versus {} · first seed {} · {} seeds · {} ticks per run.",
+                        creation.draft.baseline_family,
+                        creation.draft.challenger_family,
+                        creation.draft.first_seed,
+                        creation.draft.seed_count,
+                        creation.draft.ticks_per_run,
+                    )))
+                    .child(div().text_xs().child(if current_source {
+                        "Retry retains the exact request and plan. Abandon clears the local retry; an admitted experiment may still exist in the catalog."
+                    } else {
+                        "This previous-source request cannot be retried here. Abandon clears the local retry only; an admitted experiment may still exist in the catalog."
+                    }))
+                    .child(self.lab_button(
+                        "lab-experiment-abandon".into(),
+                        "Abandon unconfirmed request".into(),
+                        LabAction::AbandonExperimentRequest,
+                        state.can_abandon_experiment_request(),
+                        cx,
+                    ));
+            }
+        }
+        let mut question = div()
+            .id("lab-experiment-question")
+            .debug_selector(|| "lab-experiment-question".to_owned())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_xs();
+        for line in draft.question_lines() {
+            question = question.child(div().child(line));
+        }
+        section = section.child(question);
+        let Some(capabilities) = &state.experiment_capabilities else {
+            return section.child(
+                div()
+                    .text_sm()
+                    .child("Loading available brain families and experiment limits…"),
+            );
+        };
+        section = section
+            .child(
+                div()
+                    .text_sm()
+                    .child(capabilities.launch_description.clone()),
+            )
+            .child(div().text_xs().child(format!(
+                "Limits: {} seeds · {} ticks per run · {} total run ticks.",
+                capabilities.max_seed_count,
+                capabilities.max_ticks_per_run,
+                capabilities.max_total_ticks,
+            )));
+        let design = draft.design();
+        section = section.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(self.lab_button(
+                    "lab-experiment-design-brain-families".into(),
+                    format!(
+                        "{}Compare brain families{}",
+                        if design == LabExperimentDesign::BrainFamilies {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                        if capabilities.families.len() < 2 {
+                            " (needs two families)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    LabAction::ExperimentDesign(LabExperimentDesign::BrainFamilies),
+                    editing && capabilities.families.len() >= 2,
+                    cx,
+                ))
+                .child(self.lab_button(
+                    "lab-experiment-design-ecological-treatment".into(),
+                    format!(
+                        "{}Compare ecological treatment{}",
+                        if design == LabExperimentDesign::EcologicalTreatment {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                        if capabilities.treatment_parameters.is_empty() {
+                            " (unavailable)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    LabAction::ExperimentDesign(LabExperimentDesign::EcologicalTreatment),
+                    editing && !capabilities.treatment_parameters.is_empty(),
+                    cx,
+                )),
+        );
+        let families: &[(bool, &str)] = if design == LabExperimentDesign::EcologicalTreatment {
+            &[(true, "Shared brain family in both arms")]
+        } else {
+            &[
+                (true, "Baseline brain family"),
+                (false, "Challenger brain family"),
+            ]
+        };
+        for &(baseline, title) in families {
+            let selected = if baseline {
+                &draft.baseline_family
+            } else {
+                &draft.challenger_family
+            };
+            let mut choices = div().flex().flex_wrap().gap_2();
+            for family in &capabilities.families {
+                choices = choices.child(self.lab_button(
+                    format!(
+                        "lab-experiment-{}-{}",
+                        if baseline { "baseline" } else { "challenger" },
+                        family,
+                    ),
+                    format!(
+                        "{}{}",
+                        if selected == family { "Selected: " } else { "" },
+                        family,
+                    ),
+                    if baseline {
+                        LabAction::DraftBaseline(family.clone())
+                    } else {
+                        LabAction::DraftChallenger(family.clone())
+                    },
+                    editing,
+                    cx,
+                ));
+            }
+            section = section.child(div().text_sm().child(title)).child(choices);
+        }
+        if let Some(treatment) = &draft.treatment {
+            section = section.child(self.render_lab_experiment_treatment(
+                treatment,
+                capabilities,
+                draft.ticks_per_run,
+                editing,
+                cx,
+            ));
+        }
+        let mut first_seed = div().flex().flex_wrap().gap_2();
+        first_seed = first_seed.child(self.lab_button(
+            "lab-experiment-seed-prev".into(),
+            "Previous first seed".into(),
+            LabAction::FirstSeed(draft.first_seed.checked_sub(1).unwrap_or(draft.first_seed)),
+            editing && draft.first_seed > 0,
+            cx,
+        ));
+        for seed in [11, 42, 137] {
+            first_seed = first_seed.child(self.lab_button(
+                format!("lab-experiment-seed-{seed}"),
+                format!(
+                    "{}First seed {seed}",
+                    if draft.first_seed == seed {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                ),
+                LabAction::FirstSeed(seed),
+                editing,
+                cx,
+            ));
+        }
+        first_seed = first_seed.child(self.lab_button(
+            "lab-experiment-seed-next".into(),
+            "Next first seed".into(),
+            LabAction::FirstSeed(draft.first_seed.checked_add(1).unwrap_or(draft.first_seed)),
+            editing && draft.first_seed < u64::MAX,
+            cx,
+        ));
+        let mut counts = div().flex().flex_wrap().gap_2().child(self.lab_button(
+            "lab-experiment-seed-count-prev".into(),
+            "One fewer seed".into(),
+            LabAction::SeedCount(draft.seed_count.checked_sub(1).unwrap_or(draft.seed_count)),
+            editing && draft.seed_count > 1,
+            cx,
+        ));
+        for count in [1, 3, 8] {
+            if count <= capabilities.max_seed_count {
+                counts = counts.child(self.lab_button(
+                    format!("lab-experiment-seed-count-{count}"),
+                    format!(
+                        "{}{count} seed{}",
+                        if draft.seed_count == count {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                        if count == 1 { "" } else { "s" },
+                    ),
+                    LabAction::SeedCount(count),
+                    editing,
+                    cx,
+                ));
+            }
+        }
+        counts = counts.child(
+            self.lab_button(
+                "lab-experiment-seed-count-next".into(),
+                "One more seed".into(),
+                LabAction::SeedCount(draft.seed_count.checked_add(1).unwrap_or(draft.seed_count)),
+                editing
+                    && draft
+                        .seed_count
+                        .checked_add(1)
+                        .is_some_and(|count| count <= capabilities.max_seed_count),
+                cx,
+            ),
+        );
+        let mut horizons = div().flex().flex_wrap().gap_2().child(
+            self.lab_button(
+                "lab-experiment-ticks-prev".into(),
+                "One fewer tick".into(),
+                LabAction::TicksPerRun(
+                    draft
+                        .ticks_per_run
+                        .checked_sub(1)
+                        .unwrap_or(draft.ticks_per_run),
+                ),
+                editing && draft.ticks_per_run > 1,
+                cx,
+            ),
+        );
+        for ticks in [1, 10, 100, 500, 1_000, 10_000] {
+            if ticks <= capabilities.max_ticks_per_run {
+                horizons = horizons.child(self.lab_button(
+                    format!("lab-experiment-ticks-{ticks}"),
+                    format!(
+                        "{}{ticks} ticks per run",
+                        if draft.ticks_per_run == ticks {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                    ),
+                    LabAction::TicksPerRun(ticks),
+                    editing,
+                    cx,
+                ));
+            }
+        }
+        horizons = horizons.child(
+            self.lab_button(
+                "lab-experiment-ticks-next".into(),
+                "One more tick".into(),
+                LabAction::TicksPerRun(
+                    draft
+                        .ticks_per_run
+                        .checked_add(1)
+                        .unwrap_or(draft.ticks_per_run),
+                ),
+                editing
+                    && draft
+                        .ticks_per_run
+                        .checked_add(1)
+                        .is_some_and(|ticks| ticks <= capabilities.max_ticks_per_run),
+                cx,
+            ),
+        );
+        section = section
+            .child(
+                div()
+                    .text_sm()
+                    .child(format!("First seed: {}", draft.first_seed)),
+            )
+            .child(first_seed)
+            .child(
+                div()
+                    .text_sm()
+                    .child(format!("Matched seed cohort: {}", draft.seed_count)),
+            )
+            .child(counts)
+            .child(
+                div()
+                    .text_sm()
+                    .child(format!("Scientific horizon: {} ticks", draft.ticks_per_run,)),
+            )
+            .child(horizons);
+        match draft.seeds() {
+            Ok(seeds) => {
+                section = section.child(
+                    div()
+                        .text_xs()
+                        .child(format!("Exact seeds in each arm: {seeds:?}",)),
+                );
+            }
+            Err(error) => {
+                section = section.child(
+                    div()
+                        .text_xs()
+                        .child(format!("Seed schedule refused: {error}")),
+                );
+            }
+        }
+        let total_runs = draft.seed_count.checked_mul(2);
+        let total_ticks = total_runs
+            .and_then(|runs| u64::try_from(runs).ok())
+            .and_then(|runs| runs.checked_mul(draft.ticks_per_run));
+        section = section.child(
+            div()
+                .id("lab-experiment-preview")
+                .debug_selector(|| "lab-experiment-preview".to_owned())
+                .text_xs()
+                .child(format!(
+                    "Review: baseline {} · challenger {} · {} seeds per arm · {} ticks per run · {} total runs · {} total scientific ticks. Runs execute sequentially, one owner at a time.",
+                    draft.baseline_family,
+                    draft.challenger_family,
+                    draft.seed_count,
+                    draft.ticks_per_run,
+                    total_runs
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "overflow".into()),
+                    total_ticks
+                        .map(|ticks| ticks.to_string())
+                        .unwrap_or_else(|| "overflow".into()),
+                )),
+        );
+        if let Err(reason) = draft.validate(capabilities) {
+            section = section.child(
+                div()
+                    .text_xs()
+                    .child(format!("Plan needs attention: {reason}")),
+            );
+        }
+        section.child(
+            self.lab_button(
+                "lab-experiment-create".into(),
+                if state.is_busy() {
+                    "Awaiting experiment service"
+                } else if state.will_retry_experiment_creation() {
+                    "Retry this exact experiment"
+                } else {
+                    "Run this experiment"
+                }
+                .into(),
+                LabAction::CreateExperiment,
+                state.can_create_experiment(),
+                cx,
+            ),
+        )
+    }
+
     pub(super) fn render_lab_experiments(&self, cx: &mut Context<Self>) -> Div {
         let state = &self.lab_workflows;
-        let idle = state.job.is_none();
+        let idle = !state.is_busy();
         let mut panel = div()
             .flex()
             .flex_col()
             .gap_3()
             .child(self.lab_panel_header("Experiments", cx));
+        if state.composing_experiment {
+            return panel.child(self.render_lab_experiment_creation(cx));
+        }
         if state.selected_experiment.is_some() {
             panel = panel.child(self.lab_button(
                 "lab-all-experiments".into(),
@@ -897,6 +1335,24 @@ impl SimulationView {
                 );
             if let Some(error) = &batch.error_reason {
                 panel = panel.child(div().text_xs().child(error.clone()));
+            }
+            if let Some(creation) = state.latest_experiment_creation.as_ref().filter(|creation| {
+                creation.session_id == self.host.snapshot_hub().latest().session_id
+                    && matches!(&creation.state, LabExperimentCreationState::Created { experiment_id }
+                        if experiment_id == &summary.experiment_id)
+            }) {
+                let mut question = div()
+                    .id("lab-experiment-retained-question")
+                    .debug_selector(|| "lab-experiment-retained-question".to_owned())
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_xs()
+                    .child("Retained launch question:");
+                for line in creation.draft.question_lines() {
+                    question = question.child(div().child(line));
+                }
+                panel = panel.child(question);
             }
             for (index, variant) in batch
                 .variants
@@ -954,6 +1410,25 @@ impl SimulationView {
                         ),
                 );
             }
+            let mut metrics = div().flex().flex_wrap().gap_2();
+            for metric in LabMetric::ALL {
+                metrics = metrics.child(self.lab_button(
+                    format!("lab-metric-{}", metric.key()),
+                    format!(
+                        "{}{} ({})",
+                        if state.metric == metric {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                        metric.label(),
+                        metric.unit(),
+                    ),
+                    LabAction::Metric(metric),
+                    true,
+                    cx,
+                ));
+            }
             panel = panel
                 .child(
                     div()
@@ -976,14 +1451,18 @@ impl SimulationView {
                             cx,
                         )),
                 )
+                .child(div().text_sm().child("Compare endpoint"))
+                .child(metrics)
                 .child(div().text_xs().child(format!(
-                    "Population comparison: {} − {}. Complete matched seed cohorts are required.",
+                    "{} comparison ({}): {} − {}. Complete matched seed cohorts are required.",
+                    state.metric.label(),
+                    state.metric.unit(),
                     state.challenger.as_deref().unwrap_or("choose challenger"),
                     state.baseline.as_deref().unwrap_or("choose baseline")
                 )))
                 .child(self.lab_button(
                     "lab-compare".into(),
-                    "Compare verified population endpoints".into(),
+                    format!("Compare verified {} endpoints", state.metric.label()),
                     LabAction::Compare,
                     idle && state.comparison_request().is_some(),
                     cx,
@@ -999,6 +1478,13 @@ impl SimulationView {
             }
             return panel;
         }
+        panel = panel.child(self.lab_button(
+            "lab-new-experiment".into(),
+            "New matched-seed experiment".into(),
+            LabAction::NewExperiment,
+            state.submit.is_some(),
+            cx,
+        ));
         let Some(page) = &state.experiments else {
             return panel.child("Loading experiment catalog…");
         };
@@ -1023,7 +1509,10 @@ impl SimulationView {
             ));
         }
         if page.items.is_empty() {
-            panel = panel.child(div().text_sm().child("No retained experiment batches. Create a matched-seed batch with the experiment API or CLI, then refresh."));
+            panel =
+                panel.child(div().text_sm().child(
+                    "No retained experiment batches. Start a matched-seed experiment above.",
+                ));
         }
         panel.child(
             div()
@@ -1051,12 +1540,447 @@ impl SimulationView {
         )
     }
 
+    fn render_lab_checkpoint_save(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.lab_workflows;
+        let live = self.lab_world_is_live(cx);
+        let source = self.host.snapshot_hub().latest();
+        let saving = state.latest_checkpoint_save.as_ref().is_some_and(|save| {
+            save.session_id == source.session_id
+                && matches!(&save.state, LabCheckpointSaveState::Pending)
+                && state.is_busy()
+        });
+        let label = if saving {
+            "Saving checkpoint..."
+        } else if state.will_retry_checkpoint_save() {
+            "Retry previous checkpoint save"
+        } else {
+            "Save live checkpoint"
+        };
+        let mut section = div().flex().flex_col().gap_2()
+            .child(self.lab_button(
+                "lab-save-checkpoint".into(), label.into(), LabAction::CreateCheckpoint,
+                live && state.can_create_checkpoint(), cx,
+            ))
+            .child(div().text_xs().child(
+                "A new save records the live world. Its durable receipt identifies the exact saved tick.",
+            ));
+        if !live {
+            section = section.child(
+                div()
+                    .text_xs()
+                    .child("Return World to live before saving or retrying a checkpoint."),
+            );
+        }
+        if let Some(save) = &state.latest_checkpoint_save {
+            let current_source = source.session_id == save.session_id;
+            if !current_source {
+                section = section.child(div().text_xs().child(
+                    "Previous source save: this receipt or unconfirmed request belongs to an earlier world source.",
+                ));
+            }
+            match &save.state {
+                LabCheckpointSaveState::Pending => {
+                    section = section.child(
+                        div()
+                            .text_xs()
+                            .child("Saving checkpoint - awaiting a durable receipt."),
+                    );
+                }
+                LabCheckpointSaveState::Retryable { reason } => {
+                    section = section.child(div().text_xs().child(format!("Save not confirmed: {reason}")))
+                        .child(div().text_xs().child(if current_source {
+                            "Retry previous checkpoint save uses the same request identity."
+                        } else {
+                            "Saving this live source starts a new request after the previous worker finishes."
+                        }));
+                }
+                LabCheckpointSaveState::Saved(checkpoint) => {
+                    section = section
+                        .child(div().text_xs().child(format!(
+                            "Saved checkpoint {} · tick {} · {} agents · {} bytes",
+                            checkpoint.checkpoint_id,
+                            checkpoint.tick,
+                            checkpoint.agent_count,
+                            checkpoint.byte_size,
+                        )))
+                        .child(
+                            div()
+                                .text_xs()
+                                .child(format!("Saved world digest {}", checkpoint.world_digest,)),
+                        );
+                }
+            }
+            section = section.child(
+                div()
+                    .text_xs()
+                    .child(format!("Save request: {}", save.request_id)),
+            );
+        }
+        section
+    }
+
+    fn render_lab_branch_composer(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.lab_workflows;
+        let editing = state.can_edit_branch_draft();
+        let retained = state
+            .latest_branch_creation
+            .as_ref()
+            .filter(|creation| !matches!(&creation.state, LabBranchCreationState::Created { .. }));
+        let draft = retained
+            .map(|creation| &creation.draft)
+            .or(state.branch_draft.as_ref());
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_lg().child("A future from a saved checkpoint"))
+            .child(div().text_xs().child(format!(
+                "Application source session {}.",
+                self.host.snapshot_hub().latest().session_id.get(),
+            )));
+        if let Some(creation) = retained {
+            let current_source =
+                self.host.snapshot_hub().latest().session_id == creation.session_id;
+            panel = panel.child(div().text_xs().child(format!(
+                "{}study request {} · source session {}",
+                if current_source {
+                    "Retained "
+                } else {
+                    "Previous-source "
+                },
+                creation.request_id,
+                creation.session_id.get(),
+            )));
+            panel = panel.child(div().text_xs().child(match &creation.state {
+                LabBranchCreationState::Pending => {
+                    "Awaiting the application's study admission receipt.".to_owned()
+                }
+                LabBranchCreationState::Retryable { reason } => {
+                    format!("Study admission is unconfirmed: {reason}")
+                }
+                LabBranchCreationState::Created { .. } => String::new(),
+            }));
+            panel = panel
+                .child(div().text_xs().child(if current_source {
+                    "Retry preserves this exact saved source, treatment, horizon and request. Abandon clears the local retry only; an admitted study may still exist in the catalog."
+                } else {
+                    "This previous-source request cannot be retried here. Abandon clears the local retry only; an admitted study may still exist in the catalog."
+                }))
+                .child(self.lab_button(
+                    "lab-branch-abandon".into(),
+                    "Abandon unconfirmed study request".into(),
+                    LabAction::AbandonCheckpointBranchRequest,
+                    state.can_abandon_branch_request(),
+                    cx,
+                ));
+        }
+        let Some(draft) = draft else {
+            return panel.child("Select a retained checkpoint to configure its future.");
+        };
+        panel = panel
+            .child(div().text_sm().child(format!(
+                "Saved source: {} · completed tick {} · {} agents",
+                draft.checkpoint.checkpoint_id,
+                draft.checkpoint.tick,
+                draft.checkpoint.agent_count,
+            )))
+            .child(div().text_xs().child(format!(
+                "Saved world digest: {}",
+                draft.checkpoint.world_digest,
+            )))
+            .child(div().text_xs().child(
+                "Each future starts from this exact saved scientific state. The live owner continues separately; its session, scheduled commands and history are not transferred.",
+            ));
+        let Some(capabilities) = &state.branch_capabilities else {
+            return panel.child("Loading checkpoint-study limits…");
+        };
+        panel = panel.child(div().text_xs().child(format!(
+            "Limits: {} future ticks per branch · {} source agents.",
+            capabilities.max_ticks, capabilities.max_population,
+        )));
+        let mut treatments = div().flex().flex_wrap().gap_2();
+        for treatment in LabBranchTreatment::ALL {
+            treatments = treatments.child(self.lab_button(
+                format!("lab-branch-treatment-{}", treatment.key()),
+                format!(
+                    "{}{}",
+                    if draft.treatment == treatment {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                    treatment.label(),
+                ),
+                LabAction::BranchTreatment(treatment),
+                editing,
+                cx,
+            ));
+        }
+        panel = panel
+            .child(div().text_sm().child("Treatment"))
+            .child(treatments)
+            .child(div().text_xs().child(draft.treatment.description()));
+        let mut horizons = div().flex().flex_wrap().gap_2().child(self.lab_button(
+            "lab-branch-ticks-prev".into(),
+            "One fewer future tick".into(),
+            LabAction::BranchTicks(draft.ticks.checked_sub(1).unwrap_or(draft.ticks)),
+            editing && draft.ticks > 1,
+            cx,
+        ));
+        for ticks in [1, 10, 100, 240, 1_000, 10_000] {
+            if ticks <= capabilities.max_ticks {
+                horizons = horizons.child(self.lab_button(
+                    format!("lab-branch-ticks-{ticks}"),
+                    format!(
+                        "{}{ticks} future ticks",
+                        if draft.ticks == ticks {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                    ),
+                    LabAction::BranchTicks(ticks),
+                    editing,
+                    cx,
+                ));
+            }
+        }
+        horizons = horizons.child(
+            self.lab_button(
+                "lab-branch-ticks-next".into(),
+                "One more future tick".into(),
+                LabAction::BranchTicks(draft.ticks.checked_add(1).unwrap_or(draft.ticks)),
+                editing
+                    && draft
+                        .ticks
+                        .checked_add(1)
+                        .is_some_and(|ticks| ticks <= capabilities.max_ticks),
+                cx,
+            ),
+        );
+        let target = draft.checkpoint.tick.checked_add(draft.ticks);
+        let total_ticks = draft.treatment.branch_count().checked_mul(draft.ticks);
+        panel = panel
+            .child(div().text_sm().child(format!("Future horizon: {} ticks", draft.ticks)))
+            .child(horizons)
+            .child(
+                div()
+                    .id("lab-branch-preview")
+                    .debug_selector(|| "lab-branch-preview".to_owned())
+                    .text_xs()
+                    .child(format!(
+                        "Review: {} · {} future{} · source tick {} → target tick {} · {} total scientific transitions.",
+                        draft.treatment.label(),
+                        draft.treatment.branch_count(),
+                        if draft.treatment.branch_count() == 1 { "" } else { "s" },
+                        draft.checkpoint.tick,
+                        target.map(|tick| tick.to_string()).unwrap_or_else(|| "overflow".into()),
+                        total_ticks.map(|ticks| ticks.to_string()).unwrap_or_else(|| "overflow".into()),
+                    )),
+            )
+            .child(div().text_xs().child(
+                "Outcomes describe one saved starting state. Repeated ticks are not independent seed replicates. Any selected intervention applies at the saved boundary before its next tick.",
+            ));
+        if let Err(reason) = draft.validate(capabilities) {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .child(format!("Plan needs attention: {reason}")),
+            );
+        }
+        panel.child(
+            self.lab_button(
+                "lab-branch-create".into(),
+                if state.is_busy() {
+                    "Awaiting study service"
+                } else if state.will_retry_branch_creation() {
+                    "Retry this exact checkpoint study"
+                } else {
+                    "Run this checkpoint study"
+                }
+                .into(),
+                LabAction::CreateCheckpointBranch,
+                state.can_create_checkpoint_branch(),
+                cx,
+            ),
+        )
+    }
+
+    fn render_lab_checkpoint_studies(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.lab_workflows;
+        let idle = !state.is_busy();
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.lab_panel_header("Checkpoint studies", cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.lab_button(
+                        "lab-branch-back".into(),
+                        "Back to saved checkpoints".into(),
+                        LabAction::BackToCheckpoints,
+                        true,
+                        cx,
+                    ))
+                    .child(self.lab_button(
+                        "lab-branches-catalog".into(),
+                        "Retained checkpoint studies".into(),
+                        LabAction::CheckpointBranchesPage(None),
+                        true,
+                        cx,
+                    )),
+            );
+        match state.checkpoint_view {
+            LabCheckpointView::BranchComposer => panel.child(self.render_lab_branch_composer(cx)),
+            LabCheckpointView::BranchCatalog => {
+                let Some(page) = &state.checkpoint_branches else {
+                    return panel.child("Loading retained checkpoint studies…");
+                };
+                panel = panel.child(div().text_xs().child(format!(
+                    "{} retained studies. Reopen an observation without starting another future.",
+                    page.total,
+                )));
+                if page.items.is_empty() {
+                    panel = panel.child("No checkpoint studies are retained yet.");
+                }
+                for (index, branch) in page.items.iter().enumerate() {
+                    panel = panel.child(self.lab_button(
+                        format!("lab-branch-{index}"),
+                        format!(
+                            "{} · {} · source {} at tick {} · target tick {}",
+                            branch.branch_name,
+                            branch.status,
+                            branch.checkpoint_id,
+                            branch.source_tick,
+                            branch.target_tick,
+                        ),
+                        LabAction::SelectCheckpointBranch(branch.branch_id.clone()),
+                        true,
+                        cx,
+                    ));
+                }
+                panel.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            self.lab_button(
+                                "lab-branches-prev".into(),
+                                "Previous studies".into(),
+                                LabAction::CheckpointBranchesPage(
+                                    (page.offset > LAB_PAGE_SIZE)
+                                        .then(|| (page.offset - LAB_PAGE_SIZE).to_string()),
+                                ),
+                                idle && page.offset > 0,
+                                cx,
+                            ),
+                        )
+                        .child(self.lab_button(
+                            "lab-branches-next".into(),
+                            "Next studies".into(),
+                            LabAction::CheckpointBranchesPage(page.next_cursor.clone()),
+                            idle && page.next_cursor.is_some(),
+                            cx,
+                        )),
+                )
+            }
+            LabCheckpointView::BranchDetail => {
+                let Some(branch) = &state.branch else {
+                    return panel
+                        .child("No checkpoint study observation has arrived. Refresh to retry.");
+                };
+                panel = panel
+                    .child(div().text_lg().child(branch.branch_name.clone()))
+                    .child(div().text_sm().child(format!("Observed status: {}", branch.status)))
+                    .child(div().text_xs().child(format!("Study: {}", branch.branch_id)))
+                    .child(div().text_xs().child(format!(
+                        "Saved source: {} · tick {} · world digest {}",
+                        branch.checkpoint_id, branch.source_tick, branch.world_digest,
+                    )))
+                    .child(div().text_xs().child(format!(
+                        "Requested target tick: {}. Source and target describe the plan; they are not a live progress counter.",
+                        branch.target_tick,
+                    )))
+                    .child(self.lab_button(
+                        "lab-branch-cancel".into(),
+                        "Request study cancellation".into(),
+                        LabAction::CancelCheckpointBranch,
+                        state.can_cancel_checkpoint_branch(),
+                        cx,
+                    ));
+                if let Some(reason) = &branch.error_reason {
+                    panel = panel.child(div().text_xs().child(format!("Study outcome: {reason}")));
+                }
+                if let Some(artifact_id) = &branch.artifact_id {
+                    panel = panel.child(
+                        div()
+                            .text_xs()
+                            .child(format!("Report artifact: {artifact_id}",)),
+                    );
+                }
+                panel = panel.child(self.lab_button(
+                    "lab-branch-read-report".into(),
+                    "Read verified outcome report".into(),
+                    LabAction::ReadCheckpointBranchReport,
+                    state.can_read_branch_report(),
+                    cx,
+                ));
+                if let Some(report) = &state.branch_report {
+                    let mut evidence = div()
+                        .id("lab-branch-report")
+                        .debug_selector(|| "lab-branch-report".to_owned())
+                        .flex()
+                        .flex_col()
+                        .gap_2();
+                    for line in branch_report_lines(report) {
+                        evidence = evidence.child(div().text_xs().child(line));
+                    }
+                    panel = panel.child(evidence);
+                }
+                panel
+            }
+            LabCheckpointView::SavedCuts => panel,
+        }
+    }
+
     pub(super) fn render_lab_checkpoints(&self, cx: &mut Context<Self>) -> Div {
         let state = &self.lab_workflows;
-        let idle = state.job.is_none();
+        if state.checkpoint_view != LabCheckpointView::SavedCuts {
+            return self.render_lab_checkpoint_studies(cx);
+        }
+        let idle = !state.is_busy();
         let mut panel = div().flex().flex_col().gap_3().child(self.lab_panel_header("Saved checkpoints", cx))
+            .child(self.render_lab_checkpoint_save(cx))
             .child(div().text_xs().child("Select a saved scientific cut to reconstruct it in World. The live owner keeps its current state and controls."))
-            .child(self.lab_button("lab-world-live".into(), "Return World to live".into(), LabAction::ReturnLive, true, cx));
+            .child(self.lab_button("lab-world-live".into(), "Return World to live".into(), LabAction::ReturnLive, true, cx))
+            .child(self.lab_button("lab-review-checkpoint".into(), "Review selected checkpoint in World".into(), LabAction::ReviewCheckpoint, idle && state.selected_checkpoint_metadata().is_some(), cx));
+        panel = panel
+            .child(
+                self.lab_button(
+                    "lab-new-checkpoint-branch".into(),
+                    "Configure a checkpoint study".into(),
+                    LabAction::NewCheckpointBranch,
+                    state.selected_checkpoint_metadata().is_some()
+                        || state
+                            .latest_branch_creation
+                            .as_ref()
+                            .is_some_and(|creation| {
+                                !matches!(&creation.state, LabBranchCreationState::Created { .. })
+                            }),
+                    cx,
+                ),
+            )
+            .child(self.lab_button(
+                "lab-branches-catalog".into(),
+                "Retained checkpoint studies".into(),
+                LabAction::CheckpointBranchesPage(None),
+                state.submit.is_some(),
+                cx,
+            ));
         let Some(page) = &state.checkpoints else {
             return panel.child("Loading checkpoint catalog…");
         };
@@ -1089,96 +2013,615 @@ impl SimulationView {
             );
         }
         if page.items.is_empty() {
-            panel = panel.child(
-                "No saved checkpoints. Use Timeline → Save replay checkpoint, then refresh.",
-            );
+            panel = panel
+                .child("No saved checkpoints. Return World to live and save a checkpoint above.");
         }
-        panel
-            .child(self.lab_button(
-                "lab-review-checkpoint".into(),
-                "Review selected checkpoint in World".into(),
-                LabAction::ReviewCheckpoint,
-                idle && state.selected_checkpoint_metadata().is_some(),
-                cx,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        self.lab_button(
-                            "lab-checkpoints-prev".into(),
-                            "Previous checkpoints".into(),
-                            LabAction::CheckpointsPage(
-                                (page.offset > LAB_PAGE_SIZE)
-                                    .then(|| (page.offset - LAB_PAGE_SIZE).to_string()),
-                            ),
-                            idle && page.offset > 0,
-                            cx,
+        panel.child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    self.lab_button(
+                        "lab-checkpoints-prev".into(),
+                        "Previous checkpoints".into(),
+                        LabAction::CheckpointsPage(
+                            (page.offset > LAB_PAGE_SIZE)
+                                .then(|| (page.offset - LAB_PAGE_SIZE).to_string()),
                         ),
-                    )
-                    .child(self.lab_button(
-                        "lab-checkpoints-next".into(),
-                        "Next checkpoints".into(),
-                        LabAction::CheckpointsPage(page.next_cursor.clone()),
-                        idle && page.next_cursor.is_some(),
+                        idle && page.offset > 0,
                         cx,
-                    )),
-            )
+                    ),
+                )
+                .child(self.lab_button(
+                    "lab-checkpoints-next".into(),
+                    "Next checkpoints".into(),
+                    LabAction::CheckpointsPage(page.next_cursor.clone()),
+                    idle && page.next_cursor.is_some(),
+                    cx,
+                )),
+        )
     }
-}
-
-fn comparison_lines(comparison: &LabComparison) -> Vec<String> {
-    let optional = |value: Option<f64>| {
-        value.map_or_else(|| "unavailable".into(), |value| format!("{value:.6}"))
-    };
-    let mut lines = vec![
-        format!(
-            "Verified population (agents), endpoint tick {}, {} matched seed pairs",
-            comparison.endpoint_tick,
-            comparison.matched_seeds.len()
-        ),
-        format!(
-            "Challenger − baseline: {:.6} agents",
-            comparison.mean_difference
-        ),
-        format!(
-            "95% CI: {}",
-            comparison.ci_95.map_or_else(
-                || "unavailable".into(),
-                |(low, high)| format!("[{low:.6}, {high:.6}]")
-            )
-        ),
-        format!(
-            "p: {} · adjusted p: {} · paired Cohen's d_z: {}",
-            optional(comparison.p_value),
-            optional(comparison.adjusted_p_value),
-            optional(comparison.standardized_effect)
-        ),
-        format!(
-            "Verified source generation {} · plan {}",
-            comparison.status_generation, comparison.plan_digest
-        ),
-    ];
-    if comparison.descriptive_only {
-        lines.push("Descriptive only: one independent seed pair cannot support inference.".into());
-    }
-    if let Some(reason) = &comparison.underpowered_reason {
-        lines.push(bounded_message(reason));
-    }
-    if let Some(reason) = &comparison.undefined_effect_reason {
-        lines.push(bounded_message(reason));
-    }
-    lines.push(
-        "A population difference is an observed endpoint, not a fitness or winner claim.".into(),
-    );
-    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn gpui_guide_observes_shared_owner_receipts_and_refuses_stale_actions() {
+        use scriptbots_runtime::{HostCommand, lab_guide::LabGuideStep};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            closed: true,
+            population_minimum: 0,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let selected = world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let host = Arc::new(TestHost::new(world));
+        let command_count = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::clone(&command_count);
+        let config_count = Arc::clone(&command_count);
+        let config_host = Arc::clone(&host);
+        let command_host = Arc::clone(&host);
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(move |command| {
+                submitted.fetch_add(1, Ordering::SeqCst);
+                Some(
+                    command_host
+                        .apply(HostCommand::try_from(command).unwrap())
+                        .command_id()
+                        .to_string(),
+                )
+            }),
+        );
+        session.config_update_submit = Some(Arc::new(move |config, expected| {
+            config_count.fetch_add(1, Ordering::SeqCst);
+            let id = scriptbots_runtime::CommandId::from_client_sequence(
+                1,
+                config_host.next_command.fetch_add(1, AtomicOrdering::Relaxed),
+            );
+            config_host
+                .port
+                .clone()
+                .submit(
+                    scriptbots_runtime::CommandEnvelope::new(id, HostCommand::UpdateConfig(config))
+                        .expecting_control_revision(expected.control)
+                        .expecting_scientific_revision(expected.scientific)
+                        .expecting_config_revision(expected.config),
+                )
+                .map_err(|error| error.to_string())
+        }));
+        let context = gpui::TestAppContext::single();
+        let windows = context
+            .update(|app| Arc::new(session).install(app))
+            .unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let canvas = context.update(|app| windows.canvas.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(1_000.0), px(1_800.0)));
+        let draw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
+            draw(lab);
+            let bounds = lab.debug_bounds(selector).expect("visible guide control");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        let wait_ready = |lab: &mut gpui::VisualTestContext| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(lab);
+                if context.update(|app| hud.read(app).lab_guide.lock().unwrap().ready()) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "guide owner receipt deadline");
+                std::thread::yield_now();
+            }
+        };
+        let before = host.port.scientific_digest_v1().unwrap();
+        click(&mut lab, "lab-guide-open");
+        wait_ready(&mut lab);
+        context.update(|app| {
+            assert!(Arc::ptr_eq(
+                &hud.read(app).lab_guide,
+                &canvas.read(app).lab_guide,
+            ));
+        });
+        click(&mut lab, "lab-guide-next");
+        draw(&mut lab);
+        context.update(|app| {
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert_eq!(guide.step(), LabGuideStep::Inspect);
+            assert!(!guide.ready(), "an unselected living agent is insufficient");
+        });
+        click(&mut lab, "lab-guide-next");
+        click(&mut lab, "lab-guide-hide");
+        click(&mut lab, "lab-guide-open");
+        context.update(|app| {
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert_eq!(guide.step(), LabGuideStep::Inspect);
+            assert!(guide.visible);
+        });
+        assert_eq!(command_count.load(Ordering::SeqCst), 0);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+
+        // Focus is frontend presentation state; commands below still pass
+        // through the actual shared owner and its published journal receipts.
+        context.update(|app| {
+            canvas.update(app, |view, _| {
+                view.inspector.lock().unwrap().focused_agent = Some(selected);
+            });
+        });
+        wait_ready(&mut lab);
+        click(&mut lab, "lab-guide-next");
+        click(&mut lab, "lab-guide-perform");
+        wait_ready(&mut lab);
+        assert!(host.snapshot().playback.paused);
+        assert_eq!(command_count.load(Ordering::SeqCst), 1);
+        click(&mut lab, "lab-guide-next");
+        let step_source = host.snapshot();
+        let step_tick = step_source.world.tick;
+        let step_action = LabGuideBoundary {
+            generation: context.update(|app| hud.read(app).lab_guide.lock().unwrap().generation()),
+            step: LabGuideStep::Step,
+            session_id: step_source.session_id,
+            config_revision: step_source.revisions.config,
+            growth_proposal: None,
+        };
+        click(&mut lab, "lab-guide-perform");
+        wait_ready(&mut lab);
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.guide_action(LabGuideAction::Perform(step_action), cx);
+            });
+        });
+        assert_eq!(host.snapshot().world.tick, step_tick + 1);
+        assert!(host.snapshot().playback.paused);
+        assert_eq!(command_count.load(Ordering::SeqCst), 2);
+        click(&mut lab, "lab-guide-next");
+        draw(&mut lab);
+
+        let offered = host.snapshot();
+        let stale = LabGuideBoundary {
+            generation: context.update(|app| hud.read(app).lab_guide.lock().unwrap().generation()),
+            step: LabGuideStep::Configure,
+            session_id: offered.session_id,
+            config_revision: offered.revisions.config,
+            growth_proposal: guide_growth_proposal(&offered),
+        };
+        let mut updated = offered.config.as_ref().clone();
+        updated.food_growth_rate *= 0.5;
+        host.apply(HostCommand::UpdateConfig(Box::new(updated)));
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.guide_action(LabGuideAction::Perform(stale), cx);
+            });
+        });
+        assert_eq!(command_count.load(Ordering::SeqCst), 2);
+        context.update(|app| {
+            assert!(
+                hud.read(app)
+                    .lab_workflows
+                    .notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Configuration changed")
+            );
+        });
+        let current = host.snapshot();
+        let expected = guide_growth_proposal(&current).unwrap();
+        click(&mut lab, "lab-guide-perform");
+        wait_ready(&mut lab);
+        assert_eq!(
+            host.snapshot().config.food_growth_rate.to_bits(),
+            expected.to_bits(),
+        );
+        assert_eq!(host.snapshot().world.tick, step_tick + 1);
+        assert_eq!(command_count.load(Ordering::SeqCst), 3);
+
+        // A callback from the previous guide step cannot perform another
+        // configuration change or advance the newly entered checkpoint step.
+        click(&mut lab, "lab-guide-next");
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.guide_action(LabGuideAction::Perform(stale), cx);
+                view.guide_action(LabGuideAction::Next(stale), cx);
+            });
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert_eq!(guide.step(), LabGuideStep::Checkpoint);
+            assert!(!guide.ready());
+        });
+        assert_eq!(command_count.load(Ordering::SeqCst), 3);
+        click(&mut lab, "lab-guide-perform");
+        context.update(|app| {
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert!(!guide.ready(), "missing checkpoint services cannot report a save");
+        });
+
+        // A cached request from before Checkpoint cannot become fresh merely
+        // because the guide paints its Pending and then its Saved DTO.
+        let frame = host.snapshot();
+        let mut cached = scriptbots_runtime::lab_workflows::LabCheckpointSave {
+            request_id: "earlier-save".into(),
+            session_id: frame.session_id,
+            state: LabCheckpointSaveState::Pending,
+        };
+        context.update(|app| {
+            hud.update(app, |view, _| {
+                view.lab_workflows.latest_checkpoint_save = Some(cached.clone());
+                view.observe_lab_guide();
+            });
+        });
+        cached.state = LabCheckpointSaveState::Saved(LabCheckpoint {
+            checkpoint_id: "earlier-cut".into(),
+            tick: frame.world.tick,
+            agent_count: frame.world.agents.len(),
+            byte_size: 4096,
+            world_digest: host.port.scientific_digest_v1().unwrap().overall,
+        });
+        context.update(|app| {
+            hud.update(app, |view, _| {
+                view.lab_workflows.latest_checkpoint_save = Some(cached);
+                view.observe_lab_guide();
+            });
+            assert!(!hud.read(app).lab_guide.lock().unwrap().ready());
+        });
+
+        // Re-entering the same step after restart must not revive an old
+        // callback, even though the owner and configuration still match.
+        let frame = host.snapshot();
+        let old_identify = LabGuideBoundary {
+            generation: stale.generation,
+            step: LabGuideStep::Identify,
+            session_id: frame.session_id,
+            config_revision: frame.revisions.config,
+            growth_proposal: None,
+        };
+        click(&mut lab, "lab-guide-restart");
+        wait_ready(&mut lab);
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.guide_action(LabGuideAction::Next(old_identify), cx);
+            });
+            let guide = hud.read(app).lab_guide.lock().unwrap();
+            assert_eq!(guide.step(), LabGuideStep::Identify);
+            assert!(guide.ready());
+            assert!(guide.generation() > old_identify.generation);
+        });
+        assert_eq!(command_count.load(Ordering::SeqCst), 3);
+    }
+
+    fn experiment_capabilities() -> LabExperimentCapabilities {
+        LabExperimentCapabilities {
+            families: vec!["mlp".into(), "dwraon".into(), "assembly".into()],
+            treatment_parameters: LabExperimentParameter::ALL
+                .into_iter()
+                .map(|parameter| LabExperimentParameterCapability {
+                    parameter,
+                    baseline_value: 0.25,
+                    min_value: 0.0,
+                    max_value: 1.0,
+                })
+                .collect(),
+            max_seed_count: 8,
+            max_ticks_per_run: 1_000,
+            max_total_ticks: 16_000,
+            launch_description: "Fresh worlds with the fixture's declared founder recipe.".into(),
+        }
+    }
+
+    fn completed_branch_fixture(draft: &LabBranchDraft) -> (LabCheckpointBranch, LabBranchReport) {
+        let checkpoint = &draft.checkpoint;
+        let target = checkpoint.tick.checked_add(draft.ticks).unwrap();
+        let branch = LabCheckpointBranch {
+            branch_id: "native-study-1".into(),
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            branch_name: draft.treatment.key().into(),
+            status: "completed".into(),
+            source_tick: checkpoint.tick,
+            target_tick: target,
+            world_digest: checkpoint.world_digest.clone(),
+            artifact_id: Some("native-study-report-1".into()),
+            error_reason: None,
+        };
+        let control = LabBranchOutcome {
+            tick: target,
+            population: checkpoint.agent_count,
+            total_food: 4.0,
+            total_energy: if checkpoint.agent_count == 0 {
+                0.0
+            } else {
+                2.0
+            },
+            average_health: (checkpoint.agent_count > 0).then_some(1.0),
+            final_digest: "1111111111111111".into(),
+            command_applied_tick: None,
+            minimum_population: checkpoint.agent_count,
+            extinction_tick: (checkpoint.agent_count == 0).then_some(checkpoint.tick),
+            baseline_population: checkpoint.agent_count,
+            recovery_ratio: (checkpoint.agent_count > 0).then_some(1.0),
+            first_divergence: None,
+        };
+        let report = LabBranchReport {
+            branch_id: branch.branch_id.clone(),
+            artifact_id: branch.artifact_id.clone().unwrap(),
+            base_seed: 42,
+            source_tick: checkpoint.tick,
+            target_tick: target,
+            source_world_digest: checkpoint.world_digest.clone(),
+            source_byte_size: checkpoint.byte_size,
+            source_checksum_blake3: "a".repeat(64),
+            report_byte_size: 2_048,
+            report_checksum_blake3: "b".repeat(64),
+            report_checksum_sha256: "c".repeat(64),
+            treatment: (draft.treatment != LabBranchTreatment::Unchanged).then(|| {
+                LabBranchOutcome {
+                    total_food: 6.0,
+                    final_digest: "2222222222222222".into(),
+                    command_applied_tick: Some(checkpoint.tick),
+                    first_divergence: Some(LabBranchDivergence {
+                        tick: checkpoint.tick + 1,
+                        stage: "food".into(),
+                        control_digest: "3333333333333333".into(),
+                        branch_digest: "4444444444444444".into(),
+                        command_applied_tick: checkpoint.tick,
+                        details: "Fixture's first differing food lane.".into(),
+                    }),
+                    ..control.clone()
+                }
+            }),
+            control,
+        };
+        (branch, report)
+    }
+
+    #[test]
+    fn gpui_checkpoint_study_buttons_preserve_saved_source_retry_and_report() {
+        let host = TestHost::new(
+            WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                closed: true,
+                population_minimum: 0,
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let saved = host.snapshot();
+        let checkpoint = LabCheckpoint {
+            checkpoint_id: "saved-study-cut".into(),
+            tick: saved.world.tick,
+            agent_count: saved.world.agents.len(),
+            byte_size: 1_024,
+            world_digest: host.port.scientific_digest_v1().unwrap().overall,
+        };
+        host.apply(scriptbots_runtime::HostCommand::UpdateSimulation(
+            SimulationCommand {
+                paused: Some(true),
+                speed_multiplier: None,
+                step_once: true,
+            },
+        ));
+        let before = host.port.scientific_digest_v1().unwrap();
+        let live_tick = host.snapshot().world.tick;
+        assert!(live_tick > checkpoint.tick);
+        let expected_checkpoint = checkpoint.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let retained_study = Mutex::new(None);
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| panic!("a saved-source study must not command the live owner")),
+        );
+        session.lab_submit = Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ListCheckpoints { .. } => {
+                    LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                        items: vec![checkpoint.clone()],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                        retained_bytes: checkpoint.byte_size,
+                        max_bytes: 1_000_000,
+                    })
+                }
+                LabWorkflowRequest::BranchCapabilities => {
+                    LabWorkflowResponse::BranchCapabilities(LabBranchCapabilities {
+                        max_ticks: 10_000,
+                        max_population: 10_000,
+                    })
+                }
+                LabWorkflowRequest::CreateCheckpointBranch {
+                    request_id,
+                    session_id,
+                    draft,
+                } => {
+                    assert_eq!(session_id, saved.session_id);
+                    assert_eq!(draft.checkpoint, checkpoint);
+                    let first = {
+                        let mut recorded = recorded.lock().unwrap();
+                        recorded.push((request_id.clone(), session_id, draft.clone()));
+                        recorded.len() == 1
+                    };
+                    let mut retained = retained_study.lock().unwrap();
+                    let (branch, _) =
+                        retained.get_or_insert_with(|| completed_branch_fixture(&draft));
+                    if first {
+                        return Err("study admitted but its first response was lost".into());
+                    }
+                    LabWorkflowResponse::CheckpointBranchCreated {
+                        request_id,
+                        session_id,
+                        branch: branch.clone(),
+                    }
+                }
+                LabWorkflowRequest::ListCheckpointBranches { .. } => {
+                    let retained = retained_study.lock().unwrap();
+                    let (branch, _) = retained.as_ref().unwrap();
+                    LabWorkflowResponse::CheckpointBranches(LabCheckpointBranchPage {
+                        items: vec![branch.clone()],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                    })
+                }
+                LabWorkflowRequest::GetCheckpointBranch { branch_id } => {
+                    let retained = retained_study.lock().unwrap();
+                    let (branch, _) = retained.as_ref().unwrap();
+                    assert_eq!(branch_id, branch.branch_id);
+                    LabWorkflowResponse::CheckpointBranch(branch.clone())
+                }
+                LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
+                    let retained = retained_study.lock().unwrap();
+                    let (_, report) = retained.as_ref().unwrap();
+                    assert_eq!(branch_id, report.branch_id);
+                    LabWorkflowResponse::CheckpointBranchReport(Box::new(report.clone()))
+                }
+                other => panic!("unexpected checkpoint-study request: {other:?}"),
+            })
+        }));
+        let context = gpui::TestAppContext::single();
+        let windows = context
+            .update(|app| Arc::new(session).install(app))
+            .unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(1_000.0), px(1_800.0)));
+        let draw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
+            draw(lab);
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("visible production study control");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        let wait = |lab: &mut gpui::VisualTestContext, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(lab);
+                if context.update(|app| ready(&hud.read(app).lab_workflows)) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native checkpoint-study result did not arrive"
+                );
+                std::thread::yield_now();
+            }
+        };
+        click(&mut lab, "dashboard-tab-checkpoints");
+        wait(&mut lab, &|state| {
+            state.checkpoints.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-checkpoint-0");
+        click(&mut lab, "lab-new-checkpoint-branch");
+        wait(&mut lab, &|state| {
+            state.checkpoint_view == LabCheckpointView::BranchComposer
+                && state.branch_capabilities.is_some()
+                && !state.is_busy()
+        });
+        click(&mut lab, "lab-branch-treatment-food-bloom");
+        click(&mut lab, "lab-branch-ticks-10");
+        click(&mut lab, "lab-branch-ticks-next");
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-branch-preview").is_some());
+        context.update(|app| {
+            let draft = hud.read(app).lab_workflows.branch_draft.as_ref().unwrap();
+            assert_eq!(draft.checkpoint, expected_checkpoint);
+            assert_eq!(draft.ticks, 11);
+            assert_eq!(draft.treatment, LabBranchTreatment::FoodBloom);
+        });
+        click(&mut lab, "lab-branch-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state
+                    .latest_branch_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        matches!(&creation.state, LabBranchCreationState::Retryable { .. })
+                    })
+        });
+        click(&mut lab, "lab-branch-treatment-drought");
+        click(&mut lab, "lab-branch-ticks-1000");
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            let draft = state.branch_draft.as_ref().unwrap();
+            assert_eq!(draft.ticks, 11);
+            assert_eq!(draft.treatment, LabBranchTreatment::FoodBloom);
+        });
+        click(&mut lab, "lab-branch-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state.checkpoint_view == LabCheckpointView::BranchDetail
+                && state
+                    .branch
+                    .as_ref()
+                    .is_some_and(|branch| branch.status == "completed")
+        });
+        click(&mut lab, "lab-branch-read-report");
+        wait(&mut lab, &|state| {
+            state.branch_report.is_some() && !state.is_busy()
+        });
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-branch-report").is_some());
+        context.update(|app| {
+            let report = hud.read(app).lab_workflows.branch_report.as_ref().unwrap();
+            assert_eq!(report.source_world_digest, expected_checkpoint.world_digest);
+            assert_eq!(report.source_tick, expected_checkpoint.tick);
+            assert_eq!(report.target_tick, expected_checkpoint.tick + 11);
+            let treatment = report.treatment.as_ref().unwrap();
+            assert_eq!(treatment.total_food - report.control.total_food, 2.0);
+            assert_eq!(treatment.first_divergence.as_ref().unwrap().stage, "food");
+        });
+        click(&mut lab, "lab-branches-catalog");
+        wait(&mut lab, &|state| {
+            state.checkpoint_branches.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-branch-0");
+        wait(&mut lab, &|state| {
+            state.branch.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-branch-read-report");
+        wait(&mut lab, &|state| {
+            state.branch_report.is_some() && !state.is_busy()
+        });
+        let recorded = requests.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "catalog reopen must not admit another study"
+        );
+        assert_eq!(
+            recorded[0], recorded[1],
+            "retry must preserve every request input"
+        );
+        assert_eq!(recorded[0].2.checkpoint, expected_checkpoint);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, live_tick);
+    }
 
     fn batch(variants: usize) -> LabExperiment {
         LabExperiment {
@@ -1205,14 +2648,48 @@ mod tests {
         }
     }
 
-    fn comparison(challenger: &str) -> LabComparison {
+    fn created_batch(experiment_id: &str, draft: &LabExperimentDraft) -> LabExperiment {
+        LabExperiment {
+            summary: LabExperimentSummary {
+                experiment_id: experiment_id.into(),
+                status: "pending".into(),
+                total_runs: draft.seed_count * 2,
+                completed_runs: 0,
+                failed_runs: 0,
+            },
+            plan_digest: "created-plan".into(),
+            generation: 0,
+            variants: [
+                ("baseline", &draft.baseline_family),
+                ("challenger", &draft.challenger_family),
+            ]
+            .into_iter()
+            .map(|(id, family)| LabVariantProgress {
+                variant_id: id.into(),
+                brain_family: family.clone(),
+                total_runs: draft.seed_count,
+                completed_runs: 0,
+                failed_runs: 0,
+                running_runs: 0,
+            })
+            .collect(),
+            error_reason: None,
+        }
+    }
+
+    fn comparison(challenger: &str, metric: LabMetric) -> LabComparison {
         LabComparison {
             experiment_id: "actual-batch".into(),
             baseline_variant: "arm-00".into(),
             challenger_variant: challenger.into(),
+            metric,
             endpoint_tick: 2,
             matched_seeds: vec![7],
-            mean_difference: 3.0,
+            mean_difference: if metric == LabMetric::AverageEnergy {
+                0.25
+            } else {
+                3.0
+            },
             ci_95: None,
             standardized_effect: None,
             p_value: None,
@@ -1225,225 +2702,282 @@ mod tests {
         }
     }
 
-    fn deliver(
-        state: &mut LabWorkflows,
-        request: LabWorkflowRequest,
-        response: LabWorkflowResponse,
-    ) -> Option<(String, Arc<RenderSnapshot>)> {
-        let (send, result) = std::sync::mpsc::sync_channel(1);
-        assert!(send.send(Ok(response)).is_ok());
-        state.generation += 1;
-        state.job = Some(LabJob {
-            request,
-            generation: state.generation,
-            context: state.context,
-            session: state.session.unwrap(),
-            result,
-        });
-        state.poll()
-    }
-
     #[test]
-    fn lab_worker_retains_one_slot_through_cancellation_and_rejects_old_sessions() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed_calls = Arc::clone(&calls);
-        let (started, observed_start) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let released = Mutex::new(released);
-        let mut state = LabWorkflows {
-            submit: Some(Arc::new(move |_| {
-                observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
-                started.send(()).unwrap();
-                released
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap();
-                Ok(LabWorkflowResponse::Experiments(LabExperimentPage {
-                    items: vec![],
-                    total: 0,
-                    offset: 0,
-                    next_cursor: None,
-                    reserved_run_slots: 0,
-                    max_run_slots: 1,
-                }))
-            })),
-            ..LabWorkflows::default()
-        };
-        state.synchronize(
-            scriptbots_runtime::HostSessionId::new(1),
-            LabPanel::Experiments,
+    fn gpui_ecological_composer_preserves_question_through_retry_and_comparison() {
+        let host = TestHost::new(
+            WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                closed: true,
+                population_minimum: 0,
+                persistence_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
         );
-        let request = LabWorkflowRequest::ListExperiments { cursor: None };
-        state.start(request.clone());
-        observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
-        state.invalidate();
-        state.start(request.clone());
+        let source = host.snapshot().session_id;
+        let before = host.port.scientific_digest_v1().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let retained = Mutex::new(None::<(LabExperiment, LabExperimentDraft)>);
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| panic!("independent treatment cannot command the live owner")),
+        );
+        session.lab_submit = Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ListExperiments { .. } => {
+                    LabWorkflowResponse::Experiments(LabExperimentPage {
+                        items: vec![batch(2).summary],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                        reserved_run_slots: 0,
+                        max_run_slots: 1,
+                    })
+                }
+                LabWorkflowRequest::ExperimentCapabilities => {
+                    LabWorkflowResponse::ExperimentCapabilities(experiment_capabilities())
+                }
+                LabWorkflowRequest::CreateExperiment {
+                    request_id,
+                    session_id,
+                    draft,
+                } => {
+                    assert_eq!(session_id, source);
+                    draft.validate(&experiment_capabilities()).unwrap();
+                    let first = {
+                        let mut recorded = recorded.lock().unwrap();
+                        recorded.push((request_id.clone(), session_id, draft.clone()));
+                        recorded.len() == 1
+                    };
+                    let mut retained = retained.lock().unwrap();
+                    let (experiment, _) = retained.get_or_insert_with(|| {
+                        let mut experiment = created_batch(&request_id, &draft);
+                        experiment.summary.status = "completed".into();
+                        experiment.summary.completed_runs = experiment.summary.total_runs;
+                        experiment.generation = 1;
+                        for variant in &mut experiment.variants {
+                            variant.completed_runs = variant.total_runs;
+                        }
+                        (experiment, draft)
+                    });
+                    if first {
+                        return Err("ecological experiment admitted; response was lost".into());
+                    }
+                    LabWorkflowResponse::ExperimentCreated {
+                        request_id,
+                        session_id,
+                        experiment: experiment.clone(),
+                    }
+                }
+                LabWorkflowRequest::GetExperiment { experiment_id } => {
+                    LabWorkflowResponse::Experiment(if experiment_id == "actual-batch" {
+                        batch(2)
+                    } else {
+                        retained.lock().unwrap().as_ref().unwrap().0.clone()
+                    })
+                }
+                LabWorkflowRequest::Compare {
+                    experiment_id,
+                    baseline_variant,
+                    challenger_variant,
+                    metric,
+                } => {
+                    let retained = retained.lock().unwrap();
+                    let (experiment, draft) = retained.as_ref().unwrap();
+                    assert_eq!(experiment_id, experiment.summary.experiment_id);
+                    assert_eq!(baseline_variant, "baseline");
+                    assert_eq!(challenger_variant, "challenger");
+                    assert_eq!(metric, LabMetric::TotalFood);
+                    LabWorkflowResponse::Comparison(LabComparison {
+                        experiment_id,
+                        baseline_variant,
+                        challenger_variant,
+                        metric,
+                        endpoint_tick: draft.ticks_per_run,
+                        matched_seeds: draft.seeds().unwrap(),
+                        mean_difference: 0.5,
+                        ci_95: Some((0.5, 0.5)),
+                        standardized_effect: None,
+                        p_value: None,
+                        adjusted_p_value: None,
+                        descriptive_only: false,
+                        underpowered_reason: Some("Small fixture cohort.".into()),
+                        undefined_effect_reason: Some("Constant paired difference.".into()),
+                        plan_digest: experiment.plan_digest.clone(),
+                        status_generation: experiment.generation,
+                    })
+                }
+                other => panic!("unexpected ecological request: {other:?}"),
+            })
+        }));
+        let context = gpui::TestAppContext::single();
+        let windows = context
+            .update(|app| Arc::new(session).install(app))
+            .unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(1_100.0), px(2_400.0)));
+        let draw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
+            draw(lab);
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("visible ecological control");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        let wait = |lab: &mut gpui::VisualTestContext, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(lab);
+                if context.update(|app| ready(&hud.read(app).lab_workflows)) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "ecological experiment response did not arrive"
+                );
+                std::thread::yield_now();
+            }
+        };
+        click(&mut lab, "dashboard-tab-experiments");
+        wait(&mut lab, &|state| {
+            state.experiments.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-new-experiment");
+        wait(&mut lab, &|state| {
+            state.experiment_capabilities.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-experiment-design-ecological-treatment");
+        click(&mut lab, "lab-experiment-baseline-assembly");
+        click(&mut lab, "lab-experiment-parameter-movement_drain");
+        click(&mut lab, "lab-experiment-parameter-food_growth_rate");
+        click(&mut lab, "lab-experiment-percent-100");
+        context.update(|app| {
+            let draft = &hud.read(app).lab_workflows.experiment_draft;
+            assert_eq!(draft.baseline_family, "assembly");
+            assert_eq!(draft.baseline_family, draft.challenger_family);
+            assert!(
+                draft
+                    .question_lines()
+                    .iter()
+                    .any(|line| line.contains("Unchanged-value control"))
+            );
+        });
+        draw(&mut lab);
+        assert!(
+            lab.debug_bounds("lab-experiment-challenger-assembly")
+                .is_none()
+        );
+        click(&mut lab, "lab-experiment-percent-200");
+        click(&mut lab, "lab-experiment-percent-prev");
+        click(&mut lab, "lab-experiment-percent-next");
+        click(&mut lab, "lab-experiment-treatment-tick-10");
+        click(&mut lab, "lab-experiment-treatment-tick-next");
+        click(&mut lab, "lab-experiment-ticks-10");
+        click(&mut lab, "lab-experiment-create");
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "invalid boundary cannot admit work"
+        );
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            assert_eq!(state.experiment_draft.treatment.unwrap().at_tick, 11);
+            assert_eq!(state.experiment_draft.ticks_per_run, 10);
+            assert!(!state.can_create_experiment());
+        });
+        click(&mut lab, "lab-experiment-treatment-tick-0");
+        click(&mut lab, "lab-experiment-treatment-tick-next");
+        click(&mut lab, "lab-experiment-ticks-next");
+        click(&mut lab, "lab-experiment-seed-count-prev");
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-experiment-question").is_some());
+        let expected = context.update(|app| hud.read(app).lab_workflows.experiment_draft.clone());
+        assert_eq!(expected.seeds().unwrap(), [42, 43]);
         assert_eq!(
-            calls.load(AtomicOrdering::SeqCst),
-            1,
-            "discarding a result must not create a second worker"
+            expected.treatment.unwrap(),
+            LabExperimentTreatment {
+                parameter: LabExperimentParameter::FoodGrowth,
+                baseline_value: 0.25,
+                scale_percent: 200,
+                at_tick: 1,
+            }
         );
-        state.synchronize(
-            scriptbots_runtime::HostSessionId::new(2),
-            LabPanel::Experiments,
-        );
-        release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while state.job.is_some() {
-            assert!(Instant::now() < deadline);
-            assert!(state.poll().is_none());
-            std::thread::yield_now();
-        }
-        assert!(
-            state.experiments.is_none(),
-            "an old-session catalog must not become the new session's catalog"
-        );
-        assert!(state.notice.as_deref().unwrap().contains("discarded"));
-        state.start(request);
-        observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
-        release.send(()).unwrap();
-        while state.job.is_some() {
-            assert!(Instant::now() < deadline);
-            state.poll();
-            std::thread::yield_now();
-        }
-        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
-        assert!(
-            state.experiments.is_some(),
-            "the slot must reopen after the original worker exits"
-        );
-    }
-
-    #[test]
-    fn lab_projection_keeps_every_variant_and_refuses_mismatched_or_unbounded_evidence() {
-        let mut state = LabWorkflows::default();
-        state.synchronize(
-            scriptbots_runtime::HostSessionId::new(1),
-            LabPanel::Experiments,
-        );
-        state.selected_experiment = Some("actual-batch".into());
-        let request = LabWorkflowRequest::GetExperiment {
-            experiment_id: "actual-batch".into(),
-        };
-        deliver(
-            &mut state,
-            request.clone(),
-            LabWorkflowResponse::Experiment(batch(64)),
-        );
-        assert_eq!(state.batch.as_ref().unwrap().variants.len(), 64);
-        state.challenger = Some("arm-63".into());
-        let compare = state.comparison_request().unwrap();
-        deliver(
-            &mut state,
-            compare.clone(),
-            LabWorkflowResponse::Comparison(comparison("arm-63")),
-        );
-        let lines = comparison_lines(state.comparison.as_ref().unwrap()).join("\n");
-        assert!(lines.contains("Descriptive only"));
-        assert!(lines.contains("p: unavailable"));
-        assert!(lines.contains("3.000000 agents"));
-        let mut mismatched = comparison("arm-63");
-        mismatched.plan_digest = "another-plan".into();
-        deliver(
-            &mut state,
-            compare.clone(),
-            LabWorkflowResponse::Comparison(mismatched),
-        );
-        assert!(
-            state.comparison.is_none(),
-            "inconsistent source evidence invalidates an earlier displayed comparison"
-        );
-        let mut unsupported_inference = comparison("arm-63");
-        unsupported_inference.p_value = Some(0.01);
-        deliver(
-            &mut state,
-            compare.clone(),
-            LabWorkflowResponse::Comparison(unsupported_inference),
-        );
-        assert!(
-            state.comparison.is_none(),
-            "one seed cannot acquire an inferential p value"
-        );
-        let mut unsupported_interval = comparison("arm-63");
-        unsupported_interval.ci_95 = Some((1.0, 4.0));
-        deliver(
-            &mut state,
-            compare.clone(),
-            LabWorkflowResponse::Comparison(unsupported_interval),
-        );
-        assert!(
-            state.comparison.is_none(),
-            "one seed cannot acquire an inferential confidence interval"
-        );
-        deliver(
-            &mut state,
-            compare,
-            LabWorkflowResponse::Comparison(comparison("arm-63")),
-        );
-        assert!(state.comparison.is_some());
-        let (send, result) = std::sync::mpsc::sync_channel(1);
-        assert!(
-            send.send(Err("retained artifact verification failed".into()))
-                .is_ok()
-        );
-        state.generation += 1;
-        state.job = Some(LabJob {
-            request: request.clone(),
-            generation: state.generation,
-            context: state.context,
-            session: state.session.unwrap(),
-            result,
+        assert_eq!(expected.treatment.unwrap().value().unwrap(), 0.5);
+        click(&mut lab, "lab-experiment-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state
+                    .latest_experiment_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        matches!(
+                            &creation.state,
+                            LabExperimentCreationState::Retryable { .. }
+                        )
+                    })
         });
-        state.poll();
+        for selector in [
+            "lab-experiment-design-brain-families",
+            "lab-experiment-parameter-metabolism_drain",
+            "lab-experiment-percent-0",
+            "lab-experiment-treatment-tick-0",
+            "lab-experiment-baseline-dwraon",
+        ] {
+            click(&mut lab, selector);
+        }
+        context.update(|app| assert_eq!(hud.read(app).lab_workflows.experiment_draft, expected));
+        click(&mut lab, "lab-experiment-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy() && !state.composing_experiment && state.batch.is_some()
+        });
+        draw(&mut lab);
         assert!(
-            state.comparison.is_none(),
-            "a known artifact refusal must clear prior verified output"
+            lab.debug_bounds("lab-experiment-retained-question")
+                .is_some()
         );
-        let compare = state.comparison_request().unwrap();
-        deliver(
-            &mut state,
-            compare,
-            LabWorkflowResponse::Comparison(comparison("arm-63")),
-        );
-        assert!(state.comparison.is_some());
-        let mut changed = batch(64);
-        changed.generation += 1;
-        deliver(
-            &mut state,
-            request,
-            LabWorkflowResponse::Experiment(changed),
-        );
+        click(&mut lab, "lab-metric-total_food");
+        click(&mut lab, "lab-compare");
+        wait(&mut lab, &|state| {
+            !state.is_busy() && state.comparison.is_some()
+        });
+        context.update(|app| {
+            let result = hud.read(app).lab_workflows.comparison.as_ref().unwrap();
+            assert_eq!(result.metric, LabMetric::TotalFood);
+            assert_eq!(result.matched_seeds, [42, 43]);
+            assert_eq!(result.endpoint_tick, 11);
+            assert!(
+                comparison_lines(result)
+                    .iter()
+                    .any(|line| line.contains(LabMetric::TotalFood.unit()))
+            );
+        });
+        click(&mut lab, "lab-all-experiments");
+        wait(&mut lab, &|state| {
+            !state.is_busy() && state.experiments.is_some()
+        });
+        click(&mut lab, "lab-experiment-0");
+        wait(&mut lab, &|state| !state.is_busy() && state.batch.is_some());
+        draw(&mut lab);
         assert!(
-            state.comparison.is_none(),
-            "a new source generation invalidates the displayed comparison"
+            lab.debug_bounds("lab-experiment-retained-question")
+                .is_none(),
+            "historical unknown designs must not inherit the latest question"
         );
-        state.selected_experiment = None;
-        let rows = vec![batch(2).summary; LAB_PAGE_SIZE + 1];
-        deliver(
-            &mut state,
-            LabWorkflowRequest::ListExperiments { cursor: None },
-            LabWorkflowResponse::Experiments(LabExperimentPage {
-                total: rows.len(),
-                items: rows,
-                offset: 0,
-                next_cursor: None,
-                reserved_run_slots: 0,
-                max_run_slots: 1,
-            }),
-        );
-        assert!(
-            state.experiments.is_none(),
-            "an oversized page is rejected, not silently truncated"
-        );
-        assert!(
-            !page_is_bounded(&[1], 0, 2, &None),
-            "remaining rows require a cursor"
-        );
-        assert!(
-            !page_is_bounded(&[1], 0, 2, &Some("0".into())),
-            "pagination must move forward"
-        );
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0], recorded[1]);
+        assert_eq!(recorded[0].2, expected);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
 
     #[test]
@@ -1462,6 +2996,7 @@ mod tests {
             .unwrap(),
         );
         let saved = host.snapshot();
+        let saved_world_digest = host.port.scientific_digest_v1().unwrap().overall;
         host.apply(scriptbots_runtime::HostCommand::UpdateSimulation(
             SimulationCommand {
                 paused: Some(true),
@@ -1470,7 +3005,9 @@ mod tests {
             },
         ));
         let before = host.port.scientific_digest_v1().unwrap();
-        let live_tick = host.snapshot().world.tick;
+        let created_world_digest = before.overall.clone();
+        let current = host.snapshot();
+        let live_tick = current.world.tick;
         assert!(live_tick > saved.world.tick);
         let mut session = GuiSession::new(
             host.port.clone(),
@@ -1480,6 +3017,13 @@ mod tests {
         let review_gate = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
         let worker_gate = Arc::clone(&review_gate);
         let (review_started, observed_review) = std::sync::mpsc::channel();
+        let save_requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded_saves = Arc::clone(&save_requests);
+        let comparison_metrics = Arc::new(Mutex::new(Vec::new()));
+        let recorded_metrics = Arc::clone(&comparison_metrics);
+        let creation_requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded_creations = Arc::clone(&creation_requests);
+        let created_experiments = Mutex::new(std::collections::BTreeMap::new());
         session.lab_submit = Some(Arc::new(move |request| {
             Ok(match request {
                 LabWorkflowRequest::ListExperiments { .. } => {
@@ -1492,17 +3036,56 @@ mod tests {
                         max_run_slots: 1,
                     })
                 }
-                LabWorkflowRequest::GetExperiment { .. } => {
-                    LabWorkflowResponse::Experiment(batch(2))
+                LabWorkflowRequest::ExperimentCapabilities => {
+                    LabWorkflowResponse::ExperimentCapabilities(experiment_capabilities())
+                }
+                LabWorkflowRequest::CreateExperiment {
+                    request_id,
+                    session_id,
+                    draft,
+                } => {
+                    assert_eq!(session_id, saved.session_id);
+                    let first_attempt = {
+                        let mut requests = recorded_creations.lock().unwrap();
+                        requests.push((request_id.clone(), session_id, draft.clone()));
+                        requests.len() == 1
+                    };
+                    if first_attempt {
+                        return Err("experiment receipt is unconfirmed".into());
+                    }
+                    let experiment = created_batch(&request_id, &draft);
+                    created_experiments
+                        .lock()
+                        .unwrap()
+                        .insert(request_id.clone(), experiment.clone());
+                    LabWorkflowResponse::ExperimentCreated {
+                        request_id,
+                        session_id,
+                        experiment,
+                    }
+                }
+                LabWorkflowRequest::GetExperiment { experiment_id } => {
+                    LabWorkflowResponse::Experiment(if experiment_id == "actual-batch" {
+                        batch(2)
+                    } else {
+                        created_experiments
+                            .lock()
+                            .unwrap()
+                            .get(&experiment_id)
+                            .expect("created experiment is retained")
+                            .clone()
+                    })
                 }
                 LabWorkflowRequest::Compare {
                     baseline_variant,
                     challenger_variant,
+                    metric,
                     ..
                 } => {
                     assert_eq!(baseline_variant, "arm-00");
                     assert_eq!(challenger_variant, "arm-01");
-                    LabWorkflowResponse::Comparison(comparison("arm-01"))
+                    recorded_metrics.lock().unwrap().push(metric);
+                    LabWorkflowResponse::Comparison(comparison("arm-01", metric))
                 }
                 LabWorkflowRequest::ListCheckpoints { .. } => {
                     LabWorkflowResponse::Checkpoints(LabCheckpointPage {
@@ -1511,7 +3094,7 @@ mod tests {
                             tick: saved.world.tick,
                             agent_count: saved.world.agents.len(),
                             byte_size: 1,
-                            world_digest: "component-world-cut".into(),
+                            world_digest: saved_world_digest.clone(),
                         }],
                         total: 1,
                         offset: 0,
@@ -1519,6 +3102,33 @@ mod tests {
                         retained_bytes: 1,
                         max_bytes: 100,
                     })
+                }
+                LabWorkflowRequest::CreateCheckpoint {
+                    request_id,
+                    session_id,
+                } => {
+                    assert_eq!(session_id, saved.session_id);
+                    let first_attempt = {
+                        let mut requests = recorded_saves.lock().unwrap();
+                        requests.push(request_id.clone());
+                        requests.len() == 1
+                    };
+                    if first_attempt {
+                        return Err("durable receipt not yet confirmed".into());
+                    }
+                    LabWorkflowResponse::CheckpointCreated {
+                        request_id,
+                        session_id,
+                        checkpoint: LabCheckpoint {
+                            checkpoint_id: "created-live-cut".into(),
+                            tick: live_tick,
+                            agent_count: current.world.agents.len(),
+                            byte_size: u64::try_from(current.world.agents.len())
+                                .unwrap()
+                                .max(1_024),
+                            world_digest: created_world_digest.clone(),
+                        },
+                    }
                 }
                 LabWorkflowRequest::ReviewCheckpoint { checkpoint_id } => {
                     review_started.send(()).unwrap();
@@ -1531,9 +3141,14 @@ mod tests {
                         )
                         .unwrap();
                     assert!(*allowed, "native checkpoint gate was not released");
+                    let snapshot = if checkpoint_id == "created-live-cut" {
+                        Arc::clone(&current)
+                    } else {
+                        Arc::clone(&saved)
+                    };
                     LabWorkflowResponse::CheckpointFrame {
                         checkpoint_id,
-                        snapshot: Arc::clone(&saved),
+                        snapshot,
                     }
                 }
                 _ => panic!("unexpected Lab request"),
@@ -1576,24 +3191,181 @@ mod tests {
         };
         click(&mut lab, "dashboard-tab-experiments");
         wait(&mut lab, &|state| {
-            state.experiments.is_some() && state.job.is_none()
+            state.experiments.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-new-experiment");
+        wait(&mut lab, &|state| {
+            state.composing_experiment
+                && state.experiment_capabilities.is_some()
+                && !state.is_busy()
+        });
+        click(&mut lab, "lab-experiment-baseline-dwraon");
+        click(&mut lab, "lab-experiment-challenger-assembly");
+        click(&mut lab, "lab-experiment-seed-137");
+        click(&mut lab, "lab-experiment-seed-count-3");
+        click(&mut lab, "lab-experiment-seed-count-prev");
+        click(&mut lab, "lab-experiment-ticks-10");
+        click(&mut lab, "lab-experiment-ticks-next");
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-experiment-preview").is_some());
+        context.update(|app| {
+            let draft = &hud.read(app).lab_workflows.experiment_draft;
+            assert_eq!(draft.baseline_family, "dwraon");
+            assert_eq!(draft.challenger_family, "assembly");
+            assert_eq!(draft.seeds().unwrap(), [137, 138]);
+            assert_eq!(draft.ticks_per_run, 11);
+        });
+        click(&mut lab, "lab-experiment-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state
+                    .latest_experiment_creation
+                    .as_ref()
+                    .is_some_and(|creation| {
+                        matches!(
+                            &creation.state,
+                            LabExperimentCreationState::Retryable { .. }
+                        )
+                    })
+        });
+        click(&mut lab, "lab-experiment-ticks-1000");
+        context.update(|app| {
+            assert_eq!(
+                hud.read(app).lab_workflows.experiment_draft.ticks_per_run,
+                11
+            );
+        });
+        click(&mut lab, "lab-experiment-create");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && !state.composing_experiment
+                && state.latest_experiment_creation.as_ref().is_some_and(|creation| {
+                    matches!(&creation.state, LabExperimentCreationState::Created { experiment_id }
+                        if state.selected_experiment.as_ref() == Some(experiment_id))
+                })
+        });
+        {
+            let requests = creation_requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0], requests[1],
+                "retry must retain the exact source, identity and draft",
+            );
+            assert_eq!(requests[0].2.seeds().unwrap(), [137, 138]);
+            assert_eq!(requests[0].2.ticks_per_run, 11);
+        }
+        click(&mut lab, "lab-all-experiments");
+        wait(&mut lab, &|state| {
+            state.experiments.is_some() && !state.is_busy()
         });
         click(&mut lab, "lab-experiment-0");
+        wait(&mut lab, &|state| state.batch.is_some() && !state.is_busy());
+        click(&mut lab, "lab-compare");
         wait(&mut lab, &|state| {
-            state.batch.is_some() && state.job.is_none()
+            state.comparison.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-metric-average_energy");
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            assert_eq!(state.metric, LabMetric::AverageEnergy);
+            assert!(
+                state.comparison.is_none(),
+                "changing endpoint must clear the population result"
+            );
         });
         click(&mut lab, "lab-compare");
         wait(&mut lab, &|state| {
-            state.comparison.is_some() && state.job.is_none()
+            !state.is_busy()
+                && state.comparison.as_ref().is_some_and(|result| {
+                    result.metric == LabMetric::AverageEnergy && result.mean_difference == 0.25
+                })
         });
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            let lines = comparison_lines(state.comparison.as_ref().unwrap());
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(LabMetric::AverageEnergy.unit()))
+            );
+        });
+        assert_eq!(
+            *comparison_metrics.lock().unwrap(),
+            [LabMetric::AliveAgents, LabMetric::AverageEnergy]
+        );
         click(&mut lab, "dashboard-tab-checkpoints");
         wait(&mut lab, &|state| {
-            state.checkpoints.is_some() && state.job.is_none()
+            state.checkpoints.is_some() && !state.is_busy()
         });
+        click(&mut lab, "lab-save-checkpoint");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state.latest_checkpoint_save.as_ref().is_some_and(|save| {
+                    matches!(&save.state, LabCheckpointSaveState::Retryable { .. },)
+                })
+        });
+        click(&mut lab, "lab-save-checkpoint");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+            && state.latest_checkpoint_save.as_ref().is_some_and(|save| matches!(
+                &save.state, LabCheckpointSaveState::Saved(checkpoint)
+                    if checkpoint.checkpoint_id == "created-live-cut" && checkpoint.tick == live_tick,
+            ))
+        });
+        {
+            let requests = save_requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0], requests[1],
+                "retry must use the same save identity"
+            );
+        }
+        wait(&mut lab, &|state| {
+            state.checkpoints.is_some() && !state.is_busy()
+        });
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            assert!(
+                state
+                    .checkpoints
+                    .as_ref()
+                    .unwrap()
+                    .items
+                    .iter()
+                    .all(|checkpoint| checkpoint.checkpoint_id != "created-live-cut")
+            );
+            assert_eq!(
+                state.selected_checkpoint_metadata().unwrap().checkpoint_id,
+                "created-live-cut"
+            );
+        });
+        click(&mut lab, "lab-review-checkpoint");
+        wait(&mut lab, &|state| {
+            !state.is_busy()
+                && state.notice.as_deref().is_some_and(|message| {
+                    message.starts_with("Showing checkpoint created-live-cut")
+                })
+        });
+        context.update(|app| {
+            assert_eq!(
+                world
+                    .read(app)
+                    .playback
+                    .reconstructed
+                    .as_ref()
+                    .unwrap()
+                    .tick,
+                live_tick
+            );
+        });
+        observed_review
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        click(&mut lab, "lab-world-live");
         click(&mut lab, "lab-checkpoint-0");
         click(&mut lab, "lab-review-checkpoint");
         wait(&mut lab, &|state| {
-            state.job.is_none()
+            !state.is_busy()
                 && state
                     .notice
                     .as_deref()
@@ -1608,8 +3380,40 @@ mod tests {
                 "saved-cut"
             );
         });
+        // The production button is disabled while World shows history.
+        click(&mut lab, "lab-save-checkpoint");
+        assert_eq!(save_requests.lock().unwrap().len(), 2);
+        // Also exercise a stale enabled handler from the earlier live paint.
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.lab_action(LabAction::CreateCheckpoint, cx);
+                assert!(
+                    view.lab_workflows
+                        .notice
+                        .as_deref()
+                        .is_some_and(|message| message.contains("live World"))
+                );
+            })
+        });
+        assert_eq!(save_requests.lock().unwrap().len(), 2);
         click(&mut lab, "lab-world-live");
-        context.update(|app| assert!(world.read(app).playback.reconstructed.is_none()));
+        context.update(|app| {
+            world.update(app, |view, _| {
+                assert!(view.playback.reconstructed.is_none());
+                assert_eq!(view.playback.mode(), PlaybackMode::Live);
+                // Exercise the real state between a live intent and its next
+                // presented frame, independent of background window drawing.
+                view.playback.displaying_history = true;
+            });
+            hud.update(app, |view, cx| {
+                view.lab_action(LabAction::CreateCheckpoint, cx)
+            });
+        });
+        assert_eq!(
+            save_requests.lock().unwrap().len(),
+            2,
+            "return-live intent cannot save before a live World frame is presented"
+        );
         observed_review
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
@@ -1626,7 +3430,7 @@ mod tests {
         *review_gate.0.lock().unwrap() = true;
         review_gate.1.notify_one();
         wait(&mut lab, &|state| {
-            state.job.is_none()
+            !state.is_busy()
                 && state
                     .notice
                     .as_deref()

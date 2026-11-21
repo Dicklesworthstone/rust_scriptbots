@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -221,6 +221,17 @@ pub enum ControlError {
 impl ControlError {
     fn serialization(err: serde_json::Error) -> Self {
         Self::Serialization(err.to_string())
+    }
+}
+
+impl From<scriptbots_runtime::remote::BrowserInterventionError> for ControlError {
+    fn from(error: scriptbots_runtime::remote::BrowserInterventionError) -> Self {
+        use scriptbots_runtime::remote::BrowserInterventionError;
+        match error {
+            BrowserInterventionError::InvalidRequest(message) => Self::BadRequest(message),
+            error @ (BrowserInterventionError::SourceConflict(_)
+            | BrowserInterventionError::PauseRequired) => Self::Conflict(error.to_string()),
+        }
     }
 }
 
@@ -596,6 +607,8 @@ pub struct ExperimentCreateRequest {
     pub description: Option<String>,
     pub variants: Vec<ExperimentVariantDto>,
     pub seeds: Vec<u64>,
+    /// Exact positive horizon within the runner's per-run limit; never clamped.
+    /// Omitting this field selects 1,000 scientific ticks.
     pub ticks_per_run: Option<u64>,
     pub max_concurrency: Option<usize>,
     pub idempotency_key: Option<String>,
@@ -609,7 +622,13 @@ pub struct ExperimentRunRecordDto {
     pub brain_family: String,
     pub seed: u64,
     pub state: String,
+    /// Terminal recorded transitions; remains zero for pending and running runs.
     pub total_ticks: u64,
+    /// Requested horizon from the validated experiment plan.
+    pub target_ticks: u64,
+    /// Last observed sealed cut, independently of terminal completion/status generation.
+    #[schema(inline)]
+    pub checkpoint_progress: crate::experiment_runner::ExperimentCheckpointProgress,
     pub final_digest: Option<String>,
     pub bundle_path: Option<String>,
     pub error_reason: Option<String>,
@@ -678,7 +697,7 @@ pub struct CheckpointCreateRequest {
 }
 
 /// Metadata descriptor for a simulation checkpoint.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CheckpointMetadataDto {
     pub checkpoint_id: String,
     pub tick: u64,
@@ -695,8 +714,142 @@ pub struct CheckpointMetadataDto {
     pub description: Option<String>,
 }
 
-/// Metadata descriptor for a discoverable and downloadable artifact or bundle.
+/// Maximum future transitions admitted for one checkpoint branch.
+pub const MAX_CHECKPOINT_BRANCH_TICKS: u64 = crate::branch_study::MAX_STUDY_HORIZON_TICKS;
+/// Maximum encoded managed-branch request size, shared by all transports.
+pub const MAX_CHECKPOINT_BRANCH_REQUEST_BYTES: usize = 16 * 1024;
+/// Maximum safe human-readable branch name.
+pub const MAX_CHECKPOINT_BRANCH_NAME_BYTES: usize = 64;
+/// Maximum retry key length.
+pub const MAX_CHECKPOINT_BRANCH_KEY_BYTES: usize = 1024;
+/// Maximum checkpoint or branch identifier length accepted by the API.
+pub const MAX_CHECKPOINT_BRANCH_ID_BYTES: usize = 128;
+/// Completed and interrupted branches retain their identities instead of being evicted.
+pub const MAX_RETAINED_CHECKPOINT_BRANCHES: usize = 32;
+
+/// Run an independent scientific future from a retained checkpoint.
+///
+/// An intervention adds a treatment beside an unchanged control. This does not
+/// replace the live owner or continue its session, schedule or retained history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointBranchRequest {
+    pub checkpoint_id: String,
+    pub branch_name: String,
+    pub ticks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub intervention: Option<crate::branch_study::StudyIntervention>,
+    /// Required retry identity. A changed request cannot reuse an admitted key.
+    pub idempotency_key: String,
+}
+
+impl CheckpointBranchRequest {
+    /// Validate transport-independent bounds before reading or reserving anything.
+    pub fn validate_shape(&self) -> Result<(), ControlError> {
+        if !valid_checkpoint_branch_identifier(&self.checkpoint_id) {
+            return Err(ControlError::BadRequest(
+                "checkpoint_id must be a bounded ASCII identifier".to_owned(),
+            ));
+        }
+        if self.branch_name.is_empty()
+            || self.branch_name.len() > MAX_CHECKPOINT_BRANCH_NAME_BYTES
+            || !self
+                .branch_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(ControlError::BadRequest(format!(
+                "branch_name must contain 1..={MAX_CHECKPOINT_BRANCH_NAME_BYTES} ASCII letters, digits, '_' or '-'"
+            )));
+        }
+        if self.ticks == 0 || self.ticks > MAX_CHECKPOINT_BRANCH_TICKS {
+            return Err(ControlError::BadRequest(format!(
+                "ticks must be in 1..={MAX_CHECKPOINT_BRANCH_TICKS}"
+            )));
+        }
+        if self.idempotency_key.trim().is_empty()
+            || self.idempotency_key.len() > MAX_CHECKPOINT_BRANCH_KEY_BYTES
+        {
+            return Err(ControlError::BadRequest(format!(
+                "idempotency_key must contain 1..={MAX_CHECKPOINT_BRANCH_KEY_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    fn bounded_payload(&self) -> Result<Vec<u8>, ControlError> {
+        struct Payload(Vec<u8>);
+        impl std::io::Write for Payload {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > MAX_CHECKPOINT_BRANCH_REQUEST_BYTES.saturating_sub(self.0.len()) {
+                    return Err(std::io::Error::other(
+                        "checkpoint branch request exceeds its byte bound",
+                    ));
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut payload = Payload(Vec::new());
+        serde_json::to_writer(&mut payload, self).map_err(|error| {
+            if error.is_io() {
+                ControlError::PayloadTooLarge(format!(
+                    "checkpoint branch request exceeds {MAX_CHECKPOINT_BRANCH_REQUEST_BYTES} bytes"
+                ))
+            } else {
+                ControlError::serialization(error)
+            }
+        })?;
+        Ok(payload.0)
+    }
+}
+
+fn valid_checkpoint_branch_identifier(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_CHECKPOINT_BRANCH_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Latest observed managed-branch state. Source and target ticks are not live progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CheckpointBranchStatusDto {
+    pub branch_id: String,
+    pub checkpoint_id: String,
+    pub branch_name: String,
+    /// running, cancelling, completed, cancelled, failed or stopped after interruption.
+    pub status: String,
+    pub source_tick: u64,
+    pub target_tick: u64,
+    /// Digest of the exact saved source, not a forecast or final branch digest.
+    pub world_digest_v1: String,
+    /// Downloadable study report, published only after every branch bundle verifies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<String>,
+}
+
+/// Bounded discovery of admitted checkpoint studies, including recovered receipts.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PaginatedCheckpointBranchesResponse {
+    pub items: Vec<CheckpointBranchStatusDto>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+/// Metadata descriptor for a discoverable and downloadable artifact or bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ArtifactMetadataDto {
     pub artifact_id: String,
     pub filename: String,
@@ -727,6 +880,10 @@ pub struct PaginatedExperimentsResponse {
 pub struct ExperimentExecutionCapacityDto {
     pub max_run_slots: usize,
     pub reserved_run_slots: usize,
+    /// Dense grid cardinality across every concurrently admitted experiment.
+    /// This is not a bound on population or total resident memory.
+    pub max_grid_cells: u64,
+    pub reserved_grid_cells: u64,
     pub reserved_batches: usize,
 }
 
@@ -735,6 +892,7 @@ pub struct ExperimentExecutionCapacityDto {
 struct ExperimentExecutionReservation {
     capacity: Arc<Mutex<ExperimentExecutionCapacityDto>>,
     run_slots: usize,
+    grid_cells: u64,
     experiment_id: String,
     running: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -746,6 +904,7 @@ impl Drop for ExperimentExecutionReservation {
             // Poison must not prevent this unique owner's reservation being returned.
             let mut capacity = self.capacity.lock().unwrap_or_else(PoisonError::into_inner);
             capacity.reserved_run_slots -= self.run_slots;
+            capacity.reserved_grid_cells -= self.grid_cells;
             capacity.reserved_batches -= 1;
             *capacity
         };
@@ -756,7 +915,9 @@ impl Drop for ExperimentExecutionReservation {
             tracing::info!(
                 experiment_id = %self.experiment_id,
                 released_run_slots = self.run_slots,
+                released_grid_cells = self.grid_cells,
                 reserved_run_slots = observed.reserved_run_slots,
+                reserved_grid_cells = observed.reserved_grid_cells,
                 reserved_batches = observed.reserved_batches,
                 max_run_slots = observed.max_run_slots,
                 "experiment execution reservation released"
@@ -789,6 +950,14 @@ pub struct CheckpointRetentionDto {
     pub file_bytes: u64,
     pub observed_file_count_high_water: u64,
     pub observed_file_bytes_high_water: u64,
+    /// Immutable retry admissions, including incomplete requests from earlier owners.
+    /// These do not represent requests adopted by the current owner.
+    pub retained_request_records: u64,
+    pub retained_request_record_bytes: u64,
+    /// Union of binary artifact paths and checkpoint paths reserved by requests.
+    pub reserved_checkpoint_count: u64,
+    /// Derived from the configured count limit and the bounded record encoding.
+    pub max_retained_request_record_bytes: u64,
     pub request_entries: usize,
     pub pending_entries: usize,
     pub payload_cache_bytes: u64,
@@ -1220,9 +1389,397 @@ impl ExperimentDefinitionV1 {
     }
 }
 
+const MAX_CHECKPOINT_BRANCH_CATALOG_BYTES: usize = 1024 * 1024;
+const MAX_CHECKPOINT_BRANCH_ARTIFACTS: usize =
+    2 * (crate::branch_study::STUDY_BUNDLE_VERIFICATION_LIMITS.max_artifacts + 1) + 5;
+const MAX_CHECKPOINT_BRANCH_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Immutable admission authority. Checksums detect corruption, not hostile authorship.
+/// Paths are derived from the leased root and branch identity, never accepted from callers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointBranchDefinitionV1 {
+    schema_version: u16,
+    branch_id: String,
+    request: CheckpointBranchRequest,
+    request_hash: String,
+    source_tick: u64,
+    target_tick: u64,
+    world_digest_v1: String,
+    source_byte_size: u64,
+    source_checksum_blake3: String,
+    plan: crate::branch_study::BranchStudyPlan,
+    created_at_utc: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointBranchDefinitionRecord {
+    definition: CheckpointBranchDefinitionV1,
+    checksum: String,
+}
+
+/// A terminal receipt records observed completion, not perpetual file integrity.
+/// Artifact access independently revalidates the sealed files before publication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointBranchReceiptV1 {
+    schema_version: u16,
+    definition_checksum: String,
+    status: CheckpointBranchStatusDto,
+    artifacts: Vec<ArtifactMetadataDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointBranchReceiptRecord {
+    receipt: CheckpointBranchReceiptV1,
+    checksum: String,
+}
+
+fn checkpoint_branch_catalog_error(path: &Path, error: impl std::fmt::Display) -> ControlError {
+    ControlError::Serialization(format!(
+        "checkpoint branch catalog {}: {error}; preserve the saved study and reconcile its admission or receipt before retrying",
+        path.display()
+    ))
+}
+
+fn valid_branch_digest(value: &str) -> bool {
+    value.len() == blake3::OUT_LEN * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_world_digest_v1(value: &str) -> bool {
+    value.len() == std::mem::size_of::<u64>() * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn checkpoint_branch_specs(
+    request: &CheckpointBranchRequest,
+    source_tick: u64,
+) -> Vec<crate::branch_study::StudyBranchSpec> {
+    use crate::branch_study::StudyBranchSpec;
+
+    let mut branches = vec![StudyBranchSpec {
+        branch_id: "control".to_owned(),
+        description: format!("{}: unchanged scientific future", request.branch_name),
+        intervention: None,
+        scheduled_tick: None,
+    }];
+    if let Some(intervention) = request.intervention.clone() {
+        branches.push(StudyBranchSpec {
+            branch_id: "treatment".to_owned(),
+            description: format!("{}: requested intervention", request.branch_name),
+            intervention: Some(intervention),
+            scheduled_tick: Some(source_tick),
+        });
+    }
+    branches
+}
+
+fn write_checkpoint_branch_record(
+    directory: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<(), ControlError> {
+    if bytes.len() > MAX_CHECKPOINT_BRANCH_CATALOG_BYTES {
+        return Err(ControlError::PayloadTooLarge(
+            "checkpoint branch catalog record exceeds 1 MiB".to_owned(),
+        ));
+    }
+    validate_experiment_directory(directory)?;
+    let committed = directory.join(filename);
+    match fs::symlink_metadata(&committed) {
+        Ok(_) => {
+            let (file, existing) =
+                open_artifact_file_bounded(&committed, MAX_CHECKPOINT_BRANCH_CATALOG_BYTES, true)?;
+            if existing == bytes {
+                file.sync_all()
+                    .map_err(|error| checkpoint_branch_catalog_error(&committed, error))?;
+                verify_open_artifact(&committed, &file)?;
+                #[cfg(unix)]
+                for path in [
+                    Some(directory),
+                    directory.parent(),
+                    directory.parent().and_then(Path::parent),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    sync_checkpoint_directory(path)
+                        .map_err(|error| checkpoint_branch_catalog_error(path, error))?;
+                }
+                return Ok(());
+            }
+            return Err(checkpoint_branch_catalog_error(
+                &committed,
+                "immutable catalog record already exists with different bytes",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(checkpoint_branch_catalog_error(&committed, error)),
+    }
+    let temporary = directory.join(format!("{filename}.tmp"));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| checkpoint_branch_catalog_error(&temporary, error))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| checkpoint_branch_catalog_error(&temporary, error))?;
+    verify_open_artifact(&temporary, &file)?;
+    // The exclusive admission directory and branch registry own this single writer.
+    // An interrupted temporary record is preserved and never silently retried.
+    fs::rename(&temporary, &committed)
+        .map_err(|error| checkpoint_branch_catalog_error(&committed, error))?;
+    verify_open_artifact(&committed, &file)?;
+    #[cfg(unix)]
+    for path in [
+        Some(directory),
+        directory.parent(),
+        directory.parent().and_then(Path::parent),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        sync_checkpoint_directory(path)
+            .map_err(|error| checkpoint_branch_catalog_error(path, error))?;
+    }
+    Ok(())
+}
+
+impl CheckpointBranchDefinitionV1 {
+    fn checksum(&self) -> Result<String, ControlError> {
+        serde_json::to_vec(self)
+            .map(|bytes| compute_blake3(&bytes))
+            .map_err(ControlError::serialization)
+    }
+
+    fn status(&self, status: &str) -> CheckpointBranchStatusDto {
+        CheckpointBranchStatusDto {
+            branch_id: self.branch_id.clone(),
+            checkpoint_id: self.request.checkpoint_id.clone(),
+            branch_name: self.request.branch_name.clone(),
+            status: status.to_owned(),
+            source_tick: self.source_tick,
+            target_tick: self.target_tick,
+            world_digest_v1: self.world_digest_v1.clone(),
+            artifact_id: None,
+            error_reason: None,
+        }
+    }
+
+    fn validate(&self, directory: &Path) -> Result<(), ControlError> {
+        self.request.validate_shape()?;
+        let expected_id = format!(
+            "branch-{}",
+            compute_blake3(self.request.idempotency_key.as_bytes())
+        );
+        if self.schema_version != 1
+            || self.branch_id != expected_id
+            || directory.file_name().and_then(|name| name.to_str()) != Some(expected_id.as_str())
+            || self.request_hash != compute_blake3(&self.request.bounded_payload()?)
+            || self.source_tick.checked_add(self.request.ticks) != Some(self.target_tick)
+            || !valid_world_digest_v1(&self.world_digest_v1)
+            || !valid_branch_digest(&self.source_checksum_blake3)
+            || self.source_byte_size == 0
+            || self.source_byte_size > MAX_ARTIFACT_DOWNLOAD_BYTES as u64
+            || self.created_at_utc.parse::<u64>().is_err()
+            || self.plan.study_id != self.branch_id
+            || self.plan.checkpoint_tick != self.source_tick
+            || self.plan.horizon_ticks != self.request.ticks
+            || self.plan.source_checkpoint.as_deref()
+                != Some(directory.join("study/source_checkpoint.bin").as_path())
+            || serde_json::to_vec(&self.plan.branches).map_err(ControlError::serialization)?
+                != serde_json::to_vec(&checkpoint_branch_specs(&self.request, self.source_tick))
+                    .map_err(ControlError::serialization)?
+        {
+            return Err(checkpoint_branch_catalog_error(
+                directory,
+                "admission version, request, plan or source identity mismatch",
+            ));
+        }
+        crate::branch_study::validate_study_config(&self.plan.config)
+            .map_err(|error| checkpoint_branch_catalog_error(directory, error))?;
+        Ok(())
+    }
+
+    fn persist(&self, directory: &Path) -> Result<(), ControlError> {
+        self.validate(directory)?;
+        let record = CheckpointBranchDefinitionRecord {
+            definition: self.clone(),
+            checksum: self.checksum()?,
+        };
+        write_checkpoint_branch_record(
+            directory,
+            "definition.json",
+            &serde_json::to_vec(&record).map_err(ControlError::serialization)?,
+        )
+    }
+}
+
+impl CheckpointBranchReceiptV1 {
+    fn validate(&self, definition: &CheckpointBranchDefinitionV1) -> Result<(), ControlError> {
+        let expected = definition.status(&self.status.status);
+        let mut identity = self.status.clone();
+        identity.artifact_id = None;
+        identity.error_reason = None;
+        if self.schema_version != 1
+            || self.definition_checksum != definition.checksum()?
+            || identity != expected
+            || !matches!(
+                self.status.status.as_str(),
+                "completed" | "failed" | "cancelled"
+            )
+            || self
+                .status
+                .error_reason
+                .as_ref()
+                .is_some_and(|reason| reason.len() > 8192)
+            || self.artifacts.len() > MAX_CHECKPOINT_BRANCH_ARTIFACTS
+        {
+            return Err(ControlError::InvalidPatch(
+                "checkpoint branch receipt does not match its immutable admission".to_owned(),
+            ));
+        }
+        if self.status.status != "completed" {
+            if self.status.artifact_id.is_some()
+                || self
+                    .status
+                    .error_reason
+                    .as_ref()
+                    .is_none_or(|reason| reason.is_empty())
+                || !self.artifacts.is_empty()
+            {
+                return Err(ControlError::InvalidPatch(
+                    "failed or cancelled branch receipt cannot publish artifacts".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        let prefix = format!("branches/{}/study/", definition.branch_id);
+        let mut indexed = BTreeMap::new();
+        let mut total_bytes = 0_u64;
+        for artifact in &self.artifacts {
+            let path = Path::new(&artifact.relative_path);
+            total_bytes = total_bytes
+                .checked_add(artifact.byte_size)
+                .filter(|size| *size <= MAX_CHECKPOINT_BRANCH_ARTIFACT_BYTES)
+                .ok_or_else(|| {
+                    ControlError::PayloadTooLarge(
+                        "checkpoint branch receipt exceeds its aggregate artifact byte cap"
+                            .to_owned(),
+                    )
+                })?;
+            if !artifact.relative_path.starts_with(&prefix)
+                || artifact.relative_path.contains('\\')
+                || !path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                || path.file_name().and_then(|name| name.to_str())
+                    != Some(artifact.filename.as_str())
+                || artifact.artifact_id
+                    != format!(
+                        "checkpoint-branch-{}",
+                        compute_blake3(artifact.relative_path.as_bytes())
+                    )
+                || artifact.byte_size > MAX_ARTIFACT_DOWNLOAD_BYTES as u64
+                || !valid_branch_digest(&artifact.checksum_blake3)
+                || !valid_branch_digest(&artifact.checksum_sha256)
+                || artifact.created_at_utc != definition.created_at_utc
+                || indexed
+                    .insert(artifact.relative_path.as_str(), artifact)
+                    .is_some()
+            {
+                return Err(ControlError::InvalidPatch(
+                    "checkpoint branch receipt contains an invalid artifact identity".to_owned(),
+                ));
+            }
+        }
+        let report = indexed.get(format!("{prefix}study_report.json").as_str());
+        let source = indexed.get(format!("{prefix}source_checkpoint.bin").as_str());
+        let plan = indexed.get(format!("{prefix}study_plan.json").as_str());
+        let expected_plan =
+            serde_json::to_vec_pretty(&definition.plan).map_err(ControlError::serialization)?;
+        if self.status.error_reason.is_some()
+            || report.is_none_or(|artifact| {
+                self.status.artifact_id.as_deref() != Some(artifact.artifact_id.as_str())
+            })
+            || source.is_none_or(|artifact| {
+                artifact.byte_size != definition.source_byte_size
+                    || artifact.checksum_blake3 != definition.source_checksum_blake3
+            })
+            || plan.is_none_or(|artifact| {
+                artifact.byte_size != expected_plan.len() as u64
+                    || artifact.checksum_blake3 != compute_blake3(&expected_plan)
+            })
+            || !indexed.contains_key(format!("{prefix}study_source.json").as_str())
+            || !indexed.contains_key(format!("{prefix}study_summary.md").as_str())
+            || definition.plan.branches.iter().any(|branch| {
+                !indexed.contains_key(
+                    format!("{prefix}bundle_{}/bundle_manifest.json", branch.branch_id).as_str(),
+                )
+            })
+        {
+            return Err(ControlError::InvalidPatch(
+                "completed checkpoint branch receipt lacks its exact source, plan or report"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn persist(&self, directory: &Path) -> Result<(), ControlError> {
+        let bytes = serde_json::to_vec(self).map_err(ControlError::serialization)?;
+        let record = CheckpointBranchReceiptRecord {
+            receipt: self.clone(),
+            checksum: compute_blake3(&bytes),
+        };
+        write_checkpoint_branch_record(
+            directory,
+            "receipt.json",
+            &serde_json::to_vec(&record).map_err(ControlError::serialization)?,
+        )
+    }
+}
+
+fn read_checkpoint_branch_receipt(
+    directory: &Path,
+    definition: &CheckpointBranchDefinitionV1,
+) -> Result<Option<CheckpointBranchReceiptV1>, ControlError> {
+    let path = directory.join("receipt.json");
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(checkpoint_branch_catalog_error(&path, error)),
+        Ok(_) => {}
+    }
+    let bytes = read_artifact_file_bounded(&path, MAX_CHECKPOINT_BRANCH_CATALOG_BYTES)
+        .map_err(|error| checkpoint_branch_catalog_error(&path, error))?;
+    let record: CheckpointBranchReceiptRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| checkpoint_branch_catalog_error(&path, error))?;
+    if record.checksum
+        != compute_blake3(
+            &serde_json::to_vec(&record.receipt).map_err(ControlError::serialization)?,
+        )
+    {
+        return Err(checkpoint_branch_catalog_error(
+            &path,
+            "terminal receipt checksum mismatch",
+        ));
+    }
+    record.receipt.validate(definition)?;
+    Ok(Some(record.receipt))
+}
+
 /// A REST/MCP-created matched-seed batch executing on a background runner thread.
 ///
-/// The runner's atomically written status file is the only source of run
+/// The runner's atomically written status file is the source of terminal run
+/// evidence. Separate source-bound observations expose its sealed checkpoint
 /// progress; this job adds process-local execution state and the last status
 /// generation whose completed artifacts were verified and published.
 struct ExperimentJob {
@@ -1334,7 +1891,10 @@ impl ExperimentJob {
         }
     }
 
-    fn status_dto(&self) -> Result<ExperimentBatchStatusDto, ControlError> {
+    fn status_dto(
+        &self,
+        recover_checkpoint: bool,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
         use crate::experiment_runner::RunState;
         use std::sync::atomic::Ordering;
         let running = self.running.load(Ordering::Acquire);
@@ -1373,10 +1933,18 @@ impl ExperimentJob {
         } else {
             "stopped"
         };
+        let mut checkpoint_progress = self
+            .runner
+            .checkpoint_progress_snapshot(&self.state_file, &status, running || !recover_checkpoint)
+            .map_err(|error| experiment_catalog_error(&self.state_file, error))?;
         let runs = status
             .runs
             .into_iter()
             .map(|run| ExperimentRunRecordDto {
+                target_ticks: self.runner.max_ticks,
+                checkpoint_progress: checkpoint_progress
+                    .remove(&run.run_id)
+                    .expect("progress covers every validated run"),
                 run_id: run.run_id,
                 variant_id: run.variant_id,
                 brain_family: run.brain_family,
@@ -1415,13 +1983,15 @@ impl ExperimentJob {
 #[derive(Debug)]
 pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
+    /// One retry authority and worker owner for every admitted checkpoint branch.
+    checkpoint_branches: Mutex<BTreeMap<String, CheckpointBranchJob>>,
     /// A nonblocking, shared admission slot for bundle restoration and statistics.
     experiment_comparison: Mutex<()>,
     /// Once closed, retained handles may inspect work but cannot start or resume it.
     experiment_shutdown_requested: std::sync::atomic::AtomicBool,
     execution_capacity: Arc<Mutex<ExperimentExecutionCapacityDto>>,
     checkpoints: Mutex<BTreeMap<String, CheckpointMetadataDto>>,
-    artifacts: Mutex<BTreeMap<String, RetainedArtifact>>,
+    artifacts: Arc<Mutex<BTreeMap<String, RetainedArtifact>>>,
     /// Admission authority, recovered from immutable experiment definitions:
     /// request key -> (payload hash, admitted ID).
     /// Status is read from the job rather than cached as a creation response.
@@ -1430,10 +2000,590 @@ pub struct DataServices {
     checkpoint_retention: Mutex<CheckpointRetentionState>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RetainedArtifact {
     metadata: ArtifactMetadataDto,
     directory: PathBuf,
+}
+
+/// A finite scientific fork. Workers never retain DataServices, so dropping the
+/// final service handle can cancel and join them without an ownership cycle.
+#[derive(Debug)]
+struct CheckpointBranchJob {
+    definition: CheckpointBranchDefinitionV1,
+    directory: PathBuf,
+    artifact_root: PathBuf,
+    /// Recovered historical receipt; current files are checked on artifact access.
+    receipt: Option<CheckpointBranchReceiptV1>,
+    artifacts_published: bool,
+    status: Arc<Mutex<CheckpointBranchStatusDto>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CheckpointBranchJob {
+    fn start(
+        &mut self,
+        runner: crate::branch_study::BranchStudyOrchestrator,
+        checkpoint: scriptbots_core::WorldCheckpointV1,
+        artifact_root: PathBuf,
+        artifacts: Arc<Mutex<BTreeMap<String, RetainedArtifact>>>,
+        reservation: ExperimentExecutionReservation,
+    ) {
+        let status = Arc::clone(&self.status);
+        let cancel = Arc::clone(&self.cancel);
+        let definition = self.definition.clone();
+        let directory = self.directory.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("checkpoint-branch-{}", runner.plan.study_id))
+            // Checkpoint reconstruction uses the application's established reader stack.
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                let _reservation = reservation;
+                let result = runner.execute_from_checkpoint(&checkpoint, Some(&cancel));
+                let result = match result {
+                    Ok(report) => stage_checkpoint_branch_artifacts(
+                        &artifact_root,
+                        &runner.output_dir,
+                        &report,
+                        &definition,
+                    )
+                    .map_err(|error| (false, error.to_string())),
+                    Err(crate::branch_study::BranchStudyError::Cancelled) => {
+                        Err((true, "checkpoint branch cancellation observed".to_owned()))
+                    }
+                    Err(error) => Err((false, error.to_string())),
+                };
+                let mut terminal = definition.status("failed");
+                let mut staged = BTreeMap::new();
+                match result {
+                    Ok((artifact_id, ready)) => {
+                        terminal.status = "completed".to_owned();
+                        terminal.artifact_id = Some(artifact_id);
+                        staged = ready;
+                    }
+                    Err((cancelled, reason)) => {
+                        terminal.status = if cancelled { "cancelled" } else { "failed" }.to_owned();
+                        terminal.error_reason = Some(reason.chars().take(2048).collect());
+                    }
+                }
+                let sealed = (|| {
+                    // Producers sync their files; seal the complete directory tree too,
+                    // before a durable terminal receipt names any downloadable output.
+                    #[cfg(unix)]
+                    {
+                        let mut directories = std::collections::BTreeSet::new();
+                        for artifact in staged.values() {
+                            let path = artifact_root.join(&artifact.metadata.relative_path);
+                            let mut parent = path.parent();
+                            while let Some(path) = parent {
+                                if !path.starts_with(&directory) {
+                                    break;
+                                }
+                                directories.insert(path.to_path_buf());
+                                parent = path.parent();
+                            }
+                        }
+                        for path in directories.into_iter().rev() {
+                            sync_checkpoint_directory(&path)
+                                .map_err(|error| checkpoint_branch_catalog_error(&path, error))?;
+                        }
+                    }
+                    let receipt = CheckpointBranchReceiptV1 {
+                        schema_version: 1,
+                        definition_checksum: definition.checksum()?,
+                        status: terminal.clone(),
+                        artifacts: staged
+                            .values()
+                            .map(|artifact| artifact.metadata.clone())
+                            .collect(),
+                    };
+                    receipt.validate(&definition)?;
+                    receipt.persist(&directory)?;
+                    // Completion is the synced terminal observation. A volatile
+                    // publication failure cannot undo that observation; cold lookup
+                    // can revalidate and publish the same sealed artifact set.
+                    if let Err(error) = publish_checkpoint_branch_artifact_set(&artifacts, staged) {
+                        tracing::error!(branch_id = %definition.branch_id, %error,
+                            "completed checkpoint branch artifact publication requires retry");
+                    }
+                    Ok::<(), ControlError>(())
+                })();
+                if let Err(error) = sealed {
+                    terminal.status = "failed".to_owned();
+                    terminal.artifact_id = None;
+                    terminal.error_reason = Some(format!(
+                        "checkpoint branch receipt/publication failed: {error}"
+                    ));
+                }
+                let mut state = status.lock().unwrap_or_else(PoisonError::into_inner);
+                *state = terminal;
+                tracing::info!(
+                    branch_id = %state.branch_id,
+                    checkpoint_id = %state.checkpoint_id,
+                    status = %state.status,
+                    source_tick = state.source_tick,
+                    target_tick = state.target_tick,
+                    "checkpoint branch execution stopped"
+                );
+            });
+        match spawned {
+            Ok(worker) => self.worker = Some(worker),
+            Err(error) => {
+                let mut state = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+                state.status = "failed".to_owned();
+                state.error_reason =
+                    Some(format!("cannot spawn checkpoint branch worker: {error}"));
+                let retained = self.definition.checksum().and_then(|checksum| {
+                    CheckpointBranchReceiptV1 {
+                        schema_version: 1,
+                        definition_checksum: checksum,
+                        status: state.clone(),
+                        artifacts: Vec::new(),
+                    }
+                    .persist(&self.directory)
+                });
+                if let Err(error) = retained {
+                    state.error_reason = Some(format!(
+                        "{}; receipt persistence failed: {error}",
+                        state.error_reason.as_deref().unwrap_or("worker failed")
+                    ));
+                }
+            }
+        }
+    }
+
+    fn recover_artifacts(
+        &mut self,
+        artifacts: &Mutex<BTreeMap<String, RetainedArtifact>>,
+    ) -> Result<(), ControlError> {
+        if self.artifacts_published {
+            return Ok(());
+        }
+        let Some(receipt) = &self.receipt else {
+            return Ok(());
+        };
+        if receipt.status.status != "completed" {
+            return Ok(());
+        }
+        let output = self.directory.join("study");
+        validate_experiment_directory(&self.directory)?;
+        validate_experiment_directory(&output)?;
+        // Check the receipt's complete fixed file set before consulting any
+        // recovered manifest. Each read is bounded by its sealed byte length.
+        for artifact in &receipt.artifacts {
+            let path = self.artifact_root.join(&artifact.relative_path);
+            if path
+                .canonicalize()
+                .map_err(|error| checkpoint_branch_catalog_error(&path, error))?
+                != path
+            {
+                return Err(checkpoint_branch_catalog_error(
+                    &path,
+                    "artifact path is aliased",
+                ));
+            }
+            let bytes = read_artifact_file_bounded(
+                &path,
+                usize::try_from(artifact.byte_size)
+                    .map_err(|error| checkpoint_branch_catalog_error(&path, error))?,
+            )?;
+            if bytes.len() as u64 != artifact.byte_size
+                || compute_blake3(&bytes) != artifact.checksum_blake3
+                || compute_sha256(&bytes) != artifact.checksum_sha256
+            {
+                return Err(checkpoint_branch_catalog_error(
+                    &path,
+                    "artifact differs from the terminal receipt",
+                ));
+            }
+        }
+        let report_artifact = receipt
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                receipt.status.artifact_id.as_deref() == Some(artifact.artifact_id.as_str())
+            })
+            .ok_or_else(|| {
+                checkpoint_branch_catalog_error(&self.directory, "receipt lost its report")
+            })?;
+        let bytes = read_artifact_file_bounded(
+            &output.join("study_report.json"),
+            MAX_ARTIFACT_DOWNLOAD_BYTES,
+        )?;
+        if bytes.len() as u64 != report_artifact.byte_size
+            || compute_blake3(&bytes) != report_artifact.checksum_blake3
+            || compute_sha256(&bytes) != report_artifact.checksum_sha256
+        {
+            return Err(checkpoint_branch_catalog_error(
+                &output,
+                "report differs from the terminal receipt",
+            ));
+        }
+        let report = serde_json::from_slice(&bytes).map_err(ControlError::serialization)?;
+        let (report_id, staged) = stage_checkpoint_branch_artifacts(
+            &self.artifact_root,
+            &output,
+            &report,
+            &self.definition,
+        )?;
+        let expected: Vec<_> = staged
+            .values()
+            .map(|artifact| artifact.metadata.clone())
+            .collect();
+        if receipt.status.artifact_id.as_deref() != Some(report_id.as_str())
+            || expected != receipt.artifacts
+        {
+            return Err(checkpoint_branch_catalog_error(
+                &output,
+                "artifact set differs from the terminal receipt",
+            ));
+        }
+        publish_checkpoint_branch_artifact_set(artifacts, staged)?;
+        self.artifacts_published = true;
+        Ok(())
+    }
+
+    fn request_cancel(&self) {
+        let mut state = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(state.status.as_str(), "running" | "cancelling") {
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            state.status = "cancelling".to_owned();
+        }
+    }
+
+    fn join_worker(&mut self) -> Result<(), String> {
+        if let Some(worker) = self.worker.take() {
+            if let Err(panic) = worker.join() {
+                let mut state = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+                let message = format!(
+                    "checkpoint branch '{}' worker panicked: {panic:?}",
+                    state.branch_id
+                );
+                state.status = "failed".to_owned();
+                state.artifact_id = None;
+                state.error_reason = Some(message.clone());
+                return Err(message);
+            }
+            self.receipt = read_checkpoint_branch_receipt(&self.directory, &self.definition)
+                .map_err(|error| error.to_string())?;
+            if let Some(receipt) = &self.receipt {
+                *self.status.lock().unwrap_or_else(PoisonError::into_inner) =
+                    receipt.status.clone();
+            }
+        }
+        Ok(())
+    }
+
+    fn status_dto(&mut self) -> Result<CheckpointBranchStatusDto, ControlError> {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            // The failed observation remains available as a typed terminal job status.
+            self.join_worker().map_err(ControlError::Serialization)?;
+        }
+        Ok(self
+            .status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone())
+    }
+}
+
+impl Drop for CheckpointBranchJob {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Err(error) = self.join_worker() {
+            tracing::error!(%error, "checkpoint branch worker failed during drop");
+        }
+    }
+}
+
+/// Validate report-controlled identities before using any of them as paths.
+fn validate_checkpoint_branch_report(
+    definition: &CheckpointBranchDefinitionV1,
+    report: &crate::branch_study::BranchStudyReport,
+) -> Result<(), ControlError> {
+    let expected_source = crate::branch_study::BranchStudySource::SavedCheckpoint {
+        artifact_path: "source_checkpoint.bin".to_owned(),
+        byte_size: definition.source_byte_size,
+        checksum_blake3: definition.source_checksum_blake3.clone(),
+    };
+    if report.schema_version != crate::branch_study::BRANCH_STUDY_REPORT_SCHEMA_VERSION
+        || report.study_id != definition.branch_id
+        || report.base_seed != definition.plan.base_seed
+        || report.source != expected_source
+        || report.checkpoint_tick != definition.source_tick
+        || report.horizon_ticks != definition.request.ticks
+        || report.pre_intervention_digest != definition.world_digest_v1
+        || !report.pre_intervention_digest_verified_for_all_branches
+        || report.control_branch_id != "control"
+        || report.branch_reports.len() != definition.plan.branches.len()
+        || report
+            .branch_reports
+            .iter()
+            .zip(&definition.plan.branches)
+            .any(|(branch, spec)| {
+                branch.branch_id != spec.branch_id
+                    || branch.description != spec.description
+                    || branch.command_applied_tick != spec.scheduled_tick
+                    || branch.terminal_sample.tick != definition.target_tick
+                    || branch.final_digest != branch.terminal_sample.digest_overall
+                    || !valid_world_digest_v1(&branch.final_digest)
+                    || !branch.bundle_verified
+            })
+    {
+        return Err(ControlError::InvalidPatch(
+            "checkpoint branch report differs from its admitted source, plan or complete branch roster".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Stage bounded, verified files before sealing or publishing any metadata.
+fn stage_checkpoint_branch_artifacts(
+    root: &Path,
+    output: &Path,
+    report: &crate::branch_study::BranchStudyReport,
+    definition: &CheckpointBranchDefinitionV1,
+) -> Result<(String, BTreeMap<String, RetainedArtifact>), ControlError> {
+    validate_checkpoint_branch_report(definition, report)?;
+    validate_experiment_directory(root)?;
+    validate_experiment_directory(output)?;
+    let report_path = output.join("study_report.json");
+    let report_bytes = read_artifact_file_bounded(&report_path, MAX_ARTIFACT_DOWNLOAD_BYTES)?;
+    if report_bytes != serde_json::to_vec_pretty(report).map_err(ControlError::serialization)? {
+        return Err(ControlError::InvalidPatch(
+            "checkpoint branch report changed before publication".to_owned(),
+        ));
+    }
+    let mut files = BTreeMap::new();
+    for (name, bytes) in [
+        (
+            "study_plan.json",
+            serde_json::to_vec_pretty(&definition.plan).map_err(ControlError::serialization)?,
+        ),
+        (
+            "study_source.json",
+            serde_json::to_vec_pretty(&report.source).map_err(ControlError::serialization)?,
+        ),
+        (
+            "study_summary.md",
+            report.summary_markdown.as_bytes().to_vec(),
+        ),
+    ] {
+        files.insert(
+            output.join(name),
+            Some((bytes.len() as u64, compute_blake3(&bytes))),
+        );
+    }
+    files.insert(
+        report_path.clone(),
+        Some((report_bytes.len() as u64, compute_blake3(&report_bytes))),
+    );
+    let crate::branch_study::BranchStudySource::SavedCheckpoint {
+        artifact_path,
+        byte_size,
+        checksum_blake3,
+    } = &report.source
+    else {
+        return Err(ControlError::InvalidPatch(
+            "managed branch report lost its saved source".to_owned(),
+        ));
+    };
+    files.insert(
+        output.join(artifact_path),
+        Some((*byte_size, checksum_blake3.clone())),
+    );
+    for (branch, spec) in report.branch_reports.iter().zip(&definition.plan.branches) {
+        let bundle = output.join(format!("bundle_{}", branch.branch_id));
+        if !branch.bundle_verified
+            || branch.bundle_path.as_deref().map(Path::new) != Some(bundle.as_path())
+        {
+            return Err(ControlError::InvalidPatch(
+                "checkpoint branch bundle identity mismatch".to_owned(),
+            ));
+        }
+        validate_experiment_directory(&bundle)?;
+        let manifest = bundle.join("bundle_manifest.json");
+        let manifest_limit = usize::try_from(
+            crate::branch_study::STUDY_BUNDLE_VERIFICATION_LIMITS.max_manifest_bytes,
+        )
+        .expect("study manifest byte limit fits usize");
+        let bytes = read_artifact_file_bounded(&manifest, manifest_limit)?;
+        scriptbots_storage::bundle::verify_run_bundle_bounded(
+            &bundle,
+            crate::branch_study::STUDY_BUNDLE_VERIFICATION_LIMITS,
+        )
+        .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        if read_artifact_file_bounded(&manifest, manifest_limit)? != bytes {
+            return Err(ControlError::InvalidPatch(
+                "checkpoint branch manifest changed during verification".to_owned(),
+            ));
+        }
+        let parsed: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&bytes).map_err(ControlError::serialization)?;
+        if parsed.artifacts.len()
+            > crate::branch_study::STUDY_BUNDLE_VERIFICATION_LIMITS.max_artifacts
+        {
+            return Err(ControlError::PayloadTooLarge(
+                "checkpoint branch bundle contains too many artifacts".to_owned(),
+            ));
+        }
+        // Bundle checksums alone cannot bind an intact bundle copied from another
+        // study to this report. Compare the actual evidence with the admitted arm.
+        validate_experiment_directory(&bundle.join("evidence"))?;
+        let evidence = read_artifact_file_bounded(
+            &bundle.join("evidence/branch_evidence.json"),
+            MAX_ARTIFACT_DOWNLOAD_BYTES,
+        )?;
+        let expected_evidence = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": report.schema_version,
+            "branch_id": spec.branch_id,
+            "description": spec.description,
+            "base_seed": report.base_seed,
+            "source": report.source,
+            "checkpoint_tick": report.checkpoint_tick,
+            "horizon_ticks": report.horizon_ticks,
+            "intervention": spec.intervention,
+            "scheduled_tick": spec.scheduled_tick,
+            "command_applied_tick": branch.command_applied_tick,
+            "first_divergence": branch.first_divergence,
+            "extinction": branch.extinction,
+            "recovery": branch.recovery,
+            "hysteresis": branch.hysteresis,
+            "effect_sizes": branch.effect_sizes,
+            "terminal_sample": branch.terminal_sample,
+        }))
+        .map_err(ControlError::serialization)?;
+        if evidence != expected_evidence {
+            return Err(ControlError::InvalidPatch(
+                "checkpoint branch bundle evidence differs from its admitted arm or report"
+                    .to_owned(),
+            ));
+        }
+        files.insert(manifest, Some((bytes.len() as u64, compute_blake3(&bytes))));
+        for artifact in parsed.artifacts {
+            files.insert(
+                bundle.join(artifact.relative_path),
+                Some((artifact.bytes_len, artifact.blake3_hex)),
+            );
+        }
+    }
+    if files.len() > MAX_CHECKPOINT_BRANCH_ARTIFACTS {
+        return Err(ControlError::PayloadTooLarge(
+            "checkpoint branch artifact count exceeds its bound".to_owned(),
+        ));
+    }
+    let mut staged = BTreeMap::new();
+    let mut report_id = None;
+    let mut total_bytes = 0_u64;
+    for (path, expected) in files {
+        let relative = path.strip_prefix(root).map_err(|_| {
+            ControlError::BadRequest(
+                "checkpoint branch artifact escapes its source root".to_owned(),
+            )
+        })?;
+        if !relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+            || path
+                .canonicalize()
+                .map_err(|error| ControlError::Serialization(error.to_string()))?
+                != path
+        {
+            return Err(ControlError::BadRequest(
+                "checkpoint branch artifact is aliased or contains traversal".to_owned(),
+            ));
+        }
+        let bytes = read_artifact_file_bounded(&path, MAX_ARTIFACT_DOWNLOAD_BYTES)?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len() as u64)
+            .filter(|size| *size <= MAX_CHECKPOINT_BRANCH_ARTIFACT_BYTES)
+            .ok_or_else(|| {
+                ControlError::PayloadTooLarge(
+                    "checkpoint branch artifacts exceed their aggregate byte cap".to_owned(),
+                )
+            })?;
+        let checksum_blake3 = compute_blake3(&bytes);
+        if expected
+            .as_ref()
+            .is_some_and(|(size, digest)| *size != bytes.len() as u64 || digest != &checksum_blake3)
+        {
+            return Err(ControlError::InvalidPatch(
+                "checkpoint branch artifact changed before publication".to_owned(),
+            ));
+        }
+        let relative_path = relative
+            .components()
+            .map(|component| {
+                component.as_os_str().to_str().ok_or_else(|| {
+                    ControlError::BadRequest("non-UTF-8 branch artifact path".to_owned())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("/");
+        let artifact_id = format!(
+            "checkpoint-branch-{}",
+            compute_blake3(relative_path.as_bytes())
+        );
+        if path == report_path {
+            report_id = Some(artifact_id.clone());
+        }
+        let metadata = ArtifactMetadataDto {
+            artifact_id: artifact_id.clone(),
+            filename: path
+                .file_name()
+                .ok_or(ControlError::Lock)?
+                .to_string_lossy()
+                .into_owned(),
+            content_type: match path.extension().and_then(|extension| extension.to_str()) {
+                Some("json") => "application/json",
+                Some("csv") => "text/csv",
+                Some("md") => "text/markdown",
+                _ => "application/octet-stream",
+            }
+            .to_owned(),
+            byte_size: bytes.len() as u64,
+            checksum_blake3,
+            checksum_sha256: compute_sha256(&bytes),
+            created_at_utc: definition.created_at_utc.clone(),
+            relative_path,
+        };
+        staged.insert(
+            artifact_id,
+            RetainedArtifact {
+                metadata,
+                directory: root.to_path_buf(),
+            },
+        );
+    }
+    let report_id = report_id.ok_or_else(|| {
+        ControlError::InvalidPatch("completed branch has no report artifact".to_owned())
+    })?;
+    Ok((report_id, staged))
+}
+
+fn publish_checkpoint_branch_artifact_set(
+    artifacts: &Mutex<BTreeMap<String, RetainedArtifact>>,
+    staged: BTreeMap<String, RetainedArtifact>,
+) -> Result<(), ControlError> {
+    let mut catalog = artifacts.lock().map_err(|_| ControlError::Lock)?;
+    if staged
+        .iter()
+        .any(|(id, artifact)| catalog.get(id).is_some_and(|known| known != artifact))
+    {
+        return Err(ControlError::Conflict(
+            "checkpoint branch artifact identity was published with different metadata or root"
+                .to_owned(),
+        ));
+    }
+    catalog.extend(staged);
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1449,6 +2599,360 @@ struct RetainedCheckpoint {
     source_config_revision: scriptbots_runtime::ConfigRevision,
     source_persistence_interval: u32,
     source_scheduled_input_count: u64,
+}
+
+const CHECKPOINT_CATALOG_SUFFIX: &str = ".checkpoint.json";
+const CHECKPOINT_CATALOG_READY_SUFFIX: &str = ".checkpoint.ready";
+const MAX_CHECKPOINT_CATALOG_RECORD_BYTES: usize = 16 * 1024;
+const CHECKPOINT_REQUEST_PREFIX: &str = "checkpoint-request-";
+const CHECKPOINT_REQUEST_SUFFIX: &str = ".json";
+const MAX_CHECKPOINT_REQUEST_RECORD_BYTES: usize = 16 * 1024;
+const MAX_CATALOG_CHECKPOINTS: usize = 1_024;
+const MAX_CHECKPOINT_DISCOVERY_ENTRIES: usize = 16_384;
+const MAX_CHECKPOINT_DISCOVERY_BYTES: u64 = 256 * 1024 * 1024;
+
+// Admission limits for a saved remote canvas, not a total resident-memory guarantee.
+const MAX_CHECKPOINT_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CHECKPOINT_PREVIEW_GRID_CELLS: u64 = 262_144;
+const MAX_CHECKPOINT_PREVIEW_HISTORY: usize = 10_000;
+
+/// A completed file catalog entry, published only after the original writer
+/// acknowledges. Recovery exposes saved science for review/download; it does
+/// not adopt the original owner's requests, journal or persistence session.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCatalogRecord {
+    schema_version: u16,
+    metadata: CheckpointMetadataDto,
+    checksum_blake3: String,
+}
+
+/// Reserve the exact request before creating its payload. An admission alone
+/// never proves completion: recovery requires the ready catalog and original bytes.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRequestAdmission {
+    schema_version: u16,
+    idempotency_key: String,
+    request_hash: String,
+    metadata: CheckpointMetadataDto,
+    /// Original capture context only. WorldCheckpointV1 excludes host identity,
+    /// and recovery never adopts this session.
+    source_session: scriptbots_runtime::HostSessionId,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointRequestRecord {
+    admission: CheckpointRequestAdmission,
+    checksum_blake3: String,
+}
+
+fn checkpoint_request_path(directory: &Path, key: &str) -> PathBuf {
+    directory.join(format!(
+        "{CHECKPOINT_REQUEST_PREFIX}{}{CHECKPOINT_REQUEST_SUFFIX}",
+        compute_blake3(key.as_bytes())
+    ))
+}
+
+fn write_checkpoint_request_admission(
+    directory: &Path,
+    key: &str,
+    retained: &RetainedCheckpoint,
+) -> Result<(), ControlError> {
+    let path = checkpoint_request_path(directory, key);
+    let admission = CheckpointRequestAdmission {
+        schema_version: 1,
+        idempotency_key: key.to_owned(),
+        request_hash: retained.request_hash.clone(),
+        metadata: retained.metadata.clone(),
+        source_session: retained.source_session,
+    };
+    let encoded = serde_json::to_vec(&admission).map_err(ControlError::serialization)?;
+    let record = CheckpointRequestRecord {
+        admission,
+        checksum_blake3: compute_blake3(&encoded),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(ControlError::serialization)?;
+    if bytes.len() > MAX_CHECKPOINT_REQUEST_RECORD_BYTES {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "request admission exceeds its byte bound",
+        ));
+    }
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes)
+                .map_err(|error| checkpoint_catalog_error(&path, error))?;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let (file, existing) =
+                open_artifact_file_bounded(&path, MAX_CHECKPOINT_REQUEST_RECORD_BYTES, true)
+                    .map_err(|error| checkpoint_catalog_error(&path, error))?;
+            if existing != bytes {
+                return Err(checkpoint_catalog_error(
+                    &path,
+                    "existing request admission is incomplete or different; retry cannot overwrite it",
+                ));
+            }
+            file
+        }
+        Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+    };
+    file.sync_all()
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    verify_open_artifact(&path, &file).map_err(|error| checkpoint_catalog_error(&path, error))?;
+    #[cfg(unix)]
+    sync_checkpoint_directory(directory)
+        .map_err(|error| checkpoint_catalog_error(directory, error))?;
+    Ok(())
+}
+
+fn read_checkpoint_request_record(path: &Path) -> Result<CheckpointRequestAdmission, ControlError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| checkpoint_catalog_error(path, "request admission has no directory"))?;
+    let bytes = read_artifact_file_bounded(path, MAX_CHECKPOINT_REQUEST_RECORD_BYTES)
+        .map_err(|error| checkpoint_catalog_error(path, error))?;
+    let record: CheckpointRequestRecord =
+        serde_json::from_slice(&bytes).map_err(|error| checkpoint_catalog_error(path, error))?;
+    let encoded = serde_json::to_vec(&record.admission).map_err(ControlError::serialization)?;
+    let admission = record.admission;
+    if admission.schema_version != 1
+        || record.checksum_blake3 != compute_blake3(&encoded)
+        || admission.idempotency_key.is_empty()
+        || admission.idempotency_key.len() > 1024
+        || checkpoint_request_path(directory, &admission.idempotency_key).as_path() != path
+        || !valid_checkpoint_catalog_id(&admission.metadata.checkpoint_id)
+        || !valid_branch_digest(&admission.request_hash)
+    {
+        return Err(checkpoint_catalog_error(
+            path,
+            "unsupported, inconsistent or corrupt request admission",
+        ));
+    }
+    Ok(admission)
+}
+
+fn read_checkpoint_request_admission(
+    directory: &Path,
+    key: &str,
+    request_hash: &str,
+) -> Result<CheckpointRequestAdmission, ControlError> {
+    let admission = read_checkpoint_request_record(&checkpoint_request_path(directory, key))?;
+    if admission.idempotency_key != key || admission.request_hash != request_hash {
+        return Err(ControlError::Conflict(
+            "checkpoint idempotency key reused with a changed request".to_owned(),
+        ));
+    }
+    Ok(admission)
+}
+
+fn checkpoint_catalog_error(path: &Path, error: impl std::fmt::Display) -> ControlError {
+    ControlError::CheckpointRetentionUnavailable(format!(
+        "checkpoint catalog {}: {error}; retained files are preserved",
+        path.display()
+    ))
+}
+
+fn valid_checkpoint_catalog_id(id: &str) -> bool {
+    let Some((nonce, tick)) = id.strip_prefix("ckpt-").and_then(|id| id.split_once("-t")) else {
+        return false;
+    };
+    nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && tick
+            .parse::<u64>()
+            .is_ok_and(|value| value.to_string() == tick)
+}
+
+fn checkpoint_artifact_metadata(metadata: &CheckpointMetadataDto) -> ArtifactMetadataDto {
+    let filename = format!("{}.bin", metadata.checkpoint_id);
+    ArtifactMetadataDto {
+        artifact_id: metadata.checkpoint_id.clone(),
+        filename: filename.clone(),
+        content_type: "application/octet-stream".to_owned(),
+        byte_size: metadata.byte_size,
+        checksum_blake3: metadata.checksum_blake3.clone(),
+        checksum_sha256: metadata.checksum_sha256.clone(),
+        created_at_utc: metadata.created_at_utc.clone(),
+        relative_path: filename,
+    }
+}
+
+fn read_checkpoint_catalog(
+    directory: &Path,
+    id: &str,
+) -> Result<CheckpointMetadataDto, ControlError> {
+    let metadata = read_checkpoint_catalog_record(directory, id)?;
+    if metadata.byte_size > MAX_ARTIFACT_DOWNLOAD_BYTES as u64 {
+        return Err(checkpoint_catalog_error(
+            &directory.join(format!("{id}{CHECKPOINT_CATALOG_SUFFIX}")),
+            "unsupported, inconsistent or corrupt descriptor",
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Read the small committed descriptor before choosing a consumer's payload bound.
+fn read_checkpoint_catalog_record(
+    directory: &Path,
+    id: &str,
+) -> Result<CheckpointMetadataDto, ControlError> {
+    let path = directory.join(format!("{id}{CHECKPOINT_CATALOG_SUFFIX}"));
+    if !valid_checkpoint_catalog_id(id) {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "invalid checkpoint identity",
+        ));
+    }
+    let ready_path = directory.join(format!("{id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
+    read_artifact_file_bounded(&ready_path, 0)
+        .map_err(|error| checkpoint_catalog_error(&ready_path, error))?;
+    let bytes = read_artifact_file_bounded(&path, MAX_CHECKPOINT_CATALOG_RECORD_BYTES)
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    let record: CheckpointCatalogRecord =
+        serde_json::from_slice(&bytes).map_err(|error| checkpoint_catalog_error(&path, error))?;
+    let encoded = serde_json::to_vec(&record.metadata).map_err(ControlError::serialization)?;
+    let metadata = record.metadata;
+    if record.schema_version != 1
+        || record.checksum_blake3 != compute_blake3(&encoded)
+        || metadata.checkpoint_id != id
+        || !id.ends_with(&format!("-t{}", metadata.tick))
+        || metadata.schema != scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+        || metadata.byte_size == 0
+        || metadata
+            .description
+            .as_ref()
+            .is_some_and(|description| description.len() > 4096)
+    {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "unsupported, inconsistent or corrupt descriptor",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn verify_checkpoint_catalog_payload(
+    directory: &Path,
+    metadata: &CheckpointMetadataDto,
+) -> Result<ArtifactMetadataDto, ControlError> {
+    let artifact = checkpoint_artifact_metadata(metadata);
+    let path = directory.join(&artifact.relative_path);
+    let declared_bytes = usize::try_from(metadata.byte_size)
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    // Discovery charges this exact declaration against its per-call budget.
+    // Refuse a larger file before reading it, including sparse or forged inputs.
+    let bytes = read_artifact_file_bounded(&path, declared_bytes)
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    if bytes.len() as u64 != metadata.byte_size
+        || compute_blake3(&bytes) != metadata.checksum_blake3
+        || compute_sha256(&bytes) != metadata.checksum_sha256
+    {
+        return Err(checkpoint_catalog_error(&path, "artifact identity changed"));
+    }
+    let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    if checkpoint.tick().0 != metadata.tick
+        || checkpoint.agent_count() != metadata.agent_count
+        || checkpoint.source_digest().overall != metadata.world_digest_v1
+    {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "descriptor disagrees with the saved scientific cut",
+        ));
+    }
+    Ok(artifact)
+}
+
+fn write_checkpoint_catalog(
+    directory: &Path,
+    metadata: &CheckpointMetadataDto,
+) -> Result<(), ControlError> {
+    let path = directory.join(format!(
+        "{}{CHECKPOINT_CATALOG_SUFFIX}",
+        metadata.checkpoint_id
+    ));
+    let encoded = serde_json::to_vec(metadata).map_err(ControlError::serialization)?;
+    let record = CheckpointCatalogRecord {
+        schema_version: 1,
+        metadata: metadata.clone(),
+        checksum_blake3: compute_blake3(&encoded),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(ControlError::serialization)?;
+    if bytes.len() > MAX_CHECKPOINT_CATALOG_RECORD_BYTES {
+        return Err(checkpoint_catalog_error(
+            &path,
+            "descriptor exceeds its byte bound",
+        ));
+    }
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes)
+                .map_err(|error| checkpoint_catalog_error(&path, error))?;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let (file, existing) =
+                open_artifact_file_bounded(&path, MAX_CHECKPOINT_CATALOG_RECORD_BYTES, true)
+                    .map_err(|error| checkpoint_catalog_error(&path, error))?;
+            if existing != bytes {
+                return Err(checkpoint_catalog_error(
+                    &path,
+                    "existing descriptor is incomplete or different; retry cannot overwrite it",
+                ));
+            }
+            file
+        }
+        Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+    };
+    file.sync_all()
+        .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    verify_open_artifact(&path, &file).map_err(|error| checkpoint_catalog_error(&path, error))?;
+    #[cfg(unix)]
+    sync_checkpoint_directory(directory)
+        .map_err(|error| checkpoint_catalog_error(directory, error))?;
+    // An empty marker is an atomic, no-overwrite publication. A crash during
+    // descriptor writing leaves an undiscoverable partial file, not a poisoned
+    // catalog. Keep both files immutable and never remove interrupted evidence.
+    let ready_path = directory.join(format!(
+        "{}{CHECKPOINT_CATALOG_READY_SUFFIX}",
+        metadata.checkpoint_id
+    ));
+    let ready = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ready_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open_artifact_file_bounded(&ready_path, 0, true)
+                .map_err(|error| checkpoint_catalog_error(&ready_path, error))?
+                .0
+        }
+        Err(error) => return Err(checkpoint_catalog_error(&ready_path, error)),
+    };
+    ready
+        .sync_all()
+        .map_err(|error| checkpoint_catalog_error(&ready_path, error))?;
+    verify_open_artifact(&ready_path, &ready)
+        .map_err(|error| checkpoint_catalog_error(&ready_path, error))?;
+    #[cfg(unix)]
+    sync_checkpoint_directory(directory)
+        .map_err(|error| checkpoint_catalog_error(directory, error))?;
+    Ok(())
 }
 
 /// Hard bound on the complete checkpoint-to-current verification interval.
@@ -1467,6 +2971,9 @@ struct CheckpointRetentionState {
     requests: BTreeMap<String, RetainedCheckpoint>,
     file_count: u64,
     file_bytes: u64,
+    request_record_count: u64,
+    request_record_bytes: u64,
+    reservation_count: u64,
     count_high_water: u64,
     bytes_high_water: u64,
     inventory_error: Option<String>,
@@ -1489,6 +2996,67 @@ impl CheckpointRetentionState {
             })?
             .verify()
             .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))
+    }
+
+    fn request_admission(
+        &self,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<Option<(PathBuf, CheckpointRequestAdmission)>, ControlError> {
+        if self.directories.len() > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+            return Err(ControlError::CheckpointRetentionUnavailable(
+                "checkpoint request discovery exceeds its directory bound".to_owned(),
+            ));
+        }
+        let mut found = None;
+        for directory in self.directories.keys() {
+            self.verify_directory(directory)?;
+            let path = checkpoint_request_path(directory, key);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    if found.is_some() {
+                        return Err(ControlError::Conflict(
+                            "checkpoint idempotency key is retained in multiple artifact directories"
+                                .to_owned(),
+                        ));
+                    }
+                    found = Some(directory.clone());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+            }
+        }
+        found
+            .map(|directory| {
+                read_checkpoint_request_admission(&directory, key, request_hash)
+                    .map(|admission| (directory, admission))
+            })
+            .transpose()
+    }
+
+    fn completed_request(
+        &self,
+        directory: &Path,
+        admission: &CheckpointRequestAdmission,
+    ) -> Result<CheckpointMetadataDto, ControlError> {
+        self.verify_directory(directory)?;
+        let metadata = read_checkpoint_catalog(directory, &admission.metadata.checkpoint_id)
+            .map_err(|error| {
+                ControlError::CheckpointRetentionUnavailable(format!(
+                    "checkpoint {} completion is unconfirmed for original source session {}: {error}; retained request identity forbids a new capture",
+                    admission.metadata.checkpoint_id,
+                    admission.source_session.get(),
+                ))
+            })?;
+        if metadata != admission.metadata {
+            return Err(checkpoint_catalog_error(
+                &checkpoint_request_path(directory, &admission.idempotency_key),
+                "request admission disagrees with the completed checkpoint",
+            ));
+        }
+        verify_checkpoint_catalog_payload(directory, &metadata)?;
+        self.verify_directory(directory)?;
+        Ok(metadata)
     }
 
     fn add_directory(&mut self, path: &Path) -> Result<PathBuf, ControlError> {
@@ -1528,7 +3096,23 @@ impl CheckpointRetentionState {
                 "no artifact directory lease was acquired".to_owned(),
             ));
         }
-        fn scan(path: &Path, depth: usize) -> std::io::Result<(u64, u64)> {
+        fn reserve(reservations: &mut BTreeSet<PathBuf>, path: PathBuf) -> std::io::Result<()> {
+            if reservations.len() >= MAX_CHECKPOINT_DISCOVERY_ENTRIES
+                && !reservations.contains(&path)
+            {
+                return Err(std::io::Error::other(
+                    "checkpoint reservations exceed their entry bound",
+                ));
+            }
+            reservations.insert(path);
+            Ok(())
+        }
+        fn scan(
+            path: &Path,
+            depth: usize,
+            entries: &mut usize,
+            reservations: &mut BTreeSet<PathBuf>,
+        ) -> std::io::Result<(u64, u64, u64, u64)> {
             if depth > 32 {
                 return Err(std::io::Error::other(
                     "checkpoint inventory exceeds its directory depth bound",
@@ -1536,11 +3120,21 @@ impl CheckpointRetentionState {
             }
             let mut count = 0_u64;
             let mut bytes = 0_u64;
+            let mut request_count = 0_u64;
+            let mut request_bytes = 0_u64;
             for entry in fs::read_dir(path)? {
                 let entry = entry?;
+                *entries = (*entries)
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_CHECKPOINT_DISCOVERY_ENTRIES)
+                    .ok_or_else(|| {
+                        std::io::Error::other("checkpoint inventory exceeds its entry bound")
+                    })?;
                 let metadata = fs::symlink_metadata(entry.path())?;
-                let (added_count, added_bytes) = if metadata.is_dir() {
-                    scan(&entry.path(), depth + 1)?
+                let (added_count, added_bytes, added_requests, added_request_bytes) = if metadata
+                    .is_dir()
+                {
+                    scan(&entry.path(), depth + 1, entries, reservations)?
                 } else if entry
                     .path()
                     .extension()
@@ -1551,9 +3145,30 @@ impl CheckpointRetentionState {
                             "checkpoint inventory contains a non-regular binary artifact",
                         ));
                     }
-                    (1, metadata.len())
+                    reserve(reservations, entry.path())?;
+                    (1, metadata.len(), 0, 0)
+                } else if entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(CHECKPOINT_REQUEST_PREFIX)
+                        && name.ends_with(CHECKPOINT_REQUEST_SUFFIX)
+                }) {
+                    if !metadata.is_file()
+                        || metadata.len() > MAX_CHECKPOINT_REQUEST_RECORD_BYTES as u64
+                    {
+                        return Err(std::io::Error::other(
+                            "checkpoint inventory contains an invalid request admission",
+                        ));
+                    }
+                    let request_path = entry.path();
+                    let reservation = read_checkpoint_request_record(&request_path).map_or_else(
+                        |_| request_path,
+                        |admission| path.join(format!("{}.bin", admission.metadata.checkpoint_id)),
+                    );
+                    // Unreadable/partial records reserve their own evidence path.
+                    // Only a verified identity can merge with a payload reservation.
+                    reserve(reservations, reservation)?;
+                    (0, 0, 1, metadata.len())
                 } else {
-                    (0, 0)
+                    (0, 0, 0, 0)
                 };
                 count = count
                     .checked_add(added_count)
@@ -1561,17 +3176,29 @@ impl CheckpointRetentionState {
                 bytes = bytes
                     .checked_add(added_bytes)
                     .ok_or_else(|| std::io::Error::other("checkpoint bytes overflow"))?;
+                request_count = request_count
+                    .checked_add(added_requests)
+                    .ok_or_else(|| std::io::Error::other("checkpoint request count overflow"))?;
+                request_bytes = request_bytes
+                    .checked_add(added_request_bytes)
+                    .ok_or_else(|| std::io::Error::other("checkpoint request bytes overflow"))?;
             }
-            Ok((count, bytes))
+            Ok((count, bytes, request_count, request_bytes))
         }
         let mut count = 0_u64;
         let mut bytes = 0_u64;
+        let mut request_count = 0_u64;
+        let mut request_bytes = 0_u64;
+        let mut entries = 0_usize;
+        let mut reservations = BTreeSet::new();
         for (path, lease) in &self.directories {
             lease
                 .verify()
                 .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
-            let (directory_count, directory_bytes) = scan(path, 0)
-                .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
+            let (directory_count, directory_bytes, directory_requests, directory_request_bytes) =
+                scan(path, 0, &mut entries, &mut reservations).map_err(|error| {
+                    ControlError::CheckpointRetentionUnavailable(error.to_string())
+                })?;
             count = count.checked_add(directory_count).ok_or_else(|| {
                 ControlError::CheckpointRetentionUnavailable("checkpoint count overflow".to_owned())
             })?;
@@ -1580,9 +3207,34 @@ impl CheckpointRetentionState {
                     "checkpoint byte count overflow".to_owned(),
                 )
             })?;
+            request_count = request_count
+                .checked_add(directory_requests)
+                .ok_or_else(|| {
+                    ControlError::CheckpointRetentionUnavailable(
+                        "checkpoint request count overflow".to_owned(),
+                    )
+                })?;
+            request_bytes = request_bytes
+                .checked_add(directory_request_bytes)
+                .ok_or_else(|| {
+                    ControlError::CheckpointRetentionUnavailable(
+                        "checkpoint request byte count overflow".to_owned(),
+                    )
+                })?;
+        }
+        for retained in self.requests.values() {
+            reserve(
+                &mut reservations,
+                retained.directory.join(&retained.artifact.relative_path),
+            )
+            .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
         }
         self.file_count = count;
         self.file_bytes = bytes;
+        self.request_record_count = request_count;
+        self.request_record_bytes = request_bytes;
+        self.reservation_count = u64::try_from(reservations.len())
+            .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))?;
         self.count_high_water = self.count_high_water.max(count);
         self.bytes_high_water = self.bytes_high_water.max(bytes);
         self.inventory_error = None;
@@ -1593,7 +3245,8 @@ impl CheckpointRetentionState {
         if let Some(error) = &self.inventory_error {
             return Err(ControlError::CheckpointRetentionUnavailable(error.clone()));
         }
-        if self.file_count >= self.limits.max_count
+        if self.reservation_count >= self.limits.max_count
+            || self.request_record_count >= self.limits.max_count
             || u64::try_from(self.requests.len()).unwrap_or(u64::MAX) >= self.limits.max_count
             || self
                 .file_bytes
@@ -1601,10 +3254,12 @@ impl CheckpointRetentionState {
                 .is_none_or(|bytes| bytes > self.limits.max_bytes)
         {
             return Err(ControlError::CheckpointCapacity(format!(
-                "files={} / {} bytes, request_entries={}, requested={} bytes; limits={} files / {} bytes; preserved artifacts require additional configured capacity or a separate run/directory",
+                "files={} / {} bytes, reserved_checkpoints={}, request_entries={}, retained_request_records={}, requested={} bytes; limits={} files / {} bytes; preserved artifacts require additional configured capacity or a separate run/directory",
                 self.file_count,
                 self.file_bytes,
+                self.reservation_count,
                 self.requests.len(),
+                self.request_record_count,
                 requested_bytes,
                 self.limits.max_count,
                 self.limits.max_bytes,
@@ -1622,6 +3277,9 @@ impl DataServices {
             requests: BTreeMap::new(),
             file_count: 0,
             file_bytes: 0,
+            request_record_count: 0,
+            request_record_bytes: 0,
+            reservation_count: 0,
             count_high_water: 0,
             bytes_high_water: 0,
             inventory_error: None,
@@ -1635,15 +3293,18 @@ impl DataServices {
         };
         Self {
             experiments: Mutex::new(BTreeMap::new()),
+            checkpoint_branches: Mutex::new(BTreeMap::new()),
             experiment_comparison: Mutex::new(()),
             experiment_shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             execution_capacity: Arc::new(Mutex::new(ExperimentExecutionCapacityDto {
                 max_run_slots: crate::experiment_runner::MAX_CONCURRENT_RUNS,
                 reserved_run_slots: 0,
+                max_grid_cells: crate::experiment_runner::MAX_CONCURRENT_GRID_CELLS,
+                reserved_grid_cells: 0,
                 reserved_batches: 0,
             })),
             checkpoints: Mutex::new(BTreeMap::new()),
-            artifacts: Mutex::new(BTreeMap::new()),
+            artifacts: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency: Mutex::new(BTreeMap::new()),
             artifacts_dir: RwLock::new(artifacts_dir),
             checkpoint_retention: Mutex::new(retention),
@@ -1665,6 +3326,446 @@ impl DataServices {
             .read()
             .map(|p| p.clone())
             .unwrap_or_else(|_| std::env::temp_dir().join("scriptbots_artifacts"))
+    }
+
+    /// Recover bounded admission/receipt metadata only. Completed status names a
+    /// historical synced receipt; it does not assert that output is still intact.
+    /// The caller holds the same registry lock used by create and shutdown.
+    fn recover_checkpoint_branches_locked(
+        &self,
+        jobs: &mut BTreeMap<String, CheckpointBranchJob>,
+        requested: Option<&str>,
+    ) -> Result<usize, ControlError> {
+        let roots = {
+            let retention = self
+                .checkpoint_retention
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            if retention.directories.len() > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+                return Err(ControlError::ExperimentCapacity(
+                    "branch catalog root budget exceeded".to_owned(),
+                ));
+            }
+            let mut roots = Vec::with_capacity(retention.directories.len());
+            for root in retention.directories.keys() {
+                retention.verify_directory(root)?;
+                roots.push(root.clone());
+            }
+            roots
+        };
+        let mut locations: BTreeMap<String, Vec<(PathBuf, PathBuf)>> = BTreeMap::new();
+        let mut entries_seen = 0_usize;
+        for root in roots {
+            let parent = root.join("branches");
+            let entries = match fs::read_dir(&parent) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(checkpoint_branch_catalog_error(&parent, error)),
+            };
+            validate_experiment_directory(&parent)?;
+            for entry in entries.take(MAX_RETAINED_CHECKPOINT_BRANCHES + 1) {
+                let entry =
+                    entry.map_err(|error| checkpoint_branch_catalog_error(&parent, error))?;
+                entries_seen += 1;
+                // Unknown and interrupted entries also consume capacity. Reopening
+                // another retained root cannot evade the service-wide admission cap.
+                if entries_seen > MAX_RETAINED_CHECKPOINT_BRANCHES {
+                    return Err(ControlError::ExperimentCapacity(format!(
+                        "retained branch catalog exceeds {MAX_RETAINED_CHECKPOINT_BRANCHES} entries across its leased roots"
+                    )));
+                }
+                let id = entry.file_name().into_string().map_err(|_| {
+                    checkpoint_branch_catalog_error(&parent, "non-UTF-8 branch entry")
+                })?;
+                locations
+                    .entry(id)
+                    .or_default()
+                    .push((root.clone(), entry.path()));
+            }
+        }
+        let mut first_error = None;
+        for (id, sources) in locations {
+            if requested.is_some_and(|requested| requested != id) {
+                continue;
+            }
+            let recovered = (|| {
+                if sources.len() != 1 {
+                    return Err(ControlError::Conflict(format!(
+                        "checkpoint branch '{id}' occurs in multiple retained artifact roots"
+                    )));
+                }
+                let (root, directory) = &sources[0];
+                validate_experiment_directory(directory)?;
+                if let Some(job) = jobs.get(&id) {
+                    if &job.artifact_root != root || &job.directory != directory {
+                        return Err(ControlError::Conflict(format!(
+                            "checkpoint branch '{id}' changed its retained artifact root"
+                        )));
+                    }
+                    return Ok(());
+                }
+                if !valid_checkpoint_branch_identifier(&id) {
+                    return Err(checkpoint_branch_catalog_error(
+                        directory,
+                        "invalid branch identifier",
+                    ));
+                }
+                let path = directory.join("definition.json");
+                if requested.is_none()
+                    && matches!(fs::symlink_metadata(&path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    // Earlier managed studies and interrupted admission attempts
+                    // have no reconstructible request identity. Preserve and count
+                    // them, but never invent a catalog entry or rerun their science.
+                    return Ok(());
+                }
+                let bytes = read_artifact_file_bounded(&path, MAX_CHECKPOINT_BRANCH_CATALOG_BYTES)
+                    .map_err(|error| checkpoint_branch_catalog_error(&path, error))?;
+                let record: CheckpointBranchDefinitionRecord = serde_json::from_slice(&bytes)
+                    .map_err(|error| checkpoint_branch_catalog_error(&path, error))?;
+                let definition = record.definition;
+                definition.validate(directory)?;
+                if record.checksum != definition.checksum()? {
+                    return Err(checkpoint_branch_catalog_error(
+                        &path,
+                        "definition checksum mismatch",
+                    ));
+                }
+                let receipt = read_checkpoint_branch_receipt(directory, &definition)?;
+                let status = receipt.as_ref().map_or_else(|| {
+                    let mut status = definition.status("stopped");
+                    status.error_reason = Some("Execution was interrupted before a terminal receipt was sealed. Saved output is preserved; this study is not automatically rerun or resumable.".to_owned());
+                    status
+                }, |receipt| receipt.status.clone());
+                if jobs.len() >= MAX_RETAINED_CHECKPOINT_BRANCHES {
+                    return Err(ControlError::ExperimentCapacity(
+                        "retained branch identity capacity reached".to_owned(),
+                    ));
+                }
+                jobs.insert(
+                    id.clone(),
+                    CheckpointBranchJob {
+                        definition,
+                        directory: directory.clone(),
+                        artifact_root: root.clone(),
+                        receipt,
+                        artifacts_published: false,
+                        status: Arc::new(Mutex::new(status)),
+                        cancel: Arc::default(),
+                        worker: None,
+                    },
+                );
+                Ok(())
+            })();
+            if let Err(error) = recovered {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(entries_seen), Err)
+    }
+
+    /// A cold artifact lookup restores at most the one study named by its sealed
+    /// index. Whole-artifact discovery has a separate aggregate I/O admission cap.
+    fn recover_checkpoint_branch_artifacts(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<(), ControlError> {
+        let mut jobs = self
+            .checkpoint_branches
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let mut first_error = match self.recover_checkpoint_branches_locked(&mut jobs, None) {
+            Err(
+                error @ (ControlError::Conflict(_)
+                | ControlError::ExperimentCapacity(_)
+                | ControlError::CheckpointRetentionUnavailable(_)
+                | ControlError::Lock),
+            ) => return Err(error),
+            result => result.err(),
+        };
+        if let Some(artifact_id) = requested {
+            let branch_id = jobs.iter().find_map(|(id, job)| {
+                job.receipt
+                    .as_ref()
+                    .filter(|receipt| {
+                        receipt
+                            .artifacts
+                            .iter()
+                            .any(|artifact| artifact.artifact_id == artifact_id)
+                    })
+                    .map(|_| id.clone())
+            });
+            if let Some(branch_id) = branch_id {
+                // A healthy companion can survive an unrelated catalog refusal,
+                // but never suppress a conflict for the requested identity itself.
+                self.recover_checkpoint_branches_locked(&mut jobs, Some(&branch_id))?;
+            }
+        }
+        let mut work_bytes = 0_u64;
+        for job in jobs.values_mut() {
+            if let Err(error) = job.status_dto() {
+                first_error.get_or_insert(error);
+                continue;
+            }
+            let Some(receipt) = &job.receipt else {
+                continue;
+            };
+            if requested.is_some_and(|id| {
+                !receipt
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.artifact_id == id)
+            }) {
+                continue;
+            }
+            if !job.artifacts_published {
+                work_bytes = receipt.artifacts.iter().try_fold(work_bytes, |sum, artifact| {
+                    sum.checked_add(artifact.byte_size).filter(|sum| *sum <= MAX_CHECKPOINT_BRANCH_ARTIFACT_BYTES)
+                }).ok_or_else(|| ControlError::PayloadTooLarge(
+                    "branch artifact discovery exceeds its aggregate verification byte budget; download a known artifact from one study instead".to_owned(),
+                ))?;
+            }
+            match job.recover_artifacts(&self.artifacts) {
+                Ok(()) if requested.is_some() => return Ok(()),
+                Ok(()) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn verify_checkpoint_branch_artifact_identity(
+        &self,
+        artifact: &RetainedArtifact,
+    ) -> Result<(), ControlError> {
+        if !artifact
+            .metadata
+            .artifact_id
+            .starts_with("checkpoint-branch-")
+        {
+            return Ok(());
+        }
+        let id = artifact
+            .metadata
+            .relative_path
+            .split('/')
+            .nth(1)
+            .ok_or_else(|| {
+                ControlError::InvalidPatch("branch artifact lost its owner identity".to_owned())
+            })?;
+        let mut jobs = self
+            .checkpoint_branches
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        self.recover_checkpoint_branches_locked(&mut jobs, Some(id))?;
+        let job = jobs
+            .get(id)
+            .ok_or_else(|| ControlError::NotFound(format!("checkpoint branch '{id}' not found")))?;
+        if artifact.directory != job.artifact_root {
+            return Err(ControlError::Conflict(
+                "branch artifact changed its retained root".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_checkpoint_catalog_identity(&self, id: &str) -> Result<(), ControlError> {
+        if !valid_checkpoint_catalog_id(id) {
+            return Ok(());
+        }
+        let retention = self
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        if retention.directories.len() > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+            return Err(ControlError::CheckpointCapacity(
+                "checkpoint discovery directory budget exceeded".into(),
+            ));
+        }
+        let mut found = false;
+        for directory in retention.directories.keys() {
+            retention.verify_directory(directory)?;
+            let path = directory.join(format!("{id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
+            match fs::symlink_metadata(&path) {
+                Ok(_) if found => {
+                    return Err(ControlError::Conflict(format!(
+                        "checkpoint {id} appears in multiple retained directories"
+                    )));
+                }
+                Ok(_) => found = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Recover only completed descriptors in leased roots. Uncatalogued binary
+    /// files still consume retention capacity but cannot imply a completed
+    /// capture. Reads never record historical checkpoints in the live database.
+    fn recover_checkpoint_catalogs(&self, requested: Option<&str>) -> Result<(), ControlError> {
+        if requested.is_some_and(|id| !valid_checkpoint_catalog_id(id)) {
+            return Ok(());
+        }
+        let retention = self
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let mut paths = Vec::new();
+        let mut entries_seen = 0_usize;
+        for directory in retention.directories.keys() {
+            entries_seen += 1;
+            if entries_seen > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+                return Err(ControlError::CheckpointCapacity(
+                    "checkpoint discovery directory budget exceeded".into(),
+                ));
+            }
+            retention.verify_directory(directory)?;
+            if let Some(id) = requested {
+                let path = directory.join(format!("{id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
+                match fs::symlink_metadata(&path) {
+                    Ok(_) => paths.push((directory.clone(), id.to_owned())),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+                }
+            } else {
+                for entry in fs::read_dir(directory)
+                    .map_err(|error| checkpoint_catalog_error(directory, error))?
+                {
+                    let entry =
+                        entry.map_err(|error| checkpoint_catalog_error(directory, error))?;
+                    entries_seen += 1;
+                    if entries_seen > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+                        return Err(ControlError::CheckpointCapacity(format!(
+                            "checkpoint discovery exceeds {MAX_CHECKPOINT_DISCOVERY_ENTRIES} directory entries; request a checkpoint by ID"
+                        )));
+                    }
+                    let name = entry.file_name();
+                    let Some(id) = name
+                        .to_str()
+                        .filter(|name| name.starts_with("ckpt-"))
+                        .and_then(|name| name.strip_suffix(CHECKPOINT_CATALOG_READY_SUFFIX))
+                    else {
+                        continue;
+                    };
+                    paths.push((directory.clone(), id.to_owned()));
+                    if paths.len() > MAX_CATALOG_CHECKPOINTS {
+                        return Err(ControlError::CheckpointCapacity(format!(
+                            "checkpoint discovery exceeds {MAX_CATALOG_CHECKPOINTS} descriptors; request a saved checkpoint by ID; no files were removed"
+                        )));
+                    }
+                }
+            }
+        }
+        paths.sort();
+        let mut verified_bytes = 0_u64;
+        let mut first_error = None;
+        let mut identity_counts = BTreeMap::new();
+        for (_, id) in &paths {
+            *identity_counts.entry(id.clone()).or_insert(0_usize) += 1;
+        }
+        for (id, count) in &identity_counts {
+            if *count > 1 {
+                // Invalidate derived caches as well: an observed ambiguity must
+                // not become an apparently successful fast-path read later.
+                self.checkpoints
+                    .lock()
+                    .map_err(|_| ControlError::Lock)?
+                    .remove(id);
+                self.artifacts
+                    .lock()
+                    .map_err(|_| ControlError::Lock)?
+                    .remove(id);
+                first_error.get_or_insert_with(|| {
+                    ControlError::Conflict(format!(
+                        "checkpoint {id} appears in multiple retained directories"
+                    ))
+                });
+            }
+        }
+        for (directory, id) in paths {
+            if identity_counts[&id] > 1 {
+                continue;
+            }
+            let recovered = (|| {
+                if retention
+                    .requests
+                    .values()
+                    .any(|request| !request.acknowledged && request.metadata.checkpoint_id == id)
+                {
+                    // Only the original exact retry may finish a pending capture.
+                    return Ok(());
+                }
+                let metadata = read_checkpoint_catalog(&directory, &id)?;
+                {
+                    let checkpoints = self.checkpoints.lock().map_err(|_| ControlError::Lock)?;
+                    let artifacts = self.artifacts.lock().map_err(|_| ControlError::Lock)?;
+                    if let Some(known) = checkpoints.get(&id) {
+                        if serde_json::to_vec(known).map_err(ControlError::serialization)?
+                            != serde_json::to_vec(&metadata).map_err(ControlError::serialization)?
+                            || artifacts
+                                .get(&id)
+                                .is_none_or(|artifact| artifact.directory != directory)
+                        {
+                            return Err(ControlError::Conflict(format!(
+                                "checkpoint {id} has conflicting retained descriptors"
+                            )));
+                        }
+                        return Ok(());
+                    }
+                    let uncatalogued = retention
+                        .requests
+                        .values()
+                        .filter(|request| {
+                            !checkpoints.contains_key(&request.metadata.checkpoint_id)
+                        })
+                        .count();
+                    let retained_id = retention
+                        .requests
+                        .values()
+                        .any(|request| request.metadata.checkpoint_id == id);
+                    if !retained_id
+                        && checkpoints.len().saturating_add(uncatalogued) >= MAX_CATALOG_CHECKPOINTS
+                    {
+                        return Err(ControlError::CheckpointCapacity(format!(
+                            "checkpoint metadata reached its {MAX_CATALOG_CHECKPOINTS}-entry bound; retained files remain available in their source directories"
+                        )));
+                    }
+                }
+                verified_bytes = verified_bytes
+                    .checked_add(metadata.byte_size)
+                    .filter(|bytes| *bytes <= MAX_CHECKPOINT_DISCOVERY_BYTES)
+                    .ok_or_else(|| ControlError::CheckpointCapacity(format!(
+                        "checkpoint discovery reached its {MAX_CHECKPOINT_DISCOVERY_BYTES}-byte verification budget; retry discovery or request a checkpoint by ID"
+                    )))?;
+                let artifact = verify_checkpoint_catalog_payload(&directory, &metadata)?;
+                retention.verify_directory(&directory)?;
+                let mut checkpoints = self.checkpoints.lock().map_err(|_| ControlError::Lock)?;
+                let mut artifacts = self.artifacts.lock().map_err(|_| ControlError::Lock)?;
+                if artifacts.contains_key(&id) {
+                    return Err(ControlError::Conflict(format!(
+                        "checkpoint {id} conflicts with an existing artifact"
+                    )));
+                }
+                checkpoints.insert(id.clone(), metadata);
+                artifacts.insert(
+                    id,
+                    RetainedArtifact {
+                        metadata: artifact,
+                        directory,
+                    },
+                );
+                Ok(())
+            })();
+            if let Err(error) = recovered
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Reconstitute admission only. Reads never launch a worker or rewrite status.
@@ -1989,6 +4090,7 @@ impl DataServices {
         &self,
         experiment_id: &str,
         run_slots: usize,
+        grid_cells: u64,
     ) -> Result<ExperimentExecutionReservation, ControlError> {
         if self
             .experiment_shutdown_requested
@@ -1996,9 +4098,9 @@ impl DataServices {
         {
             return Err(ControlError::ExperimentShuttingDown);
         }
-        if run_slots == 0 {
+        if run_slots == 0 || grid_cells == 0 {
             return Err(ControlError::BadRequest(
-                "experiment execution must reserve at least one run slot".to_owned(),
+                "experiment execution must reserve nonzero run slots and grid cells".to_owned(),
             ));
         }
         let mut capacity = self
@@ -2013,23 +4115,35 @@ impl DataServices {
                 "requested_run_slots={run_slots}, reserved_run_slots={}, max_run_slots={}; no experiment worker admitted; retry after capacity is released or change SCRIPTBOTS_EXPERIMENT_RUN_SLOTS at startup",
                 capacity.reserved_run_slots, capacity.max_run_slots,
             )))?;
+        let reserved_grid_cells = capacity
+            .reserved_grid_cells
+            .checked_add(grid_cells)
+            .filter(|count| *count <= capacity.max_grid_cells)
+            .ok_or_else(|| ControlError::ExperimentCapacity(format!(
+                "requested_grid_cells={grid_cells}, reserved_grid_cells={}, max_grid_cells={}; no experiment worker admitted; retry after capacity is released or reduce concurrent world grids",
+                capacity.reserved_grid_cells, capacity.max_grid_cells,
+            )))?;
         let reserved_batches = capacity.reserved_batches.checked_add(1).ok_or_else(|| {
             ControlError::ExperimentCapacity("batch reservation count overflow".to_owned())
         })?;
         let reservation = ExperimentExecutionReservation {
             capacity: Arc::clone(&self.execution_capacity),
             run_slots,
+            grid_cells,
             experiment_id: experiment_id.to_owned(),
             running: None,
         };
         capacity.reserved_run_slots = reserved_run_slots;
+        capacity.reserved_grid_cells = reserved_grid_cells;
         capacity.reserved_batches = reserved_batches;
         let observed = *capacity;
         drop(capacity);
         tracing::info!(
             experiment_id,
             requested_run_slots = run_slots,
+            requested_grid_cells = grid_cells,
             reserved_run_slots = observed.reserved_run_slots,
+            reserved_grid_cells = observed.reserved_grid_cells,
             reserved_batches = observed.reserved_batches,
             max_run_slots = observed.max_run_slots,
             "experiment execution capacity reserved"
@@ -2037,12 +4151,13 @@ impl DataServices {
         Ok(reservation)
     }
 
-    /// Close experiment admission, cancel every active batch, and join all workers.
+    /// Close admission, cancel active batches and checkpoint branches, and join all workers.
     ///
     /// The existing runner finishes its current durable tick before stopping.
     /// This waits for that work and filesystem operations; it is not a hard
-    /// shutdown deadline. Retained continuation artifacts remain resumable by a
-    /// fresh service. The registry lock serializes admission and repeated shutdown
+    /// shutdown deadline. Matched-seed continuation artifacts remain resumable by a
+    /// fresh service; interrupted branch-study output is preserved without claiming
+    /// resumability. The registry locks serialize admission and repeated shutdown
     /// calls; workers never acquire it while finishing or publishing artifacts.
     pub(crate) fn shutdown_experiments(&self) -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
@@ -2052,16 +4167,32 @@ impl DataServices {
             Ok(jobs) => (jobs, false),
             Err(error) => (error.into_inner(), true),
         };
+        let (mut branches, branches_poisoned) = match self.checkpoint_branches.lock() {
+            Ok(branches) => (branches, false),
+            Err(error) => (error.into_inner(), true),
+        };
         for job in jobs.values() {
             job.cancel.store(true, Ordering::Release);
+        }
+        for branch in branches.values() {
+            branch.request_cancel();
         }
         let mut failures = Vec::new();
         if poisoned {
             failures.push("experiment registry was poisoned before shutdown".to_owned());
         }
+        if branches_poisoned {
+            failures.push("checkpoint branch registry was poisoned before shutdown".to_owned());
+        }
         for job in jobs.values_mut() {
             if let Err(error) = job.join_worker() {
                 tracing::error!(%error, "experiment worker failed during shutdown");
+                failures.push(error);
+            }
+        }
+        for branch in branches.values_mut() {
+            if let Err(error) = branch.join_worker() {
+                tracing::error!(%error, "checkpoint branch worker failed during shutdown");
                 failures.push(error);
             }
         }
@@ -2100,18 +4231,36 @@ pub struct ControlHandle {
     data_services: std::sync::Arc<DataServices>,
 }
 
+fn allocate_control_command_namespace() -> u64 {
+    // A continued host retains its command ledger across processes. Process-local
+    // counters and wall clocks cannot identify a new control client after restart.
+    // Keep the high bit clear so unkeyed commands cannot collide with keyed IDs
+    // or the runtime's reserved lifecycle/bootstrap namespaces. This RNG is not
+    // the world's seeded scientific stream.
+    loop {
+        let namespace = rand::random::<u64>() & (u64::MAX >> 1);
+        if namespace != 0 {
+            return namespace;
+        }
+    }
+}
+
 impl ControlHandle {
     pub fn new(host: ChannelHostPort) -> Self {
-        static NEXT_NAMESPACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             host,
             knobs_cache: std::sync::Arc::new(Mutex::new(None)),
             command_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            command_namespace: NEXT_NAMESPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            command_namespace: allocate_control_command_namespace(),
             database_path: None,
             checkpoint_writer: None,
             data_services: std::sync::Arc::new(DataServices::default()),
         }
+    }
+
+    /// Immutable owner identity, available without requesting or advancing a snapshot.
+    pub(crate) fn session_id(&self) -> scriptbots_runtime::HostSessionId {
+        self.host.session_id()
     }
 
     /// Return a reference to the canonical data services.
@@ -2217,6 +4366,7 @@ impl ControlHandle {
                 "experiments_batch".into(),
                 "experiment_comparisons".into(),
                 "checkpoints_v1".into(),
+                "checkpoint_branch_catalog_v1".into(),
                 "artifacts_storage".into(),
                 "map_generation".into(),
                 "narrative_search".into(),
@@ -2249,6 +4399,10 @@ impl ControlHandle {
                 "/api/v1/experiments/{experiment_id}/resume".into(),
                 "/api/v1/checkpoints".into(),
                 "/api/v1/checkpoints/{checkpoint_id}".into(),
+                "/api/v1/checkpoints/branches".into(),
+                "/api/v1/checkpoints/branches/{branch_id}".into(),
+                "/api/v1/checkpoints/branches/{branch_id}/artifacts".into(),
+                "/api/v1/checkpoints/branches/{branch_id}/cancel".into(),
                 "/api/v1/artifacts".into(),
                 "/api/v1/artifacts/{artifact_id}".into(),
                 "/api/v1/artifacts/{artifact_id}/download".into(),
@@ -2283,6 +4437,10 @@ impl ControlHandle {
                 "checkpoint_create".into(),
                 "checkpoint_list".into(),
                 "checkpoint_status".into(),
+                "checkpoint_branch_create".into(),
+                "checkpoint_branch_list".into(),
+                "checkpoint_branch_status".into(),
+                "checkpoint_branch_cancel".into(),
                 "artifact_list".into(),
                 "artifact_get".into(),
             ],
@@ -2298,6 +4456,9 @@ impl ControlHandle {
                 "ScenarioInterventionV1".into(),
                 "CheckpointCreateRequest".into(),
                 "CheckpointMetadataDto".into(),
+                "CheckpointBranchRequest".into(),
+                "CheckpointBranchStatusDto".into(),
+                "PaginatedCheckpointBranchesResponse".into(),
                 "CheckpointRetentionDto".into(),
                 "ArtifactMetadataDto".into(),
                 "PaginatedExperimentsResponse".into(),
@@ -2315,6 +4476,19 @@ impl ControlHandle {
         &self,
         request: ExperimentCreateRequest,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        let ticks_per_run = request.ticks_per_run.unwrap_or(1_000);
+        let maximum_ticks = crate::experiment_runner::MAX_TICKS_PER_RUN;
+        if !(1..=maximum_ticks).contains(&ticks_per_run) {
+            return Err(ControlError::BadRequest(format!(
+                "ticks_per_run must be in 1..={maximum_ticks}, found {ticks_per_run}; the requested scientific horizon is never clamped"
+            )));
+        }
+        crate::experiment_runner::validate_experiment_workload(
+            request.variants.len(),
+            request.seeds.len(),
+            ticks_per_run,
+        )
+        .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         self.data_services.recover_experiment_catalog()?;
         if request.variants.is_empty() {
             return Err(ControlError::BadRequest("variants cannot be empty".into()));
@@ -2353,15 +4527,6 @@ impl ControlHandle {
                 "seeds exceed maximum limit of 128".into(),
             ));
         }
-        let total_runs = request.variants.len().saturating_mul(request.seeds.len());
-        if total_runs > 4096 {
-            return Err(ControlError::BadRequest(format!(
-                "total batch runs ({total_runs}) exceed maximum limit of 4096"
-            )));
-        }
-
-        let ticks_per_run = request.ticks_per_run.unwrap_or(1000).clamp(1, 10_000_000);
-
         let request_identity = request
             .idempotency_key
             .as_ref()
@@ -2474,6 +4639,9 @@ impl ControlHandle {
             .map_err(|error| ControlError::BadRequest(error.to_string()))?
             .len()
             .min(runner.max_concurrency);
+        let grid_cells = runner
+            .concurrent_grid_cells()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         let definition = ExperimentDefinitionV1 {
             schema_version: 1,
             experiment_id: experiment_id.clone(),
@@ -2514,9 +4682,11 @@ impl ControlHandle {
                     "experiment catalog capacity reached".into(),
                 ));
             }
-            let reservation = self
-                .data_services
-                .reserve_experiment_execution(&experiment_id, run_slots)?;
+            let reservation = self.data_services.reserve_experiment_execution(
+                &experiment_id,
+                run_slots,
+                grid_cells,
+            )?;
             definition.persist(&output_dir)?;
             job.start(std::sync::Arc::clone(&self.data_services), reservation);
             lock.insert(experiment_id.clone(), job);
@@ -2545,7 +4715,7 @@ impl ControlHandle {
         let job = lock.get(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
-        job.status_dto()
+        job.status_dto(true)
     }
 
     /// Compare one declared endpoint across two complete, distinct variant cohorts.
@@ -2682,6 +4852,7 @@ impl ControlHandle {
                     summary_artifact_digest: state.summary_artifact_digest,
                     variant_id: variant.variant_id.clone(),
                     config_overrides: variant.config_overrides.clone(),
+                    interventions: variant.interventions.clone(),
                     brain_family: state.summary.brain_family,
                 }));
             }
@@ -2748,7 +4919,7 @@ impl ControlHandle {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
         job.cancel.store(true, std::sync::atomic::Ordering::Release);
-        job.status_dto()
+        job.status_dto(true)
     }
 
     /// Resume a stopped experiment with pending or checkpointed unfinished runs.
@@ -2765,7 +4936,7 @@ impl ControlHandle {
         let job = lock.get_mut(experiment_id).ok_or_else(|| {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
-        let current = job.status_dto()?;
+        let current = job.status_dto(false)?;
         match current.status.as_str() {
             "running" | "pending" => {
                 return Err(ControlError::Conflict(format!(
@@ -2785,26 +4956,35 @@ impl ControlHandle {
                 current.status
             )));
         }
+        job.runner
+            .validate_execution_workload()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         let run_slots = current
             .runs
             .iter()
             .filter(|run| matches!(run.state.as_str(), "pending" | "running"))
             .count()
             .min(job.runner.max_concurrency);
+        let grid_cells = job
+            .runner
+            .concurrent_grid_cells()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         // A cleared running flag can also mean unwind. Observe the old exit
         // before clearing diagnostics, cancellation or reserving a new wave.
         job.join_worker()
             .map_err(ControlError::ExperimentWorkerFailed)?;
-        let reservation = self
-            .data_services
-            .reserve_experiment_execution(experiment_id, run_slots)?;
+        let reservation = self.data_services.reserve_experiment_execution(
+            experiment_id,
+            run_slots,
+            grid_cells,
+        )?;
         job.cancel
             .store(false, std::sync::atomic::Ordering::Release);
         if let Ok(mut error) = job.last_error.lock() {
             *error = None;
         }
         job.start(std::sync::Arc::clone(&self.data_services), reservation);
-        job.status_dto()
+        job.status_dto(true)
     }
 
     /// List experiments with bounded pagination.
@@ -2834,7 +5014,9 @@ impl ControlHandle {
             .skip(offset)
             .take(limit)
             .map(|job| {
-                job.status_dto().map(|e| ExperimentSummaryDto {
+                // The listing omits per-run progress. Do not decode one large
+                // cold checkpoint for every listed experiment only to discard it.
+                job.status_dto(false).map(|e| ExperimentSummaryDto {
                     experiment_id: e.experiment_id,
                     status: e.status,
                     total_runs: e.total_runs,
@@ -2876,6 +5058,8 @@ impl ControlHandle {
     }
 
     /// Create a simulation checkpoint and register it as an artifact.
+    /// Keyed retries can recover the original completed cut after catalog reopen;
+    /// this does not resume or adopt the original owner or persistence session.
     pub fn create_checkpoint(
         &self,
         request: CheckpointCreateRequest,
@@ -2907,6 +5091,12 @@ impl ControlHandle {
             .idempotency_key
             .as_ref()
             .map(|key| format!("checkpoint:{key}"));
+        let admission = request
+            .idempotency_key
+            .as_deref()
+            .map(|key| retention.request_admission(key, &request_hash))
+            .transpose()?
+            .flatten();
         if let Some(identity) = &request_identity
             && let Some(retained) = retention.requests.get(identity).cloned()
         {
@@ -2915,7 +5105,43 @@ impl ControlHandle {
                     "checkpoint idempotency key reused with a changed request".to_owned(),
                 ));
             }
+            if let Some((directory, admission)) = &admission
+                && (directory != &retained.directory
+                    || admission.metadata != retained.metadata
+                    || admission.source_session != retained.source_session)
+            {
+                return Err(ControlError::Conflict(
+                    "checkpoint request admission disagrees with its retained source".to_owned(),
+                ));
+            }
+            if let Some(key) = request.idempotency_key.as_deref() {
+                write_checkpoint_request_admission(&retained.directory, key, &retained)?;
+            }
             return self.finish_retained_checkpoint(&mut retention, identity, retained);
+        }
+        if let Some((directory, admission)) = admission {
+            let metadata = retention.completed_request(&directory, &admission)?;
+            drop(retention);
+            self.data_services
+                .recover_checkpoint_catalogs(Some(&metadata.checkpoint_id))?;
+            return Ok(metadata);
+        }
+        {
+            let checkpoints = self
+                .data_services
+                .checkpoints
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            let uncatalogued = retention
+                .requests
+                .values()
+                .filter(|request| !checkpoints.contains_key(&request.metadata.checkpoint_id))
+                .count();
+            if checkpoints.len().saturating_add(uncatalogued) >= MAX_CATALOG_CHECKPOINTS {
+                return Err(ControlError::CheckpointCapacity(format!(
+                    "checkpoint metadata reached its {MAX_CATALOG_CHECKPOINTS}-entry bound; no new capture was admitted"
+                )));
+            }
         }
         let dir = self.data_services.artifacts_dir();
         if !retention.directories.contains_key(&dir) {
@@ -2955,26 +5181,15 @@ impl ControlHandle {
             agent_count: checkpoint.agent_count(),
             world_digest_v1: checkpoint.source_digest().overall.clone(),
             byte_size,
-            checksum_blake3: blake3_hex.clone(),
-            checksum_sha256: sha256_hex.clone(),
+            checksum_blake3: blake3_hex,
+            checksum_sha256: sha256_hex,
             schema,
             created_at_utc: format!("{secs}"),
             description: request.description.clone(),
         };
 
-        let filename = format!("{checkpoint_id}.bin");
-        let art_meta = ArtifactMetadataDto {
-            artifact_id: checkpoint_id.clone(),
-            filename: filename.clone(),
-            content_type: "application/octet-stream".into(),
-            byte_size,
-            checksum_blake3: blake3_hex.clone(),
-            checksum_sha256: sha256_hex,
-            created_at_utc: format!("{secs}"),
-            relative_path: filename.clone(),
-        };
-
-        let file_path = dir.join(&filename);
+        let art_meta = checkpoint_artifact_metadata(&meta);
+        let file_path = dir.join(&art_meta.relative_path);
         let identity = request_identity.unwrap_or_else(|| checkpoint_id.clone());
         let retained = RetainedCheckpoint {
             request_hash,
@@ -2989,6 +5204,14 @@ impl ControlHandle {
             source_persistence_interval: captured.persistence_interval,
             source_scheduled_input_count: captured.scheduled_input_count,
         };
+        if let Some(key) = request.idempotency_key.as_deref() {
+            let admitted = write_checkpoint_request_admission(&retained.directory, key, &retained);
+            retention.refresh()?;
+            admitted?;
+            retention
+                .requests
+                .insert(identity.clone(), retained.clone());
+        }
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -3070,6 +5293,11 @@ impl ControlHandle {
                         )),
                     })?;
             }
+            // A raw .bin can exist after an unconfirmed write. Publish its
+            // immutable descriptor only after the original persistence receipt,
+            // so restart discovery cannot turn an incomplete capture into one.
+            write_checkpoint_catalog(&retained.directory, &retained.metadata)?;
+            retention.verify_directory(&retained.directory)?;
             self.data_services
                 .checkpoints
                 .lock()
@@ -3115,6 +5343,13 @@ impl ControlHandle {
             file_bytes: retention.file_bytes,
             observed_file_count_high_water: retention.count_high_water,
             observed_file_bytes_high_water: retention.bytes_high_water,
+            retained_request_records: retention.request_record_count,
+            retained_request_record_bytes: retention.request_record_bytes,
+            reserved_checkpoint_count: retention.reservation_count,
+            max_retained_request_record_bytes: retention
+                .limits
+                .max_count
+                .saturating_mul(MAX_CHECKPOINT_REQUEST_RECORD_BYTES as u64),
             request_entries: retention.requests.len(),
             pending_entries: retention
                 .requests
@@ -3145,6 +5380,20 @@ impl ControlHandle {
         &self,
         checkpoint_id: &str,
     ) -> Result<CheckpointMetadataDto, ControlError> {
+        let cached = self
+            .data_services
+            .checkpoints
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .get(checkpoint_id)
+            .cloned();
+        if let Some(metadata) = cached {
+            self.data_services
+                .verify_checkpoint_catalog_identity(checkpoint_id)?;
+            return Ok(metadata);
+        }
+        self.data_services
+            .recover_checkpoint_catalogs(Some(checkpoint_id))?;
         let lock = self
             .data_services
             .checkpoints
@@ -3170,6 +5419,7 @@ impl ControlHandle {
             0
         };
 
+        self.data_services.recover_checkpoint_catalogs(None)?;
         let lock = self
             .data_services
             .checkpoints
@@ -3205,30 +5455,54 @@ impl ControlHandle {
     }
 
     fn retained_artifact(&self, artifact_id: &str) -> Result<RetainedArtifact, ControlError> {
-        if let Some(artifact) = self
+        let cached = self
             .data_services
             .artifacts
             .lock()
             .map_err(|_| ControlError::Lock)?
             .get(artifact_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(artifact) = cached {
+            self.data_services
+                .verify_checkpoint_catalog_identity(artifact_id)?;
+            self.data_services
+                .verify_checkpoint_branch_artifact_identity(&artifact)?;
             return Ok(artifact);
+        }
+        if valid_checkpoint_catalog_id(artifact_id) {
+            self.data_services
+                .recover_checkpoint_catalogs(Some(artifact_id))?;
+            if let Some(artifact) = self
+                .data_services
+                .artifacts
+                .lock()
+                .map_err(|_| ControlError::Lock)?
+                .get(artifact_id)
+                .cloned()
+            {
+                return Ok(artifact);
+            }
         }
         // Do not hold the artifact lock while discovery takes the job locks or
         // publishes verified files. The miss path also supports cold downloads
         // when the client already knows an ID and never asks for a list.
+        let branch_discovery = self
+            .data_services
+            .recover_checkpoint_branch_artifacts(Some(artifact_id));
         let discovery = self.data_services.recover_experiment_artifacts();
-        if let Some(artifact) = self
+        let recovered = self
             .data_services
             .artifacts
             .lock()
             .map_err(|_| ControlError::Lock)?
             .get(artifact_id)
-            .cloned()
-        {
+            .cloned();
+        if let Some(artifact) = recovered {
+            self.data_services
+                .verify_checkpoint_branch_artifact_identity(&artifact)?;
             return Ok(artifact);
         }
+        branch_discovery?;
         discovery?;
         Err(ControlError::NotFound(format!(
             "artifact '{artifact_id}' not found"
@@ -3250,7 +5524,10 @@ impl ControlHandle {
             0
         };
 
+        self.data_services.recover_checkpoint_catalogs(None)?;
         self.data_services.recover_experiment_artifacts()?;
+        self.data_services
+            .recover_checkpoint_branch_artifacts(None)?;
         let lock = self
             .data_services
             .artifacts
@@ -3337,12 +5614,352 @@ impl ControlHandle {
         Ok((artifact, bytes))
     }
 
+    /// Admit a finite independent future from an exact retained scientific cut.
+    ///
+    /// Retry identities and terminal receipts survive reopening the same artifact
+    /// root. Interrupted output is preserved without rerunning or resuming science.
+    /// The source owner is neither stepped nor replaced, and its session/schedule
+    /// is not continued.
+    pub fn create_checkpoint_branch(
+        &self,
+        request: CheckpointBranchRequest,
+    ) -> Result<CheckpointBranchStatusDto, ControlError> {
+        use crate::branch_study::{BranchStudyOrchestrator, BranchStudyPlan};
+
+        request.validate_shape()?;
+        let payload = request.bounded_payload()?;
+        let request_hash = compute_blake3(&payload);
+        let branch_id = format!(
+            "branch-{}",
+            compute_blake3(request.idempotency_key.as_bytes())
+        );
+        // One bounded authority covers lookup, source validation, directory claim,
+        // worker admission and identity publication. Workers never acquire it.
+        let mut jobs = self
+            .data_services
+            .checkpoint_branches
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let retained_entries = self
+            .data_services
+            .recover_checkpoint_branches_locked(&mut jobs, Some(&branch_id))?;
+        if let Some(job) = jobs.get_mut(&branch_id) {
+            if job.definition.request.idempotency_key != request.idempotency_key
+                || job.definition.request_hash != request_hash
+            {
+                return Err(ControlError::Conflict(
+                    "checkpoint branch idempotency key reused with a different request".to_owned(),
+                ));
+            }
+            return job.status_dto();
+        }
+        if jobs.len() >= MAX_RETAINED_CHECKPOINT_BRANCHES
+            || retained_entries >= MAX_RETAINED_CHECKPOINT_BRANCHES
+        {
+            return Err(ControlError::ExperimentCapacity(format!(
+                "retained checkpoint branches reached {MAX_RETAINED_CHECKPOINT_BRANCHES}; existing identities and artifacts are preserved"
+            )));
+        }
+        let checkpoint = self.verified_canvas_checkpoint(&request.checkpoint_id)?;
+        crate::branch_study::validate_study_config(checkpoint.config())
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        if checkpoint.agent_count() as u64 > crate::branch_study::MAX_STUDY_POPULATION {
+            return Err(ControlError::PayloadTooLarge(format!(
+                "checkpoint population exceeds branch-study limit {}",
+                crate::branch_study::MAX_STUDY_POPULATION,
+            )));
+        }
+        let (width, height) = checkpoint
+            .config()
+            .food_dimensions()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        let reservation = self.data_services.reserve_experiment_execution(
+            &branch_id,
+            1,
+            u64::from(width) * u64::from(height),
+        )?;
+        let (world, preset) = Self::restore_canvas_world_and_preset(&checkpoint, None)?;
+        let preset = preset.ok_or_else(|| {
+            ControlError::BadRequest(
+                "checkpoint branching requires a versioned compiled application brain preset"
+                    .to_owned(),
+            )
+        })?;
+        let base_seed = world.agent_substream_protocol_v1().root_seed();
+        drop(world);
+        let source_tick = checkpoint.tick().0;
+        let target_tick = source_tick.checked_add(request.ticks).ok_or_else(|| {
+            ControlError::BadRequest("checkpoint branch target tick overflows".to_owned())
+        })?;
+        let root = self.artifacts_dir();
+        let directory = root.join("branches").join(&branch_id);
+        let output = directory.join("study");
+        let branches = checkpoint_branch_specs(&request, source_tick);
+        let runner = BranchStudyOrchestrator::new(
+            BranchStudyPlan {
+                study_id: branch_id.clone(),
+                description: format!(
+                    "Independent checkpoint branch {} from {}",
+                    request.branch_name, request.checkpoint_id
+                ),
+                base_seed,
+                checkpoint_tick: source_tick,
+                horizon_ticks: request.ticks,
+                brain_preset: preset,
+                config: checkpoint.config().clone(),
+                source_checkpoint: None,
+                branches,
+            },
+            output.clone(),
+        );
+        // Reuse the runner's exact raw-cut restrictions, supported adapters and
+        // work accounting. No reconstructed world survives this preflight.
+        let source = runner
+            .validate_from_checkpoint(&checkpoint)
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        let mut retained_plan = runner.plan.clone();
+        retained_plan.source_checkpoint = Some(output.join("source_checkpoint.bin"));
+        let definition = CheckpointBranchDefinitionV1 {
+            schema_version: 1,
+            branch_id: branch_id.clone(),
+            request,
+            request_hash,
+            source_tick,
+            target_tick,
+            world_digest_v1: checkpoint.source_digest().overall.clone(),
+            source_byte_size: source.len() as u64,
+            source_checksum_blake3: compute_blake3(&source),
+            plan: retained_plan,
+            created_at_utc: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or_else(
+                    |_| "0".to_owned(),
+                    |duration| duration.as_secs().to_string(),
+                ),
+        };
+        drop(source);
+        self.data_services
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .verify_directory(&root)?;
+        let parent = root.join("branches");
+        fs::create_dir_all(&parent).map_err(|error| experiment_catalog_error(&parent, error))?;
+        validate_experiment_directory(&parent)?;
+        let retained = fs::read_dir(&parent)
+            .map_err(|error| experiment_catalog_error(&parent, error))?
+            .take(MAX_RETAINED_CHECKPOINT_BRANCHES + 1)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| experiment_catalog_error(&parent, error))?;
+        if retained.len() >= MAX_RETAINED_CHECKPOINT_BRANCHES {
+            return Err(ControlError::ExperimentCapacity(format!(
+                "branch artifact directory reached {MAX_RETAINED_CHECKPOINT_BRANCHES} retained entries; existing output is preserved"
+            )));
+        }
+        // Exclusive create is also the cross-process no-overwrite admission.
+        fs::create_dir(&directory).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ControlError::Conflict(
+                    "checkpoint branch output already exists; retained output is never replaced"
+                        .to_owned(),
+                )
+            } else {
+                experiment_catalog_error(&directory, error)
+            }
+        })?;
+        validate_experiment_directory(&directory)?;
+        definition.persist(&directory)?;
+        let status = definition.status("running");
+        let mut job = CheckpointBranchJob {
+            definition,
+            directory,
+            artifact_root: root.clone(),
+            receipt: None,
+            artifacts_published: false,
+            status: Arc::new(Mutex::new(status)),
+            cancel: Arc::default(),
+            worker: None,
+        };
+        job.start(
+            runner,
+            checkpoint,
+            root,
+            Arc::clone(&self.data_services.artifacts),
+            reservation,
+        );
+        // Publish identity before the first fallible status observation.
+        jobs.insert(branch_id.clone(), job);
+        jobs.get_mut(&branch_id)
+            .ok_or(ControlError::Lock)?
+            .status_dto()
+    }
+
+    /// Observe a managed scientific fork without reading or advancing the live world.
+    pub fn get_checkpoint_branch(
+        &self,
+        branch_id: &str,
+    ) -> Result<CheckpointBranchStatusDto, ControlError> {
+        if !valid_checkpoint_branch_identifier(branch_id) {
+            return Err(ControlError::BadRequest(
+                "invalid checkpoint branch identifier".to_owned(),
+            ));
+        }
+        let mut jobs = self
+            .data_services
+            .checkpoint_branches
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        self.data_services
+            .recover_checkpoint_branches_locked(&mut jobs, Some(branch_id))?;
+        jobs.get_mut(branch_id)
+            .ok_or_else(|| {
+                ControlError::NotFound(format!("checkpoint branch '{branch_id}' not found"))
+            })?
+            .status_dto()
+    }
+
+    /// Discover admitted studies from bounded metadata, without reading bundle
+    /// payloads or advancing science. Completion is a historical terminal receipt;
+    /// artifact download separately revalidates the exact retained bytes.
+    pub fn list_checkpoint_branches(
+        &self,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedCheckpointBranchesResponse, ControlError> {
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let offset = cursor.map_or(Ok(0), |value| {
+            value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| ControlError::BadRequest(format!("invalid cursor: '{value}'")))
+        })?;
+        let mut jobs = self
+            .data_services
+            .checkpoint_branches
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        self.data_services
+            .recover_checkpoint_branches_locked(&mut jobs, None)?;
+        let total = jobs.len();
+        let items = jobs
+            .values_mut()
+            .skip(offset)
+            .take(limit)
+            .map(CheckpointBranchJob::status_dto)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_offset = offset.saturating_add(items.len());
+        let has_more = next_offset < total;
+        Ok(PaginatedCheckpointBranchesResponse {
+            items,
+            total,
+            limit,
+            offset,
+            next_cursor: has_more.then(|| next_offset.to_string()),
+            has_more,
+        })
+    }
+
+    /// Page the actual artifacts published for one completed checkpoint study.
+    ///
+    /// Publication verifies every branch bundle before exposing its report. An
+    /// unfinished job's files are never inferred from the filesystem. Downloads
+    /// still revalidate the retained file's size, path and checksums independently.
+    pub fn list_checkpoint_branch_artifacts(
+        &self,
+        branch_id: &str,
+        limit: Option<usize>,
+        cursor: Option<&str>,
+    ) -> Result<PaginatedArtifactsResponse, ControlError> {
+        let limit = limit.unwrap_or(20).clamp(1, 100);
+        let offset = cursor.map_or(Ok(0), |value| {
+            value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| ControlError::BadRequest(format!("invalid cursor: '{value}'")))
+        })?;
+        let status = self.get_checkpoint_branch(branch_id)?;
+        let report_id = status
+            .artifact_id
+            .as_deref()
+            .filter(|_| status.status == "completed")
+            .ok_or_else(|| {
+                ControlError::Conflict(
+                    "checkpoint branch artifacts are available only after verified completion"
+                        .to_owned(),
+                )
+            })?;
+        // A recovered terminal status is metadata only. Restore this study's
+        // verified artifact set before taking the catalog lock for pagination.
+        self.get_artifact(report_id)?;
+        let prefix = format!("branches/{branch_id}/study/");
+        let artifacts = self
+            .data_services
+            .artifacts
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let report = artifacts.get(report_id).ok_or_else(|| {
+            ControlError::Conflict("completed checkpoint branch report is unavailable".to_owned())
+        })?;
+        if report.metadata.relative_path != format!("{prefix}study_report.json") {
+            return Err(ControlError::Conflict(
+                "completed checkpoint branch report has a different source identity".to_owned(),
+            ));
+        }
+        let belongs_to_branch = |artifact: &&RetainedArtifact| {
+            artifact.directory == report.directory
+                && artifact.metadata.relative_path.starts_with(&prefix)
+        };
+        let total = artifacts.values().filter(belongs_to_branch).count();
+        let items: Vec<_> = artifacts
+            .values()
+            .filter(belongs_to_branch)
+            .skip(offset)
+            .take(limit)
+            .map(|artifact| artifact.metadata.clone())
+            .collect();
+        let next_offset = offset.saturating_add(items.len());
+        let has_more = next_offset < total;
+        Ok(PaginatedArtifactsResponse {
+            items,
+            total,
+            limit,
+            offset,
+            next_cursor: has_more.then(|| next_offset.to_string()),
+            has_more,
+        })
+    }
+
+    /// Request cooperative cancellation; completion wins if it was already observed.
+    /// Interrupted output is preserved, and is not advertised as a resumable owner.
+    pub fn cancel_checkpoint_branch(
+        &self,
+        branch_id: &str,
+    ) -> Result<CheckpointBranchStatusDto, ControlError> {
+        if !valid_checkpoint_branch_identifier(branch_id) {
+            return Err(ControlError::BadRequest(
+                "invalid checkpoint branch identifier".to_owned(),
+            ));
+        }
+        let mut jobs = self
+            .data_services
+            .checkpoint_branches
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        self.data_services
+            .recover_checkpoint_branches_locked(&mut jobs, Some(branch_id))?;
+        let job = jobs.get_mut(branch_id).ok_or_else(|| {
+            ControlError::NotFound(format!("checkpoint branch '{branch_id}' not found"))
+        })?;
+        job.request_cancel();
+        job.status_dto()
+    }
+
     /// Reconstruct the selected saved cut for read-only canvas inspection.
     ///
     /// File reads and reconstruction run on the caller's background worker. This
     /// never drives or replaces the live owner, advances science, or opens SQL.
-    /// Only exact registries produced by the compiled application presets are
-    /// supported; the core's full registry and restored-digest checks still apply.
+    /// Saved combinations of compiled adapters are restored in their original
+    /// registry order; the core's full registry and restored-digest checks apply.
     /// This is a reconstructed science projection, not the original host publication:
     /// arena handles, per-tick activity counts and presentation history are not retained.
     pub(crate) fn checkpoint_canvas(
@@ -3353,13 +5970,164 @@ impl ControlHandle {
         self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)
     }
 
+    /// Project saved science for remote review with explicit resource admission bounds.
+    ///
+    /// Descriptor discovery is exact-ID and does not run the general catalog recovery:
+    /// a cold request must apply the 16 MiB source bound before decoding any payload.
+    /// The one verified payload read supplies both metadata validation and restoration.
+    pub(crate) fn checkpoint_canvas_bounded(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<(CheckpointMetadataDto, Arc<RenderSnapshot>), ControlError> {
+        let (metadata, checkpoint) = self.read_bounded_canvas_checkpoint(checkpoint_id)?;
+        let snapshot = self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?;
+        Ok((metadata, snapshot))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one retained-directory lease covers source discovery, verification and revalidation"
+    )]
+    fn read_bounded_canvas_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<(CheckpointMetadataDto, scriptbots_core::WorldCheckpointV1), ControlError> {
+        if checkpoint_id.len() > MAX_CHECKPOINT_BRANCH_ID_BYTES
+            || !valid_checkpoint_catalog_id(checkpoint_id)
+        {
+            return Err(ControlError::NotFound("checkpoint not found".into()));
+        }
+        let retention = self
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        if retention.directories.len() > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+            return Err(ControlError::CheckpointCapacity(
+                "checkpoint discovery directory budget exceeded".into(),
+            ));
+        }
+        if retention.requests.values().any(|request| {
+            !request.acknowledged && request.metadata.checkpoint_id == checkpoint_id
+        }) {
+            return Err(ControlError::NotFound(
+                "checkpoint completion is pending; retry its original capture request".into(),
+            ));
+        }
+        let find_directory = || {
+            let mut found = None;
+            for directory in retention.directories.keys() {
+                retention.verify_directory(directory)?;
+                let ready =
+                    directory.join(format!("{checkpoint_id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
+                match fs::symlink_metadata(&ready) {
+                    Ok(_) if found.is_some() => {
+                        return Err(ControlError::Conflict(format!(
+                            "checkpoint {checkpoint_id} appears in multiple retained directories"
+                        )));
+                    }
+                    Ok(_) => found = Some(directory.clone()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(checkpoint_catalog_error(&ready, error)),
+                }
+            }
+            found.ok_or_else(|| {
+                ControlError::NotFound(format!("checkpoint '{checkpoint_id}' not found"))
+            })
+        };
+        let directory = find_directory()?;
+        let metadata = read_checkpoint_catalog_record(&directory, checkpoint_id)?;
+        if metadata.byte_size > MAX_CHECKPOINT_PREVIEW_BYTES as u64
+            || metadata.agent_count > scriptbots_runtime::remote::REMOTE_MAX_AGENTS
+        {
+            return Err(ControlError::PayloadTooLarge(
+                "checkpoint preview exceeds its source-byte or agent admission bound".into(),
+            ));
+        }
+        let artifact = checkpoint_artifact_metadata(&metadata);
+        let validate_cached_identity = || {
+            let checkpoints = self
+                .data_services
+                .checkpoints
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            let artifacts = self
+                .data_services
+                .artifacts
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            match (checkpoints.get(checkpoint_id), artifacts.get(checkpoint_id)) {
+                (None, None) => Ok(()),
+                (Some(known), Some(retained))
+                    if known == &metadata
+                        && retained.directory == directory
+                        && retained.metadata == artifact =>
+                {
+                    Ok(())
+                }
+                _ => Err(ControlError::Conflict(format!(
+                    "checkpoint {checkpoint_id} has conflicting retained descriptors"
+                ))),
+            }
+        };
+        validate_cached_identity()?;
+        let path = directory.join(&artifact.relative_path);
+        let bytes = read_artifact_file_bounded(&path, MAX_CHECKPOINT_PREVIEW_BYTES)?;
+        if bytes.len() as u64 != metadata.byte_size
+            || compute_blake3(&bytes) != metadata.checksum_blake3
+            || compute_sha256(&bytes) != metadata.checksum_sha256
+        {
+            return Err(ControlError::InvalidPatch(
+                "artifact byte count or checksum changed".into(),
+            ));
+        }
+        let checkpoint = Self::decode_canvas_checkpoint(&metadata, &artifact, &bytes)?;
+        Self::validate_checkpoint_preview_config(checkpoint.config(), checkpoint.agent_count())?;
+        if find_directory()? != directory
+            || read_checkpoint_catalog_record(&directory, checkpoint_id)? != metadata
+        {
+            return Err(ControlError::Conflict(
+                "checkpoint descriptor changed during preview verification".into(),
+            ));
+        }
+        validate_cached_identity()?;
+        Ok((metadata, checkpoint))
+    }
+
+    fn validate_checkpoint_preview_config(
+        config: &ScriptBotsConfig,
+        agent_count: usize,
+    ) -> Result<(), ControlError> {
+        let (width, height) = config
+            .food_dimensions()
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        if agent_count > scriptbots_runtime::remote::REMOTE_MAX_AGENTS
+            || u64::from(width) * u64::from(height) > MAX_CHECKPOINT_PREVIEW_GRID_CELLS
+            || config.history_capacity > MAX_CHECKPOINT_PREVIEW_HISTORY
+            || config.narrative_capacity > MAX_CHECKPOINT_PREVIEW_HISTORY
+        {
+            return Err(ControlError::PayloadTooLarge(
+                "checkpoint preview exceeds its agent, grid or history admission bound".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn verified_canvas_checkpoint(
         &self,
         checkpoint_id: &str,
     ) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
         let metadata = self.get_checkpoint(checkpoint_id)?;
         let (artifact, bytes) = self.read_artifact_bytes(checkpoint_id)?;
-        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
+        Self::decode_canvas_checkpoint(&metadata, &artifact, &bytes)
+    }
+
+    fn decode_canvas_checkpoint(
+        metadata: &CheckpointMetadataDto,
+        artifact: &ArtifactMetadataDto,
+        bytes: &[u8],
+    ) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
+        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(bytes)
             .map_err(|error| ControlError::Serialization(error.to_string()))?;
         if metadata.schema != scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
             || metadata.tick != checkpoint.tick().0
@@ -3386,45 +6154,34 @@ impl ControlHandle {
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         continuity: Option<&scriptbots_core::WorldHostCheckpointV1>,
     ) -> Result<WorldState, ControlError> {
-        let mut restored = None;
-        for preset in [
-            None,
-            Some(crate::BrainPreset::Mlp),
-            Some(crate::BrainPreset::Dwraon),
-            Some(crate::BrainPreset::Assembly),
-            Some(crate::BrainPreset::Mixed),
-            Some(crate::BrainPreset::Ft),
-        ] {
-            if preset == Some(crate::BrainPreset::Ft) && !cfg!(feature = "brain-ft") {
-                continue;
+        Self::restore_canvas_world_and_preset(checkpoint, continuity).map(|(world, _)| world)
+    }
+
+    fn restore_canvas_world_and_preset(
+        checkpoint: &scriptbots_core::WorldCheckpointV1,
+        continuity: Option<&scriptbots_core::WorldHostCheckpointV1>,
+    ) -> Result<(WorldState, Option<crate::BrainPreset>), ControlError> {
+        let registry = crate::brains::create_brain_registry_for_checkpoint(checkpoint)
+            .map_err(|error| {
+                ControlError::BadRequest(format!(
+                    "checkpoint registry does not match the compiled application adapters: {error}"
+                ))
+            })?;
+        let world = match continuity {
+            Some(continuity) => {
+                WorldState::restore_host_checkpoint_v1(checkpoint, continuity, registry)
             }
-            let registry = match preset {
-                None => scriptbots_core::BrainRegistry::new(),
-                Some(preset) => {
-                    crate::create_brain_registry_for_config(preset, checkpoint.config())
-                        .map_err(|error| ControlError::Serialization(error.to_string()))?
-                }
-            };
-            let candidate = match continuity {
-                Some(continuity) => {
-                    WorldState::restore_host_checkpoint_v1(checkpoint, continuity, registry)
-                }
-                None => WorldState::restore_checkpoint_v1(checkpoint, registry),
-            };
-            match candidate {
-                Ok(world) => {
-                    restored = Some(world);
-                    break;
-                }
-                Err(scriptbots_core::WorldCheckpointError::RegistryMismatch { .. }) => {}
-                Err(error) => return Err(ControlError::Serialization(error.to_string())),
-            }
+            None => WorldState::restore_checkpoint_v1(checkpoint, registry),
         }
-        let world = restored.ok_or_else(|| {
-            ControlError::BadRequest(
-                "checkpoint requires a registry outside the compiled application presets".into(),
-            )
+        .map_err(|error| match error {
+            scriptbots_core::WorldCheckpointError::RegistryMismatch { .. } => {
+                ControlError::BadRequest(format!(
+                    "checkpoint registry does not match the compiled application adapters: {error}"
+                ))
+            }
+            _ => ControlError::Serialization(error.to_string()),
         })?;
+        let preset = crate::brains::checkpoint_brain_preset(checkpoint);
         let actual_digest = world
             .world_digest_v1()
             .map_err(|error| ControlError::Serialization(error.to_string()))?;
@@ -3433,7 +6190,7 @@ impl ControlHandle {
                 "reconstructed checkpoint scientific digest differs from its saved cut".into(),
             ));
         }
-        Ok(world)
+        Ok((world, preset))
     }
 
     fn project_canvas_world(&self, world: WorldState) -> Result<Arc<RenderSnapshot>, ControlError> {
@@ -4051,6 +6808,12 @@ impl ControlHandle {
             .ok_or(ControlError::Lock)
     }
 
+    /// Observe immutable owner publications without submitting work or advancing science.
+    /// The hub carries latest-only data and independent publication wakeups.
+    pub(crate) fn snapshot_hub(&self) -> scriptbots_runtime::SnapshotHub {
+        self.host.snapshot_hub()
+    }
+
     /// Retrieve the current configuration snapshot.
     pub fn snapshot(&self) -> Result<ConfigSnapshot, ControlError> {
         let snapshot = self.read_snapshot()?;
@@ -4089,6 +6852,91 @@ impl ControlHandle {
         query: AgentDebugQuery,
     ) -> Result<Vec<AgentDebugInfo>, ControlError> {
         Ok(self.host.debug_agents(query)?)
+    }
+
+    /// Read one creature from the scientific owner, bound to the caller's session and epoch.
+    /// Inspection is read-only and has a bounded owner-response deadline.
+    pub fn inspect_agent(
+        &self,
+        uid: scriptbots_core::AgentUid,
+        session_id: u64,
+        epoch: u64,
+    ) -> Result<Option<scriptbots_runtime::inspector::AgentInspection>, ControlError> {
+        if self.host.session_id().get() != session_id {
+            return Err(ControlError::Conflict(
+                "inspector host session changed".to_owned(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let (observed_epoch, detail) = self
+            .host
+            .inspect_agent_basic_with_epoch_before(uid, deadline)?;
+        if observed_epoch != epoch {
+            return Err(ControlError::Conflict(
+                "inspector source epoch changed".to_owned(),
+            ));
+        }
+        if let Some(detail) = &detail
+            && (detail.source.session_id.get() != session_id || detail.epoch != epoch)
+        {
+            return Err(ControlError::Conflict(
+                "inspector source epoch or session changed".to_owned(),
+            ));
+        }
+        Ok(detail.map(scriptbots_runtime::inspector::AgentInspection::from))
+    }
+
+    /// Read bounded brain activity from one owner boundary without installing a probe.
+    pub fn inspect_brain_activity(
+        &self,
+        uid: scriptbots_core::AgentUid,
+        session_id: u64,
+        epoch: u64,
+    ) -> Result<scriptbots_runtime::inspector::BrainActivityInspection, ControlError> {
+        if self.host.session_id().get() != session_id {
+            return Err(ControlError::Conflict(
+                "brain inspector host session changed".to_owned(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let detail = self.host.inspect_brain_activity_before(uid, deadline)?;
+        if detail.source.session_id != session_id.to_string()
+            || detail.source.epoch != epoch.to_string()
+        {
+            return Err(ControlError::Conflict(
+                "brain inspector source epoch or session changed".to_owned(),
+            ));
+        }
+        Ok(detail)
+    }
+
+    /// Read one complete bounded genome page from the selected scientific owner.
+    pub fn inspect_genome_page(
+        &self,
+        uid: scriptbots_core::AgentUid,
+        session_id: u64,
+        epoch: u64,
+        locus_offset: usize,
+        delta_offset: usize,
+    ) -> Result<scriptbots_runtime::inspector::GenomeInspection, ControlError> {
+        scriptbots_runtime::inspector::validate_genome_page_offsets(locus_offset, delta_offset)?;
+        if self.host.session_id().get() != session_id {
+            return Err(ControlError::Conflict(
+                "genome inspector host session changed".to_owned(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let detail =
+            self.host
+                .inspect_genome_page_before(uid, locus_offset, delta_offset, deadline)?;
+        if detail.source.session_id != session_id.to_string()
+            || detail.source.epoch != epoch.to_string()
+        {
+            return Err(ControlError::Conflict(
+                "genome inspector source epoch or session changed".to_owned(),
+            ));
+        }
+        Ok(detail)
     }
 
     /// Submit a selection update and return its admission receipt.
@@ -4634,6 +7482,72 @@ impl ControlHandle {
         )
     }
 
+    /// Stage one bounded browser experiment at an observed paused boundary.
+    /// Retrying a retained request reuses its complete envelope and actual owner status.
+    pub fn browser_intervene(
+        &self,
+        request: &scriptbots_runtime::remote::BrowserInterventionRequest,
+    ) -> Result<scriptbots_runtime::remote::BrowserInterventionReceipt, ControlError> {
+        use scriptbots_runtime::remote::{
+            BrowserInterventionReceipt, validate_browser_intervention_session,
+        };
+        let envelope = request.envelope()?;
+        let snapshot = self.read_snapshot()?;
+        validate_browser_intervention_session(&snapshot, &request.session_id)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        if self
+            .host
+            .command_status_before(envelope.command_id, deadline)?
+            .is_none()
+        {
+            request.validate_new_source(&snapshot)?;
+        }
+        // Always resubmit the original envelope, even when a receipt already exists:
+        // the owner must reject a changed body or guard reusing this identity.
+        let status = self.host.submit_before(envelope, deadline)?;
+        Ok(BrowserInterventionReceipt::from_status(
+            &status,
+            self.read_snapshot()?.as_ref(),
+        ))
+    }
+
+    /// Read a retained browser command receipt without interpreting absence as non-admission.
+    pub fn browser_intervention_status(
+        &self,
+        command_id: &str,
+        session_id: &str,
+    ) -> Result<Option<scriptbots_runtime::remote::BrowserInterventionReceipt>, ControlError> {
+        use scriptbots_runtime::remote::{
+            BrowserInterventionReceipt, browser_intervention_command_id,
+            validate_browser_intervention_session,
+        };
+        let command_id = browser_intervention_command_id(command_id)?;
+        validate_browser_intervention_session(self.read_snapshot()?.as_ref(), session_id)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let status = self.host.command_status_before(command_id, deadline)?;
+        let snapshot = self.read_snapshot()?;
+        Ok(status.map(|status| BrowserInterventionReceipt::from_status(&status, &snapshot)))
+    }
+
+    /// Read bounded global effect observations; the core ring has no per-command linkage.
+    pub fn browser_intervention_history(
+        &self,
+        session_id: &str,
+        epoch: &str,
+        after_seq: &str,
+        limit: usize,
+    ) -> Result<scriptbots_runtime::remote::BrowserInterventionHistory, ControlError> {
+        Ok(
+            scriptbots_runtime::remote::BrowserInterventionHistory::capture(
+                self.read_snapshot()?.as_ref(),
+                session_id,
+                epoch,
+                after_seq,
+                limit,
+            )?,
+        )
+    }
+
     /// Generate a procedural map artifact using the requested rule or sample backend.
     pub fn generate_map(
         &self,
@@ -4785,6 +7699,25 @@ impl ControlHandle {
         idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
         self.submit_control_command_with_key(command, idempotency_key)
+    }
+
+    /// Submit a full configuration only at the caller's observed owner boundary.
+    ///
+    /// The owner checks all three revision guards when the command reaches its
+    /// ordered application boundary. A concurrent resume, tick, or configuration
+    /// edit therefore rejects this proposal instead of overwriting newer state.
+    /// The typed receipt preserves both rejected and admitted command identities.
+    pub fn submit_config_update(
+        &self,
+        config: Box<ScriptBotsConfig>,
+        expected: scriptbots_runtime::HostRevisions,
+    ) -> Result<scriptbots_runtime::CommandStatus, ControlError> {
+        let envelope = self
+            .prepare_control_command(ControlCommand::UpdateConfig(config), None)?
+            .expecting_control_revision(expected.control)
+            .expecting_scientific_revision(expected.scientific)
+            .expecting_config_revision(expected.config);
+        Ok(self.host.clone().submit(envelope)?)
     }
 }
 
@@ -5205,18 +8138,29 @@ pub(crate) mod tests {
             world: WorldState,
             schedule: Option<Vec<scriptbots_runtime::ScheduledConfigPatch>>,
         ) -> Self {
+            Self::spawn_with_identity(
+                world,
+                schedule,
+                scriptbots_runtime::HostSessionId::new(0xc017),
+            )
+        }
+
+        fn spawn_with_identity(
+            world: WorldState,
+            schedule: Option<Vec<scriptbots_runtime::ScheduledConfigPatch>>,
+            session_id: scriptbots_runtime::HostSessionId,
+        ) -> Self {
             let (send, receive) = std::sync::mpsc::sync_channel(1);
             let clock_gate = Arc::new(Mutex::new(()));
             let owner_gate = Arc::clone(&clock_gate);
             let (blocked, clock_blocked) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
                 use scriptbots_runtime::{
-                    FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, ManualInstant,
-                    PlaybackSnapshot,
+                    FixedDeadlineHost, HostCore, HostCoreOptions, ManualInstant, PlaybackSnapshot,
                     channel::{ChannelHostDriver, ChannelHostOptions},
                 };
                 let mut core = HostCore::new(
-                    HostSessionId::new(0xc017),
+                    session_id,
                     world,
                     HostCoreOptions {
                         initial_playback: PlaybackSnapshot {
@@ -5315,6 +8259,129 @@ pub(crate) mod tests {
         (host.handle(), host)
     }
 
+    #[test]
+    fn guarded_config_update_rejects_stale_axes_without_overwriting_the_owner() {
+        use scriptbots_runtime::{HostRevisions, RejectionReason};
+
+        let (handle, host) = handle();
+        let original = handle.read_snapshot().expect("original paused owner");
+        assert!(original.playback.paused);
+        let mut proposal = original.config.as_ref().clone();
+        proposal.food_growth_rate = 0.075;
+        assert_ne!(
+            proposal.food_growth_rate.to_bits(),
+            original.config.food_growth_rate.to_bits(),
+        );
+        let mut competing = original.config.as_ref().clone();
+        competing.food_max = 0.73;
+        assert_ne!(
+            competing.food_max.to_bits(),
+            original.config.food_max.to_bits(),
+        );
+        let changed = handle
+            .submit_command(ControlCommand::UpdateConfig(Box::new(competing)), None)
+            .expect("competing configuration admission");
+        host.wait_applied(&changed);
+        host.wait_applied(&handle.step().expect("intervening scientific tick"));
+        let current = handle.read_snapshot().expect("new owner boundary");
+        assert!(current.playback.paused);
+        assert!(current.revisions.control > original.revisions.control);
+        assert!(current.revisions.scientific > original.revisions.scientific);
+        assert!(current.revisions.config > original.revisions.config);
+        let digest = host
+            .port
+            .clone()
+            .scientific_digest_v1()
+            .expect("current scientific digest");
+
+        // Exercise each owner-side guard separately. A client precheck could
+        // not protect an admitted command from these intervening boundaries.
+        let stale_guards = [
+            (
+                HostRevisions {
+                    control: original.revisions.control,
+                    ..current.revisions
+                },
+                RejectionReason::ControlRevisionConflict {
+                    expected: original.revisions.control,
+                    actual: current.revisions.control,
+                },
+            ),
+            (
+                HostRevisions {
+                    scientific: original.revisions.scientific,
+                    ..current.revisions
+                },
+                RejectionReason::ScientificRevisionConflict {
+                    expected: original.revisions.scientific,
+                    actual: current.revisions.scientific,
+                },
+            ),
+            (
+                HostRevisions {
+                    config: original.revisions.config,
+                    ..current.revisions
+                },
+                RejectionReason::ConfigRevisionConflict {
+                    expected: original.revisions.config,
+                    actual: current.revisions.config,
+                },
+            ),
+        ];
+        let mut rejected_ids = BTreeSet::new();
+        for (expected, reason) in stale_guards {
+            let attempt = handle
+                .submit_config_update(Box::new(proposal.clone()), expected)
+                .expect("stale proposal has a typed command receipt");
+            let id = attempt.command_id();
+            assert!(
+                rejected_ids.insert(id),
+                "each explicit attempt has its own identity",
+            );
+            let settled = host.wait_finished(&id.to_string());
+            assert_eq!(settled.application_state, "rejected");
+            let receipt = host
+                .port
+                .clone()
+                .command_status(id)
+                .expect("authoritative command lookup")
+                .expect("retained stale command");
+            assert_eq!(receipt.application(), &ApplicationState::Rejected(reason));
+            let unchanged = handle.read_snapshot().expect("unchanged owner");
+            assert_eq!(unchanged.revisions, current.revisions);
+            assert_eq!(unchanged.world.tick, current.world.tick);
+            assert_eq!(unchanged.config, current.config);
+            assert_eq!(
+                host.port
+                    .clone()
+                    .scientific_digest_v1()
+                    .expect("unchanged digest"),
+                digest,
+            );
+        }
+
+        let mut fresh = current.config.as_ref().clone();
+        fresh.food_growth_rate = proposal.food_growth_rate;
+        let accepted = handle
+            .submit_config_update(Box::new(fresh.clone()), current.revisions)
+            .expect("current guarded proposal");
+        assert!(!rejected_ids.contains(&accepted.command_id()));
+        let applied = host.wait_finished(&accepted.command_id().to_string());
+        assert_eq!(applied.application_state, "applied");
+        let after = handle.read_snapshot().expect("applied current proposal");
+        assert_eq!(after.config.as_ref(), &fresh);
+        assert_eq!(after.world.tick, current.world.tick);
+        assert_eq!(after.revisions.scientific, current.revisions.scientific);
+        assert_eq!(
+            Some(after.revisions.config),
+            current.revisions.config.checked_next(),
+        );
+        assert_eq!(
+            Some(after.revisions.control),
+            current.revisions.control.checked_next(),
+        );
+    }
+
     fn experiment_creation_request() -> ExperimentCreateRequest {
         ExperimentCreateRequest {
             experiment_id: None,
@@ -5376,6 +8443,261 @@ pub(crate) mod tests {
         directory.join("definition.json")
     }
 
+    #[test]
+    fn experiment_horizon_refusal_precedes_catalog_and_execution_side_effects() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let (handle, _host) = handle();
+        let handle = handle.with_artifacts_dir(root.clone()).unwrap();
+        let services = handle.data_services();
+        // Leave an authentic prior admission undiscovered. An invalid new
+        // horizon must not even populate its catalog or idempotency entries.
+        let saved = pending_catalog_definition(&root, "saved-before-refusal");
+        let saved_bytes = fs::read(&saved).unwrap();
+        let catalog_entries = || {
+            fs::read_dir(root.join("experiments"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before_entries = catalog_entries();
+        let before_capacity = *services.execution_capacity.lock().unwrap();
+        for ticks in [0, crate::experiment_runner::MAX_TICKS_PER_RUN + 1, u64::MAX] {
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("refused-horizon".into());
+            request.ticks_per_run = Some(ticks);
+            let error = handle.create_experiment(request).unwrap_err();
+            assert!(
+                matches!(error, ControlError::BadRequest(ref message)
+                    if message.contains("ticks_per_run")
+                        && message.contains(&format!("found {ticks}"))),
+                "{error}"
+            );
+            assert!(services.experiments.lock().unwrap().is_empty());
+            assert!(services.idempotency.lock().unwrap().is_empty());
+            assert!(services.artifacts.lock().unwrap().is_empty());
+            assert_eq!(
+                *services.execution_capacity.lock().unwrap(),
+                before_capacity
+            );
+            assert_eq!(catalog_entries(), before_entries);
+            assert_eq!(fs::read(&saved).unwrap(), saved_bytes);
+            assert!(!saved.with_file_name("status.json").exists());
+            assert!(!root.join("experiments/refused-horizon").exists());
+        }
+    }
+
+    #[test]
+    fn experiment_horizon_admission_preserves_exact_values_and_omitted_default() {
+        for (requested, expected) in [
+            (Some(1), 1),
+            (Some(7), 7),
+            (None, 1_000),
+            (
+                Some(crate::experiment_runner::MAX_TICKS_PER_RUN),
+                crate::experiment_runner::MAX_TICKS_PER_RUN,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let (handle, _host) = handle();
+            let handle = handle.with_artifacts_dir(root.clone()).unwrap();
+            let services = handle.data_services();
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("exact-horizon".into());
+            request.ticks_per_run = requested;
+            let admitted = handle.create_experiment(request).unwrap();
+            // Exercise real admission at the upper bound without executing a
+            // ten-million-tick test. The short positive controls finish normally.
+            if expected > 7 {
+                handle.cancel_experiment(&admitted.experiment_id).unwrap();
+            }
+            {
+                let mut jobs = services.experiments.lock().unwrap();
+                let job = jobs.get_mut(&admitted.experiment_id).unwrap();
+                job.join_worker().unwrap();
+                assert_eq!(job.runner.max_ticks, expected);
+            }
+            let observed = handle.get_experiment(&admitted.experiment_id).unwrap();
+            assert_eq!(observed.total_runs, 1);
+            assert_eq!(observed.runs[0].target_ticks, expected);
+            assert_eq!(observed.failed_runs, 0, "{observed:?}");
+            assert!(observed.error_reason.is_none(), "{observed:?}");
+            assert!(
+                matches!(observed.status.as_str(), "completed" | "cancelled"),
+                "{observed:?}"
+            );
+            if expected <= 7 {
+                assert_eq!(observed.status, "completed", "{observed:?}");
+                assert_eq!(observed.completed_runs, 1);
+                assert_eq!(observed.runs[0].total_ticks, expected);
+            }
+            let catalog: ExperimentCatalogRecord = serde_json::from_slice(
+                &fs::read(root.join("experiments/exact-horizon/definition.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(catalog.definition.max_ticks, expected);
+            assert_eq!(catalog.definition.plan_digest, observed.plan_digest);
+            let capacity = *services.execution_capacity.lock().unwrap();
+            assert_eq!(capacity.reserved_run_slots, 0);
+            assert_eq!(capacity.reserved_grid_cells, 0);
+            assert_eq!(capacity.reserved_batches, 0);
+        }
+    }
+
+    #[test]
+    fn experiment_total_tick_refusal_preserves_catalog_and_admission_state() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let (handle, _host) = handle();
+        let handle = handle.with_artifacts_dir(root.clone()).unwrap();
+        let services = handle.data_services();
+        let saved = pending_catalog_definition(&root, "saved-before-work-refusal");
+        let saved_bytes = fs::read(&saved).unwrap();
+        let before_capacity = *services.execution_capacity.lock().unwrap();
+        for concurrency in [1, 4] {
+            for two_variants in [false, true] {
+                let mut request = experiment_creation_request();
+                request.experiment_id = Some("refused-work".into());
+                request.seeds = vec![7, 11];
+                request.max_concurrency = Some(concurrency);
+                request.ticks_per_run = Some(crate::experiment_runner::MAX_TICKS_PER_RUN);
+                if two_variants {
+                    let mut challenger = request.variants[0].clone();
+                    challenger.variant_id = "challenger".into();
+                    challenger.brain_family = "dwraon".into();
+                    request.variants.push(challenger);
+                    request.ticks_per_run =
+                        Some(crate::experiment_runner::MAX_BATCH_TOTAL_TICKS / 4 + 1);
+                }
+                let outcome = handle.create_experiment(request);
+                if let Ok(admitted) = &outcome {
+                    // A restored admission bug must fail without leaving its
+                    // long-running worker alive in the negative-control build.
+                    let mut jobs = services.experiments.lock().unwrap();
+                    let job = jobs.get_mut(&admitted.experiment_id).unwrap();
+                    job.cancel.store(true, std::sync::atomic::Ordering::Release);
+                    job.join_worker().unwrap();
+                }
+                let error = outcome.unwrap_err();
+                assert!(
+                    matches!(error, ControlError::BadRequest(ref message)
+                        if message.contains("scientific tick transitions")
+                            && message.contains("per-batch limit")),
+                    "{error}"
+                );
+                assert!(services.experiments.lock().unwrap().is_empty());
+                assert!(services.idempotency.lock().unwrap().is_empty());
+                assert!(services.artifacts.lock().unwrap().is_empty());
+                assert_eq!(
+                    *services.execution_capacity.lock().unwrap(),
+                    before_capacity
+                );
+                assert_eq!(fs::read(&saved).unwrap(), saved_bytes);
+                assert!(!saved.with_file_name("status.json").exists());
+                assert!(!root.join("experiments/refused-work").exists());
+                assert_eq!(fs::read_dir(root.join("experiments")).unwrap().count(), 1);
+            }
+        }
+
+        // A refusal did not consume the exact request key or execution slot.
+        // The existing catalog can subsequently recover beside a real small run.
+        let mut valid = experiment_creation_request();
+        valid.experiment_id = Some("admitted-after-work-refusal".into());
+        let admitted = handle.create_experiment(valid).unwrap();
+        {
+            let mut jobs = services.experiments.lock().unwrap();
+            jobs.get_mut(&admitted.experiment_id)
+                .unwrap()
+                .join_worker()
+                .unwrap();
+        }
+        let completed = handle.get_experiment(&admitted.experiment_id).unwrap();
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        assert_eq!(completed.completed_runs, 1);
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs[0].total_ticks, 2);
+        assert_eq!(
+            *services.execution_capacity.lock().unwrap(),
+            before_capacity
+        );
+    }
+
+    #[test]
+    fn experiment_past_workload_remains_discoverable_but_cannot_resume() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let (handle, _host) = handle();
+        let handle = handle.with_artifacts_dir(root.clone()).unwrap();
+        let services = handle.data_services();
+        let directory = root
+            .canonicalize()
+            .unwrap()
+            .join("experiments")
+            .join("past-workload");
+        let runner = crate::experiment_runner::MatchedSeedExperimentRunner::new(
+            "past-workload",
+            crate::experiment_runner::MatchedSeedCohort {
+                cohort_id: "past-workload".into(),
+                seeds: vec![7, 11],
+            },
+            vec![crate::experiment_runner::ScenarioVariant {
+                variant_id: "baseline".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
+            }],
+            crate::experiment_runner::MAX_TICKS_PER_RUN,
+            1,
+            &directory,
+        );
+        // Write a genuine versioned definition for a previously admitted plan.
+        // Pending records claim no completed science or missing bundle evidence.
+        ExperimentDefinitionV1 {
+            schema_version: 1,
+            experiment_id: runner.experiment_id.clone(),
+            cohort: runner.cohort.clone(),
+            variants: runner.variants.clone(),
+            max_ticks: runner.max_ticks,
+            max_concurrency: runner.max_concurrency,
+            plan_digest: runner.plan_digest().unwrap(),
+            created_at_utc: "123456".into(),
+            request_identity: None,
+        }
+        .persist(&directory)
+        .unwrap();
+        let definition = directory.join("definition.json");
+        let saved_bytes = fs::read(&definition).unwrap();
+        let before_capacity = *services.execution_capacity.lock().unwrap();
+        let observed = handle.get_experiment("past-workload").unwrap();
+        assert_eq!(observed.status, "stopped");
+        assert_eq!(observed.total_runs, 2);
+        assert!(observed.runs.iter().all(|run| {
+            run.target_ticks == crate::experiment_runner::MAX_TICKS_PER_RUN
+                && run.state == "pending"
+                && run.total_ticks == 0
+        }));
+        let error = handle.resume_experiment("past-workload").unwrap_err();
+        assert!(
+            matches!(error, ControlError::BadRequest(ref message)
+                if message.contains("scientific tick transitions")),
+            "{error}"
+        );
+        let after = handle.get_experiment("past-workload").unwrap();
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&observed).unwrap()
+        );
+        assert_eq!(
+            *services.execution_capacity.lock().unwrap(),
+            before_capacity
+        );
+        assert_eq!(fs::read(&definition).unwrap(), saved_bytes);
+        assert!(!directory.join("status.json").exists());
+        assert!(services.artifacts.lock().unwrap().is_empty());
+        let jobs = services.experiments.lock().unwrap();
+        let job = jobs.get("past-workload").unwrap();
+        assert!(job.worker.is_none());
+        assert!(!job.cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(job.last_error.lock().unwrap().is_none());
+    }
+
     pub(crate) fn comparison_catalog_runner(
         root: &Path,
         id: &str,
@@ -5385,11 +8707,20 @@ pub(crate) mod tests {
         use crate::experiment_runner::{
             MatchedSeedCohort, MatchedSeedExperimentRunner, ScenarioVariant,
         };
-        // The two conditions differ in actual retained food. The two-tick
-        // horizon precedes the default respawn; every override must remain
-        // executable through the production runner's registered knob contract.
-        let max_ticks = 2;
-        assert!(u64::from(ScriptBotsConfig::default().food_respawn_interval) > max_ticks);
+        const FIXTURE_TICKS: u64 = 2;
+        let defaults = ScriptBotsConfig::default();
+        // These values are not exposed as experiment knobs. The default
+        // cadences cannot fire during this two-tick fixture, and both default
+        // metabolism modifiers are zero, preserving the intended controls.
+        assert!(
+            defaults.food_respawn_interval == 0
+                || u64::from(defaults.food_respawn_interval) > FIXTURE_TICKS
+        );
+        assert!(u64::from(defaults.reproduction_attempt_interval) > FIXTURE_TICKS);
+        assert_eq!(defaults.metabolism_ramp_rate, 0.0);
+        assert_eq!(defaults.metabolism_boost_penalty, 0.0);
+        // The two conditions differ in actual retained food. No ingestion,
+        // locomotion or reproduction can turn that fixture into another outcome.
         let common = BTreeMap::from([
             ("world_width".into(), serde_json::json!(480)),
             ("world_height".into(), serde_json::json!(480)),
@@ -5411,10 +8742,7 @@ pub(crate) mod tests {
             ("temperature_discomfort_rate".into(), serde_json::json!(0.0)),
             ("spike_damage".into(), serde_json::json!(0.0)),
             ("spike_energy_cost".into(), serde_json::json!(0.0)),
-            (
-                "reproduction_energy_threshold".into(),
-                serde_json::json!(2.0),
-            ),
+
         ]);
         let variants = [("baseline", 0.0), ("challenger", 10.0)]
             .into_iter()
@@ -5437,7 +8765,7 @@ pub(crate) mod tests {
                 seeds,
             },
             variants,
-            max_ticks,
+            FIXTURE_TICKS,
             1,
             &directory,
         );
@@ -5777,6 +9105,31 @@ pub(crate) mod tests {
                     .iter()
                     .all(|run| run.state == "running" && run.total_ticks == 0)
             );
+            for run in &stopped.runs {
+                assert_eq!(run.target_ticks, 10_000);
+                let crate::experiment_runner::ExperimentCheckpointProgress::Observed {
+                    tick,
+                    checkpoint_digest,
+                    source,
+                } = &run.checkpoint_progress
+                else {
+                    panic!("cancelled owner lost its published progress: {run:?}");
+                };
+                assert!(*tick > 0 && *tick < run.target_ticks);
+                assert_eq!(
+                    *source,
+                    crate::experiment_runner::CheckpointProgressSource::Published
+                );
+                let checkpoint = directory.join(format!("{}.checkpoint", run.run_id));
+                assert_eq!(
+                    *checkpoint_digest,
+                    compute_blake3(&fs::read(checkpoint).unwrap())
+                );
+                let encoded = serde_json::to_value(run).unwrap();
+                assert_eq!(encoded["total_ticks"], 0);
+                assert_eq!(encoded["checkpoint_progress"]["state"], "observed");
+                assert_eq!(encoded["checkpoint_progress"]["tick"], *tick);
+            }
             let capacity = retained
                 .list_experiments(None, None)
                 .unwrap()
@@ -5852,7 +9205,7 @@ pub(crate) mod tests {
                 let finished = Arc::clone(&sibling_finished);
                 let observed = Arc::clone(&observed_all_cancellations);
                 let mut reservation = services
-                    .reserve_experiment_execution(&job.runner.experiment_id, 1)
+                    .reserve_experiment_execution(&job.runner.experiment_id, 1, 1)
                     .unwrap();
                 job.running.store(true, Ordering::Release);
                 reservation.running = Some(Arc::clone(&job.running));
@@ -5889,7 +9242,7 @@ pub(crate) mod tests {
         assert_eq!(capacity.reserved_run_slots, 0);
         assert_eq!(capacity.reserved_batches, 0);
         assert!(matches!(
-            services.reserve_experiment_execution("new", 1),
+            services.reserve_experiment_execution("new", 1, 1),
             Err(ControlError::ExperimentShuttingDown)
         ));
     }
@@ -5908,7 +9261,7 @@ pub(crate) mod tests {
         let error = services.shutdown_experiments().unwrap_err().to_string();
         assert!(error.contains("registry was poisoned"), "{error}");
         assert!(matches!(
-            services.reserve_experiment_execution("new", 1),
+            services.reserve_experiment_execution("new", 1, 1),
             Err(ControlError::ExperimentShuttingDown)
         ));
     }
@@ -6193,6 +9546,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn experiment_grid_capacity_is_shared_across_batches_and_released_atomically() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, _host) = handle();
+        let handle = handle.with_artifacts_dir(directory.clone()).unwrap();
+        let services = handle.data_services();
+        let limit = crate::experiment_runner::MAX_CONCURRENT_GRID_CELLS;
+        let first = services
+            .reserve_experiment_execution("first", 1, limit - 1)
+            .unwrap();
+        let last = services.reserve_experiment_execution("last", 1, 1).unwrap();
+        let full = *services.execution_capacity.lock().unwrap();
+        assert_eq!(full.reserved_grid_cells, limit);
+        assert!(full.reserved_run_slots < full.max_run_slots);
+        for cells in [1, u64::MAX] {
+            assert!(matches!(
+                services.reserve_experiment_execution("overflow", 1, cells),
+                Err(ControlError::ExperimentCapacity(_))
+            ));
+            assert_eq!(*services.execution_capacity.lock().unwrap(), full);
+        }
+        let mut request = experiment_creation_request();
+        request.experiment_id = Some("grid-refused".into());
+        assert!(matches!(
+            handle.create_experiment(request),
+            Err(ControlError::ExperimentCapacity(message)) if message.contains("grid_cells")
+        ));
+        assert!(!directory.join("experiments/grid-refused").exists());
+        assert!(
+            !services
+                .experiments
+                .lock()
+                .unwrap()
+                .contains_key("grid-refused")
+        );
+        assert_eq!(*services.execution_capacity.lock().unwrap(), full);
+        drop(last);
+        let retry = services
+            .reserve_experiment_execution("retry", 1, 1)
+            .unwrap();
+        assert_eq!(*services.execution_capacity.lock().unwrap(), full);
+        drop(first);
+        drop(retry);
+        let free = *services.execution_capacity.lock().unwrap();
+        assert_eq!(free.reserved_grid_cells, 0);
+        assert_eq!(free.reserved_run_slots, 0);
+        assert_eq!(free.reserved_batches, 0);
+        assert!(matches!(
+            services.reserve_experiment_execution("empty-grid", 1, 0),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert_eq!(*services.execution_capacity.lock().unwrap(), free);
+    }
+
+    #[test]
     fn experiment_execution_reservation_returns_capacity_on_unstarted_drop_and_unwind() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let root = tempfile::tempdir().unwrap();
@@ -6201,9 +9608,11 @@ pub(crate) mod tests {
         let running = Arc::new(AtomicBool::new(false));
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut reservation = services.reserve_experiment_execution("unwind", 1).unwrap();
+                let mut reservation = services
+                    .reserve_experiment_execution("unwind", 1, 1)
+                    .unwrap();
                 assert!(matches!(
-                    services.reserve_experiment_execution("over-cap", 1),
+                    services.reserve_experiment_execution("over-cap", 1, 1),
                     Err(ControlError::ExperimentCapacity(_))
                 ));
                 running.store(true, Ordering::Release);
@@ -6214,14 +9623,15 @@ pub(crate) mod tests {
         );
         assert!(!running.load(Ordering::Acquire));
         let reservation = services
-            .reserve_experiment_execution("unstarted", 1)
+            .reserve_experiment_execution("unstarted", 1, 1)
             .unwrap();
         drop(reservation);
         let free = *services.execution_capacity.lock().unwrap();
         assert_eq!(free.reserved_run_slots, 0);
+        assert_eq!(free.reserved_grid_cells, 0);
         assert_eq!(free.reserved_batches, 0);
         assert!(matches!(
-            services.reserve_experiment_execution("zero", 0),
+            services.reserve_experiment_execution("zero", 0, 1),
             Err(ControlError::BadRequest(_))
         ));
         assert_eq!(*services.execution_capacity.lock().unwrap(), free);
@@ -6238,7 +9648,7 @@ pub(crate) mod tests {
             let jobs = services.experiments.lock().unwrap();
             assert_eq!(jobs.len(), 1);
             let job = jobs.get("saved").unwrap();
-            let status = job.status_dto().unwrap();
+            let status = job.status_dto(true).unwrap();
             assert_eq!(status.status, "stopped");
             assert_eq!(status.created_at_utc, "123456");
             assert_eq!(status.total_runs, 1);
@@ -6317,7 +9727,10 @@ pub(crate) mod tests {
             services.recover_experiment("z-healthy").unwrap();
             let jobs = services.experiments.lock().unwrap();
             assert!(!jobs.contains_key("a-corrupt"));
-            assert_eq!(jobs["z-healthy"].status_dto().unwrap().status, "stopped");
+            assert_eq!(
+                jobs["z-healthy"].status_dto(true).unwrap().status,
+                "stopped"
+            );
             assert_eq!(fs::read(&path).unwrap(), bytes);
             assert!(healthy.is_file());
             eprintln!(
@@ -6486,6 +9899,163 @@ pub(crate) mod tests {
             assert!(matches!(
                 error,
                 ControlError::BadRequest(reason) if reason.contains("brain-ft")
+            ));
+            assert!(!root.path().join("experiments").exists());
+            assert!(handle.data_services.experiments.lock().unwrap().is_empty());
+            assert!(handle.data_services.idempotency.lock().unwrap().is_empty());
+            let listed = handle.list_experiments(None, None).unwrap();
+            assert_eq!(listed.total, 0);
+            assert_eq!(listed.execution_capacity, capacity);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        }
+        runtime
+            .shutdown()
+            .expect("join any unexpected experiment worker");
+    }
+
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn experiment_creation_compares_neuroflow_and_exports_restorable_configured_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let (_unused_handle, host) = handle();
+        let (runtime, _submit) = crate::ControlRuntime::launch(
+            host.port.clone(),
+            crate::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        let live_snapshot = handle.read_snapshot().unwrap();
+        assert!(handle.version().features.iter().any(|f| f == "neuro"));
+
+        let mut request = experiment_creation_request();
+        request.experiment_id = Some("neuro-api-run".into());
+        request.idempotency_key = Some("neuro-api-run-key".into());
+        let mut neuro = request.variants[0].clone();
+        neuro.variant_id = "neuro".into();
+        neuro.brain_family = " NeUrOfLoW ".into();
+        request.variants.push(neuro);
+        let expected_runs = request.variants.len() * request.seeds.len();
+        let expected_seed = request.seeds[0];
+        let expected_ticks = request.ticks_per_run.unwrap();
+        let created = handle
+            .create_experiment(request)
+            .expect("admit the real matched MLP/NeuroFlow cohort");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completed = loop {
+            let status = handle.get_experiment(&created.experiment_id).unwrap();
+            if status.status == "completed" {
+                break status;
+            }
+            assert_ne!(status.status, "failed", "{status:?}");
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(completed.total_runs, expected_runs);
+        assert_eq!(completed.completed_runs, expected_runs);
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs.len(), expected_runs);
+        let baseline = completed
+            .runs
+            .iter()
+            .find(|run| run.variant_id == "baseline")
+            .unwrap();
+        assert_eq!(baseline.brain_family, "mlp.baseline");
+        let run = completed
+            .runs
+            .iter()
+            .find(|run| run.variant_id == "neuro")
+            .unwrap();
+        assert_eq!(run.brain_family, "ml.neuroflow");
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.seed, expected_seed);
+        assert_eq!(run.total_ticks, expected_ticks);
+        assert_ne!(run.final_digest, baseline.final_digest);
+        let bundle_dir = Path::new(
+            run.bundle_path
+                .as_ref()
+                .expect("published NeuroFlow bundle"),
+        );
+        let verified = crate::experiment_runner::verify_portable_run_bundle(bundle_dir)
+            .expect("restore configured NeuroFlow from its portable final checkpoint");
+        let final_state = verified
+            .final_state
+            .expect("observed NeuroFlow final science");
+        assert_eq!(final_state.run_id, run.run_id);
+        assert_eq!(final_state.tick, expected_ticks);
+        assert_eq!(
+            Some(final_state.scientific_digest.as_str()),
+            run.final_digest.as_deref()
+        );
+        let bundle: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&fs::read(bundle_dir.join("bundle_manifest.json")).unwrap())
+                .unwrap();
+        let manifest: crate::RunManifestV3 =
+            serde_json::from_str(&bundle.manifest.manifest_json).unwrap();
+        assert_eq!(manifest.brain_roster.len(), 1);
+        assert_eq!(manifest.brain_roster[0].kind, "ml.neuroflow");
+        assert_eq!(manifest.root_seed, expected_seed);
+        assert_eq!(
+            manifest.identity.requested_tick_budget,
+            Some(expected_ticks)
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.config, live_snapshot.config);
+        assert_eq!(after.world.tick, live_snapshot.world.tick);
+        runtime
+            .shutdown()
+            .expect("join NeuroFlow experiment worker");
+    }
+
+    #[cfg(not(feature = "neuro"))]
+    #[test]
+    fn experiment_creation_refuses_neuroflow_aliases_before_admission_without_feature() {
+        let root = tempfile::tempdir().unwrap();
+        let (_unused_handle, host) = handle();
+        let (runtime, _submit) = crate::ControlRuntime::launch(
+            host.port.clone(),
+            crate::ControlServerConfig {
+                rest_enabled: false,
+                mcp_transport: crate::servers::McpTransportConfig::Disabled,
+                ..crate::ControlServerConfig::default()
+            },
+        )
+        .unwrap();
+        let handle = runtime
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap()
+            .with_experiment_run_capacity(1)
+            .unwrap();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        let capacity = handle
+            .list_experiments(None, None)
+            .unwrap()
+            .execution_capacity;
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
+        assert!(!handle.version().features.iter().any(|f| f == "neuro"));
+
+        for alias in [" NeUrO ", " NeUrOfLoW ", " Ml.NeUrOfLoW "] {
+            let mut request = experiment_creation_request();
+            request.experiment_id = Some("unavailable-neuro".into());
+            request.variants[0].brain_family = alias.into();
+            let error = handle
+                .create_experiment(request)
+                .expect_err("disabled NeuroFlow must fail before experiment side effects");
+            assert!(matches!(
+                error,
+                ControlError::BadRequest(reason) if reason.contains("neuro feature")
             ));
             assert!(!root.path().join("experiments").exists());
             assert!(handle.data_services.experiments.lock().unwrap().is_empty());
@@ -8506,6 +12076,8 @@ pub(crate) mod tests {
             Some(crate::BrainPreset::Dwraon),
             Some(crate::BrainPreset::Assembly),
             Some(crate::BrainPreset::Mixed),
+            #[cfg(feature = "neuro")]
+            Some(crate::BrainPreset::Neuro),
         ] {
             let directory = tempfile::Builder::new()
                 .prefix("event-canvas-control-")
@@ -8513,7 +12085,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .keep();
             eprintln!("event canvas preset {preset:?}: {}", directory.display());
-            let mut world = WorldState::new(ScriptBotsConfig {
+            let mut config = ScriptBotsConfig {
                 rng_seed: Some(42),
                 world_width: 120,
                 world_height: 120,
@@ -8524,8 +12096,12 @@ pub(crate) mod tests {
                 movement_drain: 0.0,
                 reproduction_energy_threshold: 0.0,
                 ..ScriptBotsConfig::default()
-            })
-            .unwrap();
+            };
+            if preset == Some(crate::BrainPreset::Neuro) {
+                config.neuroflow.hidden_layers = vec![7, 3];
+                config.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Sigmoid;
+            }
+            let mut world = WorldState::new(config).unwrap();
             if let Some(preset) = preset {
                 let brains = crate::install_brains(&mut world, preset)
                     .unwrap()
@@ -8713,19 +12289,22 @@ pub(crate) mod tests {
                         .apply_patch(serde_json::json!({"food_max": food_max}))
                         .unwrap(),
                 );
-                let after_config = host.port.scientific_digest_v1().unwrap();
-                let after_config_publication = handle.read_snapshot().unwrap();
-                let replayed = handle.event_canvas(target_tick).unwrap_or_else(|error| {
-                    panic!("complete recorded config round trip must replay: {error}")
-                });
+                let after_edits_digest = host.port.scientific_digest_v1().unwrap();
+                let after_edits_publication = handle.read_snapshot().unwrap();
+                let replayed = handle
+                    .event_canvas(target_tick)
+                    .expect("complete committed config history can be replayed");
                 assert_eq!(
                     logical(serde_json::to_value(&replayed.snapshot.world).unwrap()),
                     logical(serde_json::to_value(&oracle.world).unwrap())
                 );
-                assert_eq!(host.port.scientific_digest_v1().unwrap(), after_config);
+                assert_eq!(
+                    host.port.scientific_digest_v1().unwrap(),
+                    after_edits_digest
+                );
                 assert!(Arc::ptr_eq(
                     &handle.read_snapshot().unwrap(),
-                    &after_config_publication
+                    &after_edits_publication
                 ));
                 let fresh = handle
                     .create_checkpoint(CheckpointCreateRequest::default())
@@ -8886,6 +12465,1798 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn checkpoint_retry_recovers_the_original_cut_after_owner_restart_at_full_capacity() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+        host.wait_applied(&handle.step().unwrap());
+        let request = CheckpointCreateRequest {
+            description: Some("original scientific cut".into()),
+            idempotency_key: Some("restart-safe-create".into()),
+        };
+        let saved = handle.create_checkpoint(request.clone()).unwrap();
+        let original = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap().1;
+        let admission_path =
+            checkpoint_request_path(&directory, request.idempotency_key.as_deref().unwrap());
+        let admission_bytes = fs::read(&admission_path).unwrap();
+        let admission: CheckpointRequestRecord = serde_json::from_slice(&admission_bytes).unwrap();
+        assert_eq!(
+            admission.admission.source_session,
+            scriptbots_runtime::HostSessionId::new(0xc017)
+        );
+        host.wait_applied(&handle.step().unwrap());
+        assert_eq!(handle.create_checkpoint(request.clone()).unwrap(), saved);
+        drop(handle);
+        drop(host);
+
+        let owner = TestHost::spawn_with_identity(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 40,
+                world_height: 40,
+                food_cell_size: 10,
+                rng_seed: Some(57),
+                persistence_interval: 0,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+            None,
+            scriptbots_runtime::HostSessionId::new(0xc018),
+        );
+        let mut restarted = owner.handle();
+        restarted.data_services = Arc::new(DataServices::new(directory.clone()));
+        let restarted = restarted
+            .with_checkpoint_retention_limits(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 1,
+                max_bytes: saved.byte_size,
+            })
+            .unwrap();
+        let mut pipeline = scriptbots_storage::StoragePipeline::unattributed_memory().unwrap();
+        let writer = pipeline.checkpoint_writer();
+        writer
+            .configure_retention(scriptbots_storage::CheckpointRetentionLimits {
+                max_count: 0,
+                max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+        let restarted = restarted.with_checkpoint_writer(Some(writer));
+        let before = owner.port.scientific_digest_v1().unwrap();
+        let publication = restarted.read_snapshot().unwrap();
+        assert_eq!(before.tick.0, 0);
+        let retries = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let request = request.clone();
+                    let restarted = &restarted;
+                    scope.spawn(move || restarted.create_checkpoint(request).unwrap())
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for retry in retries {
+            assert_eq!(retry, saved);
+        }
+        assert_eq!(
+            restarted.get_checkpoint(&saved.checkpoint_id).unwrap(),
+            saved
+        );
+        assert_eq!(
+            restarted
+                .read_artifact_bytes(&saved.checkpoint_id)
+                .unwrap()
+                .1,
+            original
+        );
+        let usage = restarted.checkpoint_retention_usage().unwrap();
+        assert_eq!(usage.file_count, 1);
+        assert_eq!(usage.file_bytes, saved.byte_size);
+        assert_eq!(usage.request_entries, 0);
+        assert_eq!(usage.pending_entries, 0);
+        assert_eq!(usage.retained_request_records, 1);
+        assert_eq!(usage.reserved_checkpoint_count, 1);
+        assert_eq!(
+            usage.retained_request_record_bytes,
+            admission_bytes.len() as u64
+        );
+        assert!(usage.retained_request_record_bytes <= usage.max_retained_request_record_bytes);
+        assert_eq!(usage.sql_count, Some(0));
+        let changed = CheckpointCreateRequest {
+            description: Some("different request contents".into()),
+            ..request
+        };
+        assert!(matches!(
+            restarted.create_checkpoint(changed),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            restarted.create_checkpoint(CheckpointCreateRequest::default()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        assert!(Arc::ptr_eq(
+            &restarted.read_snapshot().unwrap(),
+            &publication
+        ));
+        assert_eq!(fs::read(&admission_path).unwrap(), admission_bytes);
+        pipeline.shutdown().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_retry_unfinished_admissions_never_recapture_after_reopen() {
+        let source = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&source, 4, 8 * 1024 * 1024);
+        host.wait_applied(&handle.step().unwrap());
+        let request = CheckpointCreateRequest {
+            description: Some("reserved original cut".into()),
+            idempotency_key: Some("interrupted-create".into()),
+        };
+        let saved = handle.create_checkpoint(request.clone()).unwrap();
+        let admission_name =
+            checkpoint_request_path(&source, request.idempotency_key.as_deref().unwrap())
+                .file_name()
+                .unwrap()
+                .to_owned();
+        let admission_bytes = fs::read(source.join(&admission_name)).unwrap();
+        let admission: CheckpointRequestRecord = serde_json::from_slice(&admission_bytes).unwrap();
+        let original_session = format!(
+            "original source session {}",
+            admission.admission.source_session.get()
+        );
+        let payload_name = format!("{}.bin", saved.checkpoint_id);
+        let descriptor_name = format!("{}{CHECKPOINT_CATALOG_SUFFIX}", saved.checkpoint_id);
+        drop(handle);
+        drop(host);
+
+        for prefix in ["admission", "payload", "descriptor"] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            fs::write(directory.join(&admission_name), &admission_bytes).unwrap();
+            if prefix != "admission" {
+                fs::copy(source.join(&payload_name), directory.join(&payload_name)).unwrap();
+            }
+            if prefix == "descriptor" {
+                fs::copy(
+                    source.join(&descriptor_name),
+                    directory.join(&descriptor_name),
+                )
+                .unwrap();
+            }
+            let (restarted, owner) = checkpoint_test_handle(&directory, 1, 8 * 1024 * 1024);
+            let entries = fs::read_dir(&directory).unwrap().count();
+            let before = owner.port.scientific_digest_v1().unwrap();
+            for _ in 0..2 {
+                let error = restarted.create_checkpoint(request.clone()).unwrap_err();
+                assert!(
+                    matches!(error, ControlError::CheckpointRetentionUnavailable(ref detail)
+                        if detail.contains("completion is unconfirmed")
+                            && detail.contains(&original_session)),
+                    "{prefix}: {error}"
+                );
+            }
+            assert!(matches!(
+                restarted.create_checkpoint(CheckpointCreateRequest::default()),
+                Err(ControlError::CheckpointCapacity(_))
+            ));
+            let usage = restarted.checkpoint_retention_usage().unwrap();
+            assert_eq!(usage.retained_request_records, 1);
+            assert_eq!(usage.request_entries, 0);
+            assert_eq!(restarted.list_checkpoints(None, None).unwrap().total, 0);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), entries);
+            assert_eq!(
+                fs::read(directory.join(&admission_name)).unwrap(),
+                admission_bytes
+            );
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn checkpoint_retry_counts_mixed_anonymous_and_unfinished_reservations_after_restart() {
+        let source = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&source, 2, 8 * 1024 * 1024);
+        let request = CheckpointCreateRequest {
+            description: Some("reserved keyed cut".into()),
+            idempotency_key: Some("mixed-pending-key".into()),
+        };
+        handle.create_checkpoint(request.clone()).unwrap();
+        let first_usage = handle.checkpoint_retention_usage().unwrap();
+        assert_eq!(first_usage.file_count, 1);
+        assert_eq!(first_usage.retained_request_records, 1);
+        assert_eq!(first_usage.request_entries, 1);
+        assert_eq!(first_usage.reserved_checkpoint_count, 1);
+        host.wait_applied(&handle.step().unwrap());
+        let anonymous = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .expect("one completed keyed checkpoint consumes only one slot");
+        assert_eq!(
+            handle
+                .checkpoint_retention_usage()
+                .unwrap()
+                .reserved_checkpoint_count,
+            2
+        );
+        assert!(matches!(
+            handle.create_checkpoint(CheckpointCreateRequest::default()),
+            Err(ControlError::CheckpointCapacity(_))
+        ));
+        let admission_name =
+            checkpoint_request_path(&source, request.idempotency_key.as_deref().unwrap())
+                .file_name()
+                .unwrap()
+                .to_owned();
+        let admission_bytes = fs::read(source.join(&admission_name)).unwrap();
+        drop(handle);
+        drop(host);
+
+        for intact in [true, false] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let retained_admission = if intact {
+                admission_bytes.as_slice()
+            } else {
+                &admission_bytes[..admission_bytes.len() / 2]
+            };
+            fs::write(directory.join(&admission_name), retained_admission).unwrap();
+            for suffix in [
+                ".bin",
+                CHECKPOINT_CATALOG_SUFFIX,
+                CHECKPOINT_CATALOG_READY_SUFFIX,
+            ] {
+                let name = format!("{}{suffix}", anonymous.checkpoint_id);
+                fs::copy(source.join(&name), directory.join(&name)).unwrap();
+            }
+            let (restarted, owner) = checkpoint_test_handle(&directory, 2, 8 * 1024 * 1024);
+            let before = owner.port.scientific_digest_v1().unwrap();
+            let publication = restarted.read_snapshot().unwrap();
+            let entries = fs::read_dir(&directory).unwrap().count();
+            let usage = restarted.checkpoint_retention_usage().unwrap();
+            assert_eq!(usage.file_count, 1);
+            assert_eq!(usage.retained_request_records, 1);
+            assert_eq!(usage.request_entries, 0);
+            assert_eq!(usage.reserved_checkpoint_count, 2);
+            assert_eq!(
+                restarted.get_checkpoint(&anonymous.checkpoint_id).unwrap(),
+                anonymous
+            );
+            for new_key in [None, Some("different-new-key".to_owned())] {
+                assert!(matches!(
+                    restarted.create_checkpoint(CheckpointCreateRequest {
+                        description: None,
+                        idempotency_key: new_key,
+                    }),
+                    Err(ControlError::CheckpointCapacity(_))
+                ));
+            }
+            assert!(matches!(
+                restarted.create_checkpoint(request.clone()),
+                Err(ControlError::CheckpointRetentionUnavailable(_))
+            ));
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), entries);
+            assert_eq!(
+                fs::read(directory.join(&admission_name)).unwrap(),
+                retained_admission
+            );
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+            assert!(Arc::ptr_eq(
+                &restarted.read_snapshot().unwrap(),
+                &publication
+            ));
+        }
+    }
+
+    #[test]
+    fn checkpoint_retry_rejects_corrupt_and_rehashed_admissions_without_new_captures() {
+        let source = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&source, 4, 8 * 1024 * 1024);
+        let request = CheckpointCreateRequest {
+            description: Some("original request".into()),
+            idempotency_key: Some("corrupt-admission".into()),
+        };
+        let saved = handle.create_checkpoint(request.clone()).unwrap();
+        let admission_name =
+            checkpoint_request_path(&source, request.idempotency_key.as_deref().unwrap())
+                .file_name()
+                .unwrap()
+                .to_owned();
+        let admission_bytes = fs::read(source.join(&admission_name)).unwrap();
+        drop(handle);
+        drop(host);
+
+        for corruption in [
+            "truncated",
+            "checksum",
+            "schema",
+            "key",
+            "metadata",
+            "payload",
+        ] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            for suffix in [
+                ".bin",
+                CHECKPOINT_CATALOG_SUFFIX,
+                CHECKPOINT_CATALOG_READY_SUFFIX,
+            ] {
+                let name = format!("{}{suffix}", saved.checkpoint_id);
+                fs::copy(source.join(&name), directory.join(&name)).unwrap();
+            }
+            let mut record: CheckpointRequestRecord =
+                serde_json::from_slice(&admission_bytes).unwrap();
+            match corruption {
+                "checksum" | "metadata" => {
+                    record.admission.metadata.description = Some("changed contents".into());
+                }
+                "schema" => record.admission.schema_version += 1,
+                "key" => record.admission.idempotency_key = "different-original-key".into(),
+                "truncated" | "payload" => {}
+                _ => unreachable!(),
+            }
+            if corruption != "checksum" {
+                record.checksum_blake3 =
+                    compute_blake3(&serde_json::to_vec(&record.admission).unwrap());
+            }
+            let path = directory.join(&admission_name);
+            if corruption == "truncated" {
+                fs::write(&path, &admission_bytes[..admission_bytes.len() / 2]).unwrap();
+            } else {
+                fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+            if corruption == "payload" {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(directory.join(format!("{}.bin", saved.checkpoint_id)))
+                    .unwrap()
+                    .write_all(&[0xff])
+                    .unwrap();
+            }
+            let changed = fs::read(&path).unwrap();
+            let (restarted, owner) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let entries = fs::read_dir(&directory).unwrap().count();
+            let before = owner.port.scientific_digest_v1().unwrap();
+            let error = restarted.create_checkpoint(request.clone()).unwrap_err();
+            assert!(
+                matches!(error, ControlError::CheckpointRetentionUnavailable(_)),
+                "{corruption}: {error}"
+            );
+            assert_eq!(
+                restarted
+                    .checkpoint_retention_usage()
+                    .unwrap()
+                    .request_entries,
+                0
+            );
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), entries);
+            assert_eq!(fs::read(&path).unwrap(), changed);
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn checkpoint_retry_refuses_duplicate_roots_even_with_a_cached_receipt() {
+        let first = tempfile::tempdir().unwrap().keep();
+        let second = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&first, 4, 8 * 1024 * 1024);
+        let request = CheckpointCreateRequest {
+            description: Some("one original request".into()),
+            idempotency_key: Some("ambiguous-root".into()),
+        };
+        let saved = handle.create_checkpoint(request.clone()).unwrap();
+        let first_path =
+            checkpoint_request_path(&first, request.idempotency_key.as_deref().unwrap());
+        let second_path =
+            checkpoint_request_path(&second, request.idempotency_key.as_deref().unwrap());
+        let original = fs::read(&first_path).unwrap();
+        fs::write(&second_path, &original).unwrap();
+        let handle = handle.with_artifacts_dir(second.clone()).unwrap();
+        let before = host.port.scientific_digest_v1().unwrap();
+        assert!(matches!(
+            handle.create_checkpoint(request.clone()),
+            Err(ControlError::Conflict(_))
+        ));
+        let usage = handle.checkpoint_retention_usage().unwrap();
+        assert_eq!(usage.retained_request_records, 2);
+        assert_eq!(usage.file_count, 1);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        drop(handle);
+        drop(host);
+
+        let (restarted, owner) = checkpoint_test_handle(&first, 4, 8 * 1024 * 1024);
+        let restarted = restarted.with_artifacts_dir(second).unwrap();
+        let before = owner.port.scientific_digest_v1().unwrap();
+        assert!(matches!(
+            restarted.create_checkpoint(request),
+            Err(ControlError::Conflict(_))
+        ));
+        assert_eq!(
+            restarted
+                .checkpoint_retention_usage()
+                .unwrap()
+                .request_entries,
+            0
+        );
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(fs::read(&first_path).unwrap(), original);
+        assert_eq!(fs::read(&second_path).unwrap(), original);
+        assert!(first.join(format!("{}.bin", saved.checkpoint_id)).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_retry_refuses_aliased_admissions_without_using_the_cached_receipt() {
+        for alias in ["symlink", "hardlink"] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let (handle, host) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let request = CheckpointCreateRequest {
+                description: None,
+                idempotency_key: Some("aliased-admission".into()),
+            };
+            handle.create_checkpoint(request.clone()).unwrap();
+            let path =
+                checkpoint_request_path(&directory, request.idempotency_key.as_deref().unwrap());
+            let original = fs::read(&path).unwrap();
+            let preserved = directory.join("preserved-admission");
+            fs::rename(&path, &preserved).unwrap();
+            if alias == "symlink" {
+                std::os::unix::fs::symlink(&preserved, &path).unwrap();
+            } else {
+                fs::hard_link(&preserved, &path).unwrap();
+            }
+            let before = host.port.scientific_digest_v1().unwrap();
+            assert!(
+                matches!(
+                    handle.create_checkpoint(request),
+                    Err(ControlError::CheckpointRetentionUnavailable(_))
+                ),
+                "{alias}"
+            );
+            assert_eq!(fs::read(&preserved).unwrap(), original);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_recovers_download_review_and_pagination_without_adopting_requests() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 8, 8 * 1024 * 1024);
+        host.wait_applied(&handle.step().unwrap());
+        let first = handle
+            .create_checkpoint(CheckpointCreateRequest {
+                description: Some("saved before the second intervention".into()),
+                idempotency_key: Some("original-request".into()),
+            })
+            .unwrap();
+        let first_bytes = handle.read_artifact_bytes(&first.checkpoint_id).unwrap().1;
+        host.wait_applied(&handle.step().unwrap());
+        let second = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let second_bytes = handle.read_artifact_bytes(&second.checkpoint_id).unwrap().1;
+        let uncatalogued_id = format!("ckpt-{:032x}-t{}", 0, first.tick);
+        fs::write(
+            directory.join(format!("{uncatalogued_id}.bin")),
+            &first_bytes,
+        )
+        .unwrap();
+        fs::write(
+            directory.join(format!("{uncatalogued_id}{CHECKPOINT_CATALOG_SUFFIX}")),
+            b"interrupted descriptor without a completion marker",
+        )
+        .unwrap();
+        let descriptors = [first.clone(), second.clone()].map(|metadata| {
+            let path = directory.join(format!(
+                "{}{CHECKPOINT_CATALOG_SUFFIX}",
+                metadata.checkpoint_id
+            ));
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        });
+        drop(handle);
+        drop(host);
+
+        let (restarted, owner) = checkpoint_test_handle(&directory, 8, 8 * 1024 * 1024);
+        let before = owner.port.scientific_digest_v1().unwrap();
+        assert_eq!(before.tick.0, 0);
+        // Cold download must work even when no catalog/list method was called.
+        assert_eq!(
+            restarted
+                .read_artifact_bytes(&first.checkpoint_id)
+                .unwrap()
+                .1,
+            first_bytes
+        );
+        let page = restarted.list_checkpoints(Some(1), None).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items.len(), 1);
+        assert!(page.has_more);
+        let next = restarted
+            .list_checkpoints(Some(1), page.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(next.total, 2);
+        assert_eq!(next.items.len(), 1);
+        assert!(!next.has_more);
+        assert_ne!(page.items[0].checkpoint_id, next.items[0].checkpoint_id);
+        for (expected, bytes) in [(&first, &first_bytes), (&second, &second_bytes)] {
+            assert_eq!(
+                serde_json::to_value(restarted.get_checkpoint(&expected.checkpoint_id).unwrap())
+                    .unwrap(),
+                serde_json::to_value(expected).unwrap(),
+            );
+            assert_eq!(
+                &restarted
+                    .read_artifact_bytes(&expected.checkpoint_id)
+                    .unwrap()
+                    .1,
+                bytes
+            );
+            let snapshot = restarted
+                .checkpoint_canvas(&expected.checkpoint_id)
+                .unwrap();
+            assert_eq!(snapshot.world.tick, expected.tick);
+            assert_eq!(snapshot.world.agents.len(), expected.agent_count);
+        }
+        assert_eq!(restarted.list_artifacts(None, None).unwrap().total, 2);
+        let usage = restarted.checkpoint_retention_usage().unwrap();
+        assert_eq!(
+            usage.file_count, 3,
+            "uncatalogued files still consume quota"
+        );
+        assert_eq!(usage.request_entries, 0);
+        assert_eq!(usage.pending_entries, 0);
+        assert!(matches!(
+            restarted.get_checkpoint(&uncatalogued_id),
+            Err(ControlError::NotFound(_))
+        ));
+        assert!(matches!(
+            restarted.event_canvas(first.tick),
+            Err(ControlError::NotFound(_))
+        ));
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        for (path, bytes) in descriptors {
+            assert_eq!(
+                fs::read(path).unwrap(),
+                bytes,
+                "discovery must not rewrite evidence"
+            );
+        }
+        assert_eq!(
+            fs::read(directory.join(format!("{uncatalogued_id}.bin"))).unwrap(),
+            first_bytes
+        );
+    }
+
+    #[test]
+    fn checkpoint_catalog_rejects_corrupt_and_rehashed_false_descriptors_without_mutating_owner() {
+        for corruption in [
+            "checksum",
+            "population",
+            "schema",
+            "payload_bound",
+            "record_bound",
+        ] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let (handle, host) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let metadata = handle
+                .create_checkpoint(CheckpointCreateRequest::default())
+                .unwrap();
+            let path = directory.join(format!(
+                "{}{CHECKPOINT_CATALOG_SUFFIX}",
+                metadata.checkpoint_id
+            ));
+            let original = fs::read(&path).unwrap();
+            fs::write(directory.join("descriptor.original"), &original).unwrap();
+            let payload =
+                fs::read(directory.join(format!("{}.bin", metadata.checkpoint_id))).unwrap();
+            let mut record: CheckpointCatalogRecord = serde_json::from_slice(&original).unwrap();
+            match corruption {
+                "checksum" => {
+                    record.metadata.description = Some("changed without rehashing".into())
+                }
+                "population" => record.metadata.agent_count += 1,
+                "schema" => record.schema_version += 1,
+                "payload_bound" => record.metadata.byte_size = 1,
+                "record_bound" => {}
+                _ => unreachable!(),
+            }
+            if corruption != "checksum" {
+                record.checksum_blake3 =
+                    compute_blake3(&serde_json::to_vec(&record.metadata).unwrap());
+            }
+            if corruption == "record_bound" {
+                fs::write(&path, vec![b' '; MAX_CHECKPOINT_CATALOG_RECORD_BYTES + 1]).unwrap();
+            } else {
+                fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+            let changed = fs::read(&path).unwrap();
+            drop(handle);
+            drop(host);
+            let (restarted, owner) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let before = owner.port.scientific_digest_v1().unwrap();
+            let error = restarted
+                .get_checkpoint(&metadata.checkpoint_id)
+                .unwrap_err();
+            assert!(
+                matches!(error, ControlError::CheckpointRetentionUnavailable(_)),
+                "{corruption}: {error}"
+            );
+            if corruption.ends_with("_bound") {
+                assert!(
+                    error.to_string().contains("byte bound"),
+                    "{corruption}: {error}"
+                );
+            }
+            assert!(restarted.list_checkpoints(None, None).is_err());
+            assert!(
+                restarted
+                    .read_artifact_bytes(&metadata.checkpoint_id)
+                    .is_err()
+            );
+            assert!(
+                restarted
+                    .data_services
+                    .checkpoints
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(restarted.data_services.artifacts.lock().unwrap().is_empty());
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+            assert_eq!(fs::read(&path).unwrap(), changed);
+            assert_eq!(
+                fs::read(directory.join(format!("{}.bin", metadata.checkpoint_id))).unwrap(),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_rejects_ambiguous_directories_even_after_a_cached_read() {
+        let first = tempfile::tempdir().unwrap().keep();
+        let second = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&first, 4, 8 * 1024 * 1024);
+        let metadata = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let expected = handle
+            .read_artifact_bytes(&metadata.checkpoint_id)
+            .unwrap()
+            .1;
+        for suffix in [
+            ".bin",
+            CHECKPOINT_CATALOG_SUFFIX,
+            CHECKPOINT_CATALOG_READY_SUFFIX,
+        ] {
+            let name = format!("{}{suffix}", metadata.checkpoint_id);
+            fs::copy(first.join(&name), second.join(&name)).unwrap();
+        }
+        let handle = handle.with_artifacts_dir(second.clone()).unwrap();
+        let before = host.port.scientific_digest_v1().unwrap();
+        assert!(matches!(
+            handle.get_checkpoint(&metadata.checkpoint_id),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            handle.read_artifact_bytes(&metadata.checkpoint_id),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            handle.list_checkpoints(None, None),
+            Err(ControlError::Conflict(_))
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                handle.get_checkpoint(&metadata.checkpoint_id),
+                Err(ControlError::Conflict(_))
+            ));
+            assert!(matches!(
+                handle.read_artifact_bytes(&metadata.checkpoint_id),
+                Err(ControlError::Conflict(_))
+            ));
+        }
+        assert!(handle.data_services.checkpoints.lock().unwrap().is_empty());
+        assert!(handle.data_services.artifacts.lock().unwrap().is_empty());
+        assert_eq!(
+            handle.checkpoint_retention_usage().unwrap().request_entries,
+            1
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        for directory in [first, second] {
+            assert_eq!(
+                fs::read(directory.join(format!("{}.bin", metadata.checkpoint_id))).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_catalog_failure_preserves_pending_identity_and_never_overwrites_descriptor() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+        let request = CheckpointCreateRequest {
+            description: None,
+            idempotency_key: Some("catalog-retry".into()),
+        };
+        let metadata = handle.create_checkpoint(request.clone()).unwrap();
+        let path = directory.join(format!(
+            "{}{CHECKPOINT_CATALOG_SUFFIX}",
+            metadata.checkpoint_id
+        ));
+        let original = fs::read(&path).unwrap();
+        fs::write(directory.join("descriptor.original"), &original).unwrap();
+        fs::write(&path, b"partial descriptor").unwrap();
+        assert!(matches!(
+            write_checkpoint_catalog(&directory, &metadata),
+            Err(ControlError::CheckpointRetentionUnavailable(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"partial descriptor");
+        // Model the retained state immediately before descriptor publication.
+        // Discovery must never promote that request; only its exact retry can.
+        {
+            let mut retention = handle.data_services.checkpoint_retention.lock().unwrap();
+            retention
+                .requests
+                .get_mut("checkpoint:catalog-retry")
+                .unwrap()
+                .acknowledged = false;
+            handle.data_services.checkpoints.lock().unwrap().clear();
+            handle.data_services.artifacts.lock().unwrap().clear();
+        }
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        let before = host.port.scientific_digest_v1().unwrap();
+        assert!(matches!(
+            handle.create_checkpoint(request),
+            Err(ControlError::CheckpointRetentionUnavailable(_))
+        ));
+        let usage = handle.checkpoint_retention_usage().unwrap();
+        assert_eq!(usage.file_count, 1);
+        assert_eq!(usage.request_entries, 1);
+        assert_eq!(usage.pending_entries, 1);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(fs::read(path).unwrap(), b"partial descriptor");
+    }
+
+    fn checkpoint_branch_fixture(
+        preset: Option<crate::BrainPreset>,
+        initial_ticks: usize,
+    ) -> (ControlHandle, TestHost, CheckpointMetadataDto, PathBuf) {
+        let directory = tempfile::Builder::new()
+            .prefix("managed-checkpoint-branch-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let mut config = ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            rng_seed: Some(42),
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            topography_enabled: false,
+            reproduction_energy_threshold: f32::MAX,
+            ..ScriptBotsConfig::default()
+        };
+        if preset == Some(crate::BrainPreset::Neuro) {
+            config.neuroflow.hidden_layers = vec![7, 3];
+            config.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Sigmoid;
+        }
+        let mut world = WorldState::new(config).unwrap();
+        if let Some(preset) = preset {
+            let installed = crate::install_brains(&mut world, preset).unwrap();
+            for _ in 0..2 {
+                let id = world
+                    .try_spawn_agent(scriptbots_core::AgentData::default())
+                    .expect("seed checkpoint branch founder");
+                assert!(
+                    world
+                        .bind_agent_brain(id, installed.population()[0])
+                        .unwrap()
+                );
+            }
+        }
+        let host = TestHost::spawn(world);
+        let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+        for _ in 0..initial_ticks {
+            host.wait_applied(&handle.step().unwrap());
+        }
+        let checkpoint = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        (handle, host, checkpoint, directory)
+    }
+
+    fn checkpoint_branch_request(checkpoint_id: &str, key: &str) -> CheckpointBranchRequest {
+        CheckpointBranchRequest {
+            checkpoint_id: checkpoint_id.to_owned(),
+            branch_name: "saved-future".to_owned(),
+            ticks: 3,
+            intervention: None,
+            idempotency_key: key.to_owned(),
+        }
+    }
+
+    fn wait_for_checkpoint_branch(
+        handle: &ControlHandle,
+        branch_id: &str,
+    ) -> CheckpointBranchStatusDto {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let status = handle.get_checkpoint_branch(branch_id).unwrap();
+            if !matches!(status.status.as_str(), "running" | "cancelling") {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "branch did not finish: {status:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn checkpoint_world_digest_and_artifact_checksums_have_distinct_formats() {
+        assert!(valid_world_digest_v1("0123456789abcdef"));
+        for invalid in [
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "0123456789abcdeF",
+            "0123456789abcdeg",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(!valid_world_digest_v1(invalid), "{invalid}");
+        }
+        assert!(!valid_branch_digest("0123456789abcdef"));
+        assert!(valid_branch_digest(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!valid_branch_digest(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF"
+        ));
+    }
+
+    #[test]
+    fn managed_checkpoint_branches_restore_real_saved_cuts_and_preserve_live_owner() {
+        let mut distinct = std::collections::BTreeSet::new();
+        for (preset, ticks) in [
+            (crate::BrainPreset::Mlp, 0),
+            (crate::BrainPreset::Dwraon, 1),
+            #[cfg(feature = "neuro")]
+            (crate::BrainPreset::Neuro, 2),
+        ] {
+            let (handle, host, checkpoint, directory) =
+                checkpoint_branch_fixture(Some(preset), ticks);
+            assert_eq!(checkpoint.agent_count, 2);
+            assert!(distinct.insert(checkpoint.world_digest_v1.clone()));
+            let live = host.port.scientific_digest_v1().unwrap();
+            let published = host.port.snapshot_hub().latest();
+            let (_, original_bytes) = handle
+                .read_artifact_bytes(&checkpoint.checkpoint_id)
+                .unwrap();
+            let request = checkpoint_branch_request(&checkpoint.checkpoint_id, "exact-source");
+            let admitted = handle.create_checkpoint_branch(request.clone()).unwrap();
+            assert_eq!(admitted.source_tick, ticks as u64);
+            assert_eq!(admitted.target_tick, ticks as u64 + 3);
+            assert_eq!(admitted.world_digest_v1, checkpoint.world_digest_v1);
+            assert_eq!(
+                handle
+                    .create_checkpoint_branch(request.clone())
+                    .unwrap()
+                    .branch_id,
+                admitted.branch_id
+            );
+            let mut conflict = request;
+            conflict.ticks += 1;
+            assert!(matches!(
+                handle.create_checkpoint_branch(conflict),
+                Err(ControlError::Conflict(_))
+            ));
+            let final_status = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+            assert_eq!(final_status.status, "completed", "{final_status:?}");
+            let (metadata, report_bytes) = handle
+                .read_artifact_bytes(final_status.artifact_id.as_deref().unwrap())
+                .unwrap();
+            assert_eq!(compute_blake3(&report_bytes), metadata.checksum_blake3);
+            let report: crate::branch_study::BranchStudyReport =
+                serde_json::from_slice(&report_bytes).unwrap();
+            assert_eq!(report.pre_intervention_digest, checkpoint.world_digest_v1);
+            assert!(report.pre_intervention_digest_verified_for_all_branches);
+            assert_eq!(report.branch_reports.len(), 1);
+            let outcome = &report.branch_reports[0];
+            assert_eq!(outcome.terminal_sample.tick, final_status.target_tick);
+            assert!(outcome.bundle_verified);
+            let decoded = scriptbots_core::WorldCheckpointV1::decode(&original_bytes).unwrap();
+            let registry = crate::create_brain_registry_for_config(preset, decoded.config())
+                .expect("known original preset and constructor configuration");
+            let mut oracle = WorldState::restore_checkpoint_v1(&decoded, registry).unwrap();
+            for _ in 0..3 {
+                oracle.step().unwrap();
+            }
+            assert_eq!(
+                outcome.final_digest,
+                oracle.world_digest_v1().unwrap().overall
+            );
+            assert_eq!(
+                fs::read(
+                    directory
+                        .join("branches")
+                        .join(&admitted.branch_id)
+                        .join("study")
+                        .join("source_checkpoint.bin")
+                )
+                .unwrap(),
+                original_bytes
+            );
+            let artifacts = handle.list_artifacts(Some(100), None).unwrap();
+            assert!(
+                artifacts
+                    .items
+                    .iter()
+                    .any(|item| item.filename == "source_checkpoint.bin")
+            );
+            assert!(
+                artifacts
+                    .items
+                    .iter()
+                    .any(|item| item.filename == "bundle_manifest.json")
+            );
+            // The same published plan consumed by the offline CLI must restore
+            // this saved cut, including tick zero, instead of seeding a new world.
+            let plan_artifact = artifacts
+                .items
+                .iter()
+                .find(|item| item.filename == "study_plan.json")
+                .expect("published reproducible plan");
+            let (_, plan_bytes) = handle
+                .read_artifact_bytes(&plan_artifact.artifact_id)
+                .unwrap();
+            let retained_plan: crate::branch_study::BranchStudyPlan =
+                serde_json::from_slice(&plan_bytes).unwrap();
+            let retained_source = retained_plan
+                .source_checkpoint
+                .as_ref()
+                .expect("saved-cut plan cannot imply seeded warmup");
+            assert!(retained_source.is_absolute());
+            assert_eq!(
+                retained_source,
+                &directory
+                    .join("branches")
+                    .join(&admitted.branch_id)
+                    .join("study")
+                    .join("source_checkpoint.bin")
+            );
+            assert_eq!(fs::read(retained_source).unwrap(), original_bytes);
+            let rerun_output = directory.join("offline-reproduced");
+            let rerunner = crate::branch_study::BranchStudyOrchestrator::new(
+                retained_plan,
+                rerun_output.clone(),
+            );
+            rerunner.validate().expect("published plan is executable");
+            let reproduced = std::thread::Builder::new()
+                .stack_size(32 * 1024 * 1024)
+                .spawn(move || rerunner.execute_study(None))
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+            assert_eq!(reproduced.source, report.source);
+            assert_eq!(
+                reproduced.pre_intervention_digest,
+                report.pre_intervention_digest
+            );
+            assert_eq!(reproduced.branch_reports.len(), report.branch_reports.len());
+            assert_eq!(
+                reproduced.branch_reports[0].final_digest,
+                outcome.final_digest
+            );
+            assert_eq!(
+                reproduced.branch_reports[0].terminal_sample,
+                outcome.terminal_sample
+            );
+            assert!(reproduced.branch_reports[0].bundle_verified);
+            assert_eq!(
+                fs::read(rerun_output.join("source_checkpoint.bin")).unwrap(),
+                original_bytes
+            );
+            for artifact in artifacts.items {
+                handle.read_artifact_bytes(&artifact.artifact_id).unwrap();
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+            assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &published));
+            assert_eq!(
+                handle
+                    .data_services
+                    .checkpoint_branches
+                    .lock()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            handle.data_services.shutdown_experiments().unwrap();
+            assert_eq!(
+                handle
+                    .data_services
+                    .execution_capacity
+                    .lock()
+                    .unwrap()
+                    .reserved_run_slots,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_treatment_shares_source_and_records_actual_divergence() {
+        let (handle, host, checkpoint, _) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut request = checkpoint_branch_request(&checkpoint.checkpoint_id, "paired-treatment");
+        request.intervention = Some(crate::branch_study::StudyIntervention::Drought {
+            region: None,
+            duration_ticks: 2,
+            growth_scale: 0.0,
+        });
+        let admitted = handle.create_checkpoint_branch(request).unwrap();
+        let final_status = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+        assert_eq!(final_status.status, "completed", "{final_status:?}");
+        let (_, bytes) = handle
+            .read_artifact_bytes(final_status.artifact_id.as_deref().unwrap())
+            .unwrap();
+        let report: crate::branch_study::BranchStudyReport =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report.branch_reports.len(), 2);
+        assert!(report.pre_intervention_digest_verified_for_all_branches);
+        let treatment = report
+            .branch_reports
+            .iter()
+            .find(|branch| branch.branch_id == "treatment")
+            .unwrap();
+        assert_eq!(treatment.command_applied_tick, Some(checkpoint.tick));
+        assert!(treatment.first_divergence.is_some());
+        assert!(
+            report
+                .branch_reports
+                .iter()
+                .all(|branch| branch.bundle_verified
+                    && branch.terminal_sample.tick == final_status.target_tick)
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        handle.data_services.shutdown_experiments().unwrap();
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_artifacts_page_verified_files_without_crossing_studies() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let first = handle
+            .create_checkpoint_branch(checkpoint_branch_request(
+                &checkpoint.checkpoint_id,
+                "first",
+            ))
+            .unwrap();
+        let first = wait_for_checkpoint_branch(&handle, &first.branch_id);
+        assert_eq!(first.status, "completed");
+        let second = handle
+            .create_checkpoint_branch(checkpoint_branch_request(
+                &checkpoint.checkpoint_id,
+                "second",
+            ))
+            .unwrap();
+        let second = wait_for_checkpoint_branch(&handle, &second.branch_id);
+        assert_eq!(second.status, "completed");
+
+        let prefix = format!("branches/{}/study/", first.branch_id);
+        let mut cursor = None;
+        let mut ids = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
+        let mut total = None;
+        loop {
+            let page = handle
+                .list_checkpoint_branch_artifacts(&first.branch_id, Some(2), cursor.as_deref())
+                .unwrap();
+            assert_eq!(page.limit, 2);
+            assert_eq!(page.offset, ids.len());
+            assert_eq!(*total.get_or_insert(page.total), page.total);
+            assert!(!page.items.is_empty());
+            for item in page.items {
+                assert!(item.relative_path.starts_with(&prefix));
+                assert!(
+                    ids.insert(item.artifact_id.clone()),
+                    "pagination repeated a file"
+                );
+                paths.insert(item.relative_path.clone());
+                let (download, bytes) = handle.read_artifact_bytes(&item.artifact_id).unwrap();
+                assert_eq!(download.relative_path, item.relative_path);
+                assert_eq!(bytes.len() as u64, item.byte_size);
+                assert_eq!(compute_blake3(&bytes), item.checksum_blake3);
+                assert_eq!(compute_sha256(&bytes), item.checksum_sha256);
+                assert_eq!(
+                    fs::read(directory.join(&item.relative_path)).unwrap(),
+                    bytes
+                );
+            }
+            if !page.has_more {
+                assert!(page.next_cursor.is_none());
+                break;
+            }
+            assert_eq!(page.next_cursor, Some(ids.len().to_string()));
+            cursor = page.next_cursor;
+        }
+        assert_eq!(ids.len(), total.unwrap());
+        assert!(ids.contains(first.artifact_id.as_ref().unwrap()));
+        assert!(!ids.contains(second.artifact_id.as_ref().unwrap()));
+        assert!(!ids.contains(&checkpoint.checkpoint_id));
+        for filename in [
+            "study_plan.json",
+            "study_source.json",
+            "study_summary.md",
+            "study_report.json",
+            "source_checkpoint.bin",
+            "bundle_control/bundle_manifest.json",
+        ] {
+            assert!(paths.contains(&format!("{prefix}{filename}")), "{filename}");
+        }
+        let beyond = handle
+            .list_checkpoint_branch_artifacts(&first.branch_id, Some(1000), Some("999999"))
+            .unwrap();
+        assert_eq!(beyond.limit, 100);
+        assert!(beyond.items.is_empty());
+        assert!(!beyond.has_more);
+        assert!(beyond.next_cursor.is_none());
+        assert!(matches!(
+            handle.list_checkpoint_branch_artifacts(&first.branch_id, None, Some("invalid")),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert!(matches!(
+            handle.list_checkpoint_branch_artifacts("unknown", None, None),
+            Err(ControlError::NotFound(_))
+        ));
+        assert!(matches!(
+            handle.list_checkpoint_branch_artifacts("../escape", None, None),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        handle.data_services.shutdown_experiments().unwrap();
+        drop(handle);
+
+        // The branch inventory itself must restore sealed artifacts after a
+        // restart; it cannot depend on a preceding whole-catalog list or download.
+        let cold = host.handle().with_artifacts_dir(directory).unwrap();
+        assert!(cold.data_services.artifacts.lock().unwrap().is_empty());
+        let inventory = cold
+            .list_checkpoint_branch_artifacts(&first.branch_id, Some(100), None)
+            .unwrap();
+        assert_eq!(inventory.total, ids.len());
+        assert_eq!(
+            inventory
+                .items
+                .into_iter()
+                .map(|item| item.artifact_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ids
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_refuses_invalid_inputs_corrupt_sources_and_capacity_before_admission()
+     {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let request = checkpoint_branch_request(&checkpoint.checkpoint_id, "refusals");
+        for ticks in [0, MAX_CHECKPOINT_BRANCH_TICKS + 1] {
+            let mut invalid = request.clone();
+            invalid.ticks = ticks;
+            assert!(matches!(
+                handle.create_checkpoint_branch(invalid),
+                Err(ControlError::BadRequest(_))
+            ));
+        }
+        let mut invalid = request.clone();
+        invalid.branch_name = "../escape".to_owned();
+        assert!(matches!(
+            handle.create_checkpoint_branch(invalid),
+            Err(ControlError::BadRequest(_))
+        ));
+        let mut oversized = request.clone();
+        oversized.intervention = Some(crate::branch_study::StudyIntervention::ConfigPatch(
+            serde_json::json!({"unknown": "x".repeat(MAX_CHECKPOINT_BRANCH_REQUEST_BYTES)}),
+        ));
+        assert!(matches!(
+            handle.create_checkpoint_branch(oversized),
+            Err(ControlError::PayloadTooLarge(_))
+        ));
+        assert!(matches!(
+            handle.get_checkpoint_branch("../escape"),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert!(matches!(
+            handle.cancel_checkpoint_branch("../escape"),
+            Err(ControlError::BadRequest(_))
+        ));
+        let mut unknown = request.clone();
+        unknown.checkpoint_id = "missing".to_owned();
+        assert!(matches!(
+            handle.create_checkpoint_branch(unknown),
+            Err(ControlError::NotFound(_))
+        ));
+        let handle = handle.with_experiment_run_capacity(0).unwrap();
+        assert!(matches!(
+            handle.create_checkpoint_branch(request.clone()),
+            Err(ControlError::ExperimentCapacity(_))
+        ));
+        let handle = handle.with_experiment_run_capacity(1).unwrap();
+        let (artifact, original) = handle
+            .read_artifact_bytes(&checkpoint.checkpoint_id)
+            .unwrap();
+        fs::write(directory.join("source-before-corruption.raw"), original).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join(artifact.relative_path))
+            .unwrap()
+            .write_all(&[0xff])
+            .unwrap();
+        assert!(handle.create_checkpoint_branch(request).is_err());
+        assert!(
+            handle
+                .data_services
+                .checkpoint_branches
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!directory.join("branches").exists());
+        assert_eq!(
+            handle
+                .data_services
+                .execution_capacity
+                .lock()
+                .unwrap()
+                .reserved_run_slots,
+            0
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+
+        let (unsupported, unsupported_host, cut, unsupported_directory) =
+            checkpoint_branch_fixture(None, 0);
+        assert!(matches!(
+            unsupported
+                .create_checkpoint_branch(checkpoint_branch_request(&cut.checkpoint_id, "unbound")),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert!(
+            unsupported
+                .data_services
+                .checkpoint_branches
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!unsupported_directory.join("branches").exists());
+        assert_eq!(
+            unsupported_host
+                .port
+                .scientific_digest_v1()
+                .unwrap()
+                .overall,
+            cut.world_digest_v1
+        );
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_catalog_recovers_receipts_retries_pages_and_cold_downloads() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let request = checkpoint_branch_request(&checkpoint.checkpoint_id, "restart-control");
+        let admitted = handle.create_checkpoint_branch(request.clone()).unwrap();
+        let completed = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        let artifact_id = completed.artifact_id.clone().unwrap();
+        let original = handle.read_artifact_bytes(&artifact_id).unwrap();
+        let mut treatment =
+            checkpoint_branch_request(&checkpoint.checkpoint_id, "restart-treatment");
+        treatment.intervention =
+            Some(crate::branch_study::StudyIntervention::ClosedWorld { closed: false });
+        let treated = handle.create_checkpoint_branch(treatment).unwrap();
+        assert_eq!(
+            wait_for_checkpoint_branch(&handle, &treated.branch_id).status,
+            "completed"
+        );
+        handle.data_services.shutdown_experiments().unwrap();
+        drop(handle);
+
+        let cold = host.handle().with_artifacts_dir(directory).unwrap();
+        assert!(cold.data_services.artifacts.lock().unwrap().is_empty());
+        // No list/status call precedes this known-ID download.
+        assert_eq!(cold.read_artifact_bytes(&artifact_id).unwrap(), original);
+        assert_eq!(
+            cold.get_checkpoint_branch(&admitted.branch_id).unwrap(),
+            completed
+        );
+        assert_eq!(
+            cold.create_checkpoint_branch(request.clone()).unwrap(),
+            completed
+        );
+        let mut conflicting = request;
+        conflicting.ticks += 1;
+        assert!(matches!(
+            cold.create_checkpoint_branch(conflicting),
+            Err(ControlError::Conflict(_))
+        ));
+
+        let first = cold.list_checkpoint_branches(Some(1), None).unwrap();
+        assert_eq!(first.total, 2);
+        assert_eq!(first.items.len(), 1);
+        assert!(first.has_more);
+        let second = cold
+            .list_checkpoint_branches(Some(1), first.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert!(!second.has_more);
+        assert_ne!(first.items[0].branch_id, second.items[0].branch_id);
+        assert!(
+            cold.list_checkpoint_branches(None, Some("not-a-cursor"))
+                .is_err()
+        );
+        assert!(
+            cold.list_checkpoint_branches(None, Some(&usize::MAX.to_string()))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert!(
+            cold.data_services
+                .checkpoint_branches
+                .lock()
+                .unwrap()
+                .values()
+                .all(|job| job.worker.is_none())
+        );
+        assert_eq!(
+            cold.data_services
+                .execution_capacity
+                .lock()
+                .unwrap()
+                .reserved_run_slots,
+            0
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_catalog_preserves_legacy_output_without_blocking_new_studies() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let legacy_key = "pre-catalog-study";
+        let legacy_id = format!("branch-{}", compute_blake3(legacy_key.as_bytes()));
+        let legacy = directory.join("branches").join(&legacy_id);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(
+            legacy.join("study_report.json"),
+            b"retained pre-catalog output",
+        )
+        .unwrap();
+        assert!(handle.get_checkpoint_branch(&legacy_id).is_err());
+        assert!(
+            handle
+                .create_checkpoint_branch(checkpoint_branch_request(
+                    &checkpoint.checkpoint_id,
+                    legacy_key
+                ))
+                .is_err()
+        );
+
+        let admitted = handle
+            .create_checkpoint_branch(checkpoint_branch_request(
+                &checkpoint.checkpoint_id,
+                "new-catalog-study",
+            ))
+            .unwrap();
+        let completed = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+        assert_eq!(completed.status, "completed");
+        assert_eq!(
+            handle.list_checkpoint_branches(None, None).unwrap().total,
+            1
+        );
+        handle.data_services.shutdown_experiments().unwrap();
+        drop(handle);
+        let cold = host.handle().with_artifacts_dir(directory).unwrap();
+        assert_eq!(
+            cold.list_checkpoint_branches(None, None).unwrap().items,
+            vec![completed.clone()]
+        );
+        assert!(
+            cold.read_artifact_bytes(completed.artifact_id.as_deref().unwrap())
+                .is_ok()
+        );
+        assert_eq!(
+            fs::read(legacy.join("study_report.json")).unwrap(),
+            b"retained pre-catalog output"
+        );
+        assert!(!legacy.join("definition.json").exists());
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_without_a_seal_is_stopped_and_never_reexecuted() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Dwraon), 1);
+        let request = checkpoint_branch_request(&checkpoint.checkpoint_id, "interrupted-study");
+        let admitted = handle.create_checkpoint_branch(request.clone()).unwrap();
+        let completed = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+        assert_eq!(completed.status, "completed");
+        handle.data_services.shutdown_experiments().unwrap();
+        let branch = directory.join("branches").join(&admitted.branch_id);
+        let report_path = branch.join("study/study_report.json");
+        let report = fs::read(&report_path).unwrap();
+        // Model a crash after output creation but before the terminal rename.
+        // Preserve the original seal as evidence rather than deleting output.
+        fs::rename(
+            branch.join("receipt.json"),
+            branch.join("uncommitted-receipt.original"),
+        )
+        .unwrap();
+        drop(handle);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let cold = host.handle().with_artifacts_dir(directory).unwrap();
+        let stopped = cold.get_checkpoint_branch(&admitted.branch_id).unwrap();
+        assert_eq!(stopped.status, "stopped");
+        assert!(stopped.artifact_id.is_none());
+        assert!(
+            stopped
+                .error_reason
+                .as_deref()
+                .unwrap()
+                .contains("interrupted")
+        );
+        assert_eq!(cold.create_checkpoint_branch(request).unwrap(), stopped);
+        assert_eq!(
+            cold.cancel_checkpoint_branch(&admitted.branch_id).unwrap(),
+            stopped
+        );
+        assert!(
+            cold.read_artifact_bytes(completed.artifact_id.as_deref().unwrap())
+                .is_err()
+        );
+        assert_eq!(fs::read(report_path).unwrap(), report);
+        assert!(!branch.join("receipt.json").exists());
+        assert!(
+            cold.data_services
+                .checkpoint_branches
+                .lock()
+                .unwrap()
+                .values()
+                .all(|job| job.worker.is_none())
+        );
+        assert_eq!(
+            cold.data_services
+                .execution_capacity
+                .lock()
+                .unwrap()
+                .reserved_run_slots,
+            0
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_catalog_refuses_corrupt_or_oversized_identity_records() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let request = checkpoint_branch_request(&checkpoint.checkpoint_id, "catalog-corruption");
+        let admitted = handle.create_checkpoint_branch(request.clone()).unwrap();
+        assert_eq!(
+            wait_for_checkpoint_branch(&handle, &admitted.branch_id).status,
+            "completed"
+        );
+        handle.data_services.shutdown_experiments().unwrap();
+        let branch = directory.join("branches").join(&admitted.branch_id);
+        let definition_path = branch.join("definition.json");
+        let receipt_path = branch.join("receipt.json");
+        let definition_bytes = fs::read(&definition_path).unwrap();
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        let before = host.port.scientific_digest_v1().unwrap();
+        drop(handle);
+
+        let mut changed: CheckpointBranchDefinitionRecord =
+            serde_json::from_slice(&definition_bytes).unwrap();
+        changed.definition.request.ticks += 1;
+        changed.definition.request_hash =
+            compute_blake3(&changed.definition.request.bounded_payload().unwrap());
+        changed.checksum = changed.definition.checksum().unwrap();
+        for bytes in [
+            b"truncated admission".to_vec(),
+            serde_json::to_vec(&changed).unwrap(),
+            vec![b' '; MAX_CHECKPOINT_BRANCH_CATALOG_BYTES + 1],
+        ] {
+            fs::write(&definition_path, &bytes).unwrap();
+            let cold = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            assert!(cold.get_checkpoint_branch(&admitted.branch_id).is_err());
+            assert!(cold.list_checkpoint_branches(None, None).is_err());
+            assert!(cold.create_checkpoint_branch(request.clone()).is_err());
+            assert_eq!(fs::read(&definition_path).unwrap(), bytes);
+            assert_eq!(
+                cold.data_services
+                    .execution_capacity
+                    .lock()
+                    .unwrap()
+                    .reserved_run_slots,
+                0
+            );
+        }
+        fs::write(&definition_path, definition_bytes).unwrap();
+        let mut changed: CheckpointBranchReceiptRecord =
+            serde_json::from_slice(&receipt_bytes).unwrap();
+        changed.receipt.status.source_tick += 1;
+        changed.checksum = compute_blake3(&serde_json::to_vec(&changed.receipt).unwrap());
+        for bytes in [
+            b"truncated receipt".to_vec(),
+            serde_json::to_vec(&changed).unwrap(),
+            vec![b' '; MAX_CHECKPOINT_BRANCH_CATALOG_BYTES + 1],
+        ] {
+            fs::write(&receipt_path, &bytes).unwrap();
+            let cold = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            assert!(cold.get_checkpoint_branch(&admitted.branch_id).is_err());
+            assert!(cold.list_checkpoint_branches(None, None).is_err());
+            assert!(cold.create_checkpoint_branch(request.clone()).is_err());
+            assert_eq!(fs::read(&receipt_path).unwrap(), bytes);
+        }
+        fs::write(receipt_path, receipt_bytes).unwrap();
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_recovery_refuses_forged_reports_and_changed_bundle_bytes() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let admitted = handle
+            .create_checkpoint_branch(checkpoint_branch_request(
+                &checkpoint.checkpoint_id,
+                "report-corruption",
+            ))
+            .unwrap();
+        let completed = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+        assert_eq!(completed.status, "completed");
+        let artifact_id = completed.artifact_id.as_ref().unwrap().clone();
+        handle.data_services.shutdown_experiments().unwrap();
+        let branch = directory.join("branches").join(&admitted.branch_id);
+        let report_path = branch.join("study/study_report.json");
+        let receipt_path = branch.join("receipt.json");
+        let report_bytes = fs::read(&report_path).unwrap();
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        let report: crate::branch_study::BranchStudyReport =
+            serde_json::from_slice(&report_bytes).unwrap();
+        drop(handle);
+
+        let mut forged = vec![report.clone(); 4];
+        forged[0].branch_reports.clear();
+        forged[1]
+            .branch_reports
+            .push(report.branch_reports[0].clone());
+        forged[2].branch_reports[0].branch_id = "../outside".to_owned();
+        if let crate::branch_study::BranchStudySource::SavedCheckpoint { artifact_path, .. } =
+            &mut forged[3].source
+        {
+            *artifact_path = "../outside".to_owned();
+        }
+        for report in forged {
+            let bytes = serde_json::to_vec_pretty(&report).unwrap();
+            fs::write(&report_path, &bytes).unwrap();
+            // Recompute the outer checksum to reach structural provenance guards,
+            // rather than merely proving that a changed file has a different hash.
+            let mut receipt: CheckpointBranchReceiptRecord =
+                serde_json::from_slice(&receipt_bytes).unwrap();
+            let metadata = receipt
+                .receipt
+                .artifacts
+                .iter_mut()
+                .find(|artifact| artifact.artifact_id == artifact_id)
+                .unwrap();
+            metadata.byte_size = bytes.len() as u64;
+            metadata.checksum_blake3 = compute_blake3(&bytes);
+            metadata.checksum_sha256 = compute_sha256(&bytes);
+            receipt.checksum = compute_blake3(&serde_json::to_vec(&receipt.receipt).unwrap());
+            fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            let cold = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            assert!(cold.read_artifact_bytes(&artifact_id).is_err());
+            assert!(cold.data_services.artifacts.lock().unwrap().is_empty());
+        }
+        fs::write(&report_path, report_bytes).unwrap();
+        fs::write(receipt_path, receipt_bytes).unwrap();
+        let evidence = branch.join("study/bundle_control/evidence/branch_evidence.json");
+        let original = fs::read(&evidence).unwrap();
+        fs::write(&evidence, b"damaged evidence").unwrap();
+        let cold = host.handle().with_artifacts_dir(directory).unwrap();
+        // Status is a historical receipt. Download makes the new integrity observation.
+        assert_eq!(
+            cold.get_checkpoint_branch(&admitted.branch_id)
+                .unwrap()
+                .status,
+            "completed"
+        );
+        assert!(cold.read_artifact_bytes(&artifact_id).is_err());
+        assert!(cold.data_services.artifacts.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&evidence).unwrap(), b"damaged evidence");
+        fs::write(evidence, original).unwrap();
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_catalog_refuses_ambiguous_roots_and_global_capacity_overflow() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let admitted = handle
+            .create_checkpoint_branch(checkpoint_branch_request(
+                &checkpoint.checkpoint_id,
+                "root-conflict",
+            ))
+            .unwrap();
+        let completed = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+        assert_eq!(completed.status, "completed");
+        let artifact_id = completed.artifact_id.unwrap();
+        handle.read_artifact_bytes(&artifact_id).unwrap();
+        handle.data_services.shutdown_experiments().unwrap();
+        let other = tempfile::tempdir().unwrap().keep();
+        fs::create_dir_all(other.join("branches").join(&admitted.branch_id)).unwrap();
+        let handle = handle.with_artifacts_dir(other).unwrap();
+        assert!(matches!(
+            handle.get_checkpoint_branch(&admitted.branch_id),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            handle.read_artifact_bytes(&artifact_id),
+            Err(ControlError::Conflict(_))
+        ));
+        handle.data_services.artifacts.lock().unwrap().clear();
+        assert!(matches!(
+            handle.read_artifact_bytes(&artifact_id),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(
+            directory
+                .join("branches")
+                .join(&admitted.branch_id)
+                .join("study/study_report.json")
+                .is_file()
+        );
+        drop(handle);
+
+        let first = tempfile::tempdir().unwrap().keep();
+        let second = tempfile::tempdir().unwrap().keep();
+        for (root, count) in [(&first, 17), (&second, 16)] {
+            fs::create_dir(root.join("branches")).unwrap();
+            for index in 0..count {
+                fs::create_dir(root.join("branches").join(format!("interrupted-{index}"))).unwrap();
+            }
+        }
+        let handle = host
+            .handle()
+            .with_artifacts_dir(first)
+            .unwrap()
+            .with_artifacts_dir(second)
+            .unwrap();
+        assert!(matches!(
+            handle.list_checkpoint_branches(None, None),
+            Err(ControlError::ExperimentCapacity(_))
+        ));
+        assert!(
+            handle
+                .data_services
+                .checkpoint_branches
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_checkpoint_branch_catalog_rejects_symlinked_receipts() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let admitted = handle
+            .create_checkpoint_branch(checkpoint_branch_request(
+                &checkpoint.checkpoint_id,
+                "receipt-alias",
+            ))
+            .unwrap();
+        assert_eq!(
+            wait_for_checkpoint_branch(&handle, &admitted.branch_id).status,
+            "completed"
+        );
+        handle.data_services.shutdown_experiments().unwrap();
+        let branch = directory.join("branches").join(&admitted.branch_id);
+        fs::rename(branch.join("receipt.json"), branch.join("receipt.original")).unwrap();
+        std::os::unix::fs::symlink("receipt.original", branch.join("receipt.json")).unwrap();
+        drop(handle);
+        let cold = host.handle().with_artifacts_dir(directory).unwrap();
+        assert!(cold.get_checkpoint_branch(&admitted.branch_id).is_err());
+        assert!(cold.list_checkpoint_branches(None, None).is_err());
+        assert!(
+            fs::symlink_metadata(branch.join("receipt.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_cancellation_shutdown_and_drop_join_workers() {
+        for explicit_shutdown in [true, false] {
+            let (handle, host, checkpoint, _) =
+                checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+            let before = host.port.scientific_digest_v1().unwrap();
+            let mut request =
+                checkpoint_branch_request(&checkpoint.checkpoint_id, "cancel-and-join");
+            request.ticks = MAX_CHECKPOINT_BRANCH_TICKS;
+            let admitted = handle.create_checkpoint_branch(request.clone()).unwrap();
+            let (state, capacity) = {
+                let jobs = handle.data_services.checkpoint_branches.lock().unwrap();
+                (
+                    Arc::clone(&jobs[&admitted.branch_id].status),
+                    Arc::clone(&handle.data_services.execution_capacity),
+                )
+            };
+            let weak_services = Arc::downgrade(&handle.data_services);
+            if explicit_shutdown {
+                let cancelled = handle
+                    .cancel_checkpoint_branch(&admitted.branch_id)
+                    .unwrap();
+                assert!(matches!(
+                    cancelled.status.as_str(),
+                    "cancelling" | "cancelled" | "completed"
+                ));
+                handle.data_services.shutdown_experiments().unwrap();
+                assert!(
+                    handle
+                        .data_services
+                        .checkpoint_branches
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .all(|job| job.worker.is_none())
+                );
+                let terminal = handle.get_checkpoint_branch(&admitted.branch_id).unwrap();
+                assert!(matches!(
+                    terminal.status.as_str(),
+                    "cancelled" | "completed"
+                ));
+                if terminal.status == "cancelled" {
+                    assert!(terminal.artifact_id.is_none());
+                    assert!(matches!(
+                        handle.list_checkpoint_branch_artifacts(&admitted.branch_id, None, None),
+                        Err(ControlError::Conflict(_))
+                    ));
+                }
+                assert_eq!(
+                    handle
+                        .create_checkpoint_branch(request.clone())
+                        .unwrap()
+                        .branch_id,
+                    admitted.branch_id
+                );
+                request.idempotency_key = "new-after-shutdown".to_owned();
+                assert!(matches!(
+                    handle.create_checkpoint_branch(request),
+                    Err(ControlError::ExperimentShuttingDown)
+                ));
+            }
+            drop(handle);
+            assert!(
+                weak_services.upgrade().is_none(),
+                "workers must not keep their owning service alive"
+            );
+            assert!(matches!(
+                state.lock().unwrap().status.as_str(),
+                "cancelled" | "completed"
+            ));
+            assert_eq!(capacity.lock().unwrap().reserved_run_slots, 0);
+            assert_eq!(capacity.lock().unwrap().reserved_grid_cells, 0);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn checkpoint_canvas_restores_real_application_presets_without_changing_the_owner() {
         let mut distinct_digests = std::collections::BTreeSet::new();
         for preset in [
@@ -8894,6 +14265,8 @@ pub(crate) mod tests {
             Some(crate::BrainPreset::Dwraon),
             Some(crate::BrainPreset::Assembly),
             Some(crate::BrainPreset::Mixed),
+            #[cfg(feature = "neuro")]
+            Some(crate::BrainPreset::Neuro),
         ] {
             let directory = tempfile::Builder::new()
                 .prefix("checkpoint-canvas-")
@@ -8904,7 +14277,7 @@ pub(crate) mod tests {
                 "checkpoint canvas preset {preset:?}: {}",
                 directory.display()
             );
-            let mut world = WorldState::new(ScriptBotsConfig {
+            let mut config = ScriptBotsConfig {
                 rng_seed: Some(42),
                 world_width: 120,
                 world_height: 120,
@@ -8912,8 +14285,12 @@ pub(crate) mod tests {
                 persistence_interval: 0,
                 closed: true,
                 ..ScriptBotsConfig::default()
-            })
-            .unwrap();
+            };
+            if preset == Some(crate::BrainPreset::Neuro) {
+                config.neuroflow.hidden_layers = vec![7, 3];
+                config.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Sigmoid;
+            }
+            let mut world = WorldState::new(config).unwrap();
             if let Some(preset) = preset {
                 let brains = crate::install_brains(&mut world, preset)
                     .unwrap()
@@ -9026,6 +14403,366 @@ pub(crate) mod tests {
                 Err(ControlError::InvalidPatch(_))
             ));
             assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        }
+    }
+
+    #[test]
+    fn bounded_checkpoint_canvas_verifies_cold_and_cached_sources_without_changing_owner() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 4, 64 * 1024 * 1024);
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let live = host.port.scientific_digest_v1().unwrap();
+        let publication = handle.read_snapshot().unwrap();
+        for cold in [false, true] {
+            if cold {
+                handle.data_services.checkpoints.lock().unwrap().clear();
+                handle.data_services.artifacts.lock().unwrap().clear();
+            }
+            let (metadata, frame) = handle
+                .checkpoint_canvas_bounded(&saved.checkpoint_id)
+                .unwrap();
+            assert_eq!(metadata, saved);
+            assert_eq!(frame.world.tick, saved.tick);
+            assert_eq!(frame.world.agents.len(), saved.agent_count);
+            assert!(frame.agent_visuals_complete());
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+        }
+        // An acknowledged marker cannot bypass a pending original writer request.
+        for request in handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests
+            .values_mut()
+        {
+            request.acknowledged = false;
+        }
+        assert!(matches!(
+            handle.checkpoint_canvas_bounded(&saved.checkpoint_id),
+            Err(ControlError::NotFound(reason)) if reason.contains("completion is pending")
+        ));
+        for request in handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests
+            .values_mut()
+        {
+            request.acknowledged = true;
+        }
+        let path = directory.join(format!("{}.bin", saved.checkpoint_id));
+        let preimage = fs::read(&path).unwrap();
+        fs::write(directory.join("preview-before-corruption.bin"), &preimage).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0xff])
+            .unwrap();
+        assert!(matches!(
+            handle.checkpoint_canvas_bounded(&saved.checkpoint_id),
+            Err(ControlError::InvalidPatch(_))
+        ));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+    }
+
+    #[test]
+    fn bounded_checkpoint_canvas_refuses_large_descriptors_before_payload_access() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 8, 64 * 1024 * 1024);
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        for case in 0..3 {
+            let mut metadata = saved.clone();
+            metadata.checkpoint_id = format!("ckpt-{:032x}-t{}", case + 1, saved.tick);
+            match case {
+                0 => metadata.byte_size = MAX_CHECKPOINT_PREVIEW_BYTES as u64 + 1,
+                1 => metadata.byte_size = MAX_ARTIFACT_DOWNLOAD_BYTES as u64 + 1,
+                2 => metadata.agent_count = scriptbots_runtime::remote::REMOTE_MAX_AGENTS + 1,
+                _ => unreachable!(),
+            }
+            write_checkpoint_catalog(&directory, &metadata).unwrap();
+            assert!(!directory.join(format!("{}.bin", metadata.checkpoint_id)).exists());
+            assert!(matches!(
+                handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
+                Err(ControlError::PayloadTooLarge(_))
+            ));
+        }
+        // A false small declaration cannot make an oversized physical file admissible.
+        let mut metadata = saved.clone();
+        metadata.checkpoint_id = format!("ckpt-{:032x}-t{}", 4, saved.tick);
+        metadata.byte_size = 1;
+        write_checkpoint_catalog(&directory, &metadata).unwrap();
+        fs::File::create(directory.join(format!("{}.bin", metadata.checkpoint_id)))
+            .unwrap()
+            .set_len(MAX_CHECKPOINT_PREVIEW_BYTES as u64 + 1)
+            .unwrap();
+        assert!(matches!(
+            handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
+            Err(ControlError::PayloadTooLarge(_))
+        ));
+        assert_eq!(host.port.scientific_digest_v1().unwrap().overall, saved.world_digest_v1);
+    }
+
+    #[test]
+    fn bounded_checkpoint_canvas_caps_decoded_histories_before_restoring() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let (handle, host) = checkpoint_test_handle(&directory, 8, 64 * 1024 * 1024);
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let before = host.port.scientific_digest_v1().unwrap();
+        for narrative in [false, true] {
+            let mut config = ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 40,
+                world_height: 40,
+                food_cell_size: 10,
+                persistence_interval: 0,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..ScriptBotsConfig::default()
+            };
+            if narrative {
+                config.narrative_capacity = MAX_CHECKPOINT_PREVIEW_HISTORY + 1;
+            } else {
+                config.history_capacity = MAX_CHECKPOINT_PREVIEW_HISTORY + 1;
+            }
+            let checkpoint = WorldState::new(config).unwrap().checkpoint_v1().unwrap();
+            let bytes = checkpoint.encode().unwrap();
+            assert!(bytes.len() < MAX_CHECKPOINT_PREVIEW_BYTES);
+            let mut metadata = saved.clone();
+            metadata.checkpoint_id = format!("ckpt-{:032x}-t0", if narrative { 11 } else { 10 });
+            metadata.world_digest_v1 = checkpoint.source_digest().overall.clone();
+            metadata.byte_size = bytes.len() as u64;
+            metadata.checksum_blake3 = compute_blake3(&bytes);
+            metadata.checksum_sha256 = compute_sha256(&bytes);
+            write_checkpoint_catalog(&directory, &metadata).unwrap();
+            fs::write(directory.join(format!("{}.bin", metadata.checkpoint_id)), &bytes).unwrap();
+            assert!(matches!(
+                handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
+                Err(ControlError::PayloadTooLarge(reason)) if reason.contains("history")
+            ));
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn checkpoint_preview_grid_and_agent_admission_include_exact_boundaries() {
+        let config = ScriptBotsConfig {
+            world_width: 512,
+            world_height: 512,
+            food_cell_size: 1,
+            history_capacity: MAX_CHECKPOINT_PREVIEW_HISTORY,
+            narrative_capacity: MAX_CHECKPOINT_PREVIEW_HISTORY,
+            ..ScriptBotsConfig::default()
+        };
+        ControlHandle::validate_checkpoint_preview_config(
+            &config,
+            scriptbots_runtime::remote::REMOTE_MAX_AGENTS,
+        )
+        .unwrap();
+        let mut excessive_grid = config.clone();
+        excessive_grid.world_width = 513;
+        for (config, agents) in [
+            (&excessive_grid, 0),
+            (&config, scriptbots_runtime::remote::REMOTE_MAX_AGENTS + 1),
+        ] {
+            assert!(matches!(
+                ControlHandle::validate_checkpoint_preview_config(config, agents),
+                Err(ControlError::PayloadTooLarge(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn checkpoint_canvas_restores_saved_subsets_without_claiming_a_founder_preset() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let config = ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            closed: true,
+            population_minimum: 0,
+            reproduction_attempt_chance: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        let mut world = WorldState::new(config).unwrap();
+        let first = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+            .unwrap()
+            .population[0];
+        let second = world
+            .register_brain_family(
+                scriptbots_brain::dwraon::DwraonBrain::KIND.as_str(),
+                Box::new(scriptbots_brain::dwraon::DwraonFamilyAdapter::default()),
+            )
+            .unwrap();
+        for key in [first, second] {
+            let agent = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .unwrap();
+            assert!(world.bind_agent_brain(agent, key).unwrap());
+        }
+        let host = TestHost::spawn(world);
+        let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let (_, bytes) = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap();
+        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes).unwrap();
+        let (restored, preset) =
+            ControlHandle::restore_canvas_world_and_preset(&checkpoint, None).unwrap();
+        assert_eq!(preset, None);
+        assert_eq!(restored.world_digest_v1().unwrap(), *checkpoint.source_digest());
+        host.wait_applied(&handle.step().unwrap());
+        let live = host.port.scientific_digest_v1().unwrap();
+        let publication = handle.read_snapshot().unwrap();
+        let review = handle.checkpoint_canvas(&saved.checkpoint_id).unwrap();
+        assert_eq!(review.world.tick, saved.tick);
+        assert_eq!(review.world.agents.len(), saved.agent_count);
+        assert!(review.agent_visuals_complete());
+        assert!(matches!(
+            handle.create_checkpoint_branch(checkpoint_branch_request(
+                &saved.checkpoint_id,
+                "subset-preset-refusal",
+            )),
+            Err(ControlError::BadRequest(reason))
+                if reason.contains("requires a versioned compiled application brain preset")
+        ));
+        assert!(!directory.join("branches").exists());
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+        assert_eq!(
+            handle.read_artifact_bytes(&saved.checkpoint_id).unwrap().1,
+            bytes
+        );
+    }
+
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn neuro_checkpoint_consumers_refuse_constructor_drift_without_changing_the_owner() {
+        for population in [0, 2] {
+            let directory = tempfile::Builder::new()
+                .prefix("neuro-checkpoint-constructor-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            let mut original_config = ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                persistence_interval: 0,
+                closed: true,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                reproduction_energy_threshold: f32::MAX,
+                ..ScriptBotsConfig::default()
+            };
+            original_config.neuroflow.hidden_layers = vec![7, 3];
+            original_config.neuroflow.activation =
+                scriptbots_core::NeuroflowActivationKind::Sigmoid;
+            let mut world = WorldState::new(original_config.clone()).unwrap();
+            let installed = crate::install_brains(&mut world, crate::BrainPreset::Neuro).unwrap();
+            for _ in 0..population {
+                let id = world
+                    .try_spawn_agent(scriptbots_core::AgentData::default())
+                    .unwrap();
+                assert!(
+                    world
+                        .bind_agent_brain(id, installed.population()[0])
+                        .unwrap()
+                );
+            }
+            // The raw cut retains the existing registry identity, not its former
+            // constructor recipe. An edited config must never substitute a new factory.
+            let mut changed = original_config.clone();
+            changed.neuroflow.hidden_layers = vec![11, 5];
+            scriptbots_core::apply_control_command(
+                &mut world,
+                ControlCommand::UpdateConfig(Box::new(changed)),
+            )
+            .unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            let saved = handle
+                .create_checkpoint(CheckpointCreateRequest::default())
+                .unwrap();
+            assert_eq!(saved.agent_count, population);
+            let (_, bytes) = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap();
+            let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes).unwrap();
+            let matching = crate::create_brain_registry_for_config(
+                crate::BrainPreset::Neuro,
+                &original_config,
+            )
+            .unwrap();
+            let restored = WorldState::restore_checkpoint_v1(&checkpoint, matching)
+                .expect("the known original registry still restores this valid source");
+            assert_eq!(
+                restored.world_digest_v1().unwrap(),
+                *checkpoint.source_digest()
+            );
+            let substituted = crate::create_brain_registry_for_config(
+                crate::BrainPreset::Neuro,
+                checkpoint.config(),
+            )
+            .unwrap();
+            assert!(matches!(
+                WorldState::restore_checkpoint_v1(&checkpoint, substituted),
+                Err(scriptbots_core::WorldCheckpointError::RegistryMismatch { .. })
+            ));
+            let before = host.port.scientific_digest_v1().unwrap();
+            let published = handle.read_snapshot().unwrap();
+            for error in [
+                handle.checkpoint_canvas(&saved.checkpoint_id).err(),
+                handle.event_canvas(saved.tick).err(),
+                handle
+                    .create_checkpoint_branch(checkpoint_branch_request(
+                        &saved.checkpoint_id,
+                        "constructor-drift",
+                    ))
+                    .err(),
+            ] {
+                assert!(
+                    matches!(
+                        &error,
+                        Some(ControlError::BadRequest(message))
+                            if message.contains(
+                                "checkpoint registry does not match the compiled application adapters"
+                            )
+                    ),
+                    "unexpected constructor-drift outcome: {error:?}"
+                );
+            }
+            assert!(!directory.join("branches").exists());
+            assert!(
+                handle
+                    .data_services
+                    .checkpoint_branches
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            let capacity = *handle.data_services.execution_capacity.lock().unwrap();
+            assert_eq!(capacity.reserved_run_slots, 0);
+            assert_eq!(capacity.reserved_grid_cells, 0);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &published));
+            assert_eq!(
+                handle.read_artifact_bytes(&saved.checkpoint_id).unwrap().1,
+                bytes
+            );
         }
     }
 
@@ -9528,7 +15265,11 @@ pub(crate) mod tests {
         assert!(unavailable.inventory_error.is_some());
         assert_eq!(unavailable.pending_entries, 1);
         assert_eq!(unavailable.sql_count, Some(0));
-        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+        assert!(matches!(
+            handle.list_checkpoints(None, None),
+            Err(ControlError::CheckpointRetentionUnavailable(message))
+                if message.contains("artifact directory identity changed")
+        ));
         assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
         fs::rename(&directory, root.join("refused-artifacts")).expect("preserve replacement");
         fs::rename(&leased_directory, &directory).expect("restore original leased root");
@@ -10910,6 +16651,277 @@ pub(crate) mod tests {
 
         receiver.wait_applied(&second);
         assert_eq!(handle.status().expect("status").tick, 2);
+    }
+
+    /// A process restart must preserve explicit retries without recycling new
+    /// commands into the continued owner's existing idempotency ledger.
+    #[test]
+    fn unkeyed_commands_advance_after_checkpoint_continuation_in_a_new_process() {
+        const DIRECTORY: &str = "SCRIPTBOTS_TEST_CONTROL_RESTART_DIRECTORY";
+        const PHASE: &str = "SCRIPTBOTS_TEST_CONTROL_RESTART_PHASE";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let restore = match std::env::var(PHASE).as_deref() {
+                Ok("create") => false,
+                Ok("restore") => true,
+                phase => panic!("invalid continuation fixture phase: {phase:?}"),
+            };
+            run_control_restart_phase(&PathBuf::from(directory), restore);
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("cross-process continuation directory");
+        for phase in ["create", "restore"] {
+            let stdout_path = directory.path().join(format!("{phase}.stdout.log"));
+            let stderr_path = directory.path().join(format!("{phase}.stderr.log"));
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("current control test executable"),
+            );
+            command
+                .args([
+                    "--exact",
+                    "control::tests::unkeyed_commands_advance_after_checkpoint_continuation_in_a_new_process",
+                    "--nocapture",
+                ])
+                .env(DIRECTORY, directory.path())
+                .env(PHASE, phase)
+                .stdout(fs::File::create(&stdout_path).expect("phase stdout log"))
+                .stderr(fs::File::create(&stderr_path).expect("phase stderr log"));
+            if let Err(error) =
+                crate::experiment_runner::MatchedSeedExperimentRunner::run_bounded_child(
+                    &mut command,
+                    std::time::Duration::from_secs(30),
+                )
+            {
+                let read_log = |path: &Path| {
+                    let mut text = String::new();
+                    fs::File::open(path)
+                        .expect("open phase log")
+                        .take(64 * 1024)
+                        .read_to_string(&mut text)
+                        .expect("read bounded phase log");
+                    text
+                };
+                panic!(
+                    "continuation phase {phase} failed: {error}; stdout={} stderr={}",
+                    read_log(&stdout_path),
+                    read_log(&stderr_path),
+                );
+            }
+            let (artifact, tick) = if phase == "create" {
+                ("owner.checkpoint", 2)
+            } else {
+                ("continued.checkpoint", 3)
+            };
+            let bytes = fs::read(directory.path().join(artifact))
+                .expect("child actually executed and retained its owner cut");
+            let checkpoint = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes)
+                .expect("independently reopen the child artifact");
+            assert_eq!(checkpoint.host_checkpoint().tick().0, tick);
+        }
+    }
+
+    fn run_control_restart_phase(directory: &Path, restore: bool) {
+        use scriptbots_runtime::{
+            FixedDeadlineHost, HostCore, HostCoreOptions, HostSessionId, ManualInstant,
+            PlaybackSnapshot, VolatileHostCheckpointV1,
+            channel::{ChannelHostDriver, ChannelHostOptions, ChannelRunOutcome},
+        };
+        use std::time::{Duration, Instant};
+
+        fn wait_settled(control: &ControlHandle, admitted: &CommandStatusDto) -> CommandStatusDto {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let observed = control
+                    .command_status(&admitted.command_id)
+                    .expect("actual owner status")
+                    .expect("retained command identity");
+                if observed.application_state != "admitted" && observed.journal_state != "pending" {
+                    assert_eq!(observed.application_state, "applied");
+                    assert_eq!(observed.journal_state, "committed_volatile");
+                    return observed;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "continued command did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let checkpoint_path = directory.join("owner.checkpoint");
+        let receipts_path = directory.join("receipts.json");
+        let saved = restore.then(|| fs::read(&checkpoint_path).expect("saved owner artifact"));
+        let (ready, receive) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let core = if let Some(bytes) = saved {
+                let checkpoint =
+                    VolatileHostCheckpointV1::decode(&bytes).expect("decode actual owner cut");
+                let world = checkpoint
+                    .host_checkpoint()
+                    .restore_world(scriptbots_core::BrainRegistry::new())
+                    .expect("restore actual scientific world");
+                let persistence = world
+                    .bind_persistence(Box::new(scriptbots_core::NullPersistence))
+                    .expect("bind continued persistence");
+                HostCore::restore_volatile_host_checkpoint_v1(
+                    &checkpoint,
+                    world,
+                    persistence,
+                    None,
+                    ManualInstant::from_nanos(0),
+                )
+                .expect("restore the complete owner and command authority")
+            } else {
+                let mut world = WorldState::new(ScriptBotsConfig {
+                    world_width: 200,
+                    world_height: 200,
+                    food_cell_size: 20,
+                    rng_seed: Some(42),
+                    persistence_interval: 1,
+                    closed: true,
+                    population_spawn_interval: 0,
+                    reproduction_energy_threshold: f32::MAX,
+                    history_capacity: 16,
+                    ..ScriptBotsConfig::default()
+                })
+                .expect("nonempty continuation world");
+                for _ in 0..3 {
+                    world
+                        .try_spawn_agent(scriptbots_core::AgentData::default())
+                        .expect("real founder");
+                }
+                HostCore::new(
+                    HostSessionId::new(0xc017),
+                    world,
+                    HostCoreOptions {
+                        initial_playback: PlaybackSnapshot {
+                            paused: true,
+                            speed_multiplier: 1.0,
+                        },
+                        ..HostCoreOptions::default()
+                    },
+                )
+                .expect("real original owner")
+            };
+            let (mut driver, port) =
+                ChannelHostDriver::new(FixedDeadlineHost::new(core), ChannelHostOptions::default())
+                    .expect("actual owner channel");
+            ready.send(port).expect("publish owner port");
+            let epoch = Instant::now();
+            let receipt = driver
+                .run(|| {
+                    ManualInstant::from_nanos(
+                        u64::try_from(epoch.elapsed().as_nanos()).expect("test duration"),
+                    )
+                })
+                .expect("owner handoff");
+            assert_eq!(receipt.outcome, ChannelRunOutcome::HandedOff);
+            driver
+                .host()
+                .core()
+                .capture_volatile_host_checkpoint_v1()
+                .expect("joint owner and journal cut")
+                .encode()
+                .expect("encode actual continuation artifact")
+        });
+        let port = receive.recv().expect("owner ready");
+        let control = ControlHandle::new(port.clone());
+
+        if restore {
+            let [old_step, old_pause, old_keyed]: [CommandStatusDto; 3] = serde_json::from_slice(
+                &fs::read(&receipts_path).expect("original process receipts"),
+            )
+            .expect("decode original receipts");
+            assert_eq!(control.status().expect("restored science").tick, 2);
+
+            // Do not obtain fresh command identities by dropping the old ledger.
+            let old_id: CommandId =
+                serde_json::from_value(Value::String(old_step.command_id.clone()))
+                    .expect("old unkeyed identity");
+            let old_retry = control
+                .host
+                .clone()
+                .submit(CommandEnvelope::new(old_id, HostCommand::Step))
+                .expect("an explicit old envelope still retries");
+            assert_eq!(
+                old_retry
+                    .admission_sequence()
+                    .map(|sequence| sequence.get()),
+                old_step.admission_sequence,
+            );
+            assert!(matches!(
+                control
+                    .host
+                    .clone()
+                    .submit(CommandEnvelope::new(old_id, HostCommand::Pause)),
+                Err(scriptbots_runtime::HostAccessError::CommandIdCollision { .. })
+            ));
+            let keyed = control
+                .submit_command(ControlCommand::Step, Some("control-restart-key"))
+                .expect("keyed retry across processes");
+            assert_eq!(keyed.command_id, old_keyed.command_id);
+            assert_eq!(keyed.admission_sequence, old_keyed.admission_sequence);
+            wait_settled(&control, &keyed);
+            assert_eq!(control.status().expect("retry did not advance").tick, 2);
+
+            let step = control.step().expect("new unkeyed step after restart");
+            assert_ne!(step.command_id, old_step.command_id);
+            wait_settled(&control, &step);
+            assert_eq!(control.status().expect("fresh step advanced").tick, 3);
+
+            // The old process's second command was Pause. Reusing its namespace
+            // here would collide with that payload instead of changing speed.
+            let speed = control
+                .clone()
+                .set_speed(2.0, None)
+                .expect("new command does not collide with the original Pause");
+            assert_ne!(speed.command_id, old_pause.command_id);
+            wait_settled(&control, &speed);
+            let snapshot = control.read_snapshot().expect("continued playback");
+            assert_eq!(snapshot.world.tick, 3);
+            assert!(snapshot.playback.paused);
+            assert_eq!(snapshot.playback.speed_multiplier, 2.0);
+            let fresh: CommandId = serde_json::from_value(Value::String(step.command_id))
+                .expect("fresh unkeyed identity");
+            let cloned: CommandId = serde_json::from_value(Value::String(speed.command_id))
+                .expect("cloned control identity");
+            assert_ne!(fresh.client_namespace(), 0);
+            assert_eq!(fresh.client_namespace(), cloned.client_namespace());
+            assert_eq!(fresh.client_sequence(), 0);
+            assert_eq!(cloned.client_sequence(), 1);
+            assert_eq!(fresh.get() >> 127, 0);
+        } else {
+            let step = wait_settled(&control, &control.step().expect("original unkeyed step"));
+            let pause = wait_settled(&control, &control.pause(None).expect("original pause"));
+            let keyed = wait_settled(
+                &control,
+                &control
+                    .submit_command(ControlCommand::Step, Some("control-restart-key"))
+                    .expect("original keyed step"),
+            );
+            assert_eq!(control.status().expect("original science").tick, 2);
+            fs::write(
+                &receipts_path,
+                serde_json::to_vec(&[step, pause, keyed]).expect("encode original receipts"),
+            )
+            .expect("retain original process receipts");
+        }
+        let handoff = port
+            .handoff_host_checkpoint_v1()
+            .expect("settled actual host handoff");
+        let bytes = worker.join().expect("original owner actually retired");
+        let paired = VolatileHostCheckpointV1::decode(&bytes).expect("final joint artifact");
+        assert_eq!(
+            paired.host_checkpoint().encode().expect("paired owner"),
+            handoff.encode().expect("acknowledged handoff"),
+        );
+        assert_eq!(handoff.tick().0, if restore { 3 } else { 2 });
+        let output = if restore {
+            directory.join("continued.checkpoint")
+        } else {
+            checkpoint_path
+        };
+        fs::write(output, bytes).expect("retain actual continuation artifact");
     }
 
     /// A selection submission must hand back a receipt a client can follow.

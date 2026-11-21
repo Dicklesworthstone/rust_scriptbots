@@ -1,0 +1,12 @@
+tools:
+  rust_scriptbots_candidate_fast:
+    repo: Dicklesworthstone/rust_scriptbots
+    local_path: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate
+    required_checks:
+      - node --test crates/scriptbots-web/web/tests/recipes.test.mjs
+      - cargo fmt --check
+  rust_scriptbots_candidate_compile:
+    repo: Dicklesworthstone/rust_scriptbots
+    local_path: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_candidate
+    required_checks:
+      - cargo test --locked -p scriptbots-web --lib browser_mixed

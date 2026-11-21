@@ -57,7 +57,25 @@
             width: 100%;
             height: auto;
             display: block;
+            cursor: crosshair;
         }
+
+        #checkpoint-view {
+            position: absolute;
+            left: 1rem;
+            right: 1rem;
+            bottom: 1rem;
+            z-index: 2;
+            max-width: 48rem;
+            padding: 0.85rem 1rem;
+            border: 1px solid #a78bfa;
+            border-radius: 0.5rem;
+            background: rgba(15, 23, 42, 0.96);
+            color: #ede9fe;
+        }
+
+        #checkpoint-view-status { margin: 0 0 0.65rem; font-size: 0.85rem; overflow-wrap: anywhere; }
+        #sim-container[data-view="checkpoint"] #sim-canvas { cursor: default; }
 
         #stats-panel {
             background: rgba(15, 23, 42, 0.95);
@@ -131,11 +149,116 @@
             background: #0f172a;
         }
 
-        #renderer-status {
+        #renderer-status, #environment-status {
             font-size: 0.75rem;
             color: #94a3b8;
             overflow-wrap: anywhere;
         }
+
+        #launch-info, #fork-recipe-info { font-size: 0.75rem; overflow-wrap: anywhere; }
+
+        #agent-inspector {
+            border: 1px solid #334155;
+            border-radius: 0.5rem;
+            padding: 0.75rem;
+            display: grid;
+            gap: 0.65rem;
+        }
+
+        #inspector-status {
+            margin: 0;
+            font-size: 0.75rem;
+            color: #cbd5e1;
+            overflow-wrap: anywhere;
+        }
+
+        #inspector-uid {
+            box-sizing: border-box;
+            width: 100%;
+            background: #0f172a;
+            color: #f8fafc;
+            border: 1px solid #475569;
+            border-radius: 0.25rem;
+            padding: 0.4rem;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .inspector-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+        #inspector-summary { grid-template-columns: 1fr 1fr; }
+        #inspector-summary dd { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #inspector-summary dt { font-size: 0.75rem; }
+
+        #brain-inspector { border-top: 1px solid #334155; padding-top: 0.5rem; }
+        #brain-inspector p { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #brain-content[hidden] { display: none; }
+        #brain-content { display: grid; gap: 0.5rem; min-width: 0; }
+        #brain-content select, #brain-node { width: 100%; box-sizing: border-box; }
+        #brain-heatmap { display: block; max-width: 100%; image-rendering: pixelated; cursor: crosshair; }
+        #brain-content table { font-size: 0.7rem; width: 100%; font-variant-numeric: tabular-nums; }
+        #brain-content th, #brain-content td { text-align: right; overflow-wrap: anywhere; }
+        #brain-content th:first-child, #brain-content td:first-child { text-align: left; }
+        #genome-inspector { border-top: 1px solid #334155; padding-top: 0.5rem; }
+        #genome-inspector p { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #genome-content[hidden] { display: none; }
+        #genome-content { display: grid; gap: 0.5rem; min-width: 0; }
+        #genome-content .genome-table { max-height: 21rem; overflow: auto; }
+        #genome-content table { width: 100%; font-size: 0.7rem; font-variant-numeric: tabular-nums; }
+        #genome-content th, #genome-content td { text-align: left; overflow-wrap: anywhere; }
+        #genome-content th { position: sticky; top: 0; background: #0f172a; }
+        #intervention-toolbox { display: block; }
+        #intervention-toolbox summary { cursor: pointer; font-weight: 700; }
+        #intervention-toolbox p { font-size: 0.8rem; overflow-wrap: anywhere; }
+        #intervention-toolbox [hidden] { display: none; }
+        #intervention-form, #intervention-disc { display: grid; gap: 0.6rem; }
+        #intervention-form label { display: grid; gap: 0.25rem; }
+        #intervention-form input, #intervention-form select { box-sizing: border-box; width: 100%; }
+        #intervention-form input { color: #e2e8f0; background: #0f172a; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
+        #intervention-form fieldset { border: 1px solid #334155; border-radius: 0.35rem; }
+        #intervention-history { max-height: 19rem; overflow: auto; padding-left: 1.25rem; font-size: 0.75rem; }
+        #intervention-history li { margin: 0.5rem 0; overflow-wrap: anywhere; }
+        #intervention-form-error, #intervention-history-gap { color: #fbbf24; }
+        #experiment-lab { display: block; border: 1px solid #334155; border-radius: 0.5rem; padding: 0.75rem; }
+        #experiment-lab summary { cursor: pointer; font-weight: 700; }
+        #experiment-lab p { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #experiment-lab h3 { font-size: 0.85rem; margin: 0.9rem 0 0.4rem; }
+        #experiment-lab h4 { font-size: 0.8rem; margin: 0.5rem 0; }
+        #experiment-lab [hidden] { display: none; }
+        #experiment-lab button { width: 100%; margin: 0.2rem 0; }
+        #experiment-lab select { width: 100%; min-width: 0; box-sizing: border-box; }
+        #experiment-form, #experiment-form fieldset { display: grid; gap: 0.5rem; }
+        #experiment-form fieldset { min-width: 0; border: 1px solid #334155; border-radius: 0.35rem; margin: 0; }
+        #experiment-lab label { display: grid; gap: 0.25rem; margin: 0.4rem 0; }
+        #experiment-form input, #experiment-form textarea { box-sizing: border-box; width: 100%; min-width: 0; background: #0f172a; color: #e2e8f0; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
+        #experiment-form textarea { resize: vertical; font-family: ui-monospace, monospace; font-size: 0.75rem; }
+        #experiment-form details { font-size: 0.75rem; }
+        #experiment-lab :focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
+        #experiment-form-error, #experiment-batch-error { color: #fbbf24; }
+        #experiment-runs { padding-left: 1.15rem; max-height: 30rem; overflow: auto; font-size: 0.75rem; }
+        #experiment-runs li { padding: 0.5rem 0; border-bottom: 1px solid #334155; overflow-wrap: anywhere; }
+        #experiment-runs p { margin: 0.25rem 0; }
+        #experiment-comparison { margin-top: 0.6rem; padding: 0.6rem; background: #101b2e; border: 1px solid #334155; border-radius: 0.35rem; }
+        #checkpoint-lab { border: 1px solid #334155; border-radius: 0.5rem; padding: 0.75rem; }
+        #checkpoint-lab summary { cursor: pointer; font-weight: 700; }
+        #checkpoint-lab p { font-size: 0.75rem; overflow-wrap: anywhere; }
+        #checkpoint-lab [hidden] { display: none; }
+        #checkpoint-lab h3 { font-size: 0.85rem; margin: 0.9rem 0 0.4rem; }
+        #checkpoint-lab select { width: 100%; min-width: 0; box-sizing: border-box; }
+        #lab-branch-form, #lab-branch-form fieldset { display: grid; gap: 0.5rem; }
+        #lab-branch-form fieldset { border: 1px solid #334155; border-radius: 0.35rem; margin: 0; }
+        #lab-branch-form label { display: grid; gap: 0.25rem; }
+        #lab-branch-form input { box-sizing: border-box; width: 100%; background: #0f172a; color: #e2e8f0; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
+        #lab-notice, #lab-form-error { color: #fbbf24; }
+        #lab-checkpoint-detail, #lab-branch-detail, #lab-artifact-detail { white-space: pre-line; }
+        #lab-study-report { margin-top: 0.75rem; padding: 0.65rem; border: 1px solid #334155; border-radius: 0.4rem; background: #101b2e; overflow-x: auto; }
+        #lab-study-report h4 { margin: 0.6rem 0 0.35rem; font-size: 0.8rem; }
+        #lab-study-report table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
+        #lab-study-report th, #lab-study-report td { text-align: left; vertical-align: top; padding: 0.35rem; border-bottom: 1px solid #334155; }
+        #lab-study-report ul { padding-left: 1.1rem; font-size: 0.75rem; }
+        #inspector-signals { max-height: 24rem; overflow: auto; }
+        #inspector-signals table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
+        #inspector-signals th { text-align: left; font-weight: 400; }
+        #inspector-signals td { text-align: right; font-variant-numeric: tabular-nums; }
+        #inspector-signals h3 { font-size: 0.8rem; }
 
         .controls button {
             padding: 0.6rem 0.8rem;
@@ -164,12 +287,17 @@
         }
 
         #remote-events {
-            max-height: 12rem;
+            max-height: 20rem;
             overflow: auto;
             margin: 0;
             padding-left: 1.2rem;
             font-size: 0.75rem;
         }
+
+        #narrative-timeline { border: 1px solid #334155; border-radius: 0.5rem; padding: 0.75rem; }
+        #narrative-timeline p { margin: 0; font-size: 0.75rem; overflow-wrap: anywhere; }
+        #narrative-gap { color: #fbbf24; }
+        #remote-events li { margin: 0.5rem 0; overflow-wrap: anywhere; }
 
         #remote-overlay {
             position: absolute;
@@ -260,12 +388,16 @@
     <div id="mismatch-banner" role="alert" aria-live="polite"></div>
     <main>
         <section id="sim-container">
-            <canvas id="sim-canvas" width="1280" height="720" aria-label="Simulation canvas"></canvas>
+            <canvas id="sim-canvas" width="1280" height="720" tabindex="0" aria-label="Simulation canvas. Click a creature to inspect it; Escape clears selection."></canvas>
             <div id="remote-overlay" role="status" hidden>Waiting for a remote canvas frame…</div>
+            <section id="checkpoint-view" aria-label="Saved-world review" hidden>
+                <p id="checkpoint-view-status" role="status" aria-live="polite"></p>
+                <button id="checkpoint-return-live" type="button">Return to live</button>
+            </section>
         </section>
         <aside id="stats-panel">
             <div class="controls">
-                <div class="chip">Live Metrics</div>
+                <div id="metrics-heading" class="chip">Live Metrics</div>
                 <dl>
                     <dt>FPS</dt>
                     <dd id="metric-fps">–</dd>
@@ -284,6 +416,7 @@
                     <dt>Avg Health</dt>
                     <dd id="metric-health">–</dd>
                 </dl>
+                <p id="launch-info" role="status">Waiting for initial-condition metadata.</p>
                 <label for="renderer">Renderer</label>
                 <select id="renderer">
                     <option value="auto">Automatic (prefer WebGPU)</option>
@@ -291,6 +424,103 @@
                     <option value="webgpu">WebGPU</option>
                 </select>
                 <div id="renderer-status" role="status" aria-live="polite">Starting renderer…</div>
+                <label for="environment-layer">World layers</label>
+                <select id="environment-layer">
+                    <option value="combined" selected>Terrain + food + water</option>
+                    <option value="terrain">Terrain</option>
+                    <option value="food">Food availability</option>
+                    <option value="water">Water depth</option>
+                    <option value="agents">Agents only</option>
+                </select>
+                <div id="environment-status" role="status" aria-live="polite">Waiting for environment layers…</div>
+                <section id="agent-inspector" aria-labelledby="inspector-heading" data-state="empty">
+                    <h2 id="inspector-heading">Creature inspector</h2>
+                    <p id="inspector-status" role="status">Click a creature in the world, or enter its stable UID.</p>
+                    <form id="inspector-form">
+                        <label for="inspector-uid">Creature UID</label>
+                        <input id="inspector-uid" type="text" inputmode="numeric" pattern="[0-9]+" maxlength="20" autocomplete="off" required />
+                        <button type="submit">Inspect</button>
+                    </form>
+                    <div class="inspector-actions">
+                        <button id="inspector-refresh" type="button" disabled>Refresh detail</button>
+                        <button id="inspector-clear" type="button" disabled>Clear selection</button>
+                    </div>
+                    <dl id="inspector-summary"></dl>
+                    <details>
+                        <summary>Senses and outputs</summary>
+                        <div id="inspector-signals"></div>
+                    </details>
+                    <details id="brain-inspector" data-state="inactive">
+                        <summary>Brain activity and output explanations</summary>
+                        <p id="brain-status" role="status">Open this panel to request bounded activity from the selected creature.</p>
+                        <p id="brain-source"></p>
+                        <button id="brain-refresh" type="button" disabled>Refresh brain observation</button>
+                        <div id="brain-content" hidden>
+                            <p id="brain-budget"></p>
+                            <label for="brain-layer">Activation layer</label>
+                            <select id="brain-layer"></select>
+                            <canvas id="brain-heatmap" width="8" height="8" role="img" aria-label="Brain activity"></canvas>
+                            <p>Blue: positive · orange: negative · dark: zero. Color saturates for large magnitudes; select a cell for its exact value.</p>
+                            <label for="brain-node">Node in this layer</label>
+                            <input id="brain-node" type="number" min="0" step="1" value="0" />
+                            <p id="brain-node-value"></p>
+                            <h3>Actual weighted connections</h3>
+                            <p id="brain-edge-page"></p>
+                            <div class="inspector-actions">
+                                <button id="brain-edge-prev" type="button">Previous connections</button>
+                                <button id="brain-edge-next" type="button">Next connections</button>
+                            </div>
+                            <table aria-label="Retained brain connection weights">
+                                <thead><tr><th scope="col">From</th><th scope="col">To</th><th scope="col">Weight</th></tr></thead>
+                                <tbody id="brain-edges"></tbody>
+                            </table>
+                            <h3>Output explanation</h3>
+                            <label for="brain-output">Chosen actuator</label>
+                            <select id="brain-output"></select>
+                            <p id="brain-output-value"></p>
+                            <table aria-label="Top input contributions from shared core">
+                                <thead><tr><th scope="col">Input</th><th scope="col">Contribution</th><th scope="col">Weight</th><th scope="col">Activation</th></tr></thead>
+                                <tbody id="brain-contributions"></tbody>
+                            </table>
+                            <p id="brain-attribution-note"></p>
+                        </div>
+                    </details>
+                    <details id="genome-inspector" data-state="inactive">
+                        <summary>Inherited genome &amp; parent differences</summary>
+                        <p id="genome-status" role="status">Open this panel to browse the selected creature’s inherited genome.</p>
+                        <p id="genome-source"></p>
+                        <button id="genome-refresh" type="button" disabled>Refresh from first page</button>
+                        <div id="genome-content" hidden>
+                            <p id="genome-digest"></p>
+                            <p id="genome-provenance"></p>
+                            <h3>Canonical loci</h3>
+                            <p id="genome-locus-page"></p>
+                            <div class="inspector-actions">
+                                <button id="genome-locus-prev" type="button" disabled>Previous loci</button>
+                                <button id="genome-locus-next" type="button" disabled>Next loci</button>
+                            </div>
+                            <div class="genome-table">
+                                <table aria-label="Canonical inherited genome loci">
+                                    <thead><tr><th>Index</th><th>Locus</th><th>Type</th><th>Value</th></tr></thead>
+                                    <tbody id="genome-loci"></tbody>
+                                </table>
+                            </div>
+                            <h3>Parent comparison</h3>
+                            <p id="genome-parent"></p>
+                            <p id="genome-delta-page"></p>
+                            <div class="inspector-actions">
+                                <button id="genome-delta-prev" type="button" disabled>Previous changes</button>
+                                <button id="genome-delta-next" type="button" disabled>Next changes</button>
+                            </div>
+                            <div class="genome-table">
+                                <table aria-label="Parent to child genome differences">
+                                    <thead><tr><th>Locus</th><th>Change</th><th>Parent</th><th>Child</th></tr></thead>
+                                    <tbody id="genome-deltas"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </details>
+                </section>
                 <button id="capture-btn" type="button" disabled>Save Frame as PNG</button>
                 <div id="capture-status" role="status" aria-live="polite"></div>
                 <label>
@@ -304,18 +534,39 @@
                 <button id="reset-btn" type="button">Reset Simulation</button>
                 <label for="brain-preset">Brain for new worlds</label>
                 <select id="brain-preset">
-                    <option value="wander" selected>Wander</option>
-                    <option value="mlp">MLP (supports saved continuations)</option>
+                    <option value="mixed_continuation" disabled>Mixed continuation — choose a new-world preset to reset</option>
+                    <option value="mlp" selected>MLP — evolving neural network</option>
+                    <option value="dwraon">DWRAON — evolving recurrent network</option>
+                    <option value="assembly">Assembly — evolving program (experimental)</option>
+                    <option value="mixed">Mixed MLP + DWRAON + Assembly</option>
+                    <option value="wander">Wander — legacy movement demo (cannot save)</option>
                     <option value="none">Unbound (supports saved continuations)</option>
                 </select>
+                <p id="checkpoint-capability" role="status">MLP, DWRAON and Assembly worlds support inherited genomes and saved continuations.</p>
                 <button id="checkpoint-save" type="button" disabled>Save Continuation File</button>
                 <label for="checkpoint-load">Load Continuation File (pauses the loaded world)</label>
                 <input id="checkpoint-load" type="file" accept=".sbcheckpoint,application/octet-stream" disabled />
                 <div id="checkpoint-status" role="status" aria-live="polite"></div>
+                <details id="world-checkpoint-transfer">
+                    <summary>Transfer a scientific checkpoint</summary>
+                    <p>Import a native saved world to start a new paused browser session at its saved tick, or export this world's scientific state for compatible native tools. Supported MLP, DWRAON, Assembly and Unbound worlds retain their genomes and evaluator state. Host commands, scheduled changes and the durable journal are not transferred. Cross-target future trajectories are not certified as identical.</p>
+                    <button id="world-checkpoint-export" type="button" disabled>Export Scientific Checkpoint</button>
+                    <label for="world-checkpoint-import">Import Scientific Checkpoint (replaces the local world after validation)</label>
+                    <input id="world-checkpoint-import" type="file" accept=".sbworld,.bin,application/octet-stream" disabled />
+                    <div id="world-checkpoint-status" role="status" aria-live="polite"></div>
+                </details>
                 <button id="checkpoint-browser-save" type="button" disabled>Save in This Browser</button>
                 <button id="checkpoint-browser-restore" type="button" disabled>Restore Saved World (paused)</button>
                 <p>One saved continuation for this site and browser. Save replaces it; restore is always explicit. Browser storage can be cleared, so download a file for a portable copy.</p>
                 <div id="checkpoint-browser-status" role="status" aria-live="polite"></div>
+                <label for="checkpoint-recovery-enabled">
+                    <input id="checkpoint-recovery-enabled" type="checkbox" disabled />
+                    Automatically save recovery for this world
+                </label>
+                <p>Saves changed state at most every 30 seconds in a separate recovery slot; your manual save stays intact. Reset, restore or remote mode turns recovery off. A reload never restores automatically.</p>
+                <button id="checkpoint-recovery-restore" type="button" disabled>Restore Recovery World (paused)</button>
+                <button id="checkpoint-recovery-retry" type="button" disabled>Retry Recovery</button>
+                <div id="checkpoint-recovery-status" role="status" aria-live="polite">Recovery is off. Browser storage may be cleared or evicted; download a continuation file for a portable copy.</div>
             </div>
             <div class="controls" aria-label="Remote simulation">
                 <div class="chip">Remote Server</div>
@@ -334,49 +585,357 @@
                 <button id="remote-refresh" type="button" disabled>Refresh Command Outcome</button>
                 <button id="remote-retry" type="button" disabled>Retry Last Command with Same ID</button>
                 <div id="remote-receipt" role="status" aria-live="polite"></div>
-                <ul id="remote-events" aria-label="Remote narrative events" aria-live="polite"></ul>
             </div>
+            <details id="experiment-lab" class="controls">
+                <summary>Matched-seed experiments</summary>
+                <p id="experiment-source" role="status">Connect to a remote server to run independent matched-seed worlds.</p>
+                <p id="experiment-notice" role="status" aria-live="polite"></p>
+                <h3>Retained experiments</h3>
+                <p>Reopen a batch retained by this host, including after reconnecting. Selecting it reads its recorded status.</p>
+                <label>Experiment
+                    <select id="experiment-select" disabled><option value="">No retained experiments observed</option></select>
+                </label>
+                <button id="experiment-catalog-refresh" type="button" disabled>Refresh experiment catalog</button>
+                <button id="experiment-catalog-first" type="button" disabled>First catalog page</button>
+                <button id="experiment-catalog-next" type="button" disabled>Next catalog page</button>
+                <p id="experiment-catalog-detail"></p>
+                <p id="experiment-capacity"></p>
+                <h3>Create a two-arm experiment</h3>
+                <p>Each arm starts fresh worlds from the runner's defaults plus its overrides, using the same seed set. These runs do not start from the current canvas or a saved checkpoint. The current world stays separate.</p>
+                <form id="experiment-form">
+                    <label>Experiment ID (optional)
+                        <input id="experiment-id" type="text" maxlength="128" pattern="[A-Za-z0-9_-]+" placeholder="Host assigns an ID when blank" />
+                    </label>
+                    <label>Description (optional)
+                        <input id="experiment-description" type="text" maxlength="1024" placeholder="Question this experiment should answer" />
+                    </label>
+                    <label>Exact decimal seeds (comma or whitespace separated)
+                        <input id="experiment-seeds" type="text" value="11, 42, 137" maxlength="2048" spellcheck="false" required />
+                    </label>
+                    <p>Use 1–32 distinct unsigned 64-bit integers, from 0 through 18446744073709551615. One seed pair supports descriptive results only.</p>
+                    <label>Horizon per run (ticks)
+                        <input id="experiment-ticks" type="number" min="1" max="10000000" step="1" value="200" required />
+                    </label>
+                    <label>Maximum simultaneous runs
+                        <input id="experiment-concurrency" type="number" min="1" max="8" step="1" value="1" required />
+                    </label>
+                    <fieldset>
+                        <legend>Baseline arm</legend>
+                        <label>Arm ID
+                            <input id="experiment-baseline-id" type="text" pattern="[A-Za-z0-9_-]+" maxlength="64" value="baseline" required />
+                        </label>
+                        <label>Brain family
+                            <select id="experiment-baseline-family">
+                                <option value="mlp" selected>MLP baseline</option>
+                                <option value="dwraon">DWRAON baseline</option>
+                                <option value="neuroflow">NeuroFlow (requires host support)</option>
+                                <option value="assembly">Assembly (experimental)</option>
+                                <option value="ft">Ft</option>
+                            </select>
+                        </label>
+                        <details>
+                            <summary>Baseline configuration and schedule</summary>
+                            <label>Initial overrides (JSON object)
+                                <textarea id="experiment-baseline-config" rows="3" maxlength="16384" spellcheck="false">{"population_minimum":20}</textarea>
+                            </label>
+                            <label>Scheduled changes (JSON array)
+                                <textarea id="experiment-baseline-schedule" rows="3" maxlength="16384" spellcheck="false">[]</textarea>
+                            </label>
+                        </details>
+                    </fieldset>
+                    <fieldset>
+                        <legend>Challenger arm</legend>
+                        <label>Arm ID
+                            <input id="experiment-challenger-id" type="text" pattern="[A-Za-z0-9_-]+" maxlength="64" value="challenger" required />
+                        </label>
+                        <label>Brain family
+                            <select id="experiment-challenger-family">
+                                <option value="mlp">MLP baseline</option>
+                                <option value="dwraon" selected>DWRAON baseline</option>
+                                <option value="neuroflow">NeuroFlow (requires host support)</option>
+                                <option value="assembly">Assembly (experimental)</option>
+                                <option value="ft">Ft</option>
+                            </select>
+                        </label>
+                        <details>
+                            <summary>Challenger configuration and schedule</summary>
+                            <label>Initial overrides (JSON object)
+                                <textarea id="experiment-challenger-config" rows="3" maxlength="16384" spellcheck="false">{"population_minimum":20}</textarea>
+                            </label>
+                            <label>Scheduled changes (JSON array)
+                                <textarea id="experiment-challenger-schedule" rows="3" maxlength="16384" spellcheck="false">[]</textarea>
+                            </label>
+                        </details>
+                    </fieldset>
+                    <p>Keep initial overrides identical to compare only brain families. NeuroFlow uses the experiment defaults for architecture and activation; this form does not sweep those settings. The host must include NeuroFlow support. Configuration keys may use dotted paths. The host validates supported configuration and refuses seed or recording-policy changes in overrides.</p>
+                    <p>Schedule example: <code>[{"tick":100,"set":{"food_growth_rate":0.001}}]</code>. Use ordered ticks within the horizon and numeric live settings; changes at the same tick keep their order.</p>
+                    <button id="experiment-launch" type="submit" disabled>Create matched-seed experiment</button>
+                </form>
+                <p id="experiment-form-error" role="alert"></p>
+                <p id="experiment-admission" role="status"></p>
+                <button id="experiment-retry" type="button" disabled>Retry exact request</button>
+                <h3>Observed runs</h3>
+                <p id="experiment-status" role="status"></p>
+                <p id="experiment-batch-error"></p>
+                <button id="experiment-refresh" type="button" disabled>Refresh selected status</button>
+                <button id="experiment-cancel" type="button" disabled>Cancel unfinished runs</button>
+                <button id="experiment-resume" type="button" disabled>Resume unfinished runs</button>
+                <p>Progress is a saved checkpoint observation. It may lag the running world. Server bundle paths identify host files; they are not browser downloads.</p>
+                <p id="experiment-run-page"></p>
+                <button id="experiment-run-previous" type="button" disabled>Previous run page</button>
+                <button id="experiment-run-next" type="button" disabled>Next run page</button>
+                <ol id="experiment-runs" aria-label="Observed experiment runs"></ol>
+                <h3>Paired endpoint comparison</h3>
+                <p>Choose two fully completed arms and one terminal metric. Each distinct matched seed contributes one pair. Results report challenger minus baseline; larger values alone do not imply better fitness.</p>
+                <label>Baseline arm
+                    <select id="experiment-compare-baseline" disabled></select>
+                </label>
+                <label>Challenger arm
+                    <select id="experiment-compare-challenger" disabled></select>
+                </label>
+                <label>Endpoint metric
+                    <select id="experiment-metric" disabled></select>
+                </label>
+                <button id="experiment-compare" type="button" disabled>Compare completed arms</button>
+                <section id="experiment-comparison" aria-label="Observed paired comparison" hidden></section>
+                <button id="experiment-export" type="button" disabled>Export browser observation JSON</button>
+                <p id="experiment-export-status" role="status">Exports retain observed status and comparison. A matching admitted request is included only when this browser still has it. This export is separate from the server's run bundles.</p>
+            </details>
+            <details id="checkpoint-lab" class="controls">
+                <summary>Saved-world experiments</summary>
+                <p id="lab-source" role="status">Connect to a remote server to save and study an evolved world.</p>
+                <p id="lab-notice" role="status" aria-live="polite"></p>
+                <h3>Reopen a retained study</h3>
+                <p>Find studies retained by this host, including after a reconnect or restart. Opening a study reads its status and available results.</p>
+                <div class="inspector-actions">
+                    <button id="lab-history-refresh" type="button" disabled>Refresh studies</button>
+                    <button id="lab-history-first" type="button" disabled>First studies page</button>
+                    <button id="lab-history-next" type="button" disabled>Next studies page</button>
+                </div>
+                <label for="lab-history-select">Retained study</label>
+                <select id="lab-history-select" disabled><option value="">No retained studies loaded</option></select>
+                <p id="lab-history-detail" role="status">Connect to discover retained studies.</p>
+                <h3>1. Choose a saved scientific state</h3>
+                <p>Save a completed state from the connected server, or select an earlier checkpoint. The saved tick identifies the actual source of your study.</p>
+                <div class="inspector-actions">
+                    <button id="lab-checkpoint-save" type="button" disabled>Save server checkpoint</button>
+                    <button id="lab-checkpoint-retry" type="button" disabled>Retry same save</button>
+                    <button id="lab-checkpoint-refresh" type="button" disabled>Refresh checkpoints</button>
+                </div>
+                <label for="lab-checkpoint-select">Study source</label>
+                <select id="lab-checkpoint-select" disabled><option value="">No checkpoints loaded</option></select>
+                <div class="inspector-actions">
+                    <button id="lab-checkpoint-first" type="button" disabled>First page</button>
+                    <button id="lab-checkpoint-next" type="button" disabled>Next page</button>
+                </div>
+                <p id="lab-checkpoint-detail">No source selected.</p>
+                <div class="inspector-actions">
+                    <button id="lab-checkpoint-review" type="button" disabled>Review saved world</button>
+                    <button id="lab-checkpoint-download" type="button" disabled>Download selected checkpoint</button>
+                    <button id="lab-checkpoint-local" type="button" disabled>Continue selected world locally (paused)</button>
+                    <p>Continuing locally replaces your retained browser world after validation and disconnects this viewer. The server keeps running independently. Original host commands, scheduled changes and durable history stay on the server. Unsupported brain families or scientific state leave both worlds intact.</p>
+                </div>
+                <p>Review draws the saved agents and environment without changing the server. Return to live before controlling, inspecting or starting a study. Births, deaths and tick rate are unavailable for a saved state.</p>
+                <h3>2. Run a future from that state</h3>
+                <p>An unchanged future runs one trajectory. A treatment runs alongside an unchanged control from the same saved state. Both run independently of the live world.</p>
+                <form id="lab-branch-form">
+                    <label for="lab-branch-name">Study name
+                        <input id="lab-branch-name" type="text" value="future" pattern="[A-Za-z0-9_\-]{1,64}" maxlength="64" required />
+                    </label>
+                    <label for="lab-branch-ticks">Future scientific ticks
+                        <input id="lab-branch-ticks" type="number" min="1" max="10000" step="1" value="120" required />
+                    </label>
+                    <label for="lab-branch-kind">Treatment
+                        <select id="lab-branch-kind">
+                            <option value="unchanged">Unchanged future</option>
+                            <option value="drought">Drought versus unchanged control</option>
+                            <option value="resource_shock">Food shock versus unchanged control</option>
+                            <option value="temperature">Temperature stress versus unchanged control</option>
+                            <option value="closed_world">Population injection policy versus control</option>
+                        </select>
+                    </label>
+                    <fieldset data-lab-kinds="drought" hidden disabled>
+                        <legend>Whole-world drought</legend>
+                        <label for="lab-drought-ticks">Drought duration (ticks)
+                            <input id="lab-drought-ticks" type="number" min="1" max="4294967295" step="1" value="120" required />
+                        </label>
+                        <label for="lab-growth-scale">Food growth multiplier (0–1)
+                            <input id="lab-growth-scale" type="number" min="0" max="1" step="any" value="0.1" required />
+                        </label>
+                    </fieldset>
+                    <fieldset data-lab-kinds="resource_shock" hidden disabled>
+                        <legend>Whole-world food shock</legend>
+                        <label for="lab-bloom">Food added per cell
+                            <input id="lab-bloom" type="number" min="0" step="any" value="0" required />
+                        </label>
+                        <label for="lab-scorch">Fraction of food removed (0–1)
+                            <input id="lab-scorch" type="number" min="0" max="1" step="any" value="0.5" required />
+                        </label>
+                    </fieldset>
+                    <fieldset data-lab-kinds="temperature" hidden disabled>
+                        <legend>Temperature stress</legend>
+                        <label for="lab-discomfort">Discomfort health drain rate
+                            <input id="lab-discomfort" type="number" min="0" step="any" value="0.01" required />
+                        </label>
+                        <label for="lab-comfort-band">Comfort band around preferred temperature
+                            <input id="lab-comfort-band" type="number" min="0" step="any" value="0.1" required />
+                        </label>
+                    </fieldset>
+                    <fieldset data-lab-kinds="closed_world" hidden disabled>
+                        <legend>Population injection policy</legend>
+                        <label for="lab-closed">Policy for treatment
+                            <select id="lab-closed">
+                                <option value="true">Closed — no automatic population injection</option>
+                                <option value="false">Open — permit configured population injection</option>
+                            </select>
+                        </label>
+                    </fieldset>
+                    <button id="lab-branch-launch" type="submit" disabled>Run study from selected checkpoint</button>
+                    <p id="lab-form-error" role="status"></p>
+                </form>
+                <p id="lab-branch-detail" role="status" aria-live="polite">No study launched in this view.</p>
+                <div class="inspector-actions">
+                    <button id="lab-branch-retry" type="button" disabled>Retry same study request</button>
+                    <button id="lab-branch-refresh" type="button" disabled>Refresh study status</button>
+                    <button id="lab-branch-cancel" type="button" disabled>Cancel study</button>
+                </div>
+                <h3>3. Inspect and reproduce the result</h3>
+                <p>The completed report compares observed outcomes and records its exact source. One saved trajectory is descriptive evidence; independent replication requires multiple starting seeds.</p>
+                <div class="inspector-actions">
+                    <button id="lab-report-preview" type="button" disabled>Read study results</button>
+                    <button id="lab-report-download" type="button" disabled>Download completed study report</button>
+                </div>
+                <section id="lab-study-report" aria-label="Verified study results" hidden></section>
+                <div class="inspector-actions">
+                    <button id="lab-artifact-refresh" type="button" disabled>List study files</button>
+                    <button id="lab-artifact-first" type="button" disabled>First files page</button>
+                    <button id="lab-artifact-next" type="button" disabled>Next files page</button>
+                </div>
+                <label for="lab-artifact-select">Source, plan and verified result files</label>
+                <select id="lab-artifact-select" disabled><option value="">No completed study files loaded</option></select>
+                <p id="lab-artifact-detail"></p>
+                <button id="lab-artifact-download" type="button" disabled>Download selected study file</button>
+                <p id="lab-download-status" role="status" aria-live="polite"></p>
+            </details>
+            <section id="narrative-timeline" class="controls" aria-label="Scientific narrative timeline">
+                <h2>Scientific timeline</h2>
+                <p id="narrative-status" role="status">Waiting for scientific history.</p>
+                <p id="narrative-source"></p>
+                <p id="narrative-retention"></p>
+                <p id="narrative-gap" role="status"></p>
+                <button id="narrative-refresh" type="button" disabled>Refresh local history</button>
+                <ul id="remote-events" aria-label="Observed scientific narrative events" aria-live="polite"></ul>
+            </section>
+            <details id="intervention-toolbox" class="controls">
+                <summary>Scientific intervention toolbox</summary>
+                <p id="intervention-owner" role="status">Waiting for an observed world.</p>
+                <div class="inspector-actions">
+                    <button id="intervention-pause" type="button" disabled>Pause</button>
+                    <button id="intervention-step" type="button" disabled>Step once</button>
+                    <button id="intervention-resume" type="button" disabled>Resume</button>
+                </div>
+                <form id="intervention-form">
+                    <label for="intervention-kind">Experiment
+                        <select id="intervention-kind">
+                            <option value="drought">Drought — suppress food growth</option>
+                            <option value="embargo">Embargo — suppress food intake</option>
+                            <option value="bloom">Bloom — add food</option>
+                            <option value="meteor">Meteor — damage agents and scorch food</option>
+                            <option value="set_closed_world">Closed/open world — population injection policy</option>
+                        </select>
+                    </label>
+                    <fieldset data-intervention-kinds="drought embargo bloom meteor">
+                        <legend>Target region</legend>
+                        <label for="intervention-region">Extent
+                            <select id="intervention-region"><option value="all">Whole world</option><option value="disc">Toroidal disc</option></select>
+                        </label>
+                        <div id="intervention-disc" hidden>
+                            <label for="intervention-x">Center X <input id="intervention-x" type="number" step="any" value="0" required /></label>
+                            <label for="intervention-y">Center Y <input id="intervention-y" type="number" step="any" value="0" required /></label>
+                            <label for="intervention-radius">Radius <input id="intervention-radius" type="number" min="0.000001" step="any" value="100" required /></label>
+                            <button id="intervention-use-selected" type="button">Center on selected creature</button>
+                        </div>
+                    </fieldset>
+                    <label for="intervention-ticks" data-intervention-kinds="drought embargo">Duration in scientific ticks
+                        <input id="intervention-ticks" type="number" min="1" max="4294967295" step="1" value="300" required />
+                    </label>
+                    <label for="intervention-growth-scale" data-intervention-kinds="drought">Food growth multiplier (0 = none, 1 = unchanged)
+                        <input id="intervention-growth-scale" type="number" min="0" max="1" step="any" value="0.1" required />
+                    </label>
+                    <label for="intervention-amount" data-intervention-kinds="bloom" hidden>Food added to each cell
+                        <input id="intervention-amount" type="number" min="0" step="any" value="0.25" required />
+                    </label>
+                    <label for="intervention-lethality" data-intervention-kinds="meteor" hidden>Health removed from each agent
+                        <input id="intervention-lethality" type="number" min="0" step="any" value="0.5" required />
+                    </label>
+                    <label for="intervention-scorch" data-intervention-kinds="meteor" hidden>Fraction of food scorched (0–1)
+                        <input id="intervention-scorch" type="number" min="0" max="1" step="any" value="0.5" required />
+                    </label>
+                    <label for="intervention-closed" data-intervention-kinds="set_closed_world" hidden>Population injection policy
+                        <select id="intervention-closed"><option value="true">Closed — no automatic population injections</option><option value="false">Open — configured injections may occur</option></select>
+                    </label>
+                    <button id="intervention-stage" type="submit" disabled>Stage intervention at paused boundary</button>
+                    <p id="intervention-form-error" role="status"></p>
+                </form>
+                <p id="intervention-request">No intervention request in this owner session.</p>
+                <p id="intervention-receipt" role="status" aria-live="polite"></p>
+                <div class="inspector-actions">
+                    <button id="intervention-status-refresh" type="button" disabled>Refresh command outcome</button>
+                    <button id="intervention-retry" type="button" disabled>Retry original request with same ID</button>
+                </div>
+                <h3>Observed ecological effects</h3>
+                <p id="intervention-history-source">Open the toolbox to read global ecological effects.</p>
+                <p id="intervention-history-gap" role="status"></p>
+                <div class="inspector-actions">
+                    <button id="intervention-history-refresh" type="button" disabled>Refresh effects</button>
+                    <button id="intervention-history-first" type="button" disabled>Oldest retained effects</button>
+                    <button id="intervention-history-next" type="button" disabled>Next effects page</button>
+                </div>
+                <ul id="intervention-history" aria-label="Global observed ecological effects"></ul>
+            </details>
             <div class="controls">
-                <div class="chip">Share &amp; Fork</div>
+                <div class="chip">Share &amp; Vary Initial Conditions</div>
+                <p>A recipe link starts a new world at tick zero. Use a saved continuation to preserve an evolved population and its history.</p>
                 <label>
-                    Load Permalink
-                    <input id="permalink-input" type="text" placeholder="Paste sbw1... permalink" spellcheck="false" />
+                    Initial-condition recipe link
+                    <input id="permalink-input" type="text" placeholder="Paste sbb1... recipe or sbw1... gallery link" spellcheck="false" />
                 </label>
                 <div style="display: flex; gap: 0.5rem;">
-                    <button id="load-permalink-btn" type="button" style="flex: 1;">Load Permalink</button>
-                    <button id="copy-permalink-btn" type="button" style="flex: 1; background: #334155;">Copy Current</button>
+                    <button id="load-permalink-btn" type="button" style="flex: 1;">Restart from Link</button>
+                    <button id="copy-permalink-btn" type="button" style="flex: 1; background: #334155;">Copy Recipe</button>
                 </div>
                 <div id="permalink-status" style="font-size: 0.75rem; opacity: 0.85;"></div>
 
                 <label>
-                    Fork Knob Patch (JSON)
+                    Variant Knob Patch (JSON)
                     <input id="fork-patch-input" type="text" placeholder='{"food_growth_rate": 0.05}' spellcheck="false" />
                 </label>
-                <button id="fork-btn" type="button" style="background: #059669;">Fork This World</button>
+                <button id="fork-btn" type="button" style="background: #059669;">Create Variant Recipe</button>
                 <div id="fork-output" style="display: none; font-size: 0.75rem; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); padding: 0.5rem; border-radius: 0.25rem; word-break: break-all;">
-                    <div style="font-weight: 600; margin-bottom: 0.25rem; color: #6ee7b7;">Fork Created:</div>
+                    <div style="font-weight: 600; margin-bottom: 0.25rem; color: #6ee7b7;">Variant Recipe:</div>
                     <div id="fork-child-link" style="font-family: monospace; font-size: 0.7rem;"></div>
+                    <p id="fork-recipe-info"></p>
                     <div style="margin-top: 0.4rem; display: flex; gap: 0.4rem;">
-                        <button id="load-forked-btn" type="button" style="padding: 0.3rem 0.5rem; font-size: 0.7rem; background: #059669;">Load Forked</button>
+                        <button id="load-forked-btn" type="button" style="padding: 0.3rem 0.5rem; font-size: 0.7rem; background: #059669;">Start Variant</button>
                         <button id="copy-fork-btn" type="button" style="padding: 0.3rem 0.5rem; font-size: 0.7rem; background: #334155;">Copy Link</button>
                     </div>
                 </div>
             </div>
             <div id="diff-container" class="controls">
-                <div class="chip">Parent Scenario Diff</div>
-                <div id="diff-empty" style="font-size: 0.8rem; opacity: 0.7;">No knob differences from base scenario.</div>
+                <div class="chip">Recipe Configuration Changes</div>
+                <div id="diff-empty" style="font-size: 0.8rem; opacity: 0.7;">No recorded configuration changes.</div>
                 <table id="diff-table" style="width: 100%; border-collapse: collapse; font-size: 0.75rem; display: none;">
                     <thead>
                         <tr style="border-bottom: 1px solid #1f2a44; text-align: left; opacity: 0.7;">
                             <th style="padding: 0.25rem 0.4rem;">Knob</th>
-                            <th style="padding: 0.25rem 0.4rem;">Base</th>
-                            <th style="padding: 0.25rem 0.4rem;">This World</th>
+                            <th style="padding: 0.25rem 0.4rem;">Original</th>
+                            <th style="padding: 0.25rem 0.4rem;">Recipe</th>
                         </tr>
                     </thead>
                     <tbody id="diff-tbody"></tbody>
                 </table>
             </div>
-            <div class="chip">Timeline</div>
+            <div class="chip">Application Log</div>
             <div id="log" aria-live="polite"></div>
         </aside>
     </main>

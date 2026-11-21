@@ -4108,123 +4108,866 @@ pub mod renderer {
         })
     }
 
-    /// Project existing application services into the optional GPUI Lab. All I/O,
-    /// verification and statistics execute on the renderer's single Lab worker.
-    #[cfg(any(feature = "gui", test))]
+    /// Project application services into the terminal and graphical Lab frontends. All I/O,
+    /// verification and statistics execute on the shared bounded Lab worker.
     #[must_use]
     pub fn lab_workflow_submit(
         control: crate::control::ControlHandle,
-    ) -> scriptbots_render::lab_workflows::LabWorkflowSubmit {
-        use scriptbots_render::lab_workflows::{
+    ) -> scriptbots_runtime::lab_workflows::LabWorkflowSubmit {
+        use scriptbots_runtime::lab_workflows::{
             LAB_PAGE_SIZE, LabCheckpoint, LabCheckpointPage, LabComparison, LabExperimentPage,
             LabWorkflowRequest, LabWorkflowResponse,
         };
         Arc::new(move |request| {
-            let result = match request {
-                LabWorkflowRequest::ListExperiments { cursor } => control
-                    .list_experiments(Some(LAB_PAGE_SIZE), cursor.as_deref())
-                    .map(|page| {
-                        LabWorkflowResponse::Experiments(LabExperimentPage {
-                            items: page
-                                .items
-                                .into_iter()
-                                .map(
-                                    |row| scriptbots_render::lab_workflows::LabExperimentSummary {
-                                        experiment_id: row.experiment_id,
-                                        status: row.status,
-                                        total_runs: row.total_runs,
-                                        completed_runs: row.completed_runs,
-                                        failed_runs: row.failed_runs,
-                                    },
-                                )
-                                .collect(),
-                            total: page.total,
-                            offset: page.offset,
-                            next_cursor: page.next_cursor,
-                            reserved_run_slots: page.execution_capacity.reserved_run_slots,
-                            max_run_slots: page.execution_capacity.max_run_slots,
+            let result =
+                match request {
+                    LabWorkflowRequest::BranchCapabilities => native_lab_branch_capabilities()
+                        .map(LabWorkflowResponse::BranchCapabilities),
+                    LabWorkflowRequest::CreateCheckpointBranch {
+                        request_id,
+                        session_id,
+                        draft,
+                    } => create_lab_checkpoint_branch(&control, request_id, session_id, draft),
+                    LabWorkflowRequest::ListCheckpointBranches { cursor } => control
+                        .list_checkpoint_branches(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                        .map(|page| {
+                            LabWorkflowResponse::CheckpointBranches(
+                                scriptbots_runtime::lab_workflows::LabCheckpointBranchPage {
+                                    items: page
+                                        .items
+                                        .into_iter()
+                                        .map(project_lab_checkpoint_branch)
+                                        .collect(),
+                                    total: page.total,
+                                    offset: page.offset,
+                                    next_cursor: page.next_cursor,
+                                },
+                            )
+                        }),
+                    LabWorkflowRequest::GetCheckpointBranch { branch_id } => control
+                        .get_checkpoint_branch(&branch_id)
+                        .map(project_lab_checkpoint_branch)
+                        .map(LabWorkflowResponse::CheckpointBranch),
+                    LabWorkflowRequest::CancelCheckpointBranch { branch_id } => control
+                        .cancel_checkpoint_branch(&branch_id)
+                        .map(project_lab_checkpoint_branch)
+                        .map(LabWorkflowResponse::CheckpointBranch),
+                    LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
+                        read_lab_checkpoint_branch_report(&control, &branch_id).map(|report| {
+                            LabWorkflowResponse::CheckpointBranchReport(Box::new(report))
                         })
-                    }),
-                LabWorkflowRequest::GetExperiment { experiment_id } => control
-                    .get_experiment(&experiment_id)
-                    .and_then(project_lab_experiment)
-                    .map(LabWorkflowResponse::Experiment),
-                LabWorkflowRequest::CancelExperiment { experiment_id } => control
-                    .cancel_experiment(&experiment_id)
-                    .and_then(project_lab_experiment)
-                    .map(LabWorkflowResponse::Experiment),
-                LabWorkflowRequest::ResumeExperiment { experiment_id } => control
-                    .resume_experiment(&experiment_id)
-                    .and_then(project_lab_experiment)
-                    .map(LabWorkflowResponse::Experiment),
-                LabWorkflowRequest::Compare {
-                    experiment_id,
-                    baseline_variant,
-                    challenger_variant,
-                } => control
-                    .compare_experiment_variants(
-                        &experiment_id,
-                        &baseline_variant,
-                        &challenger_variant,
-                        "alive_agents",
-                    )
-                    .map(|comparison| {
-                        LabWorkflowResponse::Comparison(LabComparison {
-                            experiment_id: comparison.experiment_id,
-                            baseline_variant: comparison.baseline_variant,
-                            challenger_variant: comparison.challenger_variant,
-                            endpoint_tick: comparison.endpoint_tick,
-                            matched_seeds: comparison.matched_seeds,
-                            mean_difference: comparison.mean_difference,
-                            ci_95: comparison.ci_95,
-                            standardized_effect: comparison.standardized_effect,
-                            p_value: comparison.p_value,
-                            adjusted_p_value: comparison.adjusted_p_value,
-                            descriptive_only: comparison.descriptive_only,
-                            underpowered_reason: comparison.underpowered_reason,
-                            undefined_effect_reason: comparison.undefined_effect_reason,
-                            plan_digest: comparison.plan_digest,
-                            status_generation: comparison.status_generation,
-                        })
-                    }),
-                LabWorkflowRequest::ListCheckpoints { cursor } => control
-                    .list_checkpoints(Some(LAB_PAGE_SIZE), cursor.as_deref())
-                    .map(|page| {
-                        LabWorkflowResponse::Checkpoints(LabCheckpointPage {
-                            items: page
-                                .items
-                                .into_iter()
-                                .map(|checkpoint| LabCheckpoint {
-                                    checkpoint_id: checkpoint.checkpoint_id,
-                                    tick: checkpoint.tick,
-                                    agent_count: checkpoint.agent_count,
-                                    byte_size: checkpoint.byte_size,
-                                    world_digest: checkpoint.world_digest_v1,
-                                })
-                                .collect(),
-                            total: page.total,
-                            offset: page.offset,
-                            next_cursor: page.next_cursor,
-                            retained_bytes: page.retention.file_bytes,
-                            max_bytes: page.retention.max_bytes,
-                        })
-                    }),
-                LabWorkflowRequest::ReviewCheckpoint { checkpoint_id } => control
-                    .checkpoint_canvas(&checkpoint_id)
-                    .map(|snapshot| LabWorkflowResponse::CheckpointFrame {
-                        checkpoint_id,
-                        snapshot,
-                    }),
-            };
+                    }
+                    LabWorkflowRequest::ExperimentCapabilities => {
+                        Ok(LabWorkflowResponse::ExperimentCapabilities(
+                            native_lab_experiment_capabilities(),
+                        ))
+                    }
+                    LabWorkflowRequest::CreateExperiment {
+                        request_id,
+                        session_id,
+                        draft,
+                    } => create_lab_experiment(&control, request_id, session_id, draft),
+                    LabWorkflowRequest::ListExperiments { cursor } => {
+                        control
+                            .list_experiments(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                            .map(|page| {
+                                LabWorkflowResponse::Experiments(LabExperimentPage {
+                        items: page.items.into_iter().map(|row| {
+                            scriptbots_runtime::lab_workflows::LabExperimentSummary {
+                                experiment_id: row.experiment_id,
+                                status: row.status,
+                                total_runs: row.total_runs,
+                                completed_runs: row.completed_runs,
+                                failed_runs: row.failed_runs,
+                            }
+                        }).collect(),
+                        total: page.total,
+                        offset: page.offset,
+                        next_cursor: page.next_cursor,
+                        reserved_run_slots: page.execution_capacity.reserved_run_slots,
+                        max_run_slots: page.execution_capacity.max_run_slots,
+                    })
+                            })
+                    }
+                    LabWorkflowRequest::GetExperiment { experiment_id } => control
+                        .get_experiment(&experiment_id)
+                        .and_then(project_lab_experiment)
+                        .map(LabWorkflowResponse::Experiment),
+                    LabWorkflowRequest::CancelExperiment { experiment_id } => control
+                        .cancel_experiment(&experiment_id)
+                        .and_then(project_lab_experiment)
+                        .map(LabWorkflowResponse::Experiment),
+                    LabWorkflowRequest::ResumeExperiment { experiment_id } => control
+                        .resume_experiment(&experiment_id)
+                        .and_then(project_lab_experiment)
+                        .map(LabWorkflowResponse::Experiment),
+                    LabWorkflowRequest::Compare {
+                        experiment_id,
+                        baseline_variant,
+                        challenger_variant,
+                        metric,
+                    } => control
+                        .compare_experiment_variants(
+                            &experiment_id,
+                            &baseline_variant,
+                            &challenger_variant,
+                            metric.key(),
+                        )
+                        .and_then(|comparison| {
+                            if comparison.metric != metric.key() {
+                                return Err(crate::control::ControlError::Conflict(
+                                    "comparison service returned a different scientific endpoint"
+                                        .into(),
+                                ));
+                            }
+                            Ok(LabWorkflowResponse::Comparison(LabComparison {
+                                experiment_id: comparison.experiment_id,
+                                baseline_variant: comparison.baseline_variant,
+                                challenger_variant: comparison.challenger_variant,
+                                metric,
+                                endpoint_tick: comparison.endpoint_tick,
+                                matched_seeds: comparison.matched_seeds,
+                                mean_difference: comparison.mean_difference,
+                                ci_95: comparison.ci_95,
+                                standardized_effect: comparison.standardized_effect,
+                                p_value: comparison.p_value,
+                                adjusted_p_value: comparison.adjusted_p_value,
+                                descriptive_only: comparison.descriptive_only,
+                                underpowered_reason: comparison.underpowered_reason,
+                                undefined_effect_reason: comparison.undefined_effect_reason,
+                                plan_digest: comparison.plan_digest,
+                                status_generation: comparison.status_generation,
+                            }))
+                        }),
+                    LabWorkflowRequest::ListCheckpoints { cursor } => control
+                        .list_checkpoints(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                        .map(|page| {
+                            LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                                items: page
+                                    .items
+                                    .into_iter()
+                                    .map(|checkpoint| LabCheckpoint {
+                                        checkpoint_id: checkpoint.checkpoint_id,
+                                        tick: checkpoint.tick,
+                                        agent_count: checkpoint.agent_count,
+                                        byte_size: checkpoint.byte_size,
+                                        world_digest: checkpoint.world_digest_v1,
+                                    })
+                                    .collect(),
+                                total: page.total,
+                                offset: page.offset,
+                                next_cursor: page.next_cursor,
+                                retained_bytes: page.retention.file_bytes,
+                                max_bytes: page.retention.max_bytes,
+                            })
+                        }),
+                    LabWorkflowRequest::CreateCheckpoint {
+                        request_id,
+                        session_id,
+                    } => create_lab_checkpoint(&control, request_id, session_id),
+                    LabWorkflowRequest::ReviewCheckpoint { checkpoint_id } => control
+                        .checkpoint_canvas(&checkpoint_id)
+                        .map(|snapshot| LabWorkflowResponse::CheckpointFrame {
+                            checkpoint_id,
+                            snapshot,
+                        }),
+                    LabWorkflowRequest::ReviewEvent { event } => review_lab_event(&control, event),
+                };
             result.map_err(|error| error.to_string())
         })
     }
 
-    #[cfg(any(feature = "gui", test))]
+    fn retained_lab_event(
+        snapshot: &scriptbots_runtime::RenderSnapshot,
+        event: scriptbots_runtime::lab_workflows::LabEventIdentity,
+    ) -> Result<&scriptbots_core::narrative::EventRecord, crate::control::ControlError> {
+        let index = event
+            .ordinal
+            .checked_sub(snapshot.narrative_dropped_events)
+            .and_then(|offset| offset.checked_sub(1))
+            .and_then(|index| usize::try_from(index).ok());
+        if snapshot.session_id == event.session_id
+            && event.tick <= snapshot.world.tick
+            && let Some(record) = index.and_then(|index| snapshot.narrative_events.get(index))
+            && record.tick.0 == event.tick
+        {
+            return Ok(record);
+        }
+        Err(crate::control::ControlError::Conflict(
+            "selected narrative event is no longer retained at that identity and tick in this owner".into(),
+        ))
+    }
+
+    fn review_lab_event(
+        control: &crate::control::ControlHandle,
+        event: scriptbots_runtime::lab_workflows::LabEventIdentity,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabWorkflowResponse, crate::control::ControlError>
+    {
+        use scriptbots_runtime::lab_workflows::{LabEventReview, LabWorkflowResponse};
+
+        let source = control.read_snapshot()?;
+        let record = retained_lab_event(&source, event)?.clone();
+        let review = control.event_canvas(event.tick)?;
+        // Reconstruction happens off the render thread. Check the actual source
+        // again before returning, rather than attaching an old result to a new owner.
+        let current = control.read_snapshot()?;
+        if retained_lab_event(&current, event)? != &record
+            || review.snapshot.session_id != event.session_id
+            || review.snapshot.world.tick != event.tick
+            || review.base_tick > event.tick
+        {
+            return Err(crate::control::ControlError::Conflict(
+                "event reconstruction changed its source, canonical evidence or target tick".into(),
+            ));
+        }
+        Ok(LabWorkflowResponse::EventFrame(LabEventReview {
+            event,
+            record,
+            checkpoint_id: review.checkpoint_id,
+            base_tick: review.base_tick,
+            snapshot: review.snapshot,
+        }))
+    }
+
+    fn native_lab_branch_capabilities() -> Result<
+        scriptbots_runtime::lab_workflows::LabBranchCapabilities,
+        crate::control::ControlError,
+    > {
+        Ok(scriptbots_runtime::lab_workflows::LabBranchCapabilities {
+            max_ticks: crate::control::MAX_CHECKPOINT_BRANCH_TICKS,
+            max_population: usize::try_from(crate::branch_study::MAX_STUDY_POPULATION).map_err(
+                |_| {
+                    crate::control::ControlError::PayloadTooLarge(
+                        "branch population limit cannot be represented on this target".into(),
+                    )
+                },
+            )?,
+        })
+    }
+
+    fn project_lab_checkpoint_branch(
+        branch: crate::control::CheckpointBranchStatusDto,
+    ) -> scriptbots_runtime::lab_workflows::LabCheckpointBranch {
+        scriptbots_runtime::lab_workflows::LabCheckpointBranch {
+            branch_id: branch.branch_id,
+            checkpoint_id: branch.checkpoint_id,
+            branch_name: branch.branch_name,
+            status: branch.status,
+            source_tick: branch.source_tick,
+            target_tick: branch.target_tick,
+            world_digest: branch.world_digest_v1,
+            artifact_id: branch.artifact_id,
+            error_reason: branch
+                .error_reason
+                .map(|reason| reason.chars().take(512).collect()),
+        }
+    }
+
+    fn create_lab_checkpoint_branch(
+        control: &crate::control::ControlHandle,
+        request_id: String,
+        session_id: scriptbots_runtime::HostSessionId,
+        draft: scriptbots_runtime::lab_workflows::LabBranchDraft,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabWorkflowResponse, crate::control::ControlError>
+    {
+        use crate::branch_study::StudyIntervention;
+        use crate::control::{CheckpointBranchRequest, ControlError};
+        use scriptbots_runtime::lab_workflows::{
+            LabBranchTreatment, LabWorkflowResponse, checkpoint_request_identity_is_valid,
+        };
+
+        if !checkpoint_request_identity_is_valid(&request_id) {
+            return Err(ControlError::BadRequest(
+                "native branch request identity must contain 1..=256 bytes without control characters"
+                    .into(),
+            ));
+        }
+        draft
+            .validate(&native_lab_branch_capabilities()?)
+            .map_err(ControlError::BadRequest)?;
+        if control.read_snapshot()?.session_id != session_id {
+            return Err(ControlError::Conflict(
+                "native checkpoint study belongs to a different owner session".into(),
+            ));
+        }
+        let intervention = match draft.treatment {
+            LabBranchTreatment::Unchanged => None,
+            LabBranchTreatment::Drought => Some(StudyIntervention::Drought {
+                region: None,
+                duration_ticks: u32::try_from(draft.ticks).map_err(|_| {
+                    ControlError::BadRequest("drought duration exceeds the core tick range".into())
+                })?,
+                growth_scale: 0.0,
+            }),
+            LabBranchTreatment::FoodBloom => Some(StudyIntervention::ResourceShock {
+                region: None,
+                bloom_amount: 0.5,
+                scorch: 0.0,
+            }),
+            LabBranchTreatment::ClosedWorld => {
+                Some(StudyIntervention::ClosedWorld { closed: true })
+            }
+        };
+        let idempotency_key = format!(
+            "native-lab-branch-v1:{:016x}:{request_id}",
+            session_id.get(),
+        );
+        let expected_branch_id = format!(
+            "branch-{}",
+            crate::control::compute_blake3(idempotency_key.as_bytes()),
+        );
+        match control.get_checkpoint_branch(&expected_branch_id) {
+            Ok(_) => {
+                // A retained admission owns its exact source independently of
+                // later checkpoint eviction. The create service still checks
+                // the entire immutable payload below before accepting a retry.
+            }
+            Err(ControlError::NotFound(_)) => {
+                let saved = control.get_checkpoint(&draft.checkpoint.checkpoint_id)?;
+                if saved.checkpoint_id != draft.checkpoint.checkpoint_id
+                    || saved.tick != draft.checkpoint.tick
+                    || saved.agent_count != draft.checkpoint.agent_count
+                    || saved.byte_size != draft.checkpoint.byte_size
+                    || saved.world_digest_v1 != draft.checkpoint.world_digest
+                {
+                    return Err(ControlError::Conflict(
+                        "selected checkpoint metadata changed before native study admission".into(),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        let branch = control.create_checkpoint_branch(CheckpointBranchRequest {
+            checkpoint_id: draft.checkpoint.checkpoint_id.clone(),
+            branch_name: draft.treatment.key().into(),
+            ticks: draft.ticks,
+            intervention,
+            idempotency_key,
+        })?;
+        if control.read_snapshot()?.session_id != session_id
+            || branch.branch_id != expected_branch_id
+            || branch.checkpoint_id != draft.checkpoint.checkpoint_id
+            || branch.branch_name != draft.treatment.key()
+            || branch.source_tick != draft.checkpoint.tick
+            || branch.world_digest_v1 != draft.checkpoint.world_digest
+            || draft.checkpoint.tick.checked_add(draft.ticks) != Some(branch.target_tick)
+        {
+            return Err(ControlError::Conflict(
+                "admitted checkpoint study does not match its source session and frozen request"
+                    .into(),
+            ));
+        }
+        Ok(LabWorkflowResponse::CheckpointBranchCreated {
+            request_id,
+            session_id,
+            branch: project_lab_checkpoint_branch(branch),
+        })
+    }
+
+    fn native_lab_digest_is_valid(value: &str, bytes: usize) -> bool {
+        value.len() == bytes * 2
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+
+    fn project_lab_branch_outcome(
+        outcome: crate::branch_study::BranchOutcomeReport,
+        status: &crate::control::CheckpointBranchStatusDto,
+        is_control: bool,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabBranchOutcome, crate::control::ControlError>
+    {
+        use crate::control::ControlError;
+        use scriptbots_runtime::lab_workflows::{LabBranchDivergence, LabBranchOutcome};
+
+        let sample = outcome.terminal_sample;
+        let expected_command = (!is_control).then_some(status.source_tick);
+        if sample.tick != status.target_tick
+            || outcome.command_applied_tick != expected_command
+            || !outcome.bundle_verified
+            || outcome.final_digest != sample.digest_overall
+            || !native_lab_digest_is_valid(&outcome.final_digest, std::mem::size_of::<u64>())
+            || !sample.food_total.is_finite()
+            || !sample.total_energy.is_finite()
+            || !sample.average_health.is_finite()
+            || outcome.extinction.final_population != sample.population
+            || outcome.recovery.final_population != sample.population
+            || outcome.recovery.baseline_tick != status.source_tick
+            || outcome.extinction.min_population > sample.population
+            || !outcome.recovery.recovery_ratio.is_finite()
+            || outcome.recovery.recovery_ratio < 0.0
+            || outcome.extinction.extinct != outcome.extinction.extinction_tick.is_some()
+            || outcome
+                .extinction
+                .extinction_tick
+                .is_some_and(|tick| tick < status.source_tick || tick > status.target_tick)
+            || (is_control && outcome.first_divergence.is_some())
+        {
+            return Err(ControlError::Conflict(
+                "checkpoint study outcome does not match its terminal boundary and recorded state"
+                    .into(),
+            ));
+        }
+        let first_divergence = outcome
+            .first_divergence
+            .map(|divergence| {
+                if divergence.branch_id != outcome.branch_id
+                    || divergence.tick < status.source_tick
+                    || divergence.tick > status.target_tick
+                    || Some(divergence.command_applied_tick) != expected_command
+                    || divergence.stage.is_empty()
+                    || divergence.stage.len() > 128
+                    || divergence.stage.chars().any(char::is_control)
+                    || divergence.control_digest.is_empty()
+                    || divergence.branch_digest.is_empty()
+                    || divergence.control_digest.len() > 2048
+                    || divergence.branch_digest.len() > 2048
+                    || divergence.control_digest == divergence.branch_digest
+                {
+                    return Err(ControlError::Conflict(
+                    "checkpoint study divergence does not match its observed branch and boundary"
+                        .into(),
+                ));
+                }
+                Ok(LabBranchDivergence {
+                    tick: divergence.tick,
+                    stage: divergence.stage,
+                    control_digest: divergence.control_digest,
+                    branch_digest: divergence.branch_digest,
+                    command_applied_tick: divergence.command_applied_tick,
+                    details: divergence.details.chars().take(512).collect(),
+                })
+            })
+            .transpose()?;
+        Ok(LabBranchOutcome {
+            tick: sample.tick,
+            population: sample.population,
+            total_food: sample.food_total,
+            total_energy: f64::from(sample.total_energy),
+            average_health: (sample.population > 0).then_some(f64::from(sample.average_health)),
+            final_digest: outcome.final_digest,
+            command_applied_tick: outcome.command_applied_tick,
+            minimum_population: outcome.extinction.min_population,
+            extinction_tick: outcome.extinction.extinction_tick,
+            baseline_population: outcome.recovery.pre_intervention_population,
+            recovery_ratio: (outcome.recovery.pre_intervention_population > 0)
+                .then_some(outcome.recovery.recovery_ratio),
+            first_divergence,
+        })
+    }
+
+    fn project_lab_branch_report(
+        status: &crate::control::CheckpointBranchStatusDto,
+        metadata: crate::control::ArtifactMetadataDto,
+        report: crate::branch_study::BranchStudyReport,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabBranchReport, crate::control::ControlError>
+    {
+        use crate::branch_study::{BRANCH_STUDY_REPORT_SCHEMA_VERSION, BranchStudySource};
+        use crate::control::ControlError;
+        use scriptbots_runtime::lab_workflows::{LAB_MAX_BRANCH_REPORT_BYTES, LabBranchReport};
+
+        if status.status != "completed"
+            || status.artifact_id.as_deref() != Some(metadata.artifact_id.as_str())
+            || metadata.relative_path
+                != format!("branches/{}/study/study_report.json", status.branch_id)
+            || metadata.byte_size == 0
+            || metadata.byte_size > LAB_MAX_BRANCH_REPORT_BYTES as u64
+            || !native_lab_digest_is_valid(&metadata.checksum_blake3, blake3::OUT_LEN)
+            || !native_lab_digest_is_valid(&metadata.checksum_sha256, 32)
+            || report.schema_version != BRANCH_STUDY_REPORT_SCHEMA_VERSION
+            || report.study_id != status.branch_id
+            || report.checkpoint_tick != status.source_tick
+            || report.checkpoint_tick.checked_add(report.horizon_ticks) != Some(status.target_tick)
+            || report.horizon_ticks == 0
+            || report.horizon_ticks > crate::control::MAX_CHECKPOINT_BRANCH_TICKS
+            || report.pre_intervention_digest != status.world_digest_v1
+            || !native_lab_digest_is_valid(
+                &report.pre_intervention_digest,
+                std::mem::size_of::<u64>(),
+            )
+            || !report.pre_intervention_digest_verified_for_all_branches
+            || report.control_branch_id != "control"
+            || !(1..=2).contains(&report.branch_reports.len())
+        {
+            return Err(ControlError::Conflict(
+                "checkpoint study report does not match its verified artifact and saved-source receipt"
+                    .into(),
+            ));
+        }
+        let BranchStudySource::SavedCheckpoint {
+            artifact_path,
+            byte_size,
+            checksum_blake3,
+        } = report.source
+        else {
+            return Err(ControlError::Conflict(
+                "checkpoint study report lost its saved source".into(),
+            ));
+        };
+        if artifact_path != "source_checkpoint.bin"
+            || byte_size == 0
+            || byte_size > scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES as u64
+            || !native_lab_digest_is_valid(&checksum_blake3, blake3::OUT_LEN)
+        {
+            return Err(ControlError::Conflict(
+                "checkpoint study source provenance is invalid".into(),
+            ));
+        }
+        let mut control = None;
+        let mut treatment = None;
+        for outcome in report.branch_reports {
+            if outcome.branch_id == "control" && control.is_none() {
+                control = Some(project_lab_branch_outcome(outcome, status, true)?);
+            } else if outcome.branch_id == "treatment" && treatment.is_none() {
+                treatment = Some(project_lab_branch_outcome(outcome, status, false)?);
+            } else {
+                return Err(ControlError::Conflict(
+                    "checkpoint study report contains duplicate or unrequested branches".into(),
+                ));
+            }
+        }
+        let control = control.ok_or_else(|| {
+            ControlError::Conflict("checkpoint study report has no unchanged control".into())
+        })?;
+        if treatment.as_ref().is_some_and(|outcome| {
+            outcome.final_digest != control.final_digest && outcome.first_divergence.is_none()
+        }) {
+            return Err(ControlError::Conflict(
+                "checkpoint study has differing terminal digests without divergence evidence"
+                    .into(),
+            ));
+        }
+        Ok(LabBranchReport {
+            branch_id: status.branch_id.clone(),
+            artifact_id: metadata.artifact_id,
+            base_seed: report.base_seed,
+            source_tick: status.source_tick,
+            target_tick: status.target_tick,
+            source_world_digest: report.pre_intervention_digest,
+            source_byte_size: byte_size,
+            source_checksum_blake3: checksum_blake3,
+            report_byte_size: metadata.byte_size,
+            report_checksum_blake3: metadata.checksum_blake3,
+            report_checksum_sha256: metadata.checksum_sha256,
+            control,
+            treatment,
+        })
+    }
+
+    fn read_lab_checkpoint_branch_report(
+        control: &crate::control::ControlHandle,
+        branch_id: &str,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabBranchReport, crate::control::ControlError>
+    {
+        use crate::control::ControlError;
+        use scriptbots_runtime::lab_workflows::LAB_MAX_BRANCH_REPORT_BYTES;
+
+        let status = control.get_checkpoint_branch(branch_id)?;
+        let artifact_id = status
+            .artifact_id
+            .as_deref()
+            .filter(|_| status.status == "completed")
+            .ok_or_else(|| {
+                ControlError::Conflict(
+                    "study outcomes require a completed study with a verified report artifact"
+                        .into(),
+                )
+            })?;
+        let metadata = control.get_artifact(artifact_id)?;
+        if metadata.byte_size > LAB_MAX_BRANCH_REPORT_BYTES as u64 {
+            return Err(ControlError::PayloadTooLarge(format!(
+                "native study report exceeds {LAB_MAX_BRANCH_REPORT_BYTES} bytes",
+            )));
+        }
+        // The existing service revalidates retained paths, byte counts and both
+        // checksums. Native parsing has its own smaller report-only bound.
+        let (verified_metadata, bytes) = control.read_artifact_bytes(artifact_id)?;
+        if metadata != verified_metadata || bytes.len() > LAB_MAX_BRANCH_REPORT_BYTES {
+            return Err(ControlError::Conflict(
+                "study report changed or exceeded its native preview bound".into(),
+            ));
+        }
+        let report = serde_json::from_slice(&bytes)
+            .map_err(|error| ControlError::Serialization(error.to_string()))?;
+        let projected = project_lab_branch_report(&status, verified_metadata, report)?;
+        if control.get_checkpoint_branch(branch_id)? != status {
+            return Err(ControlError::Conflict(
+                "study receipt changed while its report was being read".into(),
+            ));
+        }
+        Ok(projected)
+    }
+
+    fn native_lab_experiment_capabilities()
+    -> scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
+        use crate::experiment_runner::{
+            EXPERIMENT_BRAIN_FAMILIES, MAX_BATCH_TOTAL_TICKS, MAX_TICKS_PER_RUN,
+        };
+        use scriptbots_runtime::lab_workflows::{
+            LabExperimentParameter, LabExperimentParameterCapability,
+        };
+        let config = scriptbots_core::ScriptBotsConfig::default();
+        scriptbots_runtime::lab_workflows::LabExperimentCapabilities {
+            families: EXPERIMENT_BRAIN_FAMILIES
+                .iter()
+                .map(|family| (*family).to_owned())
+                .collect(),
+            treatment_parameters: LabExperimentParameter::ALL
+                .into_iter()
+                .filter_map(|parameter| {
+                    let range = scriptbots_core::knob_range(parameter.key())?;
+                    if range.fresh_world_only {
+                        return None;
+                    }
+                    let baseline_value = match parameter {
+                        LabExperimentParameter::FoodGrowth => config.food_growth_rate,
+                        LabExperimentParameter::Metabolism => config.metabolism_drain,
+                        LabExperimentParameter::MovementCost => config.movement_drain,
+                    };
+                    Some(LabExperimentParameterCapability {
+                        parameter,
+                        baseline_value: f64::from(baseline_value),
+                        min_value: range.min,
+                        max_value: range.max,
+                    })
+                })
+                .collect(),
+            max_seed_count: 128,
+            max_ticks_per_run: MAX_TICKS_PER_RUN,
+            max_total_ticks: MAX_BATCH_TOTAL_TICKS,
+            launch_description: format!(
+                "Fresh worlds with the experiment runner's default environment ({} x {}; food cell width {}) and founding population. Runs execute sequentially.",
+                config.world_width, config.world_height, config.food_cell_size,
+            ),
+        }
+    }
+
+    /// Construct the exact runner plan without creating a world, worker or file.
+    /// Both admission and receipt verification use this one treatment mapping.
+    fn native_lab_experiment_plan(
+        request_id: &str,
+        draft: &scriptbots_runtime::lab_workflows::LabExperimentDraft,
+    ) -> Result<crate::experiment_runner::MatchedSeedExperimentRunner, crate::control::ControlError>
+    {
+        use crate::control::ControlError;
+        use crate::experiment_runner::{
+            MatchedSeedCohort, MatchedSeedExperimentRunner, ScenarioVariant,
+        };
+
+        draft
+            .validate(&native_lab_experiment_capabilities())
+            .map_err(ControlError::BadRequest)?;
+        let intervention = draft
+            .treatment
+            .as_ref()
+            .map(|treatment| {
+                let value = treatment.value().map_err(ControlError::BadRequest)?;
+                let mut patch = serde_json::Map::new();
+                patch.insert(treatment.parameter.key().into(), serde_json::json!(value));
+                Ok::<_, ControlError>(crate::ScenarioInterventionV1 {
+                    tick: treatment.at_tick,
+                    set: serde_json::Value::Object(patch),
+                })
+            })
+            .transpose()?;
+        let variants = [
+            ("baseline", &draft.baseline_family),
+            ("challenger", &draft.challenger_family),
+        ]
+        .into_iter()
+        .map(|(variant_id, brain_family)| ScenarioVariant {
+            variant_id: variant_id.into(),
+            brain_family: brain_family.clone(),
+            config_overrides: std::collections::BTreeMap::new(),
+            interventions: if variant_id == "challenger" {
+                intervention.iter().cloned().collect()
+            } else {
+                Vec::new()
+            },
+        })
+        .collect();
+        Ok(MatchedSeedExperimentRunner::new(
+            request_id,
+            MatchedSeedCohort {
+                cohort_id: request_id.into(),
+                seeds: draft.seeds().map_err(ControlError::BadRequest)?,
+            },
+            variants,
+            draft.ticks_per_run,
+            1,
+            std::path::PathBuf::new(),
+        ))
+    }
+
+    fn validate_created_lab_experiment(
+        batch: &crate::control::ExperimentBatchStatusDto,
+        request_id: &str,
+        draft: &scriptbots_runtime::lab_workflows::LabExperimentDraft,
+    ) -> Result<(), crate::control::ControlError> {
+        use crate::control::ControlError;
+        use std::collections::BTreeSet;
+
+        let seeds: BTreeSet<_> = draft
+            .seeds()
+            .map_err(ControlError::BadRequest)?
+            .into_iter()
+            .collect();
+        let expected_runs = seeds.len().checked_mul(2).ok_or_else(|| {
+            ControlError::BadRequest("native experiment run count overflowed".into())
+        })?;
+        let expected_plan = native_lab_experiment_plan(request_id, draft)?
+            .plan_digest()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        if batch.experiment_id != request_id
+            || batch.plan_digest != expected_plan
+            || batch.total_runs != expected_runs
+            || batch.runs.len() != expected_runs
+        {
+            return Err(ControlError::Conflict(
+                "created experiment does not match the requested identity, scientific plan and run count".into(),
+            ));
+        }
+        let mut observed = BTreeSet::new();
+        for run in &batch.runs {
+            let expected_family = match run.variant_id.as_str() {
+                "baseline" => &draft.baseline_family,
+                "challenger" => &draft.challenger_family,
+                _ => {
+                    return Err(ControlError::Conflict(
+                        "created experiment contains an unrequested arm".into(),
+                    ));
+                }
+            };
+            if &run.brain_family != expected_family
+                || run.target_ticks != draft.ticks_per_run
+                || !seeds.contains(&run.seed)
+                || !observed.insert((run.variant_id.as_str(), run.seed))
+                || run.run_id != format!("{request_id}-{}-seed{}", run.variant_id, run.seed)
+            {
+                return Err(ControlError::Conflict(
+                    "created experiment does not match the requested families, seeds and horizon"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn create_lab_experiment(
+        control: &crate::control::ControlHandle,
+        request_id: String,
+        session_id: scriptbots_runtime::HostSessionId,
+        draft: scriptbots_runtime::lab_workflows::LabExperimentDraft,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabWorkflowResponse, crate::control::ControlError>
+    {
+        use crate::control::{ControlError, ExperimentCreateRequest, ExperimentVariantDto};
+        use scriptbots_runtime::lab_workflows::{
+            LabWorkflowResponse, experiment_request_identity_is_valid,
+        };
+
+        if !experiment_request_identity_is_valid(&request_id) {
+            return Err(ControlError::BadRequest(
+                "native experiment identity must be a safe 1..=92 byte path component".into(),
+            ));
+        }
+        if control.read_snapshot()?.session_id != session_id {
+            return Err(ControlError::Conflict(
+                "native experiment launch belongs to a different owner session".into(),
+            ));
+        }
+        let plan = native_lab_experiment_plan(&request_id, &draft)?;
+        // The same pure runner preflight validates the complete scheduled patch
+        // before the service can reserve capacity or write an admission record.
+        plan.plan_digest()
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        // Every optional field is explicit and stable. An unknown admission
+        // outcome can be retried without changing the service's payload hash.
+        let batch = control.create_experiment(ExperimentCreateRequest {
+            experiment_id: Some(request_id.clone()),
+            description: Some(if draft.treatment.is_some() {
+                "Native Evolution Lab matched-seed ecological treatment comparison".into()
+            } else {
+                "Native Evolution Lab matched-seed brain-family comparison".into()
+            }),
+            variants: plan
+                .variants
+                .into_iter()
+                .map(|variant| ExperimentVariantDto {
+                    variant_id: variant.variant_id,
+                    brain_family: variant.brain_family,
+                    config_overrides: None,
+                    interventions: variant.interventions,
+                })
+                .collect(),
+            seeds: plan.cohort.seeds,
+            ticks_per_run: Some(draft.ticks_per_run),
+            max_concurrency: Some(1),
+            idempotency_key: Some(format!(
+                "native-lab-experiment-v1:{:016x}:{request_id}",
+                session_id.get(),
+            )),
+        })?;
+        // Projection omits per-run seeds, horizons and patches. Bind the full
+        // source-aware plan and service matrix before reducing that evidence.
+        validate_created_lab_experiment(&batch, &request_id, &draft)?;
+        if control.read_snapshot()?.session_id != session_id {
+            return Err(ControlError::Conflict(
+                "native experiment owner changed while admission was being observed".into(),
+            ));
+        }
+        Ok(LabWorkflowResponse::ExperimentCreated {
+            request_id,
+            session_id,
+            experiment: project_lab_experiment(batch)?,
+        })
+    }
+
+    fn create_lab_checkpoint(
+        control: &crate::control::ControlHandle,
+        request_id: String,
+        session_id: scriptbots_runtime::HostSessionId,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabWorkflowResponse, crate::control::ControlError>
+    {
+        use scriptbots_runtime::lab_workflows::{
+            LabCheckpoint, LabWorkflowResponse, checkpoint_request_identity_is_valid,
+        };
+        if !checkpoint_request_identity_is_valid(&request_id) {
+            return Err(crate::control::ControlError::BadRequest(
+                "native checkpoint request identity must contain 1..=256 bytes without control characters".into(),
+            ));
+        }
+        // This handle stays attached to one owner session. Check that real
+        // source before admitting a save; UI selection alone is not authority.
+        if control.read_snapshot()?.session_id != session_id {
+            return Err(crate::control::ControlError::Conflict(
+                "native checkpoint save belongs to a different owner session".into(),
+            ));
+        }
+        let checkpoint = control.create_checkpoint(crate::control::CheckpointCreateRequest {
+            description: Some("Native Evolution Lab checkpoint".into()),
+            idempotency_key: Some(format!(
+                "native-lab-v1:{:016x}:{request_id}",
+                session_id.get()
+            )),
+        })?;
+        Ok(LabWorkflowResponse::CheckpointCreated {
+            request_id,
+            session_id,
+            checkpoint: LabCheckpoint {
+                checkpoint_id: checkpoint.checkpoint_id,
+                tick: checkpoint.tick,
+                agent_count: checkpoint.agent_count,
+                byte_size: checkpoint.byte_size,
+                world_digest: checkpoint.world_digest_v1,
+            },
+        })
+    }
+
     fn project_lab_experiment(
         batch: crate::control::ExperimentBatchStatusDto,
-    ) -> Result<scriptbots_render::lab_workflows::LabExperiment, crate::control::ControlError> {
-        use scriptbots_render::lab_workflows::{
+    ) -> Result<scriptbots_runtime::lab_workflows::LabExperiment, crate::control::ControlError>
+    {
+        use scriptbots_runtime::lab_workflows::{
             LAB_MAX_VARIANTS, LabExperiment, LabExperimentSummary, LabVariantProgress,
         };
         if batch.runs.len() > 4096 {
@@ -4302,10 +5045,27 @@ pub mod renderer {
             TimelineReviewRequest, TimelineReviewResponse, render_png_offscreen,
         };
 
+        fn finish_native_lab_request(
+            model: &mut scriptbots_runtime::lab_workflows::LabWorkflows,
+        ) -> Option<(String, Arc<scriptbots_runtime::RenderSnapshot>)> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while model.is_busy() {
+                if let Some(frame) = model.poll() {
+                    return Some(frame);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "native Lab worker timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            None
+        }
+
         #[test]
-        fn gui_lab_provider_uses_verified_experiment_bundles_and_saved_checkpoint_cuts() {
-            use scriptbots_render::lab_workflows::{
-                LabWorkflowRequest as Request, LabWorkflowResponse as Response,
+        fn native_lab_provider_uses_verified_experiment_bundles_and_saved_checkpoint_cuts() {
+            use scriptbots_runtime::lab_workflows::{
+                LabMetric, LabWorkflowRequest as Request, LabWorkflowResponse as Response,
             };
             let root = tempfile::tempdir().unwrap();
             let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
@@ -4365,37 +5125,50 @@ pub mod renderer {
                 }
                 _ => panic!("wrong details response"),
             }
-            let direct = handle
-                .compare_experiment_variants("gui-lab", "baseline", "challenger", "alive_agents")
-                .unwrap();
-            match provider(Request::Compare {
-                experiment_id: "gui-lab".into(),
-                baseline_variant: "baseline".into(),
-                challenger_variant: "challenger".into(),
-            })
-            .unwrap()
-            {
-                Response::Comparison(comparison) => {
-                    assert_eq!(comparison.matched_seeds, vec![7, 29]);
-                    assert_eq!(
-                        comparison.mean_difference.to_bits(),
-                        direct.mean_difference.to_bits()
-                    );
-                    assert_eq!(comparison.ci_95, direct.ci_95);
-                    assert_eq!(comparison.p_value, direct.p_value);
-                    assert_eq!(comparison.adjusted_p_value, direct.adjusted_p_value);
-                    assert_eq!(comparison.standardized_effect, direct.standardized_effect);
-                    assert_eq!(comparison.plan_digest, direct.plan_digest);
-                    assert_eq!(comparison.status_generation, direct.status_generation);
-                    assert_eq!(comparison.endpoint_tick, 2);
+            for metric in LabMetric::ALL {
+                let direct = handle
+                    .compare_experiment_variants("gui-lab", "baseline", "challenger", metric.key())
+                    .unwrap();
+                match provider(Request::Compare {
+                    experiment_id: "gui-lab".into(),
+                    baseline_variant: "baseline".into(),
+                    challenger_variant: "challenger".into(),
+                    metric,
+                })
+                .unwrap()
+                {
+                    Response::Comparison(comparison) => {
+                        assert_eq!(comparison.metric, metric);
+                        assert_eq!(comparison.matched_seeds, vec![7, 29]);
+                        assert_eq!(
+                            comparison.mean_difference.to_bits(),
+                            direct.mean_difference.to_bits()
+                        );
+                        assert_eq!(comparison.ci_95, direct.ci_95);
+                        assert_eq!(comparison.p_value, direct.p_value);
+                        assert_eq!(comparison.adjusted_p_value, direct.adjusted_p_value);
+                        assert_eq!(comparison.standardized_effect, direct.standardized_effect);
+                        assert_eq!(comparison.plan_digest, direct.plan_digest);
+                        assert_eq!(comparison.status_generation, direct.status_generation);
+                        assert_eq!(comparison.endpoint_tick, 2);
+                        // The fixture's arms retain different food but the same
+                        // population. Stamping a requested metric over the former
+                        // population-only result must fail this control.
+                        if metric == LabMetric::TotalFood {
+                            assert!(comparison.mean_difference > 0.0);
+                        } else if metric == LabMetric::AliveAgents {
+                            assert_eq!(comparison.mean_difference, 0.0);
+                        }
+                    }
+                    _ => panic!("wrong comparison response"),
                 }
-                _ => panic!("wrong comparison response"),
             }
             assert!(
                 provider(Request::Compare {
                     experiment_id: "gui-lab".into(),
                     baseline_variant: "baseline".into(),
-                    challenger_variant: "baseline".into()
+                    challenger_variant: "baseline".into(),
+                    metric: LabMetric::AliveAgents,
                 })
                 .is_err()
             );
@@ -4435,6 +5208,28 @@ pub mod renderer {
                 }
                 _ => panic!("wrong checkpoint review response"),
             }
+            // Both native frontends use the same consumer. Exercise the real
+            // application worker boundary as well as the individual projections.
+            use scriptbots_runtime::lab_workflows::{LabAction, LabPanel, LabWorkflows};
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::clone(&provider));
+            model.synchronize(
+                host.port.snapshot_hub().latest().session_id,
+                LabPanel::Checkpoints,
+            );
+            model.dispatch(LabAction::Refresh);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(model.checkpoints.as_ref().unwrap().items.len(), 1);
+            model.dispatch(LabAction::SelectCheckpoint(
+                checkpoint.checkpoint_id.clone(),
+            ));
+            model.dispatch(LabAction::ReviewCheckpoint);
+            let (reviewed_id, reviewed_frame) =
+                finish_native_lab_request(&mut model).expect("saved frame");
+            assert_eq!(reviewed_id, checkpoint.checkpoint_id);
+            assert_eq!(reviewed_frame.world.tick, 0);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+
             let artifact = handle.get_artifact(&checkpoint.checkpoint_id).unwrap();
             let path = root.path().join(artifact.relative_path);
             std::fs::copy(&path, path.with_extension("preserved-original")).unwrap();
@@ -4451,22 +5246,1234 @@ pub mod renderer {
         }
 
         #[test]
-        fn gui_lab_projection_aggregates_every_variant_before_paging() {
-            let runs = (0..64)
-                .flat_map(|variant| {
-                    (0..64).map(move |seed| crate::control::ExperimentRunRecordDto {
-                        run_id: format!("arm-{variant}-{seed}"),
-                        variant_id: format!("arm-{variant:02}"),
-                        brain_family: "mlp".into(),
-                        seed,
-                        state: if seed == 0 { "completed" } else { "pending" }.into(),
-                        total_ticks: if seed == 0 { 2 } else { 0 },
-                        final_digest: None,
-                        bundle_path: None,
-                        error_reason: None,
-                    })
+        // Real saved source, isolated treatment, exact retry and verified outcome reader.
+        #[allow(clippy::too_many_lines)]
+        fn native_lab_checkpoint_study_preserves_its_saved_source_and_verified_outcome() {
+            use scriptbots_runtime::lab_workflows::{
+                LabAction, LabBranchDraft, LabBranchTreatment, LabCheckpointView, LabPanel,
+                LabWorkflowRequest as Request, LabWorkflowResponse as Response, LabWorkflows,
+            };
+            use std::sync::{
+                Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+
+            struct StopExperiments(crate::control::ControlHandle);
+            impl Drop for StopExperiments {
+                fn drop(&mut self) {
+                    let _ = self.0.data_services().shutdown_experiments();
+                }
+            }
+
+            let root = tempfile::tempdir().unwrap();
+            let seed = u64::MAX - 17;
+            let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(seed),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                closed: true,
+                topography_enabled: false,
+                initial_food: 0.1,
+                food_growth_rate: 0.0,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                temperature_discomfort_rate: 0.0,
+                aging_health_decay_rate: 0.0,
+                reproduction_energy_threshold: f32::MAX,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+            for _ in 0..2 {
+                let id = world
+                    .try_spawn_agent(scriptbots_core::AgentData::default())
+                    .unwrap();
+                assert!(world.bind_agent_brain(id, brains.population()[0]).unwrap());
+            }
+            let host = TestHost::spawn(world);
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let _stop = StopExperiments(handle.clone());
+            host.wait_applied(&handle.step().unwrap());
+            let saved = handle
+                .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+                .unwrap();
+            host.wait_applied(&handle.step().unwrap());
+            host.wait_applied(&handle.step().unwrap());
+            let live = handle.read_snapshot().unwrap();
+            let digest = host.port.scientific_digest_v1().unwrap();
+            assert!(live.world.tick > saved.tick);
+            let provider = lab_workflow_submit(handle.clone());
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&observed);
+            let service = Arc::clone(&provider);
+            let lose_first = AtomicBool::new(true);
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::new(move |request| {
+                let creates = matches!(&request, Request::CreateCheckpointBranch { .. });
+                if creates {
+                    recorded.lock().unwrap().push(request.clone());
+                }
+                let response = service(request)?;
+                if creates && lose_first.swap(false, Ordering::SeqCst) {
+                    Err("study admitted, but its first receipt was lost".into())
+                } else {
+                    Ok(response)
+                }
+            }));
+            model.synchronize(live.session_id, LabPanel::Checkpoints);
+            model.dispatch(LabAction::Refresh);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::SelectCheckpoint(saved.checkpoint_id.clone()));
+            model.dispatch(LabAction::NewCheckpointBranch);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::BranchTreatment(LabBranchTreatment::FoodBloom));
+            model.dispatch(LabAction::BranchTicks(2));
+            let draft = model.branch_draft.as_ref().unwrap().clone();
+            assert_eq!(draft.checkpoint.tick, saved.tick);
+            assert_eq!(draft.checkpoint.world_digest, saved.world_digest_v1);
+            assert!(model.can_create_checkpoint_branch());
+
+            assert!(
+                provider(Request::CreateCheckpointBranch {
+                    request_id: "wrong-owner".into(),
+                    session_id: scriptbots_runtime::HostSessionId::new(
+                        live.session_id.get().wrapping_add(1)
+                    ),
+                    draft: draft.clone(),
                 })
-                .collect();
+                .is_err()
+            );
+            let mut changed_source = draft.clone();
+            changed_source.checkpoint.tick += 1;
+            for (index, invalid) in [
+                changed_source,
+                LabBranchDraft {
+                    ticks: 0,
+                    ..draft.clone()
+                },
+                LabBranchDraft {
+                    ticks: crate::control::MAX_CHECKPOINT_BRANCH_TICKS + 1,
+                    ..draft.clone()
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(
+                    provider(Request::CreateCheckpointBranch {
+                        request_id: format!("invalid-source-{index}"),
+                        session_id: live.session_id,
+                        draft: invalid,
+                    })
+                    .is_err()
+                );
+            }
+            assert_eq!(
+                handle.list_checkpoint_branches(None, None).unwrap().total,
+                0
+            );
+
+            model.dispatch(LabAction::CreateCheckpointBranch);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(model.will_retry_branch_creation());
+            let creation = model.latest_branch_creation.as_ref().unwrap().clone();
+            let admitted = handle.list_checkpoint_branches(None, None).unwrap();
+            assert_eq!(admitted.total, 1);
+            let branch_id = admitted.items[0].branch_id.clone();
+            model.dispatch(LabAction::BranchTicks(10));
+            assert_eq!(model.branch_draft.as_ref(), Some(&draft));
+
+            // Retained study identity outlives the original cut's availability.
+            // Preserve its bytes under another name to exercise that real boundary.
+            let cut_artifact = handle.get_artifact(&saved.checkpoint_id).unwrap();
+            let cut_path = root.path().join(&cut_artifact.relative_path);
+            std::fs::rename(&cut_path, cut_path.with_extension("preserved-original")).unwrap();
+            assert!(handle.read_artifact_bytes(&saved.checkpoint_id).is_err());
+            model.dispatch(LabAction::CreateCheckpointBranch);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(model.checkpoint_view, LabCheckpointView::BranchDetail);
+            assert_eq!(model.selected_branch.as_deref(), Some(branch_id.as_str()));
+            assert_eq!(
+                handle.list_checkpoint_branches(None, None).unwrap().total,
+                1
+            );
+            {
+                let requests = observed.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0], requests[1]);
+            }
+            let conflict = provider(Request::CreateCheckpointBranch {
+                request_id: creation.request_id,
+                session_id: live.session_id,
+                draft: LabBranchDraft {
+                    ticks: 3,
+                    ..draft.clone()
+                },
+            })
+            .err()
+            .expect("retry must retain the complete scientific request");
+            assert!(conflict.contains("different request"), "{conflict}");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let completed = loop {
+                let status = handle.get_checkpoint_branch(&branch_id).unwrap();
+                if !matches!(status.status.as_str(), "running" | "cancelling") {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "study timed out: {status:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            assert_eq!(
+                completed.status, "completed",
+                "{:?}",
+                completed.error_reason
+            );
+            model.dispatch(LabAction::Refresh);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::ReadCheckpointBranchReport);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            let report = model.branch_report.as_ref().unwrap().clone();
+            assert_eq!(report.base_seed, seed);
+            assert_eq!(report.source_tick, saved.tick);
+            assert_eq!(report.target_tick, saved.tick + 2);
+            assert_eq!(report.source_world_digest, saved.world_digest_v1);
+            let treatment = report.treatment.as_ref().unwrap();
+            assert!(treatment.total_food > report.control.total_food);
+            assert!(treatment.first_divergence.is_some());
+            assert_eq!(report.control.population, treatment.population);
+
+            let (metadata, bytes) = handle.read_artifact_bytes(&report.artifact_id).unwrap();
+            let raw: crate::branch_study::BranchStudyReport =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(report.report_byte_size, bytes.len() as u64);
+            assert_eq!(report.report_checksum_blake3, metadata.checksum_blake3);
+            assert_eq!(
+                report.control.total_food,
+                raw.branch_reports[0].terminal_sample.food_total
+            );
+            assert_eq!(treatment.final_digest, raw.branch_reports[1].final_digest);
+            let mut wrong_source = raw.clone();
+            wrong_source.checkpoint_tick += 1;
+            assert!(project_lab_branch_report(&completed, metadata.clone(), wrong_source).is_err());
+            let mut duplicate = raw.clone();
+            duplicate.branch_reports[1] = duplicate.branch_reports[0].clone();
+            assert!(project_lab_branch_report(&completed, metadata.clone(), duplicate).is_err());
+            let mut invalid_metric = raw.clone();
+            invalid_metric.branch_reports[1].terminal_sample.food_total = f64::NAN;
+            assert!(
+                project_lab_branch_report(&completed, metadata.clone(), invalid_metric).is_err()
+            );
+            let mut untraced_difference = raw.clone();
+            assert_ne!(
+                untraced_difference.branch_reports[0].final_digest,
+                untraced_difference.branch_reports[1].final_digest
+            );
+            untraced_difference.branch_reports[1].first_divergence = None;
+            assert!(
+                project_lab_branch_report(&completed, metadata.clone(), untraced_difference)
+                    .is_err()
+            );
+            let mut wrong_boundary = raw;
+            wrong_boundary.branch_reports[1].terminal_sample.tick += 1;
+            assert!(
+                project_lab_branch_report(&completed, metadata.clone(), wrong_boundary).is_err()
+            );
+
+            model.dispatch(LabAction::CheckpointBranchesPage(None));
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(model.checkpoint_branches.as_ref().unwrap().total, 1);
+            model.dispatch(LabAction::SelectCheckpointBranch(branch_id.clone()));
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(
+                observed.lock().unwrap().len(),
+                2,
+                "reopening must not create work"
+            );
+            match provider(Request::CancelCheckpointBranch { branch_id }).unwrap() {
+                Response::CheckpointBranch(status) => assert_eq!(status.status, "completed"),
+                _ => panic!("wrong cancellation response"),
+            }
+
+            model.dispatch(LabAction::ReadCheckpointBranchReport);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(model.branch_report.is_some());
+
+            let report_path = root.path().join(&metadata.relative_path);
+            std::fs::copy(
+                &report_path,
+                report_path.with_extension("preserved-original"),
+            )
+            .unwrap();
+            std::fs::write(&report_path, b"intentional report corruption").unwrap();
+            model.dispatch(LabAction::ReadCheckpointBranchReport);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(
+                model.branch_report.is_none(),
+                "failed integrity must clear prior displayed evidence"
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
+            handle.data_services().shutdown_experiments().unwrap();
+        }
+
+        #[test]
+        fn native_lab_ecological_plans_use_actual_defaults_and_one_scheduled_parameter() {
+            use scriptbots_runtime::lab_workflows::{
+                LabExperimentDraft, LabExperimentParameter, LabExperimentTreatment,
+            };
+
+            let capabilities = native_lab_experiment_capabilities();
+            capabilities.validate().unwrap();
+            assert_eq!(
+                capabilities.treatment_parameters.len(),
+                LabExperimentParameter::ALL.len()
+            );
+            let defaults = serde_json::to_value(ScriptBotsConfig::default()).unwrap();
+            for parameter in &capabilities.treatment_parameters {
+                let path = parameter.parameter.key();
+                assert_eq!(
+                    parameter.baseline_value.to_bits(),
+                    defaults[path].as_f64().unwrap().to_bits()
+                );
+                let range = scriptbots_core::knob_range(path).unwrap();
+                assert!(!range.fresh_world_only);
+                assert_eq!(parameter.min_value.to_bits(), range.min.to_bits());
+                assert_eq!(parameter.max_value.to_bits(), range.max.to_bits());
+                for scale_percent in [0, 50, 100, 200, 400] {
+                    let treatment = LabExperimentTreatment {
+                        parameter: parameter.parameter,
+                        baseline_value: parameter.baseline_value,
+                        scale_percent,
+                        at_tick: 1,
+                    };
+                    let draft = LabExperimentDraft {
+                        baseline_family: "mlp.baseline".into(),
+                        challenger_family: "mlp.baseline".into(),
+                        treatment: Some(treatment),
+                        first_seed: 17,
+                        seed_count: 2,
+                        ticks_per_run: 2,
+                    };
+                    let plan = native_lab_experiment_plan("native-treatment-plan", &draft).unwrap();
+                    assert_eq!(plan.plan_batch().unwrap().len(), 4);
+                    assert_eq!(plan.cohort.seeds, [17, 18]);
+                    assert_eq!(plan.variants[0].brain_family, plan.variants[1].brain_family);
+                    assert!(
+                        plan.variants
+                            .iter()
+                            .all(|arm| arm.config_overrides.is_empty())
+                    );
+                    assert!(plan.variants[0].interventions.is_empty());
+                    let [patch] = plan.variants[1].interventions.as_slice() else {
+                        panic!("one treatment must produce exactly one scheduled patch");
+                    };
+                    assert_eq!(patch.tick, 1);
+                    assert_eq!(patch.set.as_object().unwrap().len(), 1);
+                    assert_eq!(
+                        patch.set[path],
+                        serde_json::json!(treatment.value().unwrap())
+                    );
+                    let original_digest = plan.plan_digest().unwrap();
+                    let mut different_boundary = draft.clone();
+                    different_boundary.treatment.as_mut().unwrap().at_tick = 0;
+                    assert_ne!(
+                        original_digest,
+                        native_lab_experiment_plan("native-treatment-plan", &different_boundary)
+                            .unwrap()
+                            .plan_digest()
+                            .unwrap(),
+                        "the complete plan must bind the application boundary",
+                    );
+                    if scale_percent == 100 {
+                        assert_eq!(
+                            treatment.value().unwrap().to_bits(),
+                            parameter.baseline_value.to_bits()
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn native_lab_treatment_experiments_retry_and_compare_real_paired_endpoints() {
+            use scriptbots_runtime::lab_workflows::{
+                LabAction, LabExperimentDesign, LabExperimentParameter, LabMetric, LabPanel,
+                LabWorkflowRequest as Request, LabWorkflowResponse as Response, LabWorkflows,
+            };
+            use std::sync::{
+                Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+
+            struct StopExperiments(crate::control::ControlHandle);
+            impl Drop for StopExperiments {
+                fn drop(&mut self) {
+                    let _ = self.0.data_services().shutdown_experiments();
+                }
+            }
+
+            let root = tempfile::tempdir().unwrap();
+            let host = TestHost::spawn(
+                scriptbots_core::WorldState::new(ScriptBotsConfig {
+                    rng_seed: Some(42),
+                    world_width: 120,
+                    world_height: 120,
+                    food_cell_size: 20,
+                    food_growth_rate: 0.17,
+                    population_minimum: 0,
+                    persistence_interval: 0,
+                    closed: true,
+                    ..ScriptBotsConfig::default()
+                })
+                .unwrap(),
+            );
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let _stop = StopExperiments(handle.clone());
+            let live = handle.read_snapshot().unwrap();
+            let live_digest = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit(handle.clone());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&seen);
+            let service = Arc::clone(&provider);
+            let lose_first = AtomicBool::new(true);
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::new(move |request| {
+                let creates = matches!(&request, Request::CreateExperiment { .. });
+                if creates {
+                    recorded.lock().unwrap().push(request.clone());
+                }
+                let result = service(request)?;
+                if creates && lose_first.swap(false, Ordering::SeqCst) {
+                    Err("treatment admitted, but its first receipt was lost".into())
+                } else {
+                    Ok(result)
+                }
+            }));
+            model.synchronize(live.session_id, LabPanel::Experiments);
+            model.dispatch(LabAction::NewExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::DraftBaseline("mlp.baseline".into()));
+            model.dispatch(LabAction::ExperimentDesign(
+                LabExperimentDesign::EcologicalTreatment,
+            ));
+            model.dispatch(LabAction::TreatmentParameter(
+                LabExperimentParameter::FoodGrowth,
+            ));
+            model.dispatch(LabAction::TreatmentPercent(0));
+            model.dispatch(LabAction::FirstSeed(17));
+            model.dispatch(LabAction::SeedCount(2));
+            model.dispatch(LabAction::TicksPerRun(2));
+            model.dispatch(LabAction::TreatmentTick(1));
+            let draft = model.experiment_draft.clone();
+            let treatment = draft.treatment.unwrap();
+            assert_eq!(draft.baseline_family, draft.challenger_family);
+            assert_eq!(
+                treatment.baseline_value.to_bits(),
+                f64::from(ScriptBotsConfig::default().food_growth_rate).to_bits()
+            );
+            assert_ne!(
+                treatment.baseline_value.to_bits(),
+                f64::from(live.config.food_growth_rate).to_bits()
+            );
+            assert!(model.can_create_experiment());
+
+            let mut late = draft.clone();
+            late.treatment.as_mut().unwrap().at_tick = late.ticks_per_run;
+            let mut foreign_baseline = draft.clone();
+            foreign_baseline.treatment.as_mut().unwrap().baseline_value = 0.123;
+            let mut confounded = draft.clone();
+            confounded.challenger_family = "dwraon.baseline".into();
+            for (index, invalid) in [late, foreign_baseline, confounded].into_iter().enumerate() {
+                assert!(
+                    provider(Request::CreateExperiment {
+                        request_id: format!("invalid-treatment-{index}"),
+                        session_id: live.session_id,
+                        draft: invalid,
+                    })
+                    .is_err()
+                );
+            }
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 0);
+
+            model.dispatch(LabAction::CreateExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(model.will_retry_experiment_creation());
+            let creation = model.latest_experiment_creation.as_ref().unwrap().clone();
+            for action in [
+                LabAction::TreatmentPercent(100),
+                LabAction::TreatmentTick(0),
+                LabAction::TreatmentParameter(LabExperimentParameter::Metabolism),
+                LabAction::DraftBaseline("dwraon.baseline".into()),
+                LabAction::ExperimentDesign(LabExperimentDesign::BrainFamilies),
+            ] {
+                model.dispatch(action);
+                assert_eq!(model.experiment_draft, draft);
+            }
+            model.dispatch(LabAction::CreateExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(
+                model.selected_experiment.as_deref(),
+                Some(creation.request_id.as_str())
+            );
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 1);
+            {
+                let requests = seen.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0], requests[1]);
+            }
+
+            let wait_for_batch = |experiment_id: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+                loop {
+                    let batch = handle.get_experiment(experiment_id).unwrap();
+                    assert_eq!(batch.failed_runs, 0, "{batch:?}");
+                    assert!(batch.error_reason.is_none(), "{batch:?}");
+                    if batch.status == "completed" {
+                        assert_eq!(batch.completed_runs, batch.total_runs);
+                        break batch;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "treatment experiment timed out: {batch:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+            let completed = wait_for_batch(&creation.request_id);
+            validate_created_lab_experiment(&completed, &creation.request_id, &draft).unwrap();
+            let mut unchanged = draft.clone();
+            unchanged.treatment.as_mut().unwrap().scale_percent = 100;
+            let mut wrong_schedule = draft.clone();
+            wrong_schedule.treatment.as_mut().unwrap().at_tick = 0;
+            for substituted in [&unchanged, &wrong_schedule] {
+                let mut foreign = completed.clone();
+                foreign.plan_digest = native_lab_experiment_plan(&creation.request_id, substituted)
+                    .unwrap()
+                    .plan_digest()
+                    .unwrap();
+                assert!(
+                    validate_created_lab_experiment(&foreign, &creation.request_id, &draft)
+                        .is_err(),
+                    "identical family/seed/horizon rows cannot substitute another treatment plan"
+                );
+            }
+            let conflict = provider(Request::CreateExperiment {
+                request_id: creation.request_id.clone(),
+                session_id: live.session_id,
+                draft: unchanged.clone(),
+            })
+            .err()
+            .expect("changed treatment must conflict with retained admission");
+            assert!(conflict.contains("different payload"), "{conflict}");
+
+            model.dispatch(LabAction::Refresh);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::Metric(LabMetric::TotalFood));
+            model.dispatch(LabAction::Compare);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            let comparison = model.comparison.as_ref().unwrap();
+            assert_eq!(comparison.matched_seeds, [17, 18]);
+            assert_eq!(comparison.endpoint_tick, 2);
+            assert!(
+                comparison.mean_difference < 0.0,
+                "food-growth suppression must reduce the actual endpoint: {comparison:?}"
+            );
+            assert!(!comparison.descriptive_only);
+            assert!(comparison.ci_95.is_some());
+
+            let mut endpoints = std::collections::BTreeMap::new();
+            for run in &completed.runs {
+                let directory = root
+                    .path()
+                    .join("experiments")
+                    .join(&creation.request_id)
+                    .join(&run.run_id);
+                let verified = crate::experiment_runner::verify_portable_run_bundle(&directory)
+                    .unwrap()
+                    .final_state
+                    .unwrap();
+                let bundle: scriptbots_storage::RunBundleV1 = serde_json::from_slice(
+                    &std::fs::read(directory.join("bundle_manifest.json")).unwrap(),
+                )
+                .unwrap();
+                let manifest: crate::RunManifestV3 =
+                    serde_json::from_str(&bundle.manifest.manifest_json).unwrap();
+                assert_eq!(manifest.root_seed, run.seed);
+                assert_eq!(verified.tick, 2);
+                assert_eq!(
+                    verified.scientific_digest,
+                    run.final_digest.as_ref().unwrap().as_str()
+                );
+                if run.variant_id == "baseline" {
+                    assert!(manifest.scenario.interventions.is_empty());
+                } else {
+                    assert_eq!(
+                        manifest.scenario.interventions,
+                        [crate::ScenarioInterventionV1 {
+                            tick: 1,
+                            set: serde_json::json!({"food_growth_rate": treatment.value().unwrap()}),
+                        }]
+                    );
+                }
+                endpoints.insert(
+                    (run.variant_id.as_str(), run.seed),
+                    verified.summary.total_food,
+                );
+            }
+            for seed in [17, 18] {
+                assert!(endpoints[&("challenger", seed)] < endpoints[&("baseline", seed)]);
+            }
+
+            let null_id = "native-treatment-unchanged-value";
+            assert!(matches!(
+                provider(Request::CreateExperiment {
+                    request_id: null_id.into(),
+                    session_id: live.session_id,
+                    draft: unchanged,
+                })
+                .unwrap(),
+                Response::ExperimentCreated { .. }
+            ));
+            let null_batch = wait_for_batch(null_id);
+            let null = handle
+                .compare_experiment_variants(null_id, "baseline", "challenger", "total_food")
+                .unwrap();
+            assert_eq!(null.matched_seeds, [17, 18]);
+            assert_eq!(null.mean_difference.classify(), std::num::FpCategory::Zero);
+            assert_eq!(null.ci_95, Some((0.0, 0.0)));
+            for seed in [17, 18] {
+                let baseline = null_batch
+                    .runs
+                    .iter()
+                    .find(|run| run.variant_id == "baseline" && run.seed == seed)
+                    .unwrap();
+                let challenger = null_batch
+                    .runs
+                    .iter()
+                    .find(|run| run.variant_id == "challenger" && run.seed == seed)
+                    .unwrap();
+                assert_eq!(
+                    baseline.final_digest, challenger.final_digest,
+                    "an unchanged-value control must preserve physical science"
+                );
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
+            handle.data_services().shutdown_experiments().unwrap();
+        }
+
+        #[test]
+        // Real admission, unknown outcome, exact retry and authoritative matrix binding.
+        #[allow(clippy::too_many_lines)]
+        fn native_lab_experiment_creation_retries_the_exact_admitted_seed_matrix() {
+            use scriptbots_runtime::lab_workflows::{
+                LabAction, LabExperimentDraft, LabPanel, LabWorkflowRequest as Request,
+                LabWorkflowResponse as Response, LabWorkflows,
+            };
+            use std::sync::{
+                Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+
+            struct StopExperiments(crate::control::ControlHandle);
+            impl Drop for StopExperiments {
+                fn drop(&mut self) {
+                    let _ = self.0.data_services().shutdown_experiments();
+                }
+            }
+
+            let root = tempfile::tempdir().unwrap();
+            let host = TestHost::spawn(
+                scriptbots_core::WorldState::new(ScriptBotsConfig {
+                    rng_seed: Some(42),
+                    world_width: 120,
+                    world_height: 120,
+                    food_cell_size: 20,
+                    population_minimum: 0,
+                    persistence_interval: 0,
+                    closed: true,
+                    ..ScriptBotsConfig::default()
+                })
+                .unwrap(),
+            );
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let _stop = StopExperiments(handle.clone());
+            let live = handle.read_snapshot().unwrap();
+            let live_digest = host.port.scientific_digest_v1().unwrap();
+            let session_id = live.session_id;
+            let provider = lab_workflow_submit(handle.clone());
+            let capabilities = match provider(Request::ExperimentCapabilities).unwrap() {
+                Response::ExperimentCapabilities(capabilities) => capabilities,
+                _ => panic!("wrong experiment capabilities response"),
+            };
+            capabilities.validate().unwrap();
+            let draft = LabExperimentDraft {
+                baseline_family: "mlp.baseline".into(),
+                challenger_family: "dwraon.baseline".into(),
+                treatment: None,
+                first_seed: u64::MAX - 1,
+                seed_count: 2,
+                ticks_per_run: 1,
+            };
+            draft.validate(&capabilities).unwrap();
+            assert!(
+                provider(Request::CreateExperiment {
+                    request_id: "wrong-source".into(),
+                    session_id: scriptbots_runtime::HostSessionId::new(
+                        session_id.get().wrapping_add(1),
+                    ),
+                    draft: draft.clone(),
+                })
+                .is_err()
+            );
+            for request_id in [
+                String::new(),
+                ".".into(),
+                "bad..identity".into(),
+                "has space".into(),
+                "x".repeat(93),
+            ] {
+                assert!(
+                    provider(Request::CreateExperiment {
+                        request_id,
+                        session_id,
+                        draft: draft.clone(),
+                    })
+                    .is_err()
+                );
+            }
+            for (index, invalid) in [
+                LabExperimentDraft {
+                    challenger_family: draft.baseline_family.clone(),
+                    ..draft.clone()
+                },
+                LabExperimentDraft {
+                    first_seed: u64::MAX,
+                    ..draft.clone()
+                },
+                LabExperimentDraft {
+                    baseline_family: "unsupported-family".into(),
+                    ..draft.clone()
+                },
+                LabExperimentDraft {
+                    seed_count: capabilities.max_seed_count + 1,
+                    first_seed: 7,
+                    ..draft.clone()
+                },
+                LabExperimentDraft {
+                    ticks_per_run: capabilities.max_total_ticks,
+                    ..draft.clone()
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(
+                    provider(Request::CreateExperiment {
+                        request_id: format!("invalid-draft-{index}"),
+                        session_id,
+                        draft: invalid,
+                    })
+                    .is_err()
+                );
+            }
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 0);
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&seen);
+            let service = Arc::clone(&provider);
+            let lose_first_receipt = AtomicBool::new(true);
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::new(move |request| {
+                let creates = matches!(&request, Request::CreateExperiment { .. });
+                if creates {
+                    recorded.lock().unwrap().push(request.clone());
+                }
+                let response = service(request)?;
+                if creates && lose_first_receipt.swap(false, Ordering::SeqCst) {
+                    Err("experiment admitted, but its response was lost".into())
+                } else {
+                    Ok(response)
+                }
+            }));
+            model.synchronize(session_id, LabPanel::Experiments);
+            model.dispatch(LabAction::NewExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            model.dispatch(LabAction::DraftBaseline(draft.baseline_family.clone()));
+            model.dispatch(LabAction::DraftChallenger(draft.challenger_family.clone()));
+            model.dispatch(LabAction::FirstSeed(draft.first_seed));
+            model.dispatch(LabAction::SeedCount(draft.seed_count));
+            model.dispatch(LabAction::TicksPerRun(draft.ticks_per_run));
+            assert_eq!(model.experiment_draft, draft);
+            assert!(model.can_create_experiment());
+            model.dispatch(LabAction::CreateExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(model.will_retry_experiment_creation());
+            let creation = model.latest_experiment_creation.as_ref().unwrap().clone();
+            assert_eq!(creation.draft, draft);
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 1);
+
+            // An uncertain admission freezes all draft fields until the same
+            // request is confirmed or the user explicitly abandons that receipt.
+            model.dispatch(LabAction::TicksPerRun(2));
+            assert_eq!(model.experiment_draft, draft);
+            model.dispatch(LabAction::CreateExperiment);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(!model.composing_experiment);
+            assert_eq!(
+                model.selected_experiment.as_deref(),
+                Some(creation.request_id.as_str()),
+            );
+            assert_eq!(model.batch.as_ref().unwrap().summary.total_runs, 4);
+            assert_eq!(model.batch.as_ref().unwrap().variants.len(), 2);
+            assert_eq!(handle.list_experiments(None, None).unwrap().total, 1);
+            {
+                let requests = seen.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0], requests[1]);
+            }
+            let conflict = provider(Request::CreateExperiment {
+                request_id: creation.request_id.clone(),
+                session_id,
+                draft: LabExperimentDraft {
+                    ticks_per_run: 2,
+                    ..draft.clone()
+                },
+            })
+            .err()
+            .expect("the same admission key must not accept a changed payload");
+            assert!(conflict.contains("different payload"), "{conflict}");
+
+            // Join every real experiment worker before dropping its artifact
+            // directory. The guard also performs this cleanup after an assertion.
+            handle.data_services().shutdown_experiments().unwrap();
+            let batch = handle.get_experiment(&creation.request_id).unwrap();
+            validate_created_lab_experiment(&batch, &creation.request_id, &draft).unwrap();
+            for arm in ["baseline", "challenger"] {
+                let seeds: std::collections::BTreeSet<_> = batch
+                    .runs
+                    .iter()
+                    .filter(|run| run.variant_id == arm)
+                    .map(|run| run.seed)
+                    .collect();
+                assert_eq!(
+                    seeds,
+                    [u64::MAX - 1, u64::MAX]
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                );
+            }
+            let mut duplicate = batch.clone();
+            duplicate.runs[1] = duplicate.runs[0].clone();
+            assert!(
+                validate_created_lab_experiment(&duplicate, &creation.request_id, &draft).is_err()
+            );
+            let mut wrong_family = batch.clone();
+            wrong_family.runs[0].brain_family = "unrequested-family".into();
+            assert!(
+                validate_created_lab_experiment(&wrong_family, &creation.request_id, &draft)
+                    .is_err()
+            );
+            let mut wrong_horizon = batch.clone();
+            wrong_horizon.runs[0].target_ticks = 2;
+            assert!(
+                validate_created_lab_experiment(&wrong_horizon, &creation.request_id, &draft)
+                    .is_err()
+            );
+            let mut missing = batch.clone();
+            assert!(missing.runs.pop().is_some());
+            assert!(
+                validate_created_lab_experiment(&missing, &creation.request_id, &draft).is_err()
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
+        }
+
+        #[test]
+        fn native_lab_metric_comparison_preserves_extinct_endpoint_refusals() {
+            use scriptbots_runtime::lab_workflows::{
+                LabMetric, LabWorkflowRequest as Request, LabWorkflowResponse as Response,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let host = TestHost::spawn(
+                scriptbots_core::WorldState::new(ScriptBotsConfig {
+                    rng_seed: Some(42),
+                    population_minimum: 0,
+                    persistence_interval: 0,
+                    closed: true,
+                    ..ScriptBotsConfig::default()
+                })
+                .unwrap(),
+            );
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let runner = crate::control::tests::comparison_catalog_runner(
+                root.path(),
+                "native-extinct",
+                vec![7],
+                1.0,
+            );
+            let completed = runner
+                .execute_batch(&runner.output_dir.join("status.json"))
+                .unwrap();
+            assert_eq!(completed.completed_runs, completed.total_runs);
+            let before = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit(handle);
+            let compare = |metric| {
+                provider(Request::Compare {
+                    experiment_id: "native-extinct".into(),
+                    baseline_variant: "baseline".into(),
+                    challenger_variant: "challenger".into(),
+                    metric,
+                })
+            };
+            for metric in [
+                LabMetric::AverageEnergy,
+                LabMetric::AverageHealth,
+                LabMetric::MeanAge,
+                LabMetric::MaxAge,
+                LabMetric::MaxGeneration,
+            ] {
+                let error = match compare(metric) {
+                    Ok(_) => panic!("extinct {} must be unavailable", metric.key()),
+                    Err(error) => error,
+                };
+                assert!(error.contains("unavailable"), "{error}");
+            }
+            match compare(LabMetric::TotalEnergy).unwrap() {
+                Response::Comparison(comparison) => {
+                    assert_eq!(comparison.metric, LabMetric::TotalEnergy);
+                    assert_eq!(comparison.mean_difference, 0.0);
+                    assert!(comparison.descriptive_only);
+                    assert_eq!(comparison.ci_95, None);
+                    assert_eq!(comparison.p_value, None);
+                }
+                _ => panic!("wrong comparison response"),
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        }
+
+        #[test]
+        // Real detector evidence, recorded interventions, saved source and async consumer.
+        #[allow(clippy::too_many_lines)]
+        fn native_lab_event_review_reconstructs_a_real_narrative_event_without_changing_live() {
+            use scriptbots_core::{
+                CohortSource, Intervention, InterventionCommand, InterventionSurface, Placement,
+                Region, narrative::EventKind,
+            };
+            use scriptbots_runtime::lab_workflows::{
+                LabAction, LabEventIdentity, LabPanel, LabWorkflowRequest, LabWorkflows,
+            };
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                persistence_interval: 0,
+                closed: true,
+                topography_enabled: false,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                initial_food: 0.0,
+                food_growth_rate: 0.0,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                temperature_discomfort_rate: 0.0,
+                aging_health_decay_rate: 0.0,
+                spike_damage: 0.0,
+                spike_energy_cost: 0.0,
+                reproduction_energy_threshold: f32::MAX,
+                narrative_interval: 1,
+                narrative_capacity: 32,
+                history_capacity: 128,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+                .unwrap()
+                .population;
+            crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host
+                .handle()
+                .with_artifacts_dir(directory.path().to_path_buf())
+                .unwrap();
+            let checkpoint = handle
+                .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+                .unwrap();
+            for _ in 0..16 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            assert!(!handle.read_snapshot().unwrap().world.agents.is_empty());
+            host.wait_applied(
+                &handle
+                    .intervene(
+                        InterventionCommand::new(
+                            Intervention::Meteor {
+                                region: Region::All,
+                                lethality: 10.0,
+                                scorch: 0.0,
+                            },
+                            InterventionSurface::Script,
+                            "native-narrative-review",
+                        ),
+                        None,
+                    )
+                    .unwrap(),
+            );
+            host.wait_applied(&handle.step().unwrap());
+            let target = handle.read_snapshot().unwrap();
+            assert_eq!(target.world.tick, 17);
+            assert!(target.world.agents.is_empty());
+            let (index, record) = target
+                .narrative_events
+                .iter()
+                .enumerate()
+                .find(|(_, record)| record.kind == EventKind::Extinction)
+                .expect("production detector must narrate the actual extinction");
+            assert_eq!(record.tick.0, target.world.tick);
+            let record = record.clone();
+            let event = LabEventIdentity {
+                session_id: target.session_id,
+                ordinal: target.narrative_dropped_events + u64::try_from(index).unwrap() + 1,
+                tick: record.tick.0,
+            };
+
+            // Make the live canvas observably different from the extinct target.
+            host.wait_applied(
+                &handle
+                    .intervene(
+                        InterventionCommand::new(
+                            Intervention::InjectCohort {
+                                count: 3,
+                                genome: CohortSource::RegisteredBrain { key: brains[0] },
+                                placement: Placement::Seeded {
+                                    region: Region::All,
+                                    seed: 91,
+                                },
+                                herbivore_tendency: 0.75,
+                            },
+                            InterventionSurface::Script,
+                            "native-narrative-review",
+                        ),
+                        None,
+                    )
+                    .unwrap(),
+            );
+            for _ in 0..4 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            let live = handle.read_snapshot().unwrap();
+            assert_eq!(live.world.agents.len(), 3);
+            let digest = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit(handle.clone());
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::clone(&provider));
+            model.synchronize(event.session_id, LabPanel::Narrative);
+            model.select_event(Some((event, &record)));
+            model.dispatch(LabAction::ReviewEvent(event));
+            assert!(finish_native_lab_request(&mut model).is_none());
+            let review = model
+                .take_event_review()
+                .unwrap_or_else(|| panic!("actual event review failed: {:?}", model.notice));
+            assert_eq!(review.event, event);
+            assert_eq!(review.record, record);
+            assert_eq!(review.checkpoint_id, checkpoint.checkpoint_id);
+            assert_eq!(review.base_tick, checkpoint.tick);
+            assert_eq!(review.snapshot.session_id, target.session_id);
+            assert_eq!(review.snapshot.world.tick, target.world.tick);
+            assert_eq!(review.snapshot.world.world, target.world.world);
+            assert_eq!(review.snapshot.world.agents, target.world.agents);
+            assert_ne!(review.snapshot.world.agents, live.world.agents);
+            assert_eq!(review.snapshot.layers.food, target.layers.food);
+            assert!(review.snapshot.agent_visuals_complete());
+
+            for invalid in [
+                LabEventIdentity {
+                    session_id: scriptbots_runtime::HostSessionId::new(99),
+                    ..event
+                },
+                LabEventIdentity {
+                    ordinal: 0,
+                    ..event
+                },
+                LabEventIdentity {
+                    tick: event.tick + 1,
+                    ..event
+                },
+            ] {
+                assert!(provider(LabWorkflowRequest::ReviewEvent { event: invalid }).is_err());
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
+        }
+
+        #[test]
+        fn native_lab_checkpoint_retry_preserves_the_real_cut_after_a_lost_receipt() {
+            use scriptbots_runtime::lab_workflows::{
+                LabAction, LabCheckpointSaveState, LabPanel, LabWorkflowRequest, LabWorkflows,
+            };
+            use std::sync::{
+                Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+
+            let root = tempfile::tempdir().unwrap();
+            let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                population_minimum: 0,
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let before = handle.read_snapshot().unwrap();
+            let digest_before = host.port.scientific_digest_v1().unwrap();
+            let session_id = before.session_id;
+            let provider = lab_workflow_submit(handle.clone());
+            assert!(
+                provider(LabWorkflowRequest::CreateCheckpoint {
+                    request_id: "wrong-source".into(),
+                    session_id: scriptbots_runtime::HostSessionId::new(
+                        session_id.get().wrapping_add(1)
+                    ),
+                })
+                .is_err()
+            );
+            for request_id in [String::new(), "x".repeat(257), "line\nbreak".into()] {
+                assert!(
+                    provider(LabWorkflowRequest::CreateCheckpoint {
+                        request_id,
+                        session_id
+                    })
+                    .is_err()
+                );
+            }
+            assert_eq!(
+                handle.list_checkpoints(None, None).unwrap().total,
+                0,
+                "invalid identities and sources must fail before capturing or retaining a cut"
+            );
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&seen);
+            let lose_first_receipt = AtomicBool::new(true);
+            let mut model = LabWorkflows::default();
+            model.submit = Some(Arc::new(move |request| {
+                recorded.lock().unwrap().push(request.clone());
+                let response = provider(request)?;
+                if lose_first_receipt.swap(false, Ordering::SeqCst) {
+                    Err("service completed, but its response was lost".into())
+                } else {
+                    Ok(response)
+                }
+            }));
+            model.synchronize(session_id, LabPanel::Checkpoints);
+            model.dispatch(LabAction::CreateCheckpoint);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert!(model.will_retry_checkpoint_save());
+            assert!(matches!(
+                model.latest_checkpoint_save.as_ref().unwrap().state,
+                LabCheckpointSaveState::Retryable { .. }
+            ));
+            let retained = handle.list_checkpoints(None, None).unwrap();
+            assert_eq!(
+                retained.total, 1,
+                "the lost response follows a real retained artifact"
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest_before);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &before));
+
+            host.wait_applied(&handle.step().unwrap());
+            let live_after_step = handle.read_snapshot().unwrap();
+            let digest_after_step = host.port.scientific_digest_v1().unwrap();
+            model.dispatch(LabAction::CreateCheckpoint);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            let saved = model
+                .selected_checkpoint_metadata()
+                .expect("verified saved receipt")
+                .clone();
+            assert_eq!(saved.checkpoint_id, retained.items[0].checkpoint_id);
+            assert_eq!(
+                saved.tick, before.world.tick,
+                "retry cannot capture the later live tick"
+            );
+            assert_ne!(saved.tick, live_after_step.world.tick);
+            assert_eq!(saved.agent_count, before.world.agents.len());
+            assert_eq!(saved.world_digest, digest_before.overall);
+            assert_eq!(saved.byte_size, retained.items[0].byte_size);
+            assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 1);
+            {
+                let requests = seen.lock().unwrap();
+                assert_eq!(
+                    requests[0], requests[1],
+                    "retry must preserve the exact service request"
+                );
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest_after_step);
+            assert!(Arc::ptr_eq(
+                &handle.read_snapshot().unwrap(),
+                &live_after_step
+            ));
+
+            model.dispatch(LabAction::ReviewCheckpoint);
+            let (reviewed_id, frame) = finish_native_lab_request(&mut model).unwrap();
+            assert_eq!(reviewed_id, saved.checkpoint_id);
+            assert_eq!(frame.world.tick, saved.tick);
+            assert_eq!(frame.world.agents.len(), saved.agent_count);
+            model.dispatch(LabAction::CreateCheckpoint);
+            assert!(finish_native_lab_request(&mut model).is_none());
+            assert_eq!(
+                model.selected_checkpoint_metadata().unwrap().tick,
+                live_after_step.world.tick
+            );
+            assert_eq!(
+                handle.list_checkpoints(None, None).unwrap().total,
+                2,
+                "a deliberate save after verification must create a distinct cut"
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest_after_step);
+        }
+
+        #[test]
+        fn gui_lab_projection_aggregates_every_variant_before_paging() {
+            let runs = (0..64).flat_map(|variant| (0..64).map(move |seed| crate::control::ExperimentRunRecordDto {
+                run_id: format!("arm-{variant}-{seed}"), variant_id: format!("arm-{variant:02}"), brain_family: "mlp".into(), seed,
+                state: if seed == 0 { "completed" } else { "pending" }.into(), total_ticks: if seed == 0 { 2 } else { 0 },
+                target_ticks: 2, checkpoint_progress: crate::experiment_runner::ExperimentCheckpointProgress::Unavailable {
+                    reason: crate::experiment_runner::CheckpointProgressUnavailable::NotStarted,
+                },
+                final_digest: None, bundle_path: None, error_reason: None,
+            })).collect();
             let batch = project_lab_experiment(crate::control::ExperimentBatchStatusDto {
                 schema_version: 1,
                 generation: 1,

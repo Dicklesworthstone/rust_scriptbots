@@ -186,7 +186,12 @@ pub fn propose_experiment_tool() -> Result<LlmToolSpec, LlmError> {
     Ok(LlmToolSpec {
         name: PROPOSE_EXPERIMENT_TOOL_NAME.to_owned(),
         description: "Propose one bounded, falsifiable matched-seed experiment. Every factor, \
-                      seed, metric, arm, and budget is validated before a run can start."
+                      family, intervention schedule, seed, metric, arm, and budget is validated \
+                      before a run can start. Config factors, families and schedules form a full \
+                      treatment product. The first expanded arm is the baseline; include an empty \
+                      first schedule for an untreated control. Timed patches use nested live numeric \
+                      config fields at completed-tick boundaries before the run ends, preserving \
+                      declaration order at equal ticks."
             .to_owned(),
         input_schema,
     })
@@ -1025,6 +1030,11 @@ mod tests {
             crate::lab::spec::tool_input_schema().expect("canonical schema")
         );
         assert!(tool.input_schema.pointer("/properties/factors").is_some());
+        assert!(
+            tool.input_schema
+                .pointer("/properties/intervention_schedules")
+                .is_some()
+        );
         assert!(
             tool.input_schema
                 .pointer("/x-scriptbots-knob-ranges")

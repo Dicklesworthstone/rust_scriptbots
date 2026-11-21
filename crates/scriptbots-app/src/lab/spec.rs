@@ -31,8 +31,11 @@
 //! product surface, rendered as one actionable line each and fed verbatim back to
 //! the model as a repair prompt.
 
+use crate::ScenarioInterventionV1;
 use crate::experiment_runner::{
-    DEFAULT_EXPERIMENT_BRAIN_FAMILY, EXPERIMENT_BRAIN_FAMILIES, canonical_experiment_brain_family,
+    DEFAULT_EXPERIMENT_BRAIN_FAMILY, EXPERIMENT_BRAIN_FAMILIES,
+    MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES, MAX_EXPERIMENT_INTERVENTIONS, MatchedSeedCohort,
+    MatchedSeedExperimentRunner, ScenarioVariant, canonical_experiment_brain_family,
 };
 use scriptbots_core::{KNOB_RANGES, knob_range};
 use serde::{Deserialize, Serialize};
@@ -44,8 +47,12 @@ use utoipa::{PartialSchema, ToSchema};
 pub const MAX_FACTORS: usize = 4;
 /// Most values one factor may take.
 pub const MAX_VALUES_PER_FACTOR: usize = 8;
-/// Most arms (configuration factors times brain families) one spec may expand to.
+/// Most ordered intervention schedules one spec may compare.
+pub const MAX_INTERVENTION_SCHEDULES: usize = 8;
+/// Most arms (configuration factors times families times schedules) one spec may expand to.
 pub const MAX_ARMS: usize = 32;
+/// Most predeclared conditional interaction contrasts in one report.
+pub const MAX_INTERACTION_CONTRASTS: usize = 32;
 /// Most seeds in a cohort.
 pub const MAX_SEEDS: u16 = 64;
 /// Longest run, in ticks.
@@ -111,15 +118,23 @@ pub struct ExperimentSpec {
     /// hypothesis, and a lab that accepted one would be generating confident
     /// prose rather than science.
     pub falsifier: String,
-    /// The knobs to vary. May be empty when comparing at least two brain families.
+    /// The knobs to vary. May be empty when comparing at least two brain families
+    /// or intervention schedules.
     pub factors: Vec<Factor>,
     /// Registered brain families to compare, in declaration order. Defaults to
     /// the runner's MLP family. Each configuration assignment runs every family
     /// with the same seed cohort; aliases normalize before arm identity checks.
-    /// The first configuration and family form the baseline for every other
-    /// arm; the analysis does not estimate factorial interaction effects.
+    /// The first configuration, family and schedule form the baseline for every other
+    /// arm. Conditional two-axis interactions can be requested separately.
     #[serde(default = "default_brain_families")]
     pub brain_families: Vec<String>,
+    /// Ordered timed treatments to compare. Defaults to one empty schedule.
+    /// Include an empty first schedule for an untreated control. Every config
+    /// assignment and family runs every schedule with the same seed cohort.
+    /// Patches use nested live numeric config fields; ticks are completed-tick
+    /// boundaries before the run ends, with same-tick document order preserved.
+    #[serde(default = "default_intervention_schedules")]
+    pub intervention_schedules: Vec<Vec<ScenarioInterventionV1>>,
     /// The matched seed cohort.
     pub seeds: SeedPlan,
     /// How long each run lasts.
@@ -128,12 +143,27 @@ pub struct ExperimentSpec {
     /// available in every completed run. Population means and maxima are
     /// unavailable after extinction and are never silently replaced by zero.
     pub metrics: Vec<String>,
+    /// Also estimate every two-axis difference-in-differences against the first
+    /// declared levels, with all other axes held at their first levels. Includes
+    /// configuration, brain-family and schedule axes. These conditional contrasts
+    /// are not effects averaged over the other factors. All baseline comparisons
+    /// and interaction tests share one multiple-comparison correction family.
+    #[serde(default, skip_serializing_if = "interaction_analysis_disabled")]
+    pub include_pairwise_interactions: bool,
     /// The ceiling this spec must fit inside.
     pub budget: SpecBudget,
 }
 
 fn default_brain_families() -> Vec<String> {
     vec![DEFAULT_EXPERIMENT_BRAIN_FAMILY.to_owned()]
+}
+
+fn default_intervention_schedules() -> Vec<Vec<ScenarioInterventionV1>> {
+    vec![Vec::new()]
+}
+
+const fn interaction_analysis_disabled(value: &bool) -> bool {
+    !*value
 }
 
 /// One complete treatment assignment, including its canonical registered family.
@@ -144,6 +174,180 @@ pub struct Arm {
     pub brain_family: String,
     /// Configuration factors, kept separate from the family selection.
     pub config_overrides: BTreeMap<String, serde_json::Value>,
+    /// Exact ordered timed treatment, including an empty untreated schedule.
+    pub interventions: Vec<ScenarioInterventionV1>,
+}
+
+/// An independently declared treatment axis, never an outcome-selected grouping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InteractionAxis {
+    ConfigFactor { knob_path: String },
+    BrainFamily,
+    InterventionSchedule,
+}
+
+/// Exact levels whose conditional treatment effects are compared.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionLevels {
+    pub axis: InteractionAxis,
+    pub baseline: serde_json::Value,
+    pub treatment: serde_json::Value,
+}
+
+/// One predeclared four-cell contrast, conditional on the other axes' first levels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionContrast {
+    pub first: InteractionLevels,
+    pub second: InteractionLevels,
+    /// Ordered cells [baseline, first only, second only, both], with coefficients
+    /// [+1, -1, -1, +1]. The estimate is not divided by two or four.
+    pub arm_ids: [u16; 4],
+}
+
+fn interaction_axis_value(arm: &Arm, axis: &InteractionAxis) -> Result<serde_json::Value, String> {
+    match axis {
+        InteractionAxis::ConfigFactor { knob_path } => arm
+            .config_overrides
+            .get(knob_path)
+            .cloned()
+            .ok_or_else(|| format!("interaction axis {knob_path:?} is absent from an arm")),
+        InteractionAxis::BrainFamily => Ok(serde_json::json!(arm.brain_family)),
+        InteractionAxis::InterventionSchedule => {
+            serde_json::to_value(&arm.interventions).map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn set_interaction_axis(
+    arm: &mut Arm,
+    axis: &InteractionAxis,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match axis {
+        InteractionAxis::ConfigFactor { knob_path } => {
+            let current = arm
+                .config_overrides
+                .get_mut(knob_path)
+                .ok_or_else(|| format!("interaction axis {knob_path:?} is absent from an arm"))?;
+            *current = value.clone();
+        }
+        InteractionAxis::BrainFamily => {
+            arm.brain_family = value
+                .as_str()
+                .ok_or_else(|| "interaction family level must be a string".to_owned())?
+                .to_owned();
+        }
+        InteractionAxis::InterventionSchedule => {
+            arm.interventions =
+                serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Derive the complete interaction family from treatment metadata alone.
+///
+/// Validation and reanalysis use this same authority. Axes are ordered by config
+/// path, then family and schedule; levels retain their first appearance in arm
+/// order. Equal metadata within an arm and complete seed pairing are checked by
+/// the statistics consumer before it calls this function. No outcome is read.
+pub(crate) fn derive_interaction_contrasts(
+    arms: &[Arm],
+) -> Result<Vec<InteractionContrast>, String> {
+    if arms.is_empty() || arms.len() > MAX_ARMS {
+        return Err(format!("interaction design requires 1..={MAX_ARMS} arms"));
+    }
+    let baseline = &arms[0];
+    for (index, arm) in arms.iter().enumerate() {
+        if arm
+            .config_overrides
+            .keys()
+            .ne(baseline.config_overrides.keys())
+        {
+            return Err("interaction arms must declare the same configuration axes".to_owned());
+        }
+        if arms[..index].contains(arm) {
+            return Err("interaction design contains duplicate treatment assignments".to_owned());
+        }
+    }
+    let axes = baseline
+        .config_overrides
+        .keys()
+        .cloned()
+        .map(|knob_path| InteractionAxis::ConfigFactor { knob_path })
+        .chain([
+            InteractionAxis::BrainFamily,
+            InteractionAxis::InterventionSchedule,
+        ]);
+    let mut varying = Vec::new();
+    let mut combinations = 1_usize;
+    for axis in axes {
+        let mut levels = Vec::new();
+        for arm in arms {
+            let value = interaction_axis_value(arm, &axis)?;
+            if !levels.contains(&value) {
+                levels.push(value);
+            }
+        }
+        combinations = combinations
+            .checked_mul(levels.len())
+            .ok_or_else(|| "interaction design cardinality overflow".to_owned())?;
+        if levels.len() > 1 {
+            varying.push((axis, levels));
+        }
+    }
+    if combinations != arms.len() {
+        return Err(
+            "interaction analysis requires the complete Cartesian treatment grid".to_owned(),
+        );
+    }
+    if varying.len() < 2 {
+        return Err("interaction analysis requires at least two varying treatment axes".to_owned());
+    }
+    let locate = |arm: &Arm| -> Result<u16, String> {
+        let index = arms
+            .iter()
+            .position(|candidate| candidate == arm)
+            .ok_or_else(|| "interaction design is missing an observed cell".to_owned())?;
+        u16::try_from(index).map_err(|error| error.to_string())
+    };
+    let mut contrasts = Vec::new();
+    for (first_index, (first_axis, first_levels)) in varying.iter().enumerate() {
+        for (second_axis, second_levels) in varying.iter().skip(first_index + 1) {
+            for first_value in first_levels.iter().skip(1) {
+                for second_value in second_levels.iter().skip(1) {
+                    if contrasts.len() == MAX_INTERACTION_CONTRASTS {
+                        return Err(format!(
+                            "interaction contrast count exceeds {MAX_INTERACTION_CONTRASTS}"
+                        ));
+                    }
+                    let mut first = baseline.clone();
+                    set_interaction_axis(&mut first, first_axis, first_value)?;
+                    let mut second = baseline.clone();
+                    set_interaction_axis(&mut second, second_axis, second_value)?;
+                    let mut both = first.clone();
+                    set_interaction_axis(&mut both, second_axis, second_value)?;
+                    contrasts.push(InteractionContrast {
+                        first: InteractionLevels {
+                            axis: first_axis.clone(),
+                            baseline: first_levels[0].clone(),
+                            treatment: first_value.clone(),
+                        },
+                        second: InteractionLevels {
+                            axis: second_axis.clone(),
+                            baseline: second_levels[0].clone(),
+                            treatment: second_value.clone(),
+                        },
+                        arm_ids: [0, locate(&first)?, locate(&second)?, locate(&both)?],
+                    });
+                }
+            }
+        }
+    }
+    Ok(contrasts)
 }
 
 /// A spec that has been checked and expanded.
@@ -156,9 +360,13 @@ pub struct ValidatedSpec {
     /// The proposal with brain-family aliases resolved to canonical names.
     pub spec: ExperimentSpec,
     /// Every configuration assignment in factor declaration order, with families
-    /// in declaration order inside each assignment. The first arm is the control
-    /// for every treatment comparison, not a factorial interaction model.
+    /// then schedules in declaration order inside each assignment. The first arm is the control
+    /// for every treatment comparison. Requested interactions are derived from
+    /// this same complete grid before any run executes.
     pub arms: Vec<Arm>,
+    /// Complete predeclared conditional interaction family; empty when disabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interaction_contrasts: Vec<InteractionContrast>,
     /// The cohort, ascending.
     pub seeds: Vec<u64>,
     /// Whether an arm changes the launch family or touches a knob that cannot
@@ -208,6 +416,13 @@ pub enum SpecError {
     EmptyFactors,
     /// No brain family was selected.
     EmptyBrainFamilies,
+    /// No schedule was selected, including no untreated schedule.
+    EmptyInterventionSchedules,
+    /// The canonical runner cannot execute the expanded treatment plan.
+    InvalidExecutionPlan {
+        /// Canonical runner's actionable preflight refusal.
+        reason: String,
+    },
     /// A requested family has no executable adapter in this build.
     InvalidBrainFamily {
         /// Requested name or alias.
@@ -347,8 +562,15 @@ impl fmt::Display for SpecError {
             ),
             Self::EmptyFactors => write!(
                 f,
-                "`factors` must contain a treatment axis unless `brain_families` selects at least two distinct executable families."
+                "`factors` must contain a treatment axis unless `brain_families` or `intervention_schedules` selects at least two distinct treatments."
             ),
+            Self::EmptyInterventionSchedules => write!(
+                f,
+                "`intervention_schedules` must contain at least one schedule; use `[[]]` for no timed interventions."
+            ),
+            Self::InvalidExecutionPlan { reason } => {
+                write!(f, "the expanded treatment plan is not executable: {reason}")
+            }
             Self::EmptyBrainFamilies => write!(
                 f,
                 "`brain_families` must select at least one executable family; omit it to use the default MLP family."
@@ -410,8 +632,8 @@ impl fmt::Display for SpecError {
             } => write!(f, "`{path}` expects {expected}, but got {got}."),
             Self::TooManyArms { arms, max } => write!(
                 f,
-                "configuration factors and brain families expand to {arms} arms, over the limit of {max}. \
-                 Use fewer families, factors, or values per factor."
+                "configuration factors, brain families and intervention schedules expand to {arms} arms, over the limit of {max}. \
+                 Use fewer families, schedules, factors, or values per factor."
             ),
             Self::DuplicateArm { first, second } => write!(
                 f,
@@ -475,6 +697,8 @@ impl SpecError {
             Self::EmptyHypothesis => "empty_hypothesis",
             Self::EmptyFactors => "empty_factors",
             Self::EmptyBrainFamilies => "empty_brain_families",
+            Self::EmptyInterventionSchedules => "empty_intervention_schedules",
+            Self::InvalidExecutionPlan { .. } => "invalid_execution_plan",
             Self::InvalidBrainFamily { .. } => "invalid_brain_family",
             Self::DuplicateBrainFamily { .. } => "duplicate_brain_family",
             Self::EmptyMetrics => "empty_metrics",
@@ -548,14 +772,40 @@ pub fn tool_input_schema() -> Result<serde_json::Value, serde_json::Error> {
             serde_json::json!(default_brain_families()),
         );
     }
+    if let Some(schedules) = root
+        .pointer_mut("/properties/intervention_schedules")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        schedules.insert("minItems".to_owned(), serde_json::json!(1));
+        schedules.insert(
+            "maxItems".to_owned(),
+            serde_json::json!(MAX_INTERVENTION_SCHEDULES),
+        );
+        schedules.insert("uniqueItems".to_owned(), serde_json::json!(true));
+        schedules.insert(
+            "default".to_owned(),
+            serde_json::json!(default_intervention_schedules()),
+        );
+        if let Some(schedule) = schedules
+            .get_mut("items")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            schedule.insert(
+                "maxItems".to_owned(),
+                serde_json::json!(MAX_EXPERIMENT_INTERVENTIONS),
+            );
+        }
+    }
     let mut referenced = Vec::new();
     <ExperimentSpec as ToSchema>::schemas(&mut referenced);
     let schemas = referenced
         .into_iter()
         .map(|(name, schema)| {
             let mut schema = serde_json::to_value(schema)?;
-            if matches!(name.as_str(), "Factor" | "SeedPlan" | "SpecBudget")
-                && let Some(object) = schema.as_object_mut()
+            if matches!(
+                name.as_str(),
+                "Factor" | "SeedPlan" | "SpecBudget" | "ScenarioInterventionV1"
+            ) && let Some(object) = schema.as_object_mut()
             {
                 object.insert(
                     "additionalProperties".to_owned(),
@@ -609,7 +859,11 @@ pub fn tool_input_schema() -> Result<serde_json::Value, serde_json::Error> {
                 "max_factors": MAX_FACTORS,
                 "max_values_per_factor": MAX_VALUES_PER_FACTOR,
                 "max_brain_families": EXPERIMENT_BRAIN_FAMILIES.len(),
+                "max_intervention_schedules": MAX_INTERVENTION_SCHEDULES,
+                "max_interventions_per_schedule": MAX_EXPERIMENT_INTERVENTIONS,
+                "max_intervention_patch_bytes": MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES,
                 "max_arms": MAX_ARMS,
+                "max_interaction_contrasts": MAX_INTERACTION_CONTRASTS,
                 "max_seeds": MAX_SEEDS,
                 "max_ticks_per_run": MAX_TICKS_PER_RUN,
                 "max_string_length": MAX_STRING_LEN,
@@ -650,8 +904,51 @@ pub fn validate_spec(
         errors.push(SpecError::EmptyFalsifier);
     }
     let families = resolve_brain_families(&spec.brain_families, &mut errors);
-    if spec.factors.is_empty() && families.len() < 2 {
+    if spec.factors.is_empty() && families.len() < 2 && spec.intervention_schedules.len() < 2 {
         errors.push(SpecError::EmptyFactors);
+    }
+    if spec.intervention_schedules.is_empty() {
+        errors.push(SpecError::EmptyInterventionSchedules);
+    }
+    check_len(
+        "intervention_schedules",
+        spec.intervention_schedules.len(),
+        MAX_INTERVENTION_SCHEDULES,
+        &mut errors,
+    );
+    // Bound untrusted schedules before cloning them across the treatment product.
+    // The runner's pure preflight below remains the authority for their meaning,
+    // cumulative config validity, execution order and completion horizon.
+    let mut schedules_bounded = !spec.intervention_schedules.is_empty()
+        && spec.intervention_schedules.len() <= MAX_INTERVENTION_SCHEDULES;
+    for (index, schedule) in spec
+        .intervention_schedules
+        .iter()
+        .take(MAX_INTERVENTION_SCHEDULES)
+        .enumerate()
+    {
+        check_len(
+            &format!("intervention_schedules[{index}]"),
+            schedule.len(),
+            MAX_EXPERIMENT_INTERVENTIONS,
+            &mut errors,
+        );
+        schedules_bounded &= schedule.len() <= MAX_EXPERIMENT_INTERVENTIONS;
+        for (statement, intervention) in schedule
+            .iter()
+            .take(MAX_EXPERIMENT_INTERVENTIONS)
+            .enumerate()
+        {
+            let bytes =
+                serde_json::to_vec(&intervention.set).map_or(usize::MAX, |encoded| encoded.len());
+            check_len(
+                &format!("intervention_schedules[{index}][{statement}].set"),
+                bytes,
+                MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES,
+                &mut errors,
+            );
+            schedules_bounded &= bytes <= MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES;
+        }
     }
     if spec.metrics.is_empty() {
         errors.push(SpecError::EmptyMetrics);
@@ -757,6 +1054,7 @@ pub fn validate_spec(
             count.checked_mul(factor.values.len())
         })
         .and_then(|count| count.checked_mul(spec.brain_families.len()))
+        .and_then(|count| count.checked_mul(spec.intervention_schedules.len()))
         .unwrap_or(usize::MAX);
     if arm_count > MAX_ARMS {
         errors.push(SpecError::TooManyArms {
@@ -764,18 +1062,20 @@ pub fn validate_spec(
             max: MAX_ARMS,
         });
     }
-    let can_expand = (!spec.factors.is_empty() || families.len() >= 2)
-        && !families.is_empty()
-        && families.len() == spec.brain_families.len()
-        && families.len() <= EXPERIMENT_BRAIN_FAMILIES.len()
-        && spec.factors.len() <= MAX_FACTORS
-        && factor_positions.len() == spec.factors.len()
-        && spec.factors.iter().all(|factor| {
-            !factor.values.is_empty() && factor.values.len() <= MAX_VALUES_PER_FACTOR
-        })
-        && arm_count <= MAX_ARMS;
+    let can_expand =
+        (!spec.factors.is_empty() || families.len() >= 2 || spec.intervention_schedules.len() >= 2)
+            && !families.is_empty()
+            && families.len() == spec.brain_families.len()
+            && families.len() <= EXPERIMENT_BRAIN_FAMILIES.len()
+            && spec.factors.len() <= MAX_FACTORS
+            && factor_positions.len() == spec.factors.len()
+            && spec.factors.iter().all(|factor| {
+                !factor.values.is_empty() && factor.values.len() <= MAX_VALUES_PER_FACTOR
+            })
+            && schedules_bounded
+            && arm_count <= MAX_ARMS;
     let arms = if can_expand {
-        expand(&spec.factors, &families)
+        expand(&spec.factors, &families, &spec.intervention_schedules)
     } else {
         Vec::new()
     };
@@ -828,12 +1128,51 @@ pub fn validate_spec(
         return Err(errors);
     }
 
+    // plan_batch constructs neither a world nor an artifact. Reuse the executable
+    // runner's canonical checks rather than maintain a second schedule validator.
+    // One actual matched seed is sufficient: configs and schedules are identical
+    // across the cohort, while its seed is owned exclusively by the runner.
+    let variants = arms
+        .iter()
+        .enumerate()
+        .map(|(index, arm)| ScenarioVariant {
+            variant_id: format!("arm-{index:03}"),
+            brain_family: arm.brain_family.clone(),
+            config_overrides: arm.config_overrides.clone(),
+            interventions: arm.interventions.clone(),
+        })
+        .collect();
+    MatchedSeedExperimentRunner::new(
+        "lab-preflight",
+        MatchedSeedCohort {
+            cohort_id: "lab-preflight-matched-seeds".to_owned(),
+            seeds: vec![seeds[0]],
+        },
+        variants,
+        spec.ticks_per_run,
+        2,
+        std::path::PathBuf::new(),
+    )
+    .plan_batch()
+    .map_err(|error| {
+        vec![SpecError::InvalidExecutionPlan {
+            reason: error.to_string(),
+        }]
+    })?;
+
     let mut canonical_spec = spec.clone();
     canonical_spec.brain_families = families.into_iter().map(str::to_owned).collect();
+    let interaction_contrasts = if canonical_spec.include_pairwise_interactions {
+        derive_interaction_contrasts(&arms)
+            .map_err(|reason| vec![SpecError::InvalidExecutionPlan { reason }])?
+    } else {
+        Vec::new()
+    };
     let spec_id = content_hash(&canonical_spec, &arms, &seeds);
     Ok(ValidatedSpec {
         spec: canonical_spec,
         arms,
+        interaction_contrasts,
         seeds,
         fresh_world_only,
         spec_id,
@@ -1023,7 +1362,11 @@ fn describe(value: &serde_json::Value) -> String {
 ///
 /// `BTreeMap` and `Vec` only: a `HashMap` anywhere in here would make the arm
 /// order — and therefore the spec id — depend on the hasher's seed.
-fn expand(factors: &[Factor], families: &[&str]) -> Vec<Arm> {
+fn expand(
+    factors: &[Factor],
+    families: &[&str],
+    schedules: &[Vec<ScenarioInterventionV1>],
+) -> Vec<Arm> {
     let mut assignments = vec![BTreeMap::new()];
     for factor in factors {
         let mut next = Vec::with_capacity(assignments.len() * factor.values.len().max(1));
@@ -1038,15 +1381,19 @@ fn expand(factors: &[Factor], families: &[&str]) -> Vec<Arm> {
             assignments = next;
         }
     }
-    assignments
-        .into_iter()
-        .flat_map(|config_overrides| {
-            families.iter().map(move |family| Arm {
-                brain_family: (*family).to_owned(),
-                config_overrides: config_overrides.clone(),
-            })
-        })
-        .collect()
+    let mut arms = Vec::with_capacity(assignments.len() * families.len() * schedules.len());
+    for config_overrides in assignments {
+        for family in families {
+            for interventions in schedules {
+                arms.push(Arm {
+                    brain_family: (*family).to_owned(),
+                    config_overrides: config_overrides.clone(),
+                    interventions: interventions.clone(),
+                });
+            }
+        }
+    }
+    arms
 }
 
 /// FNV-1a over the canonical JSON encoding of the validated content.
@@ -1057,14 +1404,14 @@ fn expand(factors: &[Factor], families: &[&str]) -> Vec<Arm> {
 /// colliding experiment. Reusing the same FNV-1a the characterization digest uses
 /// keeps the dependency surface flat.
 fn content_hash(spec: &ExperimentSpec, arms: &[Arm], seeds: &[u64]) -> String {
-    let canonical = serde_json::json!({
+    let canonical = crate::precedence::canonical_value(&serde_json::json!({
         "hypothesis": spec.hypothesis,
         "falsifier": spec.falsifier,
         "ticks_per_run": spec.ticks_per_run,
         "metrics": spec.metrics,
         "arms": arms,
         "seeds": seeds,
-    });
+    }));
     let encoded = serde_json::to_vec(&canonical).unwrap_or_default();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in encoded {
@@ -1096,9 +1443,11 @@ mod tests {
                 ],
             }],
             brain_families: default_brain_families(),
+            intervention_schedules: default_intervention_schedules(),
             seeds: SeedPlan { base: 1, count: 4 },
             ticks_per_run: 2_000,
             metrics: vec!["alive_agents".to_owned()],
+            include_pairwise_interactions: false,
             budget: SpecBudget {
                 runs: 64,
                 ticks: 10_000_000,
@@ -1189,6 +1538,119 @@ mod tests {
     }
 
     #[test]
+    fn interaction_opt_in_preserves_default_identity_and_predeclares_every_level() {
+        let original = spec();
+        let encoded = serde_json::to_value(&original).unwrap();
+        assert!(encoded.get("include_pairwise_interactions").is_none());
+        let mut explicit_off = encoded;
+        explicit_off["include_pairwise_interactions"] = serde_json::json!(false);
+        let explicit_off: ExperimentSpec = serde_json::from_value(explicit_off).unwrap();
+        let baseline = validate_spec(&original, OPERATOR_BUDGET).unwrap();
+        assert_eq!(
+            baseline,
+            validate_spec(&explicit_off, OPERATOR_BUDGET).unwrap()
+        );
+        assert!(baseline.interaction_contrasts.is_empty());
+
+        let mut enabled = original;
+        enabled.include_pairwise_interactions = true;
+        let errors = validate_spec(&enabled, OPERATOR_BUDGET).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidExecutionPlan { reason }
+                if reason.contains("at least two varying")
+        )));
+        enabled.brain_families = vec!["mlp".to_owned(), "dwraon".to_owned()];
+        let declared = validate_spec(&enabled, OPERATOR_BUDGET).unwrap();
+        assert_eq!(declared.arms.len(), 6);
+        assert_eq!(declared.interaction_contrasts.len(), 2);
+        assert_eq!(declared.interaction_contrasts[0].arm_ids, [0, 2, 1, 3]);
+        assert_eq!(declared.interaction_contrasts[1].arm_ids, [0, 4, 1, 5]);
+        assert_eq!(
+            declared.interaction_contrasts[0].second.baseline,
+            serde_json::json!("mlp.baseline")
+        );
+        assert_eq!(
+            declared.interaction_contrasts[0].second.treatment,
+            serde_json::json!("dwraon.baseline")
+        );
+        enabled.include_pairwise_interactions = false;
+        let without_interactions = validate_spec(&enabled, OPERATOR_BUDGET).unwrap();
+        assert_eq!(declared.arms, without_interactions.arms);
+        assert_eq!(declared.cost(), without_interactions.cost());
+        assert_ne!(declared.spec_id, without_interactions.spec_id);
+    }
+
+    #[test]
+    fn conditional_interactions_hold_other_family_and_schedule_axes_at_baseline() {
+        let mut proposed = spec();
+        proposed.factors[0].values.truncate(2);
+        proposed.brain_families = vec!["mlp".to_owned(), "dwraon".to_owned()];
+        proposed
+            .intervention_schedules
+            .push(vec![ScenarioInterventionV1 {
+                tick: 1,
+                set: serde_json::json!({"food_decay_rate": 0.001}),
+            }]);
+        proposed.include_pairwise_interactions = true;
+        let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+        assert_eq!(validated.arms.len(), 8);
+        assert_eq!(validated.interaction_contrasts.len(), 3);
+        let cells = validated
+            .interaction_contrasts
+            .iter()
+            .map(|contrast| contrast.arm_ids)
+            .collect::<Vec<_>>();
+        assert_eq!(cells, [[0, 4, 2, 6], [0, 4, 1, 5], [0, 2, 1, 3]]);
+        let schedule = &validated.interaction_contrasts[2].second;
+        assert_eq!(schedule.axis, InteractionAxis::InterventionSchedule);
+        assert_eq!(schedule.baseline, serde_json::json!([]));
+        assert_eq!(
+            schedule.treatment,
+            serde_json::to_value(&proposed.intervention_schedules[1]).unwrap()
+        );
+        let mut missing = validated.arms.clone();
+        missing.pop();
+        assert!(
+            derive_interaction_contrasts(&missing)
+                .unwrap_err()
+                .contains("complete Cartesian")
+        );
+        let mut duplicated = validated.arms.clone();
+        duplicated[7] = duplicated[0].clone();
+        assert!(
+            derive_interaction_contrasts(&duplicated)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn interaction_family_remains_bounded_at_the_largest_two_axis_grid() {
+        let mut proposed = spec();
+        proposed.factors = vec![
+            Factor {
+                knob_path: "food_growth_rate".to_owned(),
+                values: (1..=8)
+                    .map(|level| serde_json::json!(f64::from(level) * 0.01))
+                    .collect(),
+            },
+            Factor {
+                knob_path: "food_decay_rate".to_owned(),
+                values: (0..4)
+                    .map(|level| serde_json::json!(f64::from(level) * 0.01))
+                    .collect(),
+            },
+        ];
+        proposed.seeds.count = 1;
+        proposed.include_pairwise_interactions = true;
+        let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+        assert_eq!(validated.arms.len(), MAX_ARMS);
+        assert_eq!(validated.interaction_contrasts.len(), 7 * 3);
+        assert!(validated.interaction_contrasts.len() <= MAX_INTERACTION_CONTRASTS);
+    }
+
+    #[test]
     fn family_only_studies_require_distinct_executable_families() {
         let mut proposed = spec();
         proposed.factors.clear();
@@ -1232,6 +1694,288 @@ mod tests {
     }
 
     #[test]
+    fn intervention_schedule_axis_expands_after_families_and_charges_every_run() {
+        let mut proposed = spec();
+        proposed.brain_families = vec!["mlp".to_owned(), "dwraon".to_owned()];
+        let schedule = vec![
+            ScenarioInterventionV1 {
+                tick: 0,
+                set: serde_json::json!({"food_growth_rate": 0.02}),
+            },
+            ScenarioInterventionV1 {
+                tick: 0,
+                set: serde_json::json!({"food_growth_rate": 0.03}),
+            },
+        ];
+        proposed.intervention_schedules = vec![Vec::new(), schedule.clone()];
+        let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+        assert_eq!(validated.arms.len(), 12);
+        assert_eq!(validated.seeds, [1, 2, 3, 4]);
+        for (index, arm) in validated.arms.iter().enumerate() {
+            assert_eq!(
+                arm.brain_family,
+                ["mlp.baseline", "dwraon.baseline"][(index / 2) % 2]
+            );
+            assert_eq!(
+                arm.interventions,
+                proposed.intervention_schedules[index % 2]
+            );
+            assert_eq!(
+                arm.config_overrides["food_growth_rate"],
+                proposed.factors[0].values[index / 4]
+            );
+        }
+        assert_eq!(
+            validated.cost(),
+            RunCost {
+                runs: 48,
+                ticks: 96_000
+            }
+        );
+        let errors = validate_spec(
+            &proposed,
+            SpecBudget {
+                runs: 24,
+                ticks: 96_000,
+            },
+        )
+        .expect_err("schedules must count toward operator admission");
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::CostExceedsBudget {
+                runs: 48,
+                max_runs: 24,
+                ..
+            }
+        )));
+
+        proposed.intervention_schedules[1].swap(0, 1);
+        assert_ne!(
+            validated.spec_id,
+            validate_spec(&proposed, OPERATOR_BUDGET).unwrap().spec_id,
+            "same-tick statement order is part of the scientific treatment"
+        );
+        proposed.intervention_schedules[1] = schedule;
+        proposed.intervention_schedules[1][1].tick = 1;
+        assert_ne!(
+            validated.spec_id,
+            validate_spec(&proposed, OPERATOR_BUDGET).unwrap().spec_id,
+            "intervention timing is part of the scientific treatment"
+        );
+    }
+
+    #[test]
+    fn schedule_only_studies_require_distinct_treatments_and_bound_the_full_product() {
+        let mut proposed = spec();
+        proposed.factors.clear();
+        proposed.intervention_schedules = vec![
+            Vec::new(),
+            vec![ScenarioInterventionV1 {
+                tick: 1,
+                set: serde_json::json!({"metabolism_drain": 0.02}),
+            }],
+        ];
+        let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
+        assert_eq!(validated.arms.len(), 2);
+        assert!(validated.arms[0].interventions.is_empty());
+        assert_eq!(
+            validated.arms[1].interventions,
+            proposed.intervention_schedules[1]
+        );
+        assert!(
+            validated
+                .arms
+                .iter()
+                .all(|arm| arm.config_overrides.is_empty())
+        );
+        proposed.intervention_schedules[1].clear();
+        assert!(
+            validate_spec(&proposed, OPERATOR_BUDGET)
+                .unwrap_err()
+                .contains(&SpecError::DuplicateArm {
+                    first: 0,
+                    second: 1
+                })
+        );
+        proposed.intervention_schedules.clear();
+        assert!(
+            validate_spec(&proposed, OPERATOR_BUDGET)
+                .unwrap_err()
+                .contains(&SpecError::EmptyInterventionSchedules)
+        );
+
+        let mut product = spec();
+        product.factors[0].values = (1..=8)
+            .map(|value| serde_json::json!(f64::from(value) * 0.01))
+            .collect();
+        product.brain_families = vec!["mlp".to_owned(), "dwraon".to_owned()];
+        product.intervention_schedules = vec![
+            Vec::new(),
+            vec![ScenarioInterventionV1 {
+                tick: 1,
+                set: serde_json::json!({"metabolism_drain": 0.02}),
+            }],
+        ];
+        product.budget = OPERATOR_BUDGET;
+        assert_eq!(
+            validate_spec(&product, OPERATOR_BUDGET).unwrap().arms.len(),
+            MAX_ARMS
+        );
+        product
+            .intervention_schedules
+            .push(vec![ScenarioInterventionV1 {
+                tick: 2,
+                set: serde_json::json!({"metabolism_drain": 0.02}),
+            }]);
+        assert!(
+            validate_spec(&product, OPERATOR_BUDGET)
+                .unwrap_err()
+                .contains(&SpecError::TooManyArms {
+                    arms: 48,
+                    max: MAX_ARMS
+                })
+        );
+    }
+
+    #[test]
+    fn scheduled_proposals_reuse_runner_timing_live_knob_and_cumulative_validation() {
+        let at = |tick, set| ScenarioInterventionV1 { tick, set };
+        let mut proposed = spec();
+        proposed.factors = vec![Factor {
+            knob_path: "food_max".to_owned(),
+            values: vec![serde_json::json!(10.0)],
+        }];
+        proposed.ticks_per_run = 2;
+        for (schedule, diagnostic) in [
+            (
+                vec![at(2, serde_json::json!({"food_growth_rate": 0.1}))],
+                "must precede",
+            ),
+            (
+                vec![
+                    at(1, serde_json::json!({"food_growth_rate": 0.1})),
+                    at(0, serde_json::json!({"food_growth_rate": 0.2})),
+                ],
+                "nondecreasing",
+            ),
+            (
+                vec![at(0, serde_json::json!({"world_width": 80}))],
+                "requires a fresh world",
+            ),
+            (
+                vec![at(0, serde_json::json!({"rng_seed": 9}))],
+                "unsupported knob",
+            ),
+            (
+                vec![at(0, serde_json::json!({"food_growth_rate": true}))],
+                "numeric value",
+            ),
+            (
+                vec![at(0, serde_json::json!({"food_growth_rate": 1e9}))],
+                "accepted range",
+            ),
+            (vec![at(0, serde_json::json!({}))], "must not be empty"),
+        ] {
+            proposed.intervention_schedules = vec![Vec::new(), schedule];
+            let errors = validate_spec(&proposed, OPERATOR_BUDGET)
+                .expect_err("invalid timed treatment must be refused before execution");
+            assert!(
+                matches!(errors.as_slice(), [SpecError::InvalidExecutionPlan { reason }]
+                if reason.contains(diagnostic)),
+                "{errors:?}"
+            );
+        }
+
+        let fill = at(0, serde_json::json!({"initial_food": 2.0}));
+        let lower_cap = at(1, serde_json::json!({"food_max": 1.0}));
+        for independently_valid in [fill.clone(), lower_cap.clone()] {
+            proposed.intervention_schedules = vec![Vec::new(), vec![independently_valid]];
+            validate_spec(&proposed, OPERATOR_BUDGET).expect("each patch alone is admissible");
+        }
+        proposed.intervention_schedules = vec![Vec::new(), vec![fill, lower_cap]];
+        let errors = validate_spec(&proposed, OPERATOR_BUDGET)
+            .expect_err("the second patch is invalid after the first patch raises initial_food");
+        assert!(
+            matches!(errors.as_slice(), [SpecError::InvalidExecutionPlan { reason }]
+            if reason.contains("initial_food cannot exceed food_max")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn schedules_are_bounded_before_expansion_and_default_to_one_untreated_arm() {
+        let mut proposed = spec();
+        let statement = ScenarioInterventionV1 {
+            tick: 0,
+            set: serde_json::json!({"food_growth_rate": 0.01}),
+        };
+        proposed.intervention_schedules =
+            vec![vec![statement.clone(); MAX_EXPERIMENT_INTERVENTIONS]];
+        validate_spec(&proposed, OPERATOR_BUDGET).expect("exact statement cap is executable");
+        proposed.intervention_schedules[0].push(statement.clone());
+        assert!(
+            validate_spec(&proposed, OPERATOR_BUDGET)
+                .unwrap_err()
+                .iter()
+                .any(|error| matches!(
+                    error, SpecError::Bounds { field, .. } if field == "intervention_schedules[0]"
+                ))
+        );
+        proposed.intervention_schedules = vec![vec![statement]; MAX_INTERVENTION_SCHEDULES + 1];
+        assert!(
+            validate_spec(&proposed, OPERATOR_BUDGET)
+                .unwrap_err()
+                .iter()
+                .any(|error| matches!(
+                    error, SpecError::Bounds { field, .. } if field == "intervention_schedules"
+                ))
+        );
+        proposed.intervention_schedules = vec![vec![ScenarioInterventionV1 {
+            tick: 0,
+            set: serde_json::json!({"food_growth_rate": "x".repeat(MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES)}),
+        }]];
+        assert!(validate_spec(&proposed, OPERATOR_BUDGET).unwrap_err().iter().any(|error| matches!(
+            error, SpecError::Bounds { field, .. } if field == "intervention_schedules[0][0].set"
+        )));
+
+        let baseline = spec();
+        let mut encoded = serde_json::to_value(&baseline).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("intervention_schedules");
+        let defaulted: ExperimentSpec = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            defaulted.intervention_schedules,
+            vec![Vec::<ScenarioInterventionV1>::new()]
+        );
+        assert_eq!(
+            validate_spec(&defaulted, OPERATOR_BUDGET).unwrap(),
+            validate_spec(&baseline, OPERATOR_BUDGET).unwrap()
+        );
+    }
+
+    #[test]
+    fn intervention_patch_object_key_order_does_not_split_experiment_identity() {
+        let mut forward = spec();
+        forward.intervention_schedules = vec![vec![ScenarioInterventionV1 {
+            tick: 0,
+            set: serde_json::json!({"food_growth_rate": 0.01, "food_decay_rate": 0.02}),
+        }]];
+        let mut reversed = forward.clone();
+        reversed.intervention_schedules[0][0].set =
+            serde_json::json!({"food_decay_rate": 0.02, "food_growth_rate": 0.01});
+        assert_ne!(
+            serde_json::to_vec(&forward).unwrap(),
+            serde_json::to_vec(&reversed).unwrap()
+        );
+        assert_eq!(
+            validate_spec(&forward, OPERATOR_BUDGET).unwrap().spec_id,
+            validate_spec(&reversed, OPERATOR_BUDGET).unwrap().spec_id
+        );
+    }
+
+    #[test]
     fn canonical_family_selection_participates_in_the_spec_identity() {
         let proposed = spec();
         let baseline = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
@@ -1263,22 +2007,49 @@ mod tests {
         );
     }
 
+    fn assert_invalid_brain_family(requested: &str) {
+        let mut proposed = spec();
+        proposed.brain_families = vec![requested.to_owned()];
+        let errors = validate_spec(&proposed, OPERATOR_BUDGET).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SpecError::InvalidBrainFamily { name, .. } if name == requested
+        )));
+    }
+
     #[test]
     fn brain_family_validation_uses_the_compiled_runner_catalog() {
-        for requested in ["imaginary", "neuroflow"] {
-            let mut proposed = spec();
-            proposed.brain_families = vec![requested.to_owned()];
-            let errors = validate_spec(&proposed, OPERATOR_BUDGET).unwrap_err();
-            assert!(errors.iter().any(|error| matches!(
-                error,
-                SpecError::InvalidBrainFamily { name, .. } if name == requested
-            )));
-        }
+        assert_invalid_brain_family("imaginary");
+        #[cfg(not(feature = "neuro"))]
+        assert_invalid_brain_family("neuroflow");
         for &family in EXPERIMENT_BRAIN_FAMILIES {
             let mut proposed = spec();
             proposed.brain_families = vec![family.to_owned()];
             let validated = validate_spec(&proposed, OPERATOR_BUDGET).unwrap();
             assert!(validated.arms.iter().all(|arm| arm.brain_family == family));
+        }
+        for alias in ["neuro", "neuroflow", "ml.neuroflow"] {
+            let mut optional = spec();
+            optional.brain_families = vec![alias.to_owned()];
+            #[cfg(feature = "neuro")]
+            assert!(
+                validate_spec(&optional, OPERATOR_BUDGET)
+                    .unwrap()
+                    .arms
+                    .iter()
+                    .all(|arm| arm.brain_family == "ml.neuroflow")
+            );
+            #[cfg(not(feature = "neuro"))]
+            assert!(
+                validate_spec(&optional, OPERATOR_BUDGET)
+                    .unwrap_err()
+                    .iter()
+                    .any(|error| matches!(
+                        error,
+                        SpecError::InvalidBrainFamily { name, reason }
+                            if name == alias && reason.contains("neuro feature")
+                    ))
+            );
         }
         let mut optional = spec();
         optional.brain_families = vec!["frankentorch".to_owned()];
@@ -1621,6 +2392,9 @@ mod tests {
                         serde_json::json!(0.03),
                         serde_json::json!(0.04),
                     ]
+                } else if path == "food_max" {
+                    // Keep both caps at least as large as the default respawn amount.
+                    vec![serde_json::json!(0.5), serde_json::json!(0.6)]
                 } else {
                     vec![serde_json::json!(0.01), serde_json::json!(0.02)]
                 },
@@ -1692,6 +2466,36 @@ mod tests {
                 .any(|field| field.as_str() == Some("brain_families"))
         );
         assert!(
+            !required
+                .iter()
+                .any(|field| field.as_str() == Some("intervention_schedules"))
+        );
+        assert!(
+            !required
+                .iter()
+                .any(|field| field.as_str() == Some("include_pairwise_interactions"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/include_pairwise_interactions/type"),
+            Some(&serde_json::json!("boolean"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/intervention_schedules/default"),
+            Some(&serde_json::json!([[]]))
+        );
+        assert_eq!(
+            schema.pointer("/properties/intervention_schedules/maxItems"),
+            Some(&serde_json::json!(MAX_INTERVENTION_SCHEDULES))
+        );
+        assert_eq!(
+            schema.pointer("/properties/intervention_schedules/items/maxItems"),
+            Some(&serde_json::json!(MAX_EXPERIMENT_INTERVENTIONS))
+        );
+        assert_eq!(
+            schema.pointer("/components/schemas/ScenarioInterventionV1/additionalProperties"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(
             schema
                 .pointer("/x-scriptbots-knob-ranges")
                 .and_then(serde_json::Value::as_array)
@@ -1700,6 +2504,10 @@ mod tests {
         assert_eq!(
             schema.pointer("/x-scriptbots-validation-limits/max_arms"),
             Some(&serde_json::json!(MAX_ARMS))
+        );
+        assert_eq!(
+            schema.pointer("/x-scriptbots-validation-limits/max_interaction_contrasts"),
+            Some(&serde_json::json!(MAX_INTERACTION_CONTRASTS))
         );
         assert_eq!(
             schema.pointer("/x-scriptbots-seed-policy/factor_path"),

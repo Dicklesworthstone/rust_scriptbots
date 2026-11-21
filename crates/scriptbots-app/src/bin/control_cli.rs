@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEventKind},
@@ -23,7 +23,15 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Row, Table},
 };
 use reqwest::{Client, StatusCode};
-use scriptbots_app::control::MapApplyAgentPolicy;
+use scriptbots_app::control::{
+    ApiSchemaDto, ArtifactMetadataDto, CheckpointBranchRequest, CheckpointBranchStatusDto,
+    CheckpointCreateRequest, CheckpointMetadataDto, ExperimentBatchStatusDto,
+    ExperimentComparisonDto, ExperimentCreateRequest, MAX_ARTIFACT_DOWNLOAD_BYTES,
+    MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MapApplyAgentPolicy, PaginatedArtifactsResponse,
+    PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse,
+    PaginatedExperimentsResponse, compute_blake3, compute_sha256,
+};
+use scriptbots_app::experiment_runner::EXPERIMENT_ENDPOINT_METRICS;
 use scriptbots_app::{
     CommandStatusDto, ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest,
     KnobEntry, KnobKind, KnobUpdate, STORAGE_SIDECAR_SUFFIXES, default_control_rest_base_url,
@@ -200,6 +208,132 @@ enum Command {
         #[command(subcommand)]
         sub: NarrativeSubcommand,
     },
+    /// Create, inspect, stop, resume, or compare matched-seed experiments.
+    Experiment {
+        #[command(subcommand)]
+        sub: ExperimentSubcommand,
+    },
+    /// Capture and inspect saved scientific checkpoints, or download verified bytes.
+    Checkpoint {
+        #[command(subcommand)]
+        sub: CheckpointSubcommand,
+    },
+    /// Discover run artifacts and download them with checksum verification.
+    Artifact {
+        #[command(subcommand)]
+        sub: ArtifactSubcommand,
+    },
+    /// Print the server's versioned REST, MCP and data-schema discovery as JSON.
+    Schema,
+}
+
+/// Fetch one bounded catalog page; the response retains the server's next cursor.
+#[derive(Args, Debug)]
+struct CatalogPageArgs {
+    /// Maximum records on this page (1..=100).
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+    limit: u16,
+    /// Opaque next_cursor returned by the previous page.
+    #[arg(long)]
+    cursor: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ExperimentSubcommand {
+    /// Submit an ExperimentCreateRequest JSON file; prints the observed batch status.
+    Create {
+        /// JSON request file, or '-' for stdin (at most 1 MiB).
+        #[arg(long, short)]
+        file: PathBuf,
+    },
+    /// List experiments, including capacity and the next-page cursor, as JSON.
+    List {
+        #[command(flatten)]
+        page: CatalogPageArgs,
+    },
+    /// Read the saved status and per-run results as JSON.
+    Status { id: String },
+    /// Request a cooperative stop; returned status may still be 'cancelling'.
+    Cancel { id: String },
+    /// Resume a stopped batch from its verified saved progress.
+    Resume { id: String },
+    /// Compare verified completed cohorts (challenger minus baseline), as JSON.
+    Compare {
+        id: String,
+        #[arg(long)]
+        baseline: String,
+        #[arg(long)]
+        challenger: String,
+        /// Canonical final-state metric; a larger value is not a fitness verdict.
+        #[arg(long, default_value = "alive_agents", value_parser = clap::builder::PossibleValuesParser::new(EXPERIMENT_ENDPOINT_METRICS))]
+        metric: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CheckpointSubcommand {
+    /// Save the current owner boundary; prints actual saved metadata, not a resume guarantee.
+    Create {
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List saved checkpoints, retention usage and the next-page cursor as JSON.
+    List {
+        #[command(flatten)]
+        page: CatalogPageArgs,
+    },
+    /// Read metadata for one saved checkpoint.
+    Status { id: String },
+    /// Download one checkpoint after verifying its metadata and both checksums.
+    Download {
+        id: String,
+        /// New destination file; existing files and symbolic links are refused.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
+    /// Run or inspect an independent future from a saved cut; the live owner is unchanged.
+    Branch {
+        #[command(subcommand)]
+        sub: CheckpointBranchSubcommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CheckpointBranchSubcommand {
+    /// Page admitted studies, including recovered terminal history; never reruns a study.
+    List {
+        #[command(flatten)]
+        page: CatalogPageArgs,
+    },
+    /// Admit a bounded branch study; poll status to observe completion and its report.
+    Create {
+        /// CheckpointBranchRequest JSON file or '-' for stdin (at most 16 KiB).
+        /// Must include checkpoint_id, branch_name, ticks and idempotency_key.
+        #[arg(long, short)]
+        file: PathBuf,
+    },
+    /// Read observed branch progress and its source checkpoint identity as JSON.
+    Status { id: String },
+    /// Request a cooperative stop; 'cancelling' does not mean it has stopped yet.
+    Cancel { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum ArtifactSubcommand {
+    /// List artifacts, byte counts, checksums and the next-page cursor as JSON.
+    List {
+        #[command(flatten)]
+        page: CatalogPageArgs,
+    },
+    /// Read metadata for one artifact.
+    Status { id: String },
+    /// Download at most 64 MiB and verify BLAKE3 and SHA-256 before opening --out.
+    Download {
+        id: String,
+        /// New destination file; the remote filename never selects a local path.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -223,6 +357,9 @@ enum NarrativeSubcommand {
         /// Optional path to SQLite database for direct querying without a running server.
         #[arg(long = "db")]
         db: Option<PathBuf>,
+        /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+        #[arg(long)]
+        run_id: Option<String>,
     },
     /// Retrieve chronological event window around a specific tick.
     Around {
@@ -237,6 +374,9 @@ enum NarrativeSubcommand {
         /// Optional path to SQLite database for direct querying without a running server.
         #[arg(long = "db")]
         db: Option<PathBuf>,
+        /// Stored run ID (32 lowercase hex characters); required for a multi-run database.
+        #[arg(long)]
+        run_id: Option<String>,
     },
 }
 
@@ -347,6 +487,7 @@ async fn main() -> Result<()> {
         } => export_command(kind, database, out, last)?,
         other => {
             let client = Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .context("failed to build HTTP client")?;
             let key = cli.idempotency_key.as_deref();
@@ -430,11 +571,600 @@ async fn main() -> Result<()> {
                 Command::Narrative { sub } => {
                     narrative_command(&client, &cli.base_url, sub).await?
                 }
+                Command::Experiment { sub } => {
+                    let response = experiment_request(&client, &cli.base_url, sub, key).await?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
+                Command::Checkpoint { sub } => {
+                    let response = checkpoint_request(&client, &cli.base_url, sub, key).await?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
+                Command::Artifact { sub } => {
+                    let response = artifact_request(&client, &cli.base_url, sub).await?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
+                Command::Schema => {
+                    let response = data_json::<ApiSchemaDto>(
+                        client.get(data_api_url(&cli.base_url, &["schema"])?),
+                    )
+                    .await?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Client-side bounds apply even when a peer omits or lies about Content-Length.
+const MAX_DATA_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EXPERIMENT_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_DATA_ERROR_BYTES: usize = 64 * 1024;
+const DATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn data_api_url(base: &str, segments: &[&str]) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base).context("invalid control API base URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("control API base URL must be HTTP(S) without a query or fragment");
+    }
+    for segment in segments {
+        if segment.is_empty()
+            || segment.len() > 128
+            || segment.contains("..")
+            || *segment == "."
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            bail!(
+                "API identity must be 1..=128 ASCII letters, digits, '.', '_' or '-', without traversal"
+            );
+        }
+    }
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("control API base URL cannot contain path segments"))?;
+        path.pop_if_empty().extend(["api", "v1"]);
+        path.extend(segments.iter().copied());
+    }
+    Ok(url)
+}
+
+fn catalog_request(
+    client: &Client,
+    base_url: &str,
+    collection: &[&str],
+    page: &CatalogPageArgs,
+) -> Result<reqwest::RequestBuilder> {
+    if !(1..=100).contains(&page.limit) {
+        bail!("catalog --limit must be in 1..=100");
+    }
+    let mut request = client
+        .get(data_api_url(base_url, collection)?)
+        .query(&[("limit", page.limit)]);
+    if let Some(cursor) = &page.cursor {
+        if cursor.is_empty() || cursor.len() > 1024 {
+            bail!("catalog --cursor must contain 1..=1024 bytes");
+        }
+        request = request.query(&[("cursor", cursor)]);
+    }
+    Ok(request)
+}
+
+async fn bounded_response_bytes(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        bail!("control API response exceeds the {limit}-byte client limit");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read control API response")?
+    {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            bail!("control API response exceeds the {limit}-byte client limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn data_json<T>(request: reqwest::RequestBuilder) -> Result<Value>
+where
+    T: DeserializeOwned + serde::Serialize,
+{
+    serde_json::to_value(data_response::<T>(request).await?)
+        .context("failed to encode control data response")
+}
+
+async fn data_response<T: DeserializeOwned>(request: reqwest::RequestBuilder) -> Result<T> {
+    let response =
+        request.timeout(DATA_REQUEST_TIMEOUT).send().await.context(
+            "control data request failed; inspect saved status before retrying a mutation",
+        )?;
+    let status = response.status();
+    let limit = if status.is_success() {
+        MAX_DATA_JSON_BYTES
+    } else {
+        MAX_DATA_ERROR_BYTES
+    };
+    let bytes = bounded_response_bytes(response, limit)
+        .await
+        .with_context(|| format!("failed to read control API response ({status})"))?;
+    if !status.is_success() {
+        bail!(
+            "control API request failed ({status}): {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    serde_json::from_slice(&bytes).context("failed to decode the expected control data response")
+}
+
+fn read_experiment_request(file: &Path, key: Option<&str>) -> Result<ExperimentCreateRequest> {
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(MAX_EXPERIMENT_REQUEST_BYTES).expect("client input bound fits u64");
+    if file == Path::new("-") {
+        io::stdin()
+            .lock()
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read experiment JSON from stdin")?;
+    } else {
+        let metadata = fs::metadata(file)
+            .with_context(|| format!("failed to inspect experiment request {}", file.display()))?;
+        if !metadata.is_file() || metadata.len() > limit {
+            bail!("experiment request must be a regular file of at most {limit} bytes");
+        }
+        fs::File::open(file)
+            .with_context(|| format!("failed to open experiment request {}", file.display()))?
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read experiment request")?;
+    }
+    if bytes.len() > MAX_EXPERIMENT_REQUEST_BYTES {
+        bail!("experiment request exceeds the {limit}-byte input limit");
+    }
+    let mut request: ExperimentCreateRequest =
+        serde_json::from_slice(&bytes).context("invalid ExperimentCreateRequest JSON")?;
+    if let Some(key) = key {
+        if request
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|body_key| body_key != key)
+        {
+            bail!("--idempotency-key conflicts with the key in the experiment request");
+        }
+        request.idempotency_key = Some(key.to_owned());
+    }
+    if serde_json::to_vec(&request)?.len() > MAX_EXPERIMENT_REQUEST_BYTES {
+        bail!("serialized experiment request exceeds the {limit}-byte input limit");
+    }
+    Ok(request)
+}
+
+async fn experiment_request(
+    client: &Client,
+    base_url: &str,
+    command: ExperimentSubcommand,
+    key: Option<&str>,
+) -> Result<Value> {
+    match command {
+        ExperimentSubcommand::Create { file } => {
+            let body = read_experiment_request(&file, key)?;
+            let mut request = client
+                .post(data_api_url(base_url, &["experiments"])?)
+                .json(&body);
+            if let Some(key) = key {
+                request = request.header("Idempotency-Key", key);
+            }
+            data_json::<ExperimentBatchStatusDto>(request).await
+        }
+        ExperimentSubcommand::List { page } => {
+            data_json::<PaginatedExperimentsResponse>(catalog_request(
+                client,
+                base_url,
+                &["experiments"],
+                &page,
+            )?)
+            .await
+        }
+        ExperimentSubcommand::Status { id } => {
+            data_json::<ExperimentBatchStatusDto>(
+                client.get(data_api_url(base_url, &["experiments", &id])?),
+            )
+            .await
+        }
+        ExperimentSubcommand::Cancel { id } => {
+            data_json::<ExperimentBatchStatusDto>(
+                client.post(data_api_url(base_url, &["experiments", &id, "cancel"])?),
+            )
+            .await
+        }
+        ExperimentSubcommand::Resume { id } => {
+            data_json::<ExperimentBatchStatusDto>(
+                client.post(data_api_url(base_url, &["experiments", &id, "resume"])?),
+            )
+            .await
+        }
+        ExperimentSubcommand::Compare {
+            id,
+            baseline,
+            challenger,
+            metric,
+        } => {
+            if !EXPERIMENT_ENDPOINT_METRICS.contains(&metric.as_str()) {
+                bail!(
+                    "unknown endpoint metric; expected {}",
+                    EXPERIMENT_ENDPOINT_METRICS.join(", ")
+                );
+            }
+            let body = serde_json::json!({
+                "baseline_variant": baseline,
+                "challenger_variant": challenger,
+                "metric": metric,
+            });
+            if serde_json::to_vec(&body)?.len() > 4096 {
+                bail!("comparison request exceeds the API's 4096-byte limit");
+            }
+            data_json::<ExperimentComparisonDto>(
+                client
+                    .post(data_api_url(base_url, &["experiments", &id, "compare"])?)
+                    .json(&body),
+            )
+            .await
+        }
+    }
+}
+
+async fn checkpoint_request(
+    client: &Client,
+    base_url: &str,
+    command: CheckpointSubcommand,
+    key: Option<&str>,
+) -> Result<Value> {
+    match command {
+        CheckpointSubcommand::Create { description } => {
+            if description.as_ref().is_some_and(|value| value.len() > 4096) {
+                bail!("checkpoint description exceeds the API's 4096-byte limit");
+            }
+            if key.is_some_and(|value| value.is_empty() || value.len() > 1024) {
+                bail!("checkpoint idempotency key must contain 1..=1024 bytes");
+            }
+            let body = CheckpointCreateRequest {
+                description,
+                idempotency_key: key.map(str::to_owned),
+            };
+            let mut request = client
+                .post(data_api_url(base_url, &["checkpoints"])?)
+                .json(&body);
+            if let Some(key) = key {
+                request = request.header("Idempotency-Key", key);
+            }
+            data_json::<CheckpointMetadataDto>(request).await
+        }
+        CheckpointSubcommand::List { page } => {
+            data_json::<PaginatedCheckpointsResponse>(catalog_request(
+                client,
+                base_url,
+                &["checkpoints"],
+                &page,
+            )?)
+            .await
+        }
+        CheckpointSubcommand::Status { id } => {
+            data_json::<CheckpointMetadataDto>(
+                client.get(data_api_url(base_url, &["checkpoints", &id])?),
+            )
+            .await
+        }
+        CheckpointSubcommand::Download { id, out } => {
+            ensure_new_download_destination(&out)?;
+            let checkpoint: CheckpointMetadataDto =
+                data_response(client.get(data_api_url(base_url, &["checkpoints", &id])?)).await?;
+            if checkpoint.checkpoint_id != id {
+                bail!("checkpoint response identity differs from the requested checkpoint");
+            }
+            download_artifact(client, base_url, &id, &out, Some(&checkpoint)).await
+        }
+        CheckpointSubcommand::Branch { sub } => {
+            checkpoint_branch_request(client, base_url, sub, key).await
+        }
+    }
+}
+
+fn read_checkpoint_branch_request(
+    file: &Path,
+    key: Option<&str>,
+) -> Result<CheckpointBranchRequest> {
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(MAX_CHECKPOINT_BRANCH_REQUEST_BYTES)
+        .expect("checkpoint branch input bound fits u64");
+    if file == Path::new("-") {
+        io::stdin()
+            .lock()
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read checkpoint branch JSON from stdin")?;
+    } else {
+        let metadata = fs::metadata(file).with_context(|| {
+            format!(
+                "failed to inspect checkpoint branch request {}",
+                file.display()
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() > limit {
+            bail!("checkpoint branch request must be a regular file of at most {limit} bytes");
+        }
+        fs::File::open(file)
+            .with_context(|| {
+                format!(
+                    "failed to open checkpoint branch request {}",
+                    file.display()
+                )
+            })?
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .context("failed to read checkpoint branch request")?;
+    }
+    if bytes.len() > MAX_CHECKPOINT_BRANCH_REQUEST_BYTES {
+        bail!("checkpoint branch request exceeds the {limit}-byte input limit");
+    }
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        bail!("checkpoint branch request must be a JSON object");
+    }
+    let request: CheckpointBranchRequest =
+        serde_json::from_slice(&bytes).context("invalid CheckpointBranchRequest JSON")?;
+    if key.is_some_and(|key| key != request.idempotency_key) {
+        bail!("--idempotency-key conflicts with the key in the checkpoint branch request");
+    }
+    request
+        .validate_shape()
+        .context("invalid checkpoint branch request")?;
+    if serde_json::to_vec(&request)?.len() > MAX_CHECKPOINT_BRANCH_REQUEST_BYTES {
+        bail!("serialized checkpoint branch request exceeds the {limit}-byte input limit");
+    }
+    Ok(request)
+}
+
+async fn checkpoint_branch_request(
+    client: &Client,
+    base_url: &str,
+    command: CheckpointBranchSubcommand,
+    key: Option<&str>,
+) -> Result<Value> {
+    match command {
+        CheckpointBranchSubcommand::List { page } => {
+            data_json::<PaginatedCheckpointBranchesResponse>(catalog_request(
+                client,
+                base_url,
+                &["checkpoints", "branches"],
+                &page,
+            )?)
+            .await
+        }
+        CheckpointBranchSubcommand::Create { file } => {
+            let body = read_checkpoint_branch_request(&file, key)?;
+            let mut request = client
+                .post(data_api_url(base_url, &["checkpoints", "branches"])?)
+                .json(&body);
+            if let Some(key) = key {
+                request = request.header("Idempotency-Key", key);
+            }
+            data_json::<CheckpointBranchStatusDto>(request).await
+        }
+        CheckpointBranchSubcommand::Status { id } => {
+            data_json::<CheckpointBranchStatusDto>(
+                client.get(data_api_url(base_url, &["checkpoints", "branches", &id])?),
+            )
+            .await
+        }
+        CheckpointBranchSubcommand::Cancel { id } => {
+            data_json::<CheckpointBranchStatusDto>(client.post(data_api_url(
+                base_url,
+                &["checkpoints", "branches", &id, "cancel"],
+            )?))
+            .await
+        }
+    }
+}
+
+async fn artifact_request(
+    client: &Client,
+    base_url: &str,
+    command: ArtifactSubcommand,
+) -> Result<Value> {
+    match command {
+        ArtifactSubcommand::List { page } => {
+            data_json::<PaginatedArtifactsResponse>(catalog_request(
+                client,
+                base_url,
+                &["artifacts"],
+                &page,
+            )?)
+            .await
+        }
+        ArtifactSubcommand::Status { id } => {
+            data_json::<ArtifactMetadataDto>(
+                client.get(data_api_url(base_url, &["artifacts", &id])?),
+            )
+            .await
+        }
+        ArtifactSubcommand::Download { id, out } => {
+            download_artifact(client, base_url, &id, &out, None).await
+        }
+    }
+}
+
+fn ensure_new_download_destination(out: &Path) -> Result<()> {
+    if out.file_name().is_none() {
+        bail!("download destination must name a new file");
+    }
+    match fs::symlink_metadata(out) {
+        Ok(_) => bail!(
+            "download destination {} already exists; choose a new path",
+            out.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect download destination {}", out.display())),
+    }
+}
+
+fn artifact_download_size(metadata: &ArtifactMetadataDto) -> Result<usize> {
+    let size =
+        usize::try_from(metadata.byte_size).context("artifact byte count exceeds this platform")?;
+    if size > MAX_ARTIFACT_DOWNLOAD_BYTES {
+        bail!("artifact exceeds the {MAX_ARTIFACT_DOWNLOAD_BYTES}-byte download limit");
+    }
+    for (name, digest) in [
+        ("BLAKE3", &metadata.checksum_blake3),
+        ("SHA-256", &metadata.checksum_sha256),
+    ] {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("artifact metadata contains an invalid {name} checksum");
+        }
+    }
+    Ok(size)
+}
+
+fn verify_artifact_headers(
+    response: &reqwest::Response,
+    metadata: &ArtifactMetadataDto,
+) -> Result<()> {
+    if response
+        .content_length()
+        .is_some_and(|size| size != metadata.byte_size)
+    {
+        bail!("artifact Content-Length differs from the saved metadata");
+    }
+    for (name, expected) in [
+        (
+            "x-scriptbots-checksum-blake3",
+            metadata.checksum_blake3.as_str(),
+        ),
+        (
+            "x-scriptbots-checksum-sha256",
+            metadata.checksum_sha256.as_str(),
+        ),
+        ("content-type", metadata.content_type.as_str()),
+    ] {
+        let actual = response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok());
+        if actual != Some(expected) {
+            bail!("artifact {name} header differs from the saved metadata");
+        }
+    }
+    Ok(())
+}
+
+fn verify_artifact_payload(metadata: &ArtifactMetadataDto, bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 != metadata.byte_size {
+        bail!("downloaded artifact length differs from the saved metadata");
+    }
+    if compute_blake3(bytes) != metadata.checksum_blake3 {
+        bail!("downloaded artifact BLAKE3 checksum mismatch");
+    }
+    if compute_sha256(bytes) != metadata.checksum_sha256 {
+        bail!("downloaded artifact SHA-256 checksum mismatch");
+    }
+    Ok(())
+}
+
+fn save_verified_download(out: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = out.parent().filter(|path| !path.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create download directory {}", parent.display()))?;
+    }
+    // create_new is the authority, including if a file or symlink appeared
+    // after the read-only preflight. Neither remote filenames nor paths are used.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out)
+        .with_context(|| {
+            format!(
+                "cannot create new download {}; existing paths are never overwritten",
+                out.display()
+            )
+        })?;
+    let written = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        fs::File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        Ok(())
+    })();
+    written.with_context(|| {
+        format!(
+            "download write or sync failed; partial or unconfirmed data is preserved at {}",
+            out.display()
+        )
+    })
+}
+
+async fn download_artifact(
+    client: &Client,
+    base_url: &str,
+    id: &str,
+    out: &Path,
+    checkpoint: Option<&CheckpointMetadataDto>,
+) -> Result<Value> {
+    ensure_new_download_destination(out)?;
+    let metadata: ArtifactMetadataDto =
+        data_response(client.get(data_api_url(base_url, &["artifacts", id])?)).await?;
+    if metadata.artifact_id != id {
+        bail!("artifact response identity differs from the requested artifact");
+    }
+    let size = artifact_download_size(&metadata)?;
+    if let Some(checkpoint) = checkpoint
+        && (metadata.artifact_id != checkpoint.checkpoint_id
+            || metadata.byte_size != checkpoint.byte_size
+            || metadata.checksum_blake3 != checkpoint.checksum_blake3
+            || metadata.checksum_sha256 != checkpoint.checksum_sha256)
+    {
+        bail!("artifact metadata does not describe the requested saved checkpoint");
+    }
+    let response = client
+        .get(data_api_url(base_url, &["artifacts", id, "download"])?)
+        .timeout(DATA_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .context("artifact download request failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = bounded_response_bytes(response, MAX_DATA_ERROR_BYTES).await?;
+        bail!(
+            "artifact download failed ({status}): {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    verify_artifact_headers(&response, &metadata)?;
+    let bytes = bounded_response_bytes(response, size).await?;
+    verify_artifact_payload(&metadata, &bytes)?;
+    // Network, metadata and checksum failures leave no final-name output.
+    save_verified_download(out, &bytes)?;
+    Ok(serde_json::json!({
+        "artifact_id": metadata.artifact_id,
+        "path": out.display().to_string(),
+        "byte_size": bytes.len(),
+        "checksum_blake3": metadata.checksum_blake3,
+        "checksum_sha256": metadata.checksum_sha256,
+    }))
 }
 
 fn export_command(
@@ -1699,6 +2429,7 @@ async fn narrative_command(
             limit,
             json,
             db,
+            run_id,
         } => {
             let hits: Vec<NarrativeSearchHitDto> = if let Some(ref db_path) = db {
                 let db_path = db_path.clone();
@@ -1714,6 +2445,7 @@ async fn narrative_command(
                                 from_tick,
                                 to_tick,
                                 limit,
+                                run_id,
                             },
                         )
                     })
@@ -1724,6 +2456,9 @@ async fn narrative_command(
             } else {
                 let url = join_url(base_url, "/api/narrative/search");
                 let mut req = client.get(url).query(&[("q", &query)]);
+                if let Some(run_id) = run_id {
+                    req = req.query(&[("run_id", run_id)]);
+                }
                 if let Some(from) = from_tick {
                     let s = from.to_string();
                     req = req.query(&[("from", s)]);
@@ -1760,6 +2495,7 @@ async fn narrative_command(
             window,
             json,
             db,
+            run_id,
         } => {
             let hits: Vec<NarrativeSearchHitDto> = if let Some(ref db_path) = db {
                 let db_path = db_path.clone();
@@ -1770,7 +2506,11 @@ async fn narrative_command(
                         execute_narrative_around(
                             Some(db_path.as_path()),
                             None,
-                            NarrativeAroundQuery { tick, window },
+                            NarrativeAroundQuery {
+                                tick,
+                                window,
+                                run_id,
+                            },
                         )
                     })
                     .context("failed to spawn narrative around worker thread")?
@@ -1781,6 +2521,9 @@ async fn narrative_command(
                 let path = format!("/api/narrative/around/{tick}");
                 let url = join_url(base_url, &path);
                 let mut req = client.get(url);
+                if let Some(run_id) = run_id {
+                    req = req.query(&[("run_id", run_id)]);
+                }
                 if let Some(w) = window {
                     let s = w.to_string();
                     req = req.query(&[("window", s)]);
@@ -1971,6 +2714,1200 @@ fn value_to_string(value: &Value, max_len: usize) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn checkpoint_branch_cli_exposes_bounded_history_create_status_and_cancel() {
+        let parsed = Cli::try_parse_from([
+            "control",
+            "checkpoint",
+            "branch",
+            "create",
+            "--file",
+            "branch.json",
+        ])
+        .expect("checkpoint branch creation command");
+        assert!(matches!(parsed.command, Command::Checkpoint {
+            sub: CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::Create { file }
+            }
+        } if file == Path::new("branch.json")));
+        for action in ["status", "cancel"] {
+            assert!(
+                Cli::try_parse_from(["control", "checkpoint", "branch", action, "branch-1"])
+                    .is_ok()
+            );
+        }
+        assert!(Cli::try_parse_from(["control", "checkpoint", "branch", "create"]).is_err());
+        let parsed = Cli::try_parse_from([
+            "control",
+            "checkpoint",
+            "branch",
+            "list",
+            "--limit",
+            "12",
+            "--cursor",
+            "24",
+        ])
+        .expect("checkpoint branch history command");
+        assert!(matches!(parsed.command, Command::Checkpoint {
+            sub: CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::List { page }
+            }
+        } if page.limit == 12 && page.cursor.as_deref() == Some("24")));
+        for limit in ["0", "101"] {
+            assert!(
+                Cli::try_parse_from(["control", "checkpoint", "branch", "list", "--limit", limit,])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_branch_input_is_bounded_strict_and_preserves_retry_identity() -> Result<()> {
+        use scriptbots_app::control::MAX_CHECKPOINT_BRANCH_TICKS;
+        let directory = tempdir()?;
+        let path = directory.path().join("branch.json");
+        let original = serde_json::json!({
+            "checkpoint_id": "checkpoint-1", "branch_name": "food-treatment", "ticks": 2,
+            "intervention": {"type": "ConfigPatch", "params": {"food_growth_rate": 0.0}},
+            "idempotency_key": "branch-retry"
+        });
+        let mut bytes = serde_json::to_vec(&original)?;
+        bytes.resize(MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, b' ');
+        fs::write(&path, &bytes)?;
+        assert_eq!(
+            serde_json::to_value(read_checkpoint_branch_request(&path, Some("branch-retry"))?)?,
+            original
+        );
+        assert!(read_checkpoint_branch_request(&path, Some("changed-key")).is_err());
+        bytes.push(b' ');
+        fs::write(&path, &bytes)?;
+        assert!(read_checkpoint_branch_request(&path, None).is_err());
+        for (field, invalid) in [
+            ("branch_name", serde_json::json!("../escape")),
+            ("ticks", serde_json::json!(0)),
+            ("ticks", serde_json::json!(MAX_CHECKPOINT_BRANCH_TICKS + 1)),
+            ("idempotency_key", serde_json::json!("  ")),
+            ("interventon", serde_json::json!({})),
+        ] {
+            let mut request = original.clone();
+            request[field] = invalid;
+            fs::write(&path, serde_json::to_vec(&request)?)?;
+            assert!(
+                read_checkpoint_branch_request(&path, None).is_err(),
+                "{request}"
+            );
+        }
+        for bytes in [
+            br#"["checkpoint-1","branch",2,null,"retry"]"#.as_slice(),
+            br#"{"checkpoint_id":"checkpoint-1","branch_name":"branch","ticks":2}"#,
+            br#"{"checkpoint_id":"checkpoint-1","branch_name":"branch","ticks":2,"idempotency_key":"one","idempotency_key":"two"}"#,
+        ] {
+            fs::write(&path, bytes)?;
+            assert!(read_checkpoint_branch_request(&path, Some("retry")).is_err());
+        }
+        assert!(read_checkpoint_branch_request(directory.path(), None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn experiment_cli_exposes_lifecycle_and_canonical_metric_choices() {
+        for action in ["status", "cancel", "resume"] {
+            assert!(Cli::try_parse_from(["control", "experiment", action, "study-1"]).is_ok());
+        }
+        for metric in EXPERIMENT_ENDPOINT_METRICS {
+            let parsed = Cli::try_parse_from([
+                "control",
+                "experiment",
+                "compare",
+                "study-1",
+                "--baseline",
+                "mlp",
+                "--challenger",
+                "dwraon",
+                "--metric",
+                metric,
+            ])
+            .expect("canonical metric is available to the shell");
+            assert!(matches!(parsed.command, Command::Experiment {
+                sub: ExperimentSubcommand::Compare { metric: actual, .. }
+            } if actual == metric));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "control",
+                "experiment",
+                "compare",
+                "study-1",
+                "--baseline",
+                "mlp",
+                "--challenger",
+                "dwraon",
+                "--metric",
+                "invented_fitness",
+            ])
+            .is_err()
+        );
+        for limit in ["0", "101", "65536"] {
+            assert!(
+                Cli::try_parse_from(["control", "experiment", "list", "--limit", limit,]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["control", "experiment", "create"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "control",
+                "--idempotency-key",
+                "retry-1",
+                "experiment",
+                "create",
+                "--file",
+                "-",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn data_urls_preserve_the_authority_and_refuse_path_or_query_injection() {
+        let url = data_api_url(
+            "http://127.0.0.1:4000/proxy/",
+            &["experiments", "study-1", "cancel"],
+        )
+        .expect("relative API under configured base path");
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:4000/proxy/api/v1/experiments/study-1/cancel"
+        );
+        for id in [
+            "",
+            ".",
+            "..",
+            "../shutdown",
+            "a/b",
+            "a\\b",
+            "a?x=1",
+            "a#tail",
+            "%2e%2e",
+            "https://elsewhere",
+        ] {
+            assert!(
+                data_api_url("http://localhost:4000", &["experiments", id]).is_err(),
+                "identity {id:?}"
+            );
+        }
+        for base in [
+            "file:///tmp/api",
+            "http://localhost:4000/?q=1",
+            "http://localhost:4000/#fragment",
+        ] {
+            assert!(data_api_url(base, &["experiments"]).is_err());
+        }
+        let client = Client::new();
+        let request = catalog_request(
+            &client,
+            "http://localhost:4000",
+            &["experiments"],
+            &CatalogPageArgs {
+                limit: 7,
+                cursor: Some("offset&limit=100".into()),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let pairs = request.url().query_pairs().collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            [
+                ("limit".into(), "7".into()),
+                ("cursor".into(), "offset&limit=100".into())
+            ]
+        );
+        let history = catalog_request(
+            &client,
+            "http://localhost:4000/control/",
+            &["checkpoints", "branches"],
+            &CatalogPageArgs {
+                limit: 12,
+                cursor: Some("24".into()),
+            },
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(history.method(), reqwest::Method::GET);
+        assert_eq!(history.url().path(), "/control/api/v1/checkpoints/branches");
+        assert_eq!(history.url().query(), Some("limit=12&cursor=24"));
+    }
+
+    fn experiment_request_fixture() -> Value {
+        serde_json::json!({
+            "experiment_id": "cli-study", "description": "retained input",
+            "variants": [{
+                "variant_id": "baseline", "brain_family": "mlp",
+                "config_overrides": {"population_minimum": 2},
+                "interventions": [{"tick": 1, "set": {"food_growth_rate": 0.02}}]
+            }],
+            "seeds": [7, 11], "ticks_per_run": 3, "max_concurrency": 1,
+            "idempotency_key": "same-request"
+        })
+    }
+
+    #[test]
+    fn experiment_input_is_bounded_and_retains_interventions_and_retry_identity() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("request.json");
+        let original = experiment_request_fixture();
+        let mut bytes = serde_json::to_vec(&original)?;
+        bytes.resize(MAX_EXPERIMENT_REQUEST_BYTES, b' ');
+        fs::write(&path, &bytes)?;
+        let request = read_experiment_request(&path, Some("same-request"))?;
+        assert_eq!(serde_json::to_value(request)?, original);
+        assert!(read_experiment_request(&path, Some("different-request")).is_err());
+        bytes.push(b' ');
+        fs::write(&path, &bytes)?;
+        assert!(read_experiment_request(&path, None).is_err());
+        fs::write(&path, b"{\"variants\":")?;
+        assert!(read_experiment_request(&path, None).is_err());
+        assert!(read_experiment_request(directory.path(), None).is_err());
+        Ok(())
+    }
+
+    /// A wire peer records actual HTTP requests; it does not stand in for a successful owner.
+    fn data_wire_peer(
+        status: &'static str,
+        body: Vec<u8>,
+        length: Option<usize>,
+    ) -> (String, std::thread::JoinHandle<Result<String>>) {
+        data_wire_peer_with_headers(
+            status,
+            body,
+            length,
+            "Content-Type: application/json\r\n".into(),
+        )
+    }
+
+    fn data_wire_peer_with_headers(
+        status: &'static str,
+        body: Vec<u8>,
+        length: Option<usize>,
+        headers: String,
+    ) -> (String, std::thread::JoinHandle<Result<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("wire listener");
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || -> Result<String> {
+            use std::io::BufRead;
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let mut reader = io::BufReader::new(stream.try_clone()?);
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line)? == 0 {
+                    bail!("client closed before HTTP request headers");
+                }
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+                if request.len() > MAX_DATA_ERROR_BYTES {
+                    bail!("unexpected request header size");
+                }
+            }
+            let request_size = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<u64>())
+                })
+                .transpose()?
+                .unwrap_or(0);
+            if request_size > MAX_EXPERIMENT_REQUEST_BYTES as u64 {
+                bail!("unexpected request body size");
+            }
+            let mut payload = Vec::new();
+            reader.take(request_size).read_to_end(&mut payload)?;
+            request.push_str(std::str::from_utf8(&payload)?);
+            let length_header = length.map_or(String::new(), |value| {
+                format!("Content-Length: {value}\r\n")
+            });
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\n{headers}{length_header}Connection: close\r\n\r\n"
+            )?;
+            stream.write_all(&body)?;
+            stream.flush()?;
+            Ok(request)
+        });
+        (format!("http://{address}"), worker)
+    }
+
+    fn experiment_status_fixture(status: &str) -> Value {
+        serde_json::json!({
+            "schema_version": 1, "generation": 7, "plan_digest": "observed-plan",
+            "experiment_id": "cli-study", "status": status, "total_runs": 2,
+            "completed_runs": 0, "failed_runs": 0, "runs": [], "error_reason": null,
+            "created_at_utc": "123", "updated_at_utc": "456"
+        })
+    }
+
+    #[tokio::test]
+    async fn experiment_http_preserves_observed_states_and_request_identity() -> Result<()> {
+        let client = Client::new();
+        for (command, method, path, state) in [
+            (
+                ExperimentSubcommand::Status {
+                    id: "cli-study".into(),
+                },
+                "GET",
+                "/api/v1/experiments/cli-study",
+                "pending",
+            ),
+            (
+                ExperimentSubcommand::Cancel {
+                    id: "cli-study".into(),
+                },
+                "POST",
+                "/api/v1/experiments/cli-study/cancel",
+                "cancelling",
+            ),
+            (
+                ExperimentSubcommand::Resume {
+                    id: "cli-study".into(),
+                },
+                "POST",
+                "/api/v1/experiments/cli-study/resume",
+                "running",
+            ),
+        ] {
+            let expected = experiment_status_fixture(state);
+            let bytes = serde_json::to_vec(&expected)?;
+            let (base, worker) = data_wire_peer("200 OK", bytes.clone(), Some(bytes.len()));
+            assert_eq!(
+                experiment_request(&client, &base, command, None).await?,
+                expected
+            );
+            let request = worker.join().expect("wire peer joined")?;
+            assert!(
+                request.starts_with(&format!("{method} {path} HTTP/1.1\r\n")),
+                "{request}"
+            );
+        }
+        let directory = tempdir()?;
+        let file = directory.path().join("request.json");
+        fs::write(&file, serde_json::to_vec(&experiment_request_fixture())?)?;
+        let expected = experiment_status_fixture("pending");
+        let bytes = serde_json::to_vec(&expected)?;
+        let (base, worker) = data_wire_peer("201 Created", bytes.clone(), Some(bytes.len()));
+        assert_eq!(
+            experiment_request(
+                &client,
+                &base,
+                ExperimentSubcommand::Create { file },
+                Some("same-request")
+            )
+            .await?,
+            expected
+        );
+        let request = worker.join().expect("wire peer joined")?;
+        assert!(request.starts_with("POST /api/v1/experiments HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("idempotency-key: same-request\r\n")
+        );
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1)?;
+        assert_eq!(body, experiment_request_fixture());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_responses_bound_unframed_bytes_and_keep_server_refusals() -> Result<()> {
+        let client = Client::new();
+        for length in [None, Some(7)] {
+            let (base, worker) = data_wire_peer("200 OK", b"1234567".to_vec(), length);
+            let response = client.get(&base).send().await?;
+            assert!(bounded_response_bytes(response, 3).await.is_err());
+            worker.join().expect("wire peer joined")?;
+        }
+        let (base, worker) =
+            data_wire_peer("409 Conflict", b"batch is still stopping".to_vec(), None);
+        let error = experiment_request(
+            &client,
+            &base,
+            ExperimentSubcommand::Resume {
+                id: "cli-study".into(),
+            },
+            None,
+        )
+        .await
+        .expect_err("HTTP conflict must not become a successful resume");
+        assert!(error.to_string().contains("409 Conflict"));
+        assert!(error.to_string().contains("batch is still stopping"));
+        worker.join().expect("wire peer joined")?;
+        Ok(())
+    }
+
+    struct LiveDataServer {
+        host: Option<scriptbots_app::host_thread::HostThread>,
+        runtime: Option<scriptbots_app::ControlRuntime>,
+        handle: Option<scriptbots_app::ControlHandle>,
+        submit: Option<scriptbots_app::CommandSubmit>,
+        base_url: String,
+    }
+
+    impl LiveDataServer {
+        fn start(artifacts: &Path) -> Result<Self> {
+            use scriptbots_app::{
+                BrainPreset, ControlServerConfig, ControlServerReservation, McpTransportConfig,
+            };
+            use scriptbots_core::{AgentData, NullPersistence, ScriptBotsConfig, WorldState};
+            use scriptbots_runtime::{
+                HostCoreOptions, HostSessionId, PlaybackSnapshot, VolatileJournal,
+                channel::ChannelHostOptions,
+            };
+            let (mut world, persistence) = WorldState::with_persistence(
+                ScriptBotsConfig {
+                    rng_seed: Some(42),
+                    world_width: 40,
+                    world_height: 40,
+                    food_cell_size: 10,
+                    population_minimum: 0,
+                    population_spawn_interval: 0,
+                    ..ScriptBotsConfig::default()
+                },
+                Box::new(NullPersistence),
+            )?;
+            let brains = scriptbots_app::brains::install_brains(&mut world, BrainPreset::Mlp)?;
+            for _ in 0..2 {
+                let id = world.try_spawn_agent(AgentData::default())?;
+                assert!(world.bind_agent_brain(id, brains.population()[0])?);
+            }
+            let host = scriptbots_app::host_thread::HostThread::spawn(
+                HostSessionId::new(901),
+                world,
+                persistence,
+                Box::new(VolatileJournal::default()),
+                HostCoreOptions {
+                    initial_playback: PlaybackSnapshot {
+                        paused: true,
+                        speed_multiplier: 1.0,
+                    },
+                    ..HostCoreOptions::default()
+                },
+                ChannelHostOptions::default(),
+            )?;
+            let reservation = ControlServerReservation::prepare(ControlServerConfig {
+                rest_address: "127.0.0.1:0".parse()?,
+                mcp_transport: McpTransportConfig::Disabled,
+                ..ControlServerConfig::default()
+            })?;
+            let base_url = format!(
+                "http://{}",
+                reservation.rest_address().expect("reserved REST listener")
+            );
+            let (runtime, submit) = reservation.launch(host.port(), false)?;
+            let handle = runtime
+                .control_handle()
+                .expect("actual control handle")
+                .with_artifacts_dir(artifacts.to_path_buf())?;
+            Ok(Self {
+                host: Some(host),
+                runtime: Some(runtime),
+                handle: Some(handle),
+                submit: Some(submit),
+                base_url,
+            })
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            drop(self.submit.take());
+            drop(self.handle.take());
+            let server = self
+                .runtime
+                .take()
+                .map(scriptbots_app::ControlRuntime::shutdown)
+                .transpose();
+            let owner = self
+                .host
+                .take()
+                .map(scriptbots_app::host_thread::HostThread::join)
+                .transpose();
+            server?;
+            owner?;
+            Ok(())
+        }
+    }
+
+    impl Drop for LiveDataServer {
+        fn drop(&mut self) {
+            if let Err(error) = self.stop() {
+                eprintln!("live CLI test cleanup failed: {error:#}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn experiment_cli_drives_real_host_backed_rest_and_verified_comparison() -> Result<()> {
+        let root = tempdir()?;
+        let mut server = LiveDataServer::start(&root.path().join("artifacts"))?;
+        let before = server
+            .host
+            .as_ref()
+            .unwrap()
+            .port()
+            .scientific_digest_v1()?;
+        let file = root.path().join("study.json");
+        let variants = ["baseline", "challenger"].into_iter().map(|id| serde_json::json!({
+            "variant_id": id, "brain_family": "mlp",
+            "config_overrides": {"world_width": 40, "world_height": 40, "food_cell_size": 10,
+                    "population_minimum": 2, "population_spawn_interval": 0,
+                    "food_growth_rate": if id == "baseline" { 0.0 } else { 0.01 }}
+        })).collect::<Vec<_>>();
+        fs::write(
+            &file,
+            serde_json::to_vec(&serde_json::json!({
+                "experiment_id": "cli-study", "variants": variants, "seeds": [7, 11],
+                "ticks_per_run": 2, "max_concurrency": 1
+            }))?,
+        )?;
+        let client = Client::new();
+        let created = experiment_request(
+            &client,
+            &server.base_url,
+            ExperimentSubcommand::Create { file: file.clone() },
+            Some("cli-retry"),
+        )
+        .await?;
+        assert_eq!(created["experiment_id"], "cli-study");
+        assert_eq!(created["total_runs"], 4);
+        let retried = experiment_request(
+            &client,
+            &server.base_url,
+            ExperimentSubcommand::Create { file },
+            Some("cli-retry"),
+        )
+        .await?;
+        assert_eq!(retried["experiment_id"], created["experiment_id"]);
+        assert_eq!(retried["plan_digest"], created["plan_digest"]);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let completed = loop {
+            let current = experiment_request(
+                &client,
+                &server.base_url,
+                ExperimentSubcommand::Status {
+                    id: "cli-study".into(),
+                },
+                None,
+            )
+            .await?;
+            assert_ne!(current["status"], "failed", "{current}");
+            if current["status"] == "completed" {
+                break current;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual experiment did not complete: {current}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(completed["completed_runs"], 4);
+        assert!(
+            completed["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|run| run["final_digest"].is_string())
+        );
+        let listed = experiment_request(
+            &client,
+            &server.base_url,
+            ExperimentSubcommand::List {
+                page: CatalogPageArgs {
+                    limit: 1,
+                    cursor: None,
+                },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["items"][0]["experiment_id"], "cli-study");
+        let comparison = experiment_request(
+            &client,
+            &server.base_url,
+            ExperimentSubcommand::Compare {
+                id: "cli-study".into(),
+                baseline: "baseline".into(),
+                challenger: "challenger".into(),
+                metric: "alive_agents".into(),
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(comparison["matched_seeds"], serde_json::json!([7, 11]));
+        assert_eq!(comparison["endpoint_tick"], 2);
+        assert_eq!(comparison["mean_difference"], 0.0);
+        assert_eq!(comparison["plan_digest"], completed["plan_digest"]);
+        assert_eq!(comparison["descriptive_only"], false);
+        assert!(
+            experiment_request(
+                &client,
+                &server.base_url,
+                ExperimentSubcommand::Resume {
+                    id: "cli-study".into()
+                },
+                None
+            )
+            .await
+            .is_err(),
+            "a completed batch must not restart"
+        );
+        assert_eq!(
+            server
+                .host
+                .as_ref()
+                .unwrap()
+                .port()
+                .scientific_digest_v1()?,
+            before
+        );
+        server.stop()?;
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_and_artifact_cli_require_explicit_outputs_and_bounded_pages() {
+        assert!(Cli::try_parse_from(["control", "schema"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "control",
+                "checkpoint",
+                "create",
+                "--description",
+                "before treatment"
+            ])
+            .is_ok()
+        );
+        for collection in ["checkpoint", "artifact"] {
+            assert!(Cli::try_parse_from(["control", collection, "status", "saved-1"]).is_ok());
+            assert!(
+                Cli::try_parse_from([
+                    "control",
+                    collection,
+                    "download",
+                    "saved-1",
+                    "--out",
+                    "saved.bin"
+                ])
+                .is_ok()
+            );
+            assert!(Cli::try_parse_from(["control", collection, "download", "saved-1"]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "control", collection, "list", "--limit", "100", "--cursor", "20"
+                ])
+                .is_ok()
+            );
+            for limit in ["0", "101"] {
+                assert!(
+                    Cli::try_parse_from(["control", collection, "list", "--limit", limit]).is_err()
+                );
+            }
+        }
+    }
+
+    fn artifact_metadata_fixture() -> ArtifactMetadataDto {
+        // Independent published hash vectors for the three-byte input "abc".
+        ArtifactMetadataDto {
+            artifact_id: "artifact-1".into(),
+            filename: "../remote-name-is-not-a-local-path".into(),
+            content_type: "application/octet-stream".into(),
+            byte_size: 3,
+            checksum_blake3: "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+                .into(),
+            checksum_sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                .into(),
+            created_at_utc: "123".into(),
+            relative_path: "../remote-path-is-not-a-local-path".into(),
+        }
+    }
+
+    #[test]
+    fn artifact_verification_rejects_size_and_independent_checksum_failures() -> Result<()> {
+        let metadata = artifact_metadata_fixture();
+        assert_eq!(artifact_download_size(&metadata)?, 3);
+        verify_artifact_payload(&metadata, b"abc")?;
+        assert!(verify_artifact_payload(&metadata, b"ab").is_err());
+        assert!(verify_artifact_payload(&metadata, b"abd").is_err());
+        let mut sha_mismatch = metadata.clone();
+        sha_mismatch.checksum_sha256 = "0".repeat(64);
+        assert!(
+            verify_artifact_payload(&sha_mismatch, b"abc")
+                .unwrap_err()
+                .to_string()
+                .contains("SHA-256")
+        );
+        let mut invalid = metadata.clone();
+        invalid.byte_size = MAX_ARTIFACT_DOWNLOAD_BYTES as u64 + 1;
+        assert!(artifact_download_size(&invalid).is_err());
+        invalid = metadata;
+        invalid.checksum_blake3 = "not-a-checksum".into();
+        assert!(artifact_download_size(&invalid).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn artifact_download_headers_bind_saved_content_type_length_and_both_hashes() -> Result<()>
+    {
+        let metadata = artifact_metadata_fixture();
+        let client = Client::new();
+        for failure in [
+            None,
+            Some("sha256"),
+            Some("blake3"),
+            Some("type"),
+            Some("length"),
+        ] {
+            let headers = format!(
+                "Content-Type: {}\r\nX-Scriptbots-Checksum-Blake3: {}\r\nX-Scriptbots-Checksum-Sha256: {}\r\n",
+                if failure == Some("type") {
+                    "text/plain"
+                } else {
+                    &metadata.content_type
+                },
+                if failure == Some("blake3") {
+                    "bad"
+                } else {
+                    &metadata.checksum_blake3
+                },
+                if failure == Some("sha256") {
+                    "bad"
+                } else {
+                    &metadata.checksum_sha256
+                },
+            );
+            let length = Some(if failure == Some("length") { 4 } else { 3 });
+            let (base, worker) =
+                data_wire_peer_with_headers("200 OK", b"abc".to_vec(), length, headers);
+            let response = client.get(base).send().await?;
+            assert_eq!(
+                verify_artifact_headers(&response, &metadata).is_ok(),
+                failure.is_none(),
+                "{failure:?}"
+            );
+            worker.join().expect("wire peer joined")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn verified_download_never_overwrites_files_or_symlinks_even_after_preflight() -> Result<()> {
+        let directory = tempdir()?;
+        let output = directory.path().join("nested/checkpoint.bin");
+        ensure_new_download_destination(&output)?;
+        save_verified_download(&output, b"verified")?;
+        assert!(ensure_new_download_destination(&output).is_err());
+        assert!(save_verified_download(&output, b"replacement").is_err());
+        assert_eq!(fs::read(&output)?, b"verified");
+        let raced = directory.path().join("appeared-after-preflight.bin");
+        ensure_new_download_destination(&raced)?;
+        fs::write(&raced, b"user data")?;
+        assert!(save_verified_download(&raced, b"replacement").is_err());
+        assert_eq!(fs::read(&raced)?, b"user data");
+        #[cfg(unix)]
+        {
+            let target = directory.path().join("absent-target");
+            let link = directory.path().join("dangling-link");
+            std::os::unix::fs::symlink(&target, &link)?;
+            assert!(ensure_new_download_destination(&link).is_err());
+            assert!(save_verified_download(&link, b"replacement").is_err());
+            assert!(!target.exists());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one actual saved cut drives the CLI lifecycle and verified report download"
+    )]
+    async fn checkpoint_branch_cli_runs_an_isolated_future_and_downloads_its_report() -> Result<()>
+    {
+        use scriptbots_app::branch_study::{BranchStudyReport, BranchStudySource};
+        let root = tempdir()?;
+        let mut server = LiveDataServer::start(&root.path().join("artifacts"))?;
+        let before = server
+            .host
+            .as_ref()
+            .unwrap()
+            .port()
+            .scientific_digest_v1()?;
+        let client = Client::new();
+        let saved = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Create {
+                description: Some("branch source".into()),
+            },
+            Some("cli-branch-source"),
+        )
+        .await?;
+        let checkpoint: CheckpointMetadataDto = serde_json::from_value(saved)?;
+        let path = root.path().join("branch.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "branch_name": "food-treatment", "ticks": 2,
+                "intervention": {"type": "ConfigPatch", "params": {"food_growth_rate": 0.0}},
+                "idempotency_key": "cli-branch-retry"
+            }))?,
+        )?;
+        let created: CheckpointBranchStatusDto = serde_json::from_value(
+            checkpoint_request(
+                &client,
+                &server.base_url,
+                CheckpointSubcommand::Branch {
+                    sub: CheckpointBranchSubcommand::Create { file: path.clone() },
+                },
+                Some("cli-branch-retry"),
+            )
+            .await?,
+        )?;
+        assert_eq!(created.checkpoint_id, checkpoint.checkpoint_id);
+        assert_eq!(created.source_tick, checkpoint.tick);
+        assert_eq!(created.target_tick, checkpoint.tick + 2);
+        assert_eq!(created.world_digest_v1, before.overall);
+        assert!(matches!(created.status.as_str(), "running" | "completed"));
+        if created.status == "running" {
+            assert!(created.artifact_id.is_none());
+        }
+        let retry = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::Create { file: path },
+            },
+            Some("cli-branch-retry"),
+        )
+        .await?;
+        assert_eq!(retry["branch_id"], created.branch_id);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let completed = loop {
+            let observed: CheckpointBranchStatusDto = serde_json::from_value(
+                checkpoint_request(
+                    &client,
+                    &server.base_url,
+                    CheckpointSubcommand::Branch {
+                        sub: CheckpointBranchSubcommand::Status {
+                            id: created.branch_id.clone(),
+                        },
+                    },
+                    None,
+                )
+                .await?,
+            )?;
+            if observed.status == "completed" {
+                break observed;
+            }
+            assert_eq!(observed.status, "running", "{observed:?}");
+            assert!(Instant::now() < deadline, "{observed:?}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let output = root.path().join("download/report.json");
+        let artifact_id = completed
+            .artifact_id
+            .clone()
+            .expect("completed report artifact");
+        let receipt = artifact_request(
+            &client,
+            &server.base_url,
+            ArtifactSubcommand::Download {
+                id: artifact_id.clone(),
+                out: output.clone(),
+            },
+        )
+        .await?;
+        assert_eq!(receipt["artifact_id"], artifact_id);
+        let report: BranchStudyReport = serde_json::from_slice(&fs::read(output)?)?;
+        assert!(matches!(
+            report.source,
+            BranchStudySource::SavedCheckpoint { .. }
+        ));
+        assert_eq!(report.pre_intervention_digest, before.overall);
+        assert!(report.pre_intervention_digest_verified_for_all_branches);
+        assert_eq!(report.checkpoint_tick, checkpoint.tick);
+        assert_eq!(report.horizon_ticks, 2);
+        assert_eq!(report.branch_reports.len(), 2);
+        for branch in &report.branch_reports {
+            assert_eq!(branch.terminal_sample.tick, completed.target_tick);
+            assert!(branch.bundle_verified);
+        }
+        let cancelled = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::Cancel {
+                    id: created.branch_id.clone(),
+                },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(cancelled["status"], "completed");
+        assert_eq!(
+            server
+                .host
+                .as_ref()
+                .unwrap()
+                .port()
+                .scientific_digest_v1()?,
+            before
+        );
+        server.stop()?;
+        let mut restarted = LiveDataServer::start(&root.path().join("artifacts"))?;
+        let before_history = restarted
+            .host
+            .as_ref()
+            .unwrap()
+            .port()
+            .scientific_digest_v1()?;
+        let recovered: PaginatedCheckpointBranchesResponse = serde_json::from_value(
+            checkpoint_request(
+                &client,
+                &restarted.base_url,
+                CheckpointSubcommand::Branch {
+                    sub: CheckpointBranchSubcommand::List {
+                        page: CatalogPageArgs {
+                            limit: 1,
+                            cursor: None,
+                        },
+                    },
+                },
+                None,
+            )
+            .await?,
+        )?;
+        assert_eq!(recovered.total, 1);
+        assert_eq!(recovered.limit, 1);
+        assert_eq!(recovered.items, vec![completed.clone()]);
+        assert!(!recovered.has_more);
+        assert!(recovered.next_cursor.is_none());
+        let empty = checkpoint_request(
+            &client,
+            &restarted.base_url,
+            CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::List {
+                    page: CatalogPageArgs {
+                        limit: 1,
+                        cursor: Some("1".into()),
+                    },
+                },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(empty["total"], 1);
+        assert_eq!(empty["offset"], 1);
+        assert_eq!(empty["items"], serde_json::json!([]));
+        assert_eq!(empty["has_more"], false);
+        let observed = checkpoint_request(
+            &client,
+            &restarted.base_url,
+            CheckpointSubcommand::Branch {
+                sub: CheckpointBranchSubcommand::Status {
+                    id: created.branch_id,
+                },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(observed, serde_json::to_value(&completed)?);
+        assert_eq!(
+            restarted
+                .host
+                .as_ref()
+                .unwrap()
+                .port()
+                .scientific_digest_v1()?,
+            before_history
+        );
+        restarted.stop()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_cli_captures_downloads_and_decodes_an_actual_owner_boundary() -> Result<()>
+    {
+        use scriptbots_core::WorldCheckpointV1;
+        let root = tempdir()?;
+        let mut server = LiveDataServer::start(&root.path().join("artifacts"))?;
+        let before = server
+            .host
+            .as_ref()
+            .unwrap()
+            .port()
+            .scientific_digest_v1()?;
+        let client = Client::new();
+        let created = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Create {
+                description: Some("before treatment".into()),
+            },
+            Some("save-once"),
+        )
+        .await?;
+        let checkpoint: CheckpointMetadataDto = serde_json::from_value(created.clone())?;
+        assert_eq!(checkpoint.tick, 0);
+        assert_eq!(checkpoint.agent_count, 2);
+        assert_eq!(checkpoint.world_digest_v1, before.overall);
+        let retried = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Create {
+                description: Some("before treatment".into()),
+            },
+            Some("save-once"),
+        )
+        .await?;
+        assert_eq!(retried, created);
+        let id = checkpoint.checkpoint_id;
+        let status = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Status { id: id.clone() },
+            None,
+        )
+        .await?;
+        assert_eq!(status, created);
+        let page = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::List {
+                page: CatalogPageArgs {
+                    limit: 1,
+                    cursor: None,
+                },
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["items"][0], created);
+        assert!(page["retention"].is_object());
+        let artifacts = artifact_request(
+            &client,
+            &server.base_url,
+            ArtifactSubcommand::List {
+                page: CatalogPageArgs {
+                    limit: 1,
+                    cursor: None,
+                },
+            },
+        )
+        .await?;
+        assert_eq!(artifacts["total"], 1);
+        assert_eq!(artifacts["items"][0]["artifact_id"], id);
+        let metadata = artifact_request(
+            &client,
+            &server.base_url,
+            ArtifactSubcommand::Status { id: id.clone() },
+        )
+        .await?;
+        let metadata: ArtifactMetadataDto = serde_json::from_value(metadata)?;
+        let output = root.path().join("downloads/owner.checkpoint");
+        let receipt = checkpoint_request(
+            &client,
+            &server.base_url,
+            CheckpointSubcommand::Download {
+                id: id.clone(),
+                out: output.clone(),
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(receipt["artifact_id"], id);
+        assert_eq!(receipt["checksum_blake3"], created["checksum_blake3"]);
+        assert_eq!(receipt["checksum_sha256"], created["checksum_sha256"]);
+        let bytes = fs::read(&output)?;
+        let decoded = WorldCheckpointV1::decode(&bytes)?;
+        assert_eq!(decoded.tick().0, 0);
+        assert_eq!(decoded.agent_count(), 2);
+        assert_eq!(decoded.source_digest(), &before);
+        let copy = root.path().join("downloads/artifact-copy.bin");
+        artifact_request(
+            &client,
+            &server.base_url,
+            ArtifactSubcommand::Download {
+                id: id.clone(),
+                out: copy.clone(),
+            },
+        )
+        .await?;
+        assert_eq!(fs::read(copy)?, bytes);
+        assert!(
+            checkpoint_request(
+                &client,
+                &server.base_url,
+                CheckpointSubcommand::Download {
+                    id: id.clone(),
+                    out: output.clone()
+                },
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fs::read(&output)?, bytes);
+        let schema: ApiSchemaDto =
+            data_response(client.get(data_api_url(&server.base_url, &["schema"])?)).await?;
+        assert!(
+            schema
+                .routes
+                .contains(&"/api/v1/artifacts/{artifact_id}/download".into())
+        );
+        assert!(schema.schemas.contains(&"CheckpointMetadataDto".into()));
+        let artifact_file = server
+            .handle
+            .as_ref()
+            .unwrap()
+            .artifacts_dir()
+            .join(metadata.relative_path);
+        let mut corrupted = bytes.clone();
+        corrupted[0] ^= 1;
+        fs::write(artifact_file, corrupted)?;
+        let rejected = root.path().join("rejected/download.bin");
+        assert!(
+            artifact_request(
+                &client,
+                &server.base_url,
+                ArtifactSubcommand::Download {
+                    id,
+                    out: rejected.clone()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(!rejected.exists());
+        assert!(!rejected.parent().unwrap().exists());
+        assert_eq!(
+            server
+                .host
+                .as_ref()
+                .unwrap()
+                .port()
+                .scientific_digest_v1()?,
+            before
+        );
+        server.stop()?;
+        Ok(())
+    }
 
     #[test]
     fn screenshot_accepts_ansi_and_rejects_conflicting_png() {

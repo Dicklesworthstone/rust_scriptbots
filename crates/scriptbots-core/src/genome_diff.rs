@@ -50,6 +50,22 @@ pub enum Locus {
     Hyper(u8),
     /// Scalar cell at the given index in an assembly-style genome.
     Cell(u32),
+    /// Weight of a dense incoming connection whose slot can exceed 255.
+    ///
+    /// This separate address preserves the encoding of existing narrow loci.
+    NodeWeightWide {
+        /// Global index of the node that owns the connection.
+        node: u32,
+        /// Incoming connection slot within the node.
+        conn: u32,
+    },
+    /// Source node of a dense incoming connection whose slot can exceed 255.
+    NodeTargetWide {
+        /// Global index of the node that owns the connection.
+        node: u32,
+        /// Incoming connection slot within the node.
+        conn: u32,
+    },
 }
 
 impl Locus {
@@ -65,11 +81,13 @@ impl Locus {
             Self::NodeTarget { node, conn } => format!("node {node} conn {conn} target"),
             Self::Hyper(id) => format!("hyperparameter {id}"),
             Self::Cell(index) => format!("cell {index}"),
+            Self::NodeWeightWide { node, conn } => format!("node {node} weight {conn}"),
+            Self::NodeTargetWide { node, conn } => format!("node {node} conn {conn} target"),
         }
     }
 }
 
-/// One decoded locus value. Float comparison for scalars is BITWISE (`f32::to_bits`) —
+/// One decoded locus value. Float comparison for scalars is BITWISE —
 /// heredity is an exact claim, and an epsilon-tolerant diff would hide exactly the
 /// corruption it exists to find.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -80,6 +98,30 @@ pub enum LocusValue {
     Target(u32),
     /// A connection function-kind tag.
     Kind(u8),
+    /// An exact f64 parameter, without narrowing into the f32 scalar vocabulary.
+    Scalar64(f64),
+}
+
+impl LocusValue {
+    /// Return the scalar at its full precision; widening f32 to f64 is exact.
+    #[must_use]
+    pub fn scalar(self) -> Option<f64> {
+        match self {
+            Self::Scalar(value) => Some(f64::from(value)),
+            Self::Scalar64(value) => Some(value),
+            Self::Target(_) | Self::Kind(_) => None,
+        }
+    }
+
+    /// Whether this value can be represented as a finite scientific observation.
+    #[must_use]
+    pub const fn is_finite(self) -> bool {
+        match self {
+            Self::Scalar(value) => value.is_finite(),
+            Self::Scalar64(value) => value.is_finite(),
+            Self::Target(_) | Self::Kind(_) => true,
+        }
+    }
 }
 
 /// One typed change between two aligned genomes.
@@ -111,6 +153,15 @@ pub enum GenomeDelta {
         before: u8,
         /// Child kind tag.
         after: u8,
+    },
+    /// An f64 parameter whose bits changed, including a one-ULP or signed-zero change.
+    Scalar64 {
+        /// The locus that changed.
+        locus: Locus,
+        /// Exact parent value.
+        before: f64,
+        /// Exact child value.
+        after: f64,
     },
 }
 
@@ -207,6 +258,13 @@ pub fn export_locus_trace_csv(samples: &[LocusSample], locus: Locus) -> String {
                     s.generation, s.agent_uid.0, s.tick.0
                 );
             }
+            Some(LocusValue::Scalar64(v)) => {
+                let _ = writeln!(
+                    out,
+                    "{},{},{},scalar64,{v}",
+                    s.generation, s.agent_uid.0, s.tick.0
+                );
+            }
             Some(LocusValue::Target(v)) => {
                 let _ = writeln!(
                     out,
@@ -236,9 +294,8 @@ pub fn export_locus_trace_csv(samples: &[LocusSample], locus: Locus) -> String {
 /// Export a locus trace as an SVG chart string.
 #[must_use]
 #[expect(
-    clippy::cast_precision_loss,
     clippy::suboptimal_flops,
-    reason = "SVG coordinates retain their existing f32 generation projection and separate arithmetic rounding before decimal formatting"
+    reason = "SVG projection preserves separate arithmetic rounding before decimal formatting"
 )]
 pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
     let width = 600.0;
@@ -258,11 +315,13 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
         locus.human()
     );
 
-    let valid_scalars: Vec<(f32, f32)> = samples
+    let valid_scalars: Vec<(f64, f64)> = samples
         .iter()
-        .filter_map(|s| match s.value {
-            Some(LocusValue::Scalar(v)) => Some((s.generation as f32, v)),
-            _ => None,
+        .filter_map(|s| {
+            let value = s.value?.scalar()?;
+            value
+                .is_finite()
+                .then_some((f64::from(s.generation), value))
         })
         .collect();
 
@@ -270,27 +329,27 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
         let min_gen = valid_scalars
             .iter()
             .map(|(g, _)| *g)
-            .fold(f32::INFINITY, f32::min);
+            .fold(f64::INFINITY, f64::min);
         let max_gen = valid_scalars
             .iter()
             .map(|(g, _)| *g)
-            .fold(f32::NEG_INFINITY, f32::max);
+            .fold(f64::NEG_INFINITY, f64::max);
         let min_val = valid_scalars
             .iter()
             .map(|(_, v)| *v)
-            .fold(f32::INFINITY, f32::min);
+            .fold(f64::INFINITY, f64::min);
         let max_val = valid_scalars
             .iter()
             .map(|(_, v)| *v)
-            .fold(f32::NEG_INFINITY, f32::max);
+            .fold(f64::NEG_INFINITY, f64::max);
 
         let gen_span = (max_gen - min_gen).max(1.0);
-        let val_span = (max_val - min_val).max(0.001);
 
         let mut points = String::new();
         for (g, v) in &valid_scalars {
             let x = padding + (g - min_gen) / gen_span * (width - 2.0 * padding);
-            let y = height - padding - (v - min_val) / val_span * (height - 2.0 * padding);
+            let y =
+                height - padding - trace_fraction(*v, min_val, max_val) * (height - 2.0 * padding);
             if !points.is_empty() {
                 points.push(' ');
             }
@@ -304,6 +363,23 @@ pub fn export_locus_trace_svg(samples: &[LocusSample], locus: Locus) -> String {
 
     svg.push_str("</svg>");
     svg
+}
+
+/// Normalize before narrowing to pixel coordinates, retaining sub-f32 differences and
+/// avoiding overflow when finite endpoints straddle the full f64 range.
+fn trace_fraction(value: f64, min: f64, max: f64) -> f64 {
+    if min >= max {
+        return 0.0;
+    }
+    let span = max - min;
+    if span.is_finite() {
+        (value - min) / span
+    } else {
+        let value_half = value * 0.5;
+        let min_half = min * 0.5;
+        let max_half = max * 0.5;
+        (value_half - min_half) / (max_half - min_half)
+    }
 }
 
 fn crc32_chunk(chunk_type: [u8; 4], data: &[u8]) -> u32 {
@@ -460,21 +536,22 @@ fn draw_trace_frame(pixels: &mut [u8]) {
 /// Export a locus trace as a headless PNG image buffer.
 #[must_use]
 #[expect(
-    clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::suboptimal_flops,
-    reason = "PNG projection preserves f32 generation coordinates, separate arithmetic rounding, and round-then-saturating i32 pixel conversion"
+    reason = "PNG projection preserves separate arithmetic rounding and round-then-saturating i32 pixel conversion"
 )]
 pub fn export_locus_trace_png(samples: &[LocusSample], _locus: Locus) -> Vec<u8> {
     let mut pixels =
         [30u8, 30u8, 46u8, 255u8].repeat(usize::from(TRACE_WIDTH) * usize::from(TRACE_HEIGHT));
     draw_trace_frame(&mut pixels);
 
-    let valid_scalars: Vec<(f32, f32)> = samples
+    let valid_scalars: Vec<(f64, f64)> = samples
         .iter()
-        .filter_map(|s| match s.value {
-            Some(LocusValue::Scalar(v)) => Some((s.generation as f32, v)),
-            _ => None,
+        .filter_map(|s| {
+            let value = s.value?.scalar()?;
+            value
+                .is_finite()
+                .then_some((f64::from(s.generation), value))
         })
         .collect();
 
@@ -482,33 +559,33 @@ pub fn export_locus_trace_png(samples: &[LocusSample], _locus: Locus) -> Vec<u8>
         let min_gen = valid_scalars
             .iter()
             .map(|(g, _)| *g)
-            .fold(f32::INFINITY, f32::min);
+            .fold(f64::INFINITY, f64::min);
         let max_gen = valid_scalars
             .iter()
             .map(|(g, _)| *g)
-            .fold(f32::NEG_INFINITY, f32::max);
+            .fold(f64::NEG_INFINITY, f64::max);
         let min_val = valid_scalars
             .iter()
             .map(|(_, v)| *v)
-            .fold(f32::INFINITY, f32::min);
+            .fold(f64::INFINITY, f64::min);
         let max_val = valid_scalars
             .iter()
             .map(|(_, v)| *v)
-            .fold(f32::NEG_INFINITY, f32::max);
+            .fold(f64::NEG_INFINITY, f64::max);
 
         let gen_span = (max_gen - min_gen).max(1.0);
-        let val_span = (max_val - min_val).max(0.001);
 
         let mut prev_pt: Option<(i32, i32)> = None;
         let line_color = [137, 180, 250, 255]; // Catppuccin blue
         let dot_color = [205, 214, 244, 255]; // Catppuccin text
 
         for (g, v) in &valid_scalars {
-            let x = (f32::from(TRACE_PADDING)
-                + (g - min_gen) / gen_span * f32::from(TRACE_WIDTH - 2 * TRACE_PADDING))
+            let x = (f64::from(TRACE_PADDING)
+                + (g - min_gen) / gen_span * f64::from(TRACE_WIDTH - 2 * TRACE_PADDING))
             .round() as i32;
-            let y = (f32::from(TRACE_HEIGHT - TRACE_PADDING)
-                - (v - min_val) / val_span * f32::from(TRACE_HEIGHT - 2 * TRACE_PADDING))
+            let y = (f64::from(TRACE_HEIGHT - TRACE_PADDING)
+                - trace_fraction(*v, min_val, max_val)
+                    * f64::from(TRACE_HEIGHT - 2 * TRACE_PADDING))
             .round() as i32;
             if let Some((px, py)) = prev_pt {
                 draw_trace_line(&mut pixels, px, py, x, y, line_color);
@@ -521,9 +598,9 @@ pub fn export_locus_trace_png(samples: &[LocusSample], _locus: Locus) -> Vec<u8>
         let gap_color = [243, 139, 168, 255]; // Catppuccin red
         for s in samples {
             if s.value.is_none() {
-                let g = s.generation as f32;
-                let x = (f32::from(TRACE_PADDING)
-                    + (g - min_gen) / gen_span * f32::from(TRACE_WIDTH - 2 * TRACE_PADDING))
+                let g = f64::from(s.generation);
+                let x = (f64::from(TRACE_PADDING)
+                    + (g - min_gen) / gen_span * f64::from(TRACE_WIDTH - 2 * TRACE_PADDING))
                 .round() as i32;
                 let y = i32::from(TRACE_HEIGHT - TRACE_PADDING);
                 draw_trace_cross(&mut pixels, x, y, 4, gap_color);
@@ -591,6 +668,14 @@ pub enum GenomeDiffError {
         /// Child value kind name.
         child_type: &'static str,
     },
+    /// A scalar or the aggregate scalar distance cannot be represented finitely.
+    #[error("non-finite genome difference at index {index} ({locus:?})")]
+    NumericalOverflow {
+        /// Index of the first unrepresentable scalar difference.
+        index: usize,
+        /// The locus address.
+        locus: Locus,
+    },
     /// The family codec could not expose typed loci.
     #[error("family {family} cannot expose typed loci: {reason}")]
     Unsupported {
@@ -606,6 +691,7 @@ const fn locus_value_type_name(val: LocusValue) -> &'static str {
         LocusValue::Scalar(_) => "scalar",
         LocusValue::Target(_) => "target",
         LocusValue::Kind(_) => "kind",
+        LocusValue::Scalar64(_) => "scalar64",
     }
 }
 
@@ -640,7 +726,6 @@ pub fn diff_genomes(
 ) -> Result<GenomeDiff, GenomeDiffError> {
     validate_diff_envelopes(parent, child)?;
     let family = parent.family_id().clone();
-    let schema_version = parent.schema_version();
     let parent_loci = codec
         .genome_loci(parent)
         .map_err(|error| GenomeDiffError::Unsupported {
@@ -653,6 +738,28 @@ pub fn diff_genomes(
             family: family.clone(),
             reason: error.to_string(),
         })?;
+    diff_genome_loci(parent, child, &parent_loci, &child_loci)
+}
+
+/// Compare canonical loci already decoded from the named protocol envelopes.
+///
+/// Interactive callers can bound each producer before decoding and reuse the selected
+/// genome's locus vector for both its page and its parent comparison. The address, shape,
+/// value-kind and envelope checks are identical to [`diff_genomes`]; this function performs
+/// no decoding, so callers must supply the exact unmodified codec results for each envelope.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one aligned comparison keeps bitwise value checks and typed error boundaries together"
+)]
+pub fn diff_genome_loci(
+    parent: &BrainGenomeEnvelope,
+    child: &BrainGenomeEnvelope,
+    parent_loci: &[(Locus, LocusValue)],
+    child_loci: &[(Locus, LocusValue)],
+) -> Result<GenomeDiff, GenomeDiffError> {
+    validate_diff_envelopes(parent, child)?;
+    let family = parent.family_id().clone();
+    let schema_version = parent.schema_version();
     if parent_loci.len() != child_loci.len() {
         return Err(GenomeDiffError::ShapeMismatch {
             a_loci: parent_loci.len(),
@@ -676,10 +783,16 @@ pub fn diff_genomes(
                 child_human: child_locus.human(),
             });
         }
+        if !before.is_finite() || !after.is_finite() {
+            return Err(GenomeDiffError::NumericalOverflow {
+                index,
+                locus: *locus,
+            });
+        }
         match (before, after) {
             (LocusValue::Scalar(before), LocusValue::Scalar(after)) => {
                 if before.to_bits() != after.to_bits() {
-                    let magnitude = f64::from((*after - *before).abs());
+                    let magnitude = (f64::from(*after) - f64::from(*before)).abs();
                     l1 += magnitude;
                     linf = linf.max(magnitude);
                     *by_kind.entry(DeltaKind::Scalar).or_insert(0) += 1;
@@ -710,6 +823,19 @@ pub fn diff_genomes(
                     });
                 }
             }
+            (LocusValue::Scalar64(before), LocusValue::Scalar64(after)) => {
+                if before.to_bits() != after.to_bits() {
+                    let magnitude = (after - before).abs();
+                    l1 += magnitude;
+                    linf = linf.max(magnitude);
+                    *by_kind.entry(DeltaKind::Scalar).or_insert(0) += 1;
+                    deltas.push(GenomeDelta::Scalar64 {
+                        locus: *locus,
+                        before: *before,
+                        after: *after,
+                    });
+                }
+            }
             _ => {
                 return Err(GenomeDiffError::ValueTypeMismatch {
                     index,
@@ -718,6 +844,12 @@ pub fn diff_genomes(
                     child_type: locus_value_type_name(*after),
                 });
             }
+        }
+        if !l1.is_finite() {
+            return Err(GenomeDiffError::NumericalOverflow {
+                index,
+                locus: *locus,
+            });
         }
     }
 
@@ -738,6 +870,138 @@ pub fn diff_genomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn predecoded_diff_preserves_addresses_bits_and_finite_extreme_summaries() {
+        let family = BrainFamilyId::new("inspection-test").unwrap();
+        let parent = BrainGenomeEnvelope::new(
+            family.clone(),
+            1,
+            1,
+            vec![0],
+            crate::BrainProvenance::default(),
+        )
+        .unwrap();
+        let child =
+            BrainGenomeEnvelope::new(family, 1, 1, vec![1], crate::BrainProvenance::default())
+                .unwrap();
+        let parent_loci = [
+            (Locus::NodeBias(0), LocusValue::Scalar(-f32::MAX)),
+            (Locus::NodeBias(1), LocusValue::Scalar(-0.0)),
+            (
+                Locus::NodeTarget { node: 0, conn: 0 },
+                LocusValue::Target(1),
+            ),
+        ];
+        let child_loci = [
+            (Locus::NodeBias(0), LocusValue::Scalar(f32::MAX)),
+            (Locus::NodeBias(1), LocusValue::Scalar(0.0)),
+            (
+                Locus::NodeTarget { node: 0, conn: 0 },
+                LocusValue::Target(2),
+            ),
+        ];
+        let diff = diff_genome_loci(&parent, &child, &parent_loci, &child_loci).unwrap();
+        assert_eq!(diff.summary.changed_loci, 3);
+        assert_eq!(diff.summary.total_loci, 3);
+        assert_eq!(
+            diff.summary.l1.to_bits(),
+            (f64::from(f32::MAX) * 2.0).to_bits()
+        );
+        assert_eq!(diff.summary.linf.to_bits(), diff.summary.l1.to_bits());
+        assert!(serde_json::to_string(&diff).unwrap().contains("l1"));
+        let GenomeDelta::Scalar { before, after, .. } = diff.deltas[1] else {
+            panic!("signed-zero change must remain a scalar difference");
+        };
+        assert_eq!(before.to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(after.to_bits(), 0.0_f32.to_bits());
+        let mut misaligned = child_loci;
+        misaligned.swap(0, 1);
+        assert!(matches!(
+            diff_genome_loci(&parent, &child, &parent_loci, &misaligned),
+            Err(GenomeDiffError::LocusMismatch { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn f64_differences_refuse_nonfinite_values_and_distance_overflow() {
+        let genome = BrainGenomeEnvelope::new(
+            BrainFamilyId::new("inspection-test").unwrap(),
+            1,
+            1,
+            vec![0],
+            crate::BrainProvenance::default(),
+        )
+        .unwrap();
+        let before = [
+            (Locus::NodeBias(0), LocusValue::Scalar64(0.0)),
+            (Locus::NodeBias(1), LocusValue::Scalar64(0.0)),
+        ];
+        let after = [
+            (Locus::NodeBias(0), LocusValue::Scalar64(f64::MAX)),
+            (Locus::NodeBias(1), LocusValue::Scalar64(f64::MAX)),
+        ];
+        assert!(matches!(
+            diff_genome_loci(&genome, &genome, &before, &after),
+            Err(GenomeDiffError::NumericalOverflow { index: 1, .. })
+        ));
+        let negative = [(Locus::NodeBias(0), LocusValue::Scalar64(-f64::MAX))];
+        assert!(matches!(
+            diff_genome_loci(&genome, &genome, &negative, &after[..1]),
+            Err(GenomeDiffError::NumericalOverflow { index: 0, .. })
+        ));
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let invalid = [(Locus::NodeBias(0), LocusValue::Scalar64(value))];
+            assert!(matches!(
+                diff_genome_loci(&genome, &genome, &invalid, &invalid),
+                Err(GenomeDiffError::NumericalOverflow { index: 0, .. })
+            ));
+        }
+        let narrow = [(Locus::NodeBias(0), LocusValue::Scalar(0.0))];
+        assert!(matches!(
+            diff_genome_loci(&genome, &genome, &narrow, &before[..1]),
+            Err(GenomeDiffError::ValueTypeMismatch { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn f64_trace_exports_retain_one_ulp_and_subnormal_changes() {
+        let locus = Locus::NodeWeightWide {
+            node: 325,
+            conn: 299,
+        };
+        let samples: Vec<_> = [1.0, f64::from_bits(1.0_f64.to_bits() + 1)]
+            .into_iter()
+            .zip([1, 2])
+            .map(|(value, generation)| LocusSample {
+                generation,
+                agent_uid: AgentUid(u64::from(generation)),
+                tick: Tick(u64::from(generation)),
+                value: Some(LocusValue::Scalar64(value)),
+            })
+            .collect();
+        let csv = export_locus_trace_csv(&samples, locus);
+        assert!(csv.contains("1,1,1,scalar64,1\n"));
+        assert!(csv.contains("2,2,2,scalar64,1.0000000000000002\n"));
+        let svg = export_locus_trace_svg(&samples, locus);
+        assert!(svg.contains("40.0,260.0 560.0,40.0"));
+        let mut constant = samples.clone();
+        constant[1].value = constant[0].value;
+        assert_ne!(
+            export_locus_trace_png(&samples, locus),
+            export_locus_trace_png(&constant, locus),
+            "a one-ULP change must not be flattened by f32 conversion"
+        );
+        let mut extremes = samples;
+        extremes[0].value = Some(LocusValue::Scalar64(-f64::MAX));
+        extremes[1].value = Some(LocusValue::Scalar64(f64::MAX));
+        let svg = export_locus_trace_svg(&extremes, locus);
+        assert!(svg.contains("40.0,260.0 560.0,40.0"));
+        assert!(!svg.contains("NaN"));
+        extremes[0].value = Some(LocusValue::Scalar64(0.0));
+        extremes[1].value = Some(LocusValue::Scalar64(f64::from_bits(1)));
+        assert!(export_locus_trace_svg(&extremes, locus).contains("40.0,260.0 560.0,40.0"));
+    }
 
     #[test]
     fn locus_human_strings_name_the_gene() {

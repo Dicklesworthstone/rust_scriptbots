@@ -61,7 +61,7 @@ pub const MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES: usize = 1024 * 1024;
 /// Full owner checkpoint schema; distinct from the science-only core schema.
 pub const HOST_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.host-checkpoint.v1";
 /// Canonical envelope revision for [`HostCheckpointV1`].
-pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 3;
+pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 4;
 /// Actual envelope, payload and corruption-checksum codecs.
 pub const HOST_CHECKPOINT_V1_CODEC: &str = "postcard-envelope+json+blake3-v1";
 /// Fixed resource ceiling for a complete encoded host artifact.
@@ -574,6 +574,28 @@ impl HostCheckpointV1 {
         self.state.playback
     }
 
+    /// Bind an exclusive caller's next command identity to the retained owner authority.
+    pub(crate) fn matches_exclusive_command_cursor(&self, namespace: u64, next: u64) -> bool {
+        if next == 0 || self.state.next_admission.get() != next {
+            return false;
+        }
+        let previous = next - 1;
+        self.state.last_applied.map(|(_, id)| id)
+            == (previous != 0).then(|| CommandId::from_client_sequence(namespace, previous))
+            && self
+                .state
+                .commands
+                .iter()
+                .map(|entry| entry.status.command_id())
+                .chain(
+                    self.state
+                        .archived
+                        .iter()
+                        .map(|entry| entry.status.command_id()),
+                )
+                .all(|id| id.client_namespace() == namespace)
+    }
+
     /// Bounded chronological traces collected by the actual owner science steps.
     ///
     /// A consumer must validate each trace and refuse error captures before treating it as
@@ -731,6 +753,31 @@ impl HostCheckpointV1 {
 
     fn validate_owner_counters(&self) -> Result<(), HostCheckpointError> {
         let state = &self.state;
+        // A bound, untouched journal has a real empty prefix. It cannot prove
+        // completed commands, scheduled work or scientific events from this owner.
+        if state.cut.last_journal_sequence == 0
+            && (state.revisions.control.get() != 0
+                || state.revisions.scientific.get() != self.tick().0
+                || state.next_admission.get() != 1
+                || state.next_protocol_event.get() != 1
+                || state.next_audit_order != 1
+                || state.next_lifecycle_command_sequence != state.cut.session_id.get()
+                || !state.commands.is_empty()
+                || !state.archived.is_empty()
+                || state.last_applied.is_some()
+                || !state.protocol_events.is_empty()
+                || !state.step_traces.is_empty()
+                || state
+                    .completed_schedule_sequence
+                    .is_some_and(|sequence| sequence != 0)
+                || !state.scheduled_patches.is_empty()
+                || state.last_arrival.is_some())
+        {
+            return Err(checkpoint_error(
+                "journal.empty_prefix",
+                "empty journal prefix cannot carry completed owner work",
+            ));
+        }
         if state.cut.last_journal_sequence == u64::MAX
             || state.cut.last_scientific_event_sequence > state.cut.last_journal_sequence
             || state.next_admission.get() == 0
@@ -1095,6 +1142,7 @@ pub enum HostCoreBuildError {
 /// independent protocol axes.
 #[derive(Debug)]
 pub struct VolatileJournal {
+    session_id: Option<HostSessionId>,
     highest_accepted: Option<JournalBatchId>,
     continuation_eligible: bool,
     archive: VolatileJournalArchive,
@@ -1148,7 +1196,6 @@ impl VolatileJournalCheckpointV1 {
             .min(self.capacity);
         if self.schema_version != 1
             || self.cut.commitment_requirement != ShutdownCommitRequirement::CommittedVolatile
-            || self.cut.last_journal_sequence == 0
             || self.cut.last_journal_sequence == u64::MAX
             || self.cut.last_scientific_event_sequence > self.cut.last_journal_sequence
             || self.capacity > MAX_HOST_CHECKPOINT_ENTRIES
@@ -1205,11 +1252,11 @@ impl VolatileJournalCheckpointV1 {
 
     fn restore(&self) -> Result<VolatileJournal, HostCheckpointError> {
         self.validate()?;
-        let mut journal = VolatileJournal::with_capacity(self.capacity);
-        journal.highest_accepted = Some(JournalBatchId::new(
-            self.cut.session_id,
-            self.cut.last_journal_sequence,
-        ));
+        let mut journal = VolatileJournal::for_session(self.cut.session_id, self.capacity);
+        // An empty cut binds the actual session but has accepted no batch. Do not
+        // manufacture a sequence-zero receipt or advance the first real batch.
+        journal.highest_accepted = (self.cut.last_journal_sequence != 0)
+            .then(|| JournalBatchId::new(self.cut.session_id, self.cut.last_journal_sequence));
         journal.archive.scientific_entries = self.scientific_entries.iter().cloned().collect();
         journal.event_view.store(Arc::new(volatile_event_view(
             &journal.archive,
@@ -1232,6 +1279,7 @@ impl VolatileJournal {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            session_id: None,
             highest_accepted: None,
             continuation_eligible: true,
             archive: VolatileJournalArchive {
@@ -1242,6 +1290,18 @@ impl VolatileJournal {
             event_view: Arc::new(ArcSwap::from_pointee(VolatileEventArchiveView::default())),
             receipts: VecDeque::new(),
         }
+    }
+
+    /// Construct an empty volatile journal bound to one real owner session.
+    ///
+    /// Unlike an unbound adapter, this can capture its empty prefix before the
+    /// first command or science tick. No batch has been admitted or committed;
+    /// another session cannot subsequently claim this journal.
+    #[must_use]
+    pub fn for_session(session_id: HostSessionId, capacity: usize) -> Self {
+        let mut journal = Self::with_capacity(capacity);
+        journal.session_id = Some(session_id);
+        journal
     }
 
     /// Exact admitted batches whose volatile commitment receipt is still pending.
@@ -1401,7 +1461,7 @@ impl JournalPort for VolatileJournal {
     }
 
     fn continuation_cut(&self) -> Option<HostJournalCutV1> {
-        let highest = self.highest_accepted?;
+        let session_id = self.session_id?;
         if !self.continuation_eligible
             || !self.receipts.is_empty()
             || !self.archive.entries.is_empty()
@@ -1414,8 +1474,8 @@ impl JournalPort for VolatileJournal {
             return None;
         }
         Some(HostJournalCutV1 {
-            session_id: highest.session_id(),
-            last_journal_sequence: highest.sequence(),
+            session_id,
+            last_journal_sequence: self.highest_accepted.map_or(0, JournalBatchId::sequence),
             last_scientific_event_sequence: self
                 .archive
                 .scientific_entries
@@ -1427,17 +1487,17 @@ impl JournalPort for VolatileJournal {
 
     fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
         let batch_id = batch.id();
+        if self
+            .session_id
+            .is_some_and(|session_id| session_id != batch_id.session_id())
+        {
+            return JournalAdmission::Closed { batch_id };
+        }
         if self.highest_accepted.is_some_and(|highest| {
             highest.session_id() == batch_id.session_id()
                 && highest.sequence() >= batch_id.sequence()
         }) {
             return JournalAdmission::Accepted { batch_id };
-        }
-        if self
-            .highest_accepted
-            .is_some_and(|highest| highest.session_id() != batch_id.session_id())
-        {
-            return JournalAdmission::Closed { batch_id };
         }
         let scientific_entry = match batch.scientific_event_sequence() {
             None => None,
@@ -1487,6 +1547,7 @@ impl JournalPort for VolatileJournal {
             .map_or(Some(1), |highest| highest.sequence().checked_add(1));
         self.continuation_eligible &=
             expected == Some(batch_id.sequence()) && !batch.is_applied_shutdown();
+        self.session_id = Some(batch_id.session_id());
         self.highest_accepted = Some(batch_id);
         self.receipts.push_back(JournalReceipt::new(
             batch_id,
@@ -3254,7 +3315,8 @@ impl HostCore {
             session_id,
             world,
             options,
-            Box::new(VolatileJournal::with_capacity(
+            Box::new(VolatileJournal::for_session(
+                session_id,
                 options.volatile_event_history_capacity,
             )),
         )
@@ -3369,6 +3431,7 @@ impl HostCore {
             narrative_events,
             narrative_dropped_events: world.narrative_dropped_events(),
             visual_events: Arc::new(world.visual_events().to_vec()),
+            visual_seed: world.agent_substream_protocol_v1().root_seed(),
             visual_dropped_events: world.visual_dropped_events_this_tick(),
             hybrid_count: world
                 .agents()
@@ -3893,6 +3956,58 @@ impl HostCore {
         })
     }
 
+    /// Observe one brain on demand at one immutable owner boundary.
+    ///
+    /// This does not install a capture probe or inspect other creatures. The owner epoch
+    /// is retained even for an absent subject, so remote clients can reject stale worlds.
+    pub fn inspect_brain_activity(
+        &self,
+        uid: AgentUid,
+    ) -> Result<crate::inspector::BrainActivityInspection, HostAccessError> {
+        let request = BrainProjectionRequest::focused(
+            crate::ProjectionClientId::new(0),
+            crate::ProjectionRequestRevision::new(0),
+            uid,
+        );
+        let projection =
+            self.inspect_brains(&request)
+                .map_err(|error| HostAccessError::ProtocolViolation {
+                    message: format!("brain activity inspection failed: {error}"),
+                })?;
+        crate::inspector::BrainActivityInspection::from_projection(
+            self.world.epoch(),
+            uid,
+            projection,
+        )
+    }
+
+    /// Read complete canonical genome rows and a separately paged primary-parent diff.
+    ///
+    /// Both source decoders must declare work within the interactive budget. This explicit
+    /// read neither advances science nor installs a capture probe, and absent subjects retain
+    /// the exact owner epoch so clients can reject pages from retired worlds.
+    pub fn inspect_genome_page(
+        &self,
+        uid: AgentUid,
+        locus_offset: usize,
+        delta_offset: usize,
+    ) -> Result<crate::inspector::GenomeInspection, HostAccessError> {
+        let latest = self.latest_snapshot();
+        crate::inspector::GenomeInspection::from_world(
+            &self.world,
+            BrainProjectionSource {
+                session_id: self.session_id,
+                published_snapshot: latest.revision,
+                published_host: latest.revisions,
+                inspected_host: self.revisions,
+                inspected_tick: self.world.tick(),
+            },
+            uid,
+            locus_offset,
+            delta_offset,
+        )
+    }
+
     /// Current queryable health.
     #[must_use]
     pub const fn health(&self) -> &HostHealth {
@@ -4228,7 +4343,12 @@ impl HostCore {
         host.events.restore_checkpoint(&state.events)?;
         host.restore_checkpoint_observers(state);
         host.schedule = schedule;
-        host.scheduled_patches = Arc::new(state.scheduled_patches.clone());
+        host.scheduled_patches =
+            if state.snapshot.scheduled_patches.as_ref() == &state.scheduled_patches {
+                Arc::clone(&state.snapshot.scheduled_patches)
+            } else {
+                Arc::new(state.scheduled_patches.clone())
+            };
         host.playback = state.playback;
         host.health = state.health.clone();
         host.revisions = state.revisions;
@@ -4312,20 +4432,48 @@ impl HostCore {
         uid: AgentUid,
         max_contributors: usize,
     ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
-        self.inspect_agent_with_attribution(uid, Some(max_contributors))
+        self.inspect_agent_with_attribution(uid, Some(max_contributors), 0, true)
     }
 
-    pub(crate) fn inspect_agent_with_attribution(
+    /// Read bounded selected-creature detail without recomputing sensor attribution.
+    /// This is an observation of the current owner boundary and never advances time.
+    pub fn inspect_agent_basic(
         &self,
         uid: AgentUid,
-        max_contributors: Option<usize>,
     ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
+        self.inspect_agent_with_attribution(uid, None, 0, false)
+    }
+
+    fn validate_inspector_request(
+        max_contributors: Option<usize>,
+        genome_offset: usize,
+    ) -> Result<(), HostAccessError> {
         if max_contributors.is_some_and(|limit| limit > crate::channel::MAX_INSPECTOR_CONTRIBUTORS)
         {
             return Err(HostAccessError::ProtocolViolation {
                 message: "sensor explanation contributor limit exceeded".to_owned(),
             });
         }
+        let page_size = crate::channel::INSPECTOR_GENOME_PAGE_SIZE;
+        if !genome_offset.is_multiple_of(page_size)
+            || genome_offset.checked_add(page_size).is_none()
+        {
+            return Err(HostAccessError::ProtocolViolation {
+                message: "invalid genome page offset".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn inspect_agent_with_attribution(
+        &self,
+        uid: AgentUid,
+        max_contributors: Option<usize>,
+        genome_offset: usize,
+        include_genome: bool,
+    ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
+        Self::validate_inspector_request(max_contributors, genome_offset)?;
+        let page_size = crate::channel::INSPECTOR_GENOME_PAGE_SIZE;
         let Some(id) = self
             .world
             .agents()
@@ -4337,52 +4485,56 @@ impl HostCore {
         let Some(runtime) = self.world.agent_runtime(id) else {
             return Ok(None);
         };
-        let latest = self.latest_snapshot();
-        let genome_browser = if let Some(envelope) = self.world.agent_brain_genome(id) {
-            let parents: Vec<_> = envelope
-                .provenance()
-                .parents
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
-            let parent = parents.first().and_then(|parent_uid| {
-                self.world.agents().iter_handles().find_map(|handle| {
-                    (self.world.agent_uid(handle) == Some(*parent_uid))
-                        .then(|| self.world.agent_brain_genome(handle))
-                        .flatten()
-                })
-            });
-            let index = self.world.agents().index_of(id).ok_or_else(|| {
-                HostAccessError::ProtocolViolation {
-                    message: "inspected agent missing its dense index".to_owned(),
-                }
-            })?;
+        let index =
             self.world
-                .brain_registry()
-                .family_by_id(envelope.family_id())
-                .map(|codec| {
-                    scriptbots_core::genome_browser::GenomeBrowserViewModel::build(
-                        codec,
-                        uid,
-                        self.world.agents().columns().generations()[index].0,
-                        self.world.tick(),
-                        envelope,
-                        parent,
-                        parents,
-                        None,
-                        None,
-                        0,
-                        20,
-                    )
-                })
-                .transpose()
-                .map_err(|error| HostAccessError::ProtocolViolation {
-                    message: format!("genome inspection failed: {error}"),
-                })?
-        } else {
-            None
-        };
+                .agents()
+                .index_of(id)
+                .ok_or_else(|| HostAccessError::ProtocolViolation {
+                    message: "inspected agent missing its dense index".to_owned(),
+                })?;
+        let body = self.world.agents().columns().snapshot(index);
+        let latest = self.latest_snapshot();
+        let genome_browser =
+            if include_genome && let Some(envelope) = self.world.agent_brain_genome(id) {
+                let parents: Vec<_> = envelope
+                    .provenance()
+                    .parents
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let parent = parents.first().and_then(|parent_uid| {
+                    self.world.agents().iter_handles().find_map(|handle| {
+                        (self.world.agent_uid(handle) == Some(*parent_uid))
+                            .then(|| self.world.agent_brain_genome(handle))
+                            .flatten()
+                    })
+                });
+                self.world
+                    .brain_registry()
+                    .family_by_id(envelope.family_id())
+                    .map(|codec| {
+                        scriptbots_core::genome_browser::GenomeBrowserViewModel::build(
+                            codec,
+                            uid,
+                            self.world.agents().columns().generations()[index].0,
+                            self.world.tick(),
+                            envelope,
+                            parent,
+                            parents,
+                            None,
+                            None,
+                            genome_offset,
+                            page_size,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|error| HostAccessError::ProtocolViolation {
+                        message: format!("genome inspection failed: {error}"),
+                    })?
+            } else {
+                None
+            };
         Ok(Some(crate::channel::AgentInspectorData {
             source: BrainProjectionSource {
                 session_id: self.session_id,
@@ -4391,7 +4543,12 @@ impl HostCore {
                 inspected_host: self.revisions,
                 inspected_tick: self.world.tick(),
             },
+            publication: latest,
+            epoch: self.world.epoch(),
             uid,
+            health: body.health,
+            age: body.age,
+            generation: body.generation.0,
             life: crate::channel::AgentLifeData::from(runtime),
             physiology: crate::channel::AgentPhysiologyData::from(runtime),
             sensors: runtime.sensors,
@@ -5066,6 +5223,14 @@ impl HostCore {
         }
     }
 
+    fn snapshot_applied_interventions(&self, sequence: u64) -> Arc<Vec<AppliedInterventionRecord>> {
+        if sequence == self.last_published_intervention_seq {
+            Arc::clone(&self.applied_interventions)
+        } else {
+            Arc::new(self.world.applied_interventions().iter().cloned().collect())
+        }
+    }
+
     fn publish_snapshot(&mut self) -> Result<(), HostAccessError> {
         self.refresh_open_genesis_origins();
         let revision = self.next_snapshot;
@@ -5103,30 +5268,15 @@ impl HostCore {
         // seq: interventions are rare, so this is a pointer clone on almost
         // every publication rather than a copy of the ring.
         let intervention_seq = latest_intervention_seq(&self.world);
-        let applied_interventions = if intervention_seq == self.last_published_intervention_seq {
-            Arc::clone(&self.applied_interventions)
-        } else {
-            Arc::new(
-                self.world
-                    .applied_interventions()
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let (command_queue_depth, last_applied_command) = {
-            let shared = self.shared.borrow();
-            (
-                shared.queue.len(),
-                shared.last_applied.map(|(_, command_id)| command_id),
-            )
-        };
+        let applied_interventions = self.snapshot_applied_interventions(intervention_seq);
+        let (command_queue_depth, last_applied_command) = self.snapshot_command_queue_state();
         let narrative_events = self.snapshot_narrative(&mut build);
         let scheduled_patches = self.snapshot_scheduled(&mut build);
         let snapshot = Arc::new(RenderSnapshot {
             narrative_events,
             narrative_dropped_events: self.world.narrative_dropped_events(),
             visual_events: Arc::new(self.world.visual_events().to_vec()),
+            visual_seed: self.world.agent_substream_protocol_v1().root_seed(),
             visual_dropped_events: self.world.visual_dropped_events_this_tick(),
             hybrid_count: self.hybrid_count(),
             session_id: self.session_id,
@@ -5179,6 +5329,13 @@ impl HostCore {
             Arc::clone(&self.config_audit)
         };
         (config, config_audit)
+
+    fn snapshot_command_queue_state(&self) -> (usize, Option<CommandId>) {
+        let shared = self.shared.borrow();
+        (
+            shared.queue.len(),
+            shared.last_applied.map(|(_, command_id)| command_id),
+        )
     }
 
     fn snapshot_scheduled(&self, build: &mut SnapshotBuildStats) -> Arc<Vec<ScheduledPatchStatus>> {
@@ -6638,6 +6795,42 @@ mod tests {
     };
     use std::{hint::black_box, sync::Mutex, time::Instant};
 
+    #[test]
+    fn inspector_rejects_invalid_bounds_before_looking_up_an_agent() {
+        let owner = continuation_owner(71);
+        let missing = AgentUid(u64::MAX);
+        let page = crate::channel::INSPECTOR_GENOME_PAGE_SIZE;
+        let max = crate::channel::MAX_INSPECTOR_CONTRIBUTORS;
+        assert!(
+            owner
+                .inspect_agent_with_attribution(missing, None, 0, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            owner
+                .inspect_agent_with_attribution(missing, Some(max), page, true)
+                .unwrap()
+                .is_none()
+        );
+        let error = |contributors, offset| match owner.inspect_agent_with_attribution(
+            missing,
+            contributors,
+            offset,
+            true,
+        ) {
+            Err(HostAccessError::ProtocolViolation { message }) => message,
+            _ => panic!("invalid inspector request must be refused"),
+        };
+        assert_eq!(
+            error(Some(max + 1), 1),
+            "sensor explanation contributor limit exceeded"
+        );
+        assert_eq!(error(None, 1), "invalid genome page offset");
+        let overflowing_page = usize::MAX - usize::MAX % page;
+        assert_eq!(error(None, overflowing_page), "invalid genome page offset");
+    }
+
     fn world(persistence_interval: u32) -> WorldState {
         WorldState::new(ScriptBotsConfig {
             rng_seed: Some(0x5eed_cafe),
@@ -6752,6 +6945,27 @@ mod tests {
         assert_eq!(restored.next_journal_sequence, oracle.next_journal_sequence);
     }
 
+    fn assert_idle_checkpoint_unchanged(owner: &mut HostCore, now: u64) {
+        let before = owner
+            .capture_host_checkpoint_v1()
+            .unwrap()
+            .encode()
+            .unwrap();
+        let snapshot = owner.latest_snapshot();
+        let receipt = owner.drive(ManualInstant::from_nanos(now)).unwrap();
+        assert_eq!(receipt.scientific_steps, 0);
+        assert_eq!(receipt.snapshots_published, 0);
+        assert!(Arc::ptr_eq(&snapshot, &owner.latest_snapshot()));
+        assert_eq!(
+            owner
+                .capture_host_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap(),
+            before
+        );
+    }
+
     fn assert_retained_step_traces(checkpoint: &HostCheckpointV1, completed_steps: u64) {
         let capacity = checkpoint.state.options.trace_history_capacity;
         assert_eq!(
@@ -6838,6 +7052,7 @@ mod tests {
             )
             .unwrap();
             assert_continued_owner_outputs(&restored, &oracle);
+            assert_idle_checkpoint_unchanged(&mut restored, 100);
             if completed > 0 {
                 assert_continued_command_retry(&restored, completed);
             }
@@ -6860,6 +7075,171 @@ mod tests {
             assert_eq!(restored.world_tick(), Tick(completed + 1));
             assert_continued_owner_outputs(&restored, &oracle);
         }
+    }
+
+    #[test]
+    fn volatile_host_checkpoint_preserves_a_fresh_owner_without_inventing_work() {
+        for initialized_clock in [false, true] {
+            let make_owner = || {
+                HostCore::new(
+                    HostSessionId::new(0xc023),
+                    continuation_world(),
+                    options(true),
+                )
+                .unwrap()
+            };
+            let mut original = make_owner();
+            let mut oracle = make_owner();
+            if initialized_clock {
+                original.drive(ManualInstant::from_nanos(0)).unwrap();
+                oracle.drive(ManualInstant::from_nanos(0)).unwrap();
+            }
+            let before = original.scientific_digest_v1().unwrap();
+            let checkpoint = original.capture_volatile_host_checkpoint_v1().unwrap();
+            assert_eq!(checkpoint.host_checkpoint().tick(), Tick::zero());
+            assert_eq!(
+                checkpoint
+                    .host_checkpoint()
+                    .journal_cut()
+                    .last_journal_sequence,
+                0
+            );
+            assert_eq!(
+                checkpoint
+                    .host_checkpoint()
+                    .journal_cut()
+                    .last_scientific_event_sequence,
+                0
+            );
+            assert!(checkpoint.host.state.commands.is_empty());
+            assert!(checkpoint.journal.scientific_entries.is_empty());
+            assert_eq!(original.scientific_digest_v1().unwrap(), before);
+            assert_eq!(original.next_journal_sequence, 1);
+            let encoded = checkpoint.encode().unwrap();
+            assert_eq!(
+                original
+                    .capture_volatile_host_checkpoint_v1()
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+                encoded
+            );
+            let decoded = VolatileHostCheckpointV1::decode(&encoded).unwrap();
+            assert_eq!(decoded.encode().unwrap(), encoded);
+            assert!(
+                decoded
+                    .journal
+                    .restore()
+                    .unwrap()
+                    .highest_accepted
+                    .is_none()
+            );
+            let world = decoded
+                .host_checkpoint()
+                .restore_world(scriptbots_core::BrainRegistry::new())
+                .unwrap();
+            let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+            let mut restored = HostCore::restore_volatile_host_checkpoint_v1(
+                &decoded,
+                world,
+                persistence,
+                None,
+                ManualInstant::from_nanos(100),
+            )
+            .unwrap();
+            assert_continued_owner_outputs(&restored, &oracle);
+            if initialized_clock {
+                assert_idle_checkpoint_unchanged(&mut restored, 100);
+            }
+            let envelope = CommandEnvelope::new(CommandId::new(1), HostCommand::Step);
+            settle_continuation_command(&mut restored, envelope.clone(), 200);
+            settle_continuation_command(&mut oracle, envelope, 200);
+            assert_eq!(restored.world_tick(), Tick(1));
+            assert_continued_owner_outputs(&restored, &oracle);
+            assert_eq!(
+                restored
+                    .capture_volatile_host_checkpoint_v1()
+                    .unwrap()
+                    .journal
+                    .cut,
+                oracle
+                    .capture_volatile_host_checkpoint_v1()
+                    .unwrap()
+                    .journal
+                    .cut,
+            );
+        }
+    }
+
+    #[test]
+    fn volatile_host_checkpoint_empty_prefix_keeps_session_and_history_guards() {
+        let session_id = HostSessionId::new(0xc024);
+        let other_session = HostSessionId::new(0xc025);
+        let mut journal = VolatileJournal::for_session(session_id, 2);
+        let empty = journal.capture_volatile_checkpoint_v1(session_id).unwrap();
+        assert_eq!(empty.cut.last_journal_sequence, 0);
+        assert!(
+            journal
+                .capture_volatile_checkpoint_v1(other_session)
+                .is_err()
+        );
+        let batch = |session_id| {
+            Arc::new(JournalBatch::new(
+                JournalBatchId::new(session_id, 1),
+                None,
+                None,
+                AppliedCommand {
+                    tick: Tick::zero(),
+                    revisions: HostRevisions::default(),
+                },
+                None,
+                None,
+            ))
+        };
+        assert!(matches!(
+            journal.try_admit(&batch(other_session)),
+            JournalAdmission::Closed { .. }
+        ));
+        assert_eq!(journal.continuation_cut(), Some(empty.cut));
+        assert!(journal.try_admit(&batch(session_id)).is_accepted());
+        assert!(journal.capture_volatile_checkpoint_v1(session_id).is_err());
+        assert_eq!(journal.poll_receipts(1).len(), 1);
+        assert_eq!(
+            journal
+                .capture_volatile_checkpoint_v1(session_id)
+                .unwrap()
+                .cut
+                .last_journal_sequence,
+            1
+        );
+
+        let mut corrupt_empty = empty;
+        corrupt_empty.cut.last_scientific_event_sequence = 1;
+        assert!(corrupt_empty.validate().is_err());
+        assert!(
+            VolatileJournal::for_session(session_id, 0)
+                .capture_volatile_checkpoint_v1(session_id)
+                .is_err()
+        );
+
+        let mut owner = HostCore::new(session_id, continuation_world(), options(true)).unwrap();
+        settle_continuation_command(
+            &mut owner,
+            CommandEnvelope::new(CommandId::new(1), HostCommand::Step),
+            0,
+        );
+        let mut erased = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        erased.host.state.cut.last_journal_sequence = 0;
+        erased.host.state.cut.last_scientific_event_sequence = 0;
+        erased.journal.cut = erased.host.state.cut;
+        erased.journal.scientific_entries.clear();
+        assert!(matches!(
+            erased.encode(),
+            Err(HostCheckpointError::Contract {
+                path: "journal.empty_prefix",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -7493,6 +7873,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "interdependent checkpoint-continuation test"
+    )]
     fn full_host_checkpoint_continues_nonempty_owner_schedule_counters_and_exact_retries() {
         let declared = [
             scheduled(1, 1, serde_json::json!({"food_max": 0.61})),
@@ -7560,6 +7944,7 @@ mod tests {
                 restored.persistence.last_admitted_tick(),
                 Some(Tick(completed_steps))
             );
+            assert_idle_checkpoint_unchanged(&mut restored, 1_000);
             assert_continued_command_retry(&restored, completed_steps);
             let next = CommandEnvelope::new(CommandId::new(99), HostCommand::Step);
             settle_continuation_command(&mut restored, next.clone(), 1_010);
@@ -7575,6 +7960,10 @@ mod tests {
             assert_eq!(
                 after.scheduled_patch_history().len(),
                 if completed_steps == 1 { 1 } else { 2 }
+            );
+            assert_eq!(
+                restored.latest_snapshot().scheduled_patches.as_slice(),
+                after.scheduled_patch_history()
             );
             assert!(
                 after.journal_cut().last_journal_sequence
@@ -8420,6 +8809,175 @@ mod tests {
             core.scientific_digest_v1().expect("owner science digest"),
             digest
         );
+    }
+
+    fn checkpoint_lifecycle_events(
+        core: &HostCore,
+    ) -> (VolatileHostCheckpointV1, crate::EventPage) {
+        let mut client = crate::HostClient::new(core.local_port());
+        let mut cursor = client.event_cursor();
+        let crate::EventPoll::Contiguous(page) = client.read_events(&mut cursor, 64).unwrap()
+        else {
+            panic!("actual lifecycle events must remain readable");
+        };
+        assert_eq!(cursor.last_seen(), page.latest);
+        let digest = core.scientific_digest_v1().unwrap();
+        let checkpoint = core.capture_volatile_host_checkpoint_v1().unwrap();
+        let decoded = VolatileHostCheckpointV1::decode(&checkpoint.encode().unwrap()).unwrap();
+        let world = decoded
+            .host_checkpoint()
+            .restore_world(scriptbots_core::BrainRegistry::new())
+            .unwrap();
+        let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+        let restored = HostCore::restore_volatile_host_checkpoint_v1(
+            &decoded,
+            world,
+            persistence,
+            None,
+            ManualInstant::from_nanos(100),
+        )
+        .unwrap();
+        assert_eq!(core.scientific_digest_v1().unwrap(), digest);
+        assert_eq!(restored.scientific_digest_v1().unwrap(), digest);
+        let mut restored_client = crate::HostClient::new(restored.local_port());
+        let mut restored_cursor = restored_client.event_cursor();
+        assert_eq!(
+            restored_client
+                .read_events(&mut restored_cursor, 64)
+                .unwrap(),
+            crate::EventPoll::Contiguous(page.clone())
+        );
+        assert_eq!(restored_cursor, cursor);
+        (decoded, page)
+    }
+
+    fn assert_lifecycle_timestamp_refusals(
+        checkpoint: &VolatileHostCheckpointV1,
+        page: &crate::EventPage,
+        births: bool,
+    ) {
+        for defect in ["stale", "future", "natural", "genesis"] {
+            let mut changed = page.clone();
+            let entry = changed
+                .events
+                .iter_mut()
+                .find(|entry| {
+                    let boundary = entry.event.boundary.as_ref();
+                    if births {
+                        !boundary.births.is_empty()
+                    } else {
+                        !boundary.deaths.is_empty()
+                    }
+                })
+                .unwrap();
+            let event = Arc::make_mut(&mut entry.event);
+            let tick = event.tick;
+            let boundary = Arc::make_mut(&mut event.boundary);
+            if births {
+                let record = &mut boundary.births[0];
+                match defect {
+                    "stale" => record.tick = Tick(tick.0 - 2),
+                    "future" => record.tick = tick.next(),
+                    "natural" => record.origin = scriptbots_core::BirthOrigin::Born,
+                    "genesis" => record.origin = scriptbots_core::BirthOrigin::Seeded,
+                    _ => unreachable!(),
+                }
+            } else {
+                let record = &mut boundary.deaths[0];
+                match defect {
+                    "stale" => record.tick = Tick(tick.0 - 2),
+                    "future" => record.tick = tick.next(),
+                    "natural" => record.cause = scriptbots_core::DeathCause::Starvation,
+                    "genesis" => record.tick = Tick::zero(),
+                    _ => unreachable!(),
+                }
+            }
+            let cursor = crate::EventCursor::beginning(page.session_id);
+            assert!(
+                crate::validate_event_page(cursor, &changed, 64).is_err(),
+                "{defect}"
+            );
+            let host = checkpoint.host_checkpoint();
+            let mut events = host.state.events.clone();
+            events.entries.clone_from(&changed.events);
+            assert!(
+                events
+                    .validate(
+                        host.journal_cut(),
+                        host.tick(),
+                        host.state.options.scientific_event_capacity,
+                        host.state.options.genesis_origin_capacity,
+                    )
+                    .is_err(),
+                "{defect}"
+            );
+        }
+    }
+
+    #[test]
+    fn between_step_arrivals_survive_host_checkpoint_and_event_reads() {
+        let mut config = continuation_world().config().clone();
+        config.persistence_interval = 0;
+        let mut core = HostCore::new(
+            HostSessionId::new(0x4152_5249),
+            WorldState::new(config).unwrap(),
+            options(true),
+        )
+        .unwrap();
+        for (id, command) in [
+            (1, HostCommand::Step),
+            (
+                2,
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 0.5,
+                },
+            ),
+            (3, HostCommand::Step),
+        ] {
+            settle_continuation_command(&mut core, envelope(id, command), 0);
+        }
+        let (checkpoint, page) = checkpoint_lifecycle_events(&core);
+        assert_eq!(core.world_tick(), Tick(2));
+        assert_eq!(page.events.len(), 2);
+        let boundary = page.events[1].event.boundary.as_ref();
+        assert_eq!(boundary.births.len(), 1);
+        assert_eq!(
+            boundary.births[0].origin,
+            scriptbots_core::BirthOrigin::Injected
+        );
+        assert_eq!(boundary.births[0].tick, Tick(1));
+        assert_eq!(boundary.summary.births, 0);
+        assert_lifecycle_timestamp_refusals(&checkpoint, &page, true);
+    }
+
+    #[test]
+    fn map_culling_events_survive_host_checkpoint_and_event_reads() {
+        let (mut core, artifact) = map_culling_owner(3);
+        for (id, command) in [
+            (1, HostCommand::Step),
+            (
+                2,
+                HostCommand::ApplyMap {
+                    artifact: Box::new(artifact),
+                    existing_agent_policy: scriptbots_core::ExistingAgentPolicy::CullIncompatible,
+                },
+            ),
+            (3, HostCommand::Step),
+            (4, HostCommand::Step),
+        ] {
+            settle_continuation_command(&mut core, envelope(id, command), 0);
+        }
+        let (checkpoint, page) = checkpoint_lifecycle_events(&core);
+        assert_eq!(core.world_tick(), Tick(3));
+        assert_eq!(page.events.len(), 3);
+        let boundary = page.events[1].event.boundary.as_ref();
+        assert_eq!(boundary.deaths.len(), 3);
+        assert!(boundary.deaths.iter().all(|record| {
+            record.tick == Tick(1) && record.cause == scriptbots_core::DeathCause::MapIncompatible
+        }));
+        assert_eq!(boundary.summary.deaths, 0);
+        assert!(page.events[2].event.boundary.deaths.is_empty());
+        assert_lifecycle_timestamp_refusals(&checkpoint, &page, false);
     }
 
     fn host(paused: bool) -> (HostCore, LocalHostPort) {
@@ -9947,6 +10505,76 @@ mod tests {
         }
         HostCore::new(HostSessionId::new(0x0042_5241_494e), world, options(true))
             .expect("brain projection host")
+    }
+
+    #[test]
+    fn browser_brain_activity_keeps_real_layers_source_and_unavailable_outcomes() {
+        let core = projection_brain_host();
+        let publication = core.latest_snapshot();
+        let uid = publication.world.agents[0].uid;
+        let digest = core.scientific_digest_v1().unwrap();
+        let detail = core.inspect_brain_activity(uid).unwrap();
+        assert_eq!(detail.uid, uid.to_string());
+        assert_eq!(detail.source.epoch, publication.world.epoch.to_string());
+        assert_eq!(detail.source.tick, publication.world.tick.to_string());
+        let crate::inspector::BrainActivityOutcome::Ready {
+            activations,
+            build,
+            outputs,
+            ..
+        } = &detail.outcome
+        else {
+            panic!("real owner brain must be observable");
+        };
+        assert_eq!(activations.layers[0].values, [0.25, 0.75]);
+        assert_eq!(build.retained_values, 2);
+        assert_eq!(outputs.len(), OUTPUT_SIZE);
+        assert!(outputs.iter().all(|output| matches!(
+            output.method,
+            scriptbots_core::attribution::AttributionMethod::Unavailable(
+                scriptbots_core::attribution::AttributionUnavailable::NoConnections
+            )
+        )));
+        let encoded = serde_json::to_value(&detail).unwrap();
+        assert_eq!(encoded["status"], "ready");
+        assert_eq!(encoded["activitySource"], "evaluator_state");
+
+        let clipped = core
+            .inspect_brains(&BrainProjectionRequest {
+                client_id: ProjectionClientId::new(1),
+                revision: ProjectionRequestRevision::new(1),
+                targets: vec![uid],
+                limits: BrainInspectionLimits::tightened(1, 64, 1, 0, 256, 2),
+            })
+            .unwrap();
+        let clipped = crate::inspector::BrainActivityInspection::from_projection(
+            publication.world.epoch,
+            uid,
+            clipped,
+        )
+        .unwrap();
+        let crate::inspector::BrainActivityOutcome::Ready {
+            activations, build, ..
+        } = clipped.outcome
+        else {
+            panic!("clipped activity remains explicit");
+        };
+        assert!(activations.truncated && build.truncated);
+        assert_eq!(
+            build.retained_values, 0,
+            "a layer exceeding its budget is not partially invented"
+        );
+        let absent = core.inspect_brain_activity(AgentUid(u64::MAX)).unwrap();
+        assert_eq!(absent.uid, u64::MAX.to_string());
+        assert_eq!(absent.source, detail.source);
+        assert!(matches!(
+            absent.outcome,
+            crate::inspector::BrainActivityOutcome::Unavailable {
+                reason: scriptbots_core::BrainInspectionUnavailable::MissingAgent,
+            }
+        ));
+        assert_eq!(core.scientific_digest_v1().unwrap(), digest);
+        assert_eq!(core.latest_snapshot().revision, publication.revision);
     }
 
     #[test]

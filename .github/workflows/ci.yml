@@ -139,8 +139,6 @@ jobs:
         env:
           CARGO_BUILD_TARGET: ${{ matrix.cargo_target }}
 
-      # Note: We don't use --all-features because the 'tch' feature requires
-      # libtorch to be installed manually, which isn't available in CI.
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
         env:
@@ -834,6 +832,7 @@ jobs:
           WGPU_BACKEND: gl
           WGPU_POWER_PREFERENCE: low_power
           WGPU_ALLOW_SOFTWARE: "1"
+          SB_WGPU_ALLOW_SOFTWARE_ADAPTER: "1"
           BEVY_ASSET_ROOT: ${{ github.workspace }}
         run: |
           set -euo pipefail

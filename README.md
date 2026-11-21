@@ -4,6 +4,30 @@ ScriptBots is a modern Rust reimagining of Andrej Karpathy’s classic agent-bas
 
 The authoritative roadmap is `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`. The older GPUI port plan is retained as historical design evidence, and a sibling WebAssembly plan lives in `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md`.
 
+### First-run Lab guide
+
+The opt-in terminal and GPUI walkthrough connects the live world, organism
+inspector, Pause, one scientific tick, a food-growth change, a fresh checkpoint,
+and a control/intervention study. In the terminal, open it with **F1** or
+**First-run Lab Guide** in the command palette; **Esc** hides it while retaining
+progress. In GPUI, choose **First-run guide** in the Lab window. Its action
+buttons open the relevant tools, show the proposed growth change, and wait for
+evidence before enabling **Next**. Hiding and reopening keeps the same journey.
+
+Food-growth proposals are applied through the normal command path with owner
+checks for the observed control, scientific, and configuration revisions. If
+another client changes that boundary, the owner rejects the stale proposal.
+A user-interface precheck alone cannot protect against that race.
+
+Progress follows the actual owner, command identity, applied publication and
+journal receipt. A memory-only commitment is labelled `CommittedVolatile`.
+Saving requires a fresh request/result pair; the study must match that saved
+cut and its verified two-arm report. Its outcome describes one seed and does
+not establish a general effect. This is an optional guided path; automatic
+first-install onboarding and full native acceptance under `bd-2z0.10.4` remain
+open. The guide's newly authored tests and native builds have not been executed
+in the current implementation session.
+
 ### Philosophy & purpose
 - **Why this exists**: ScriptBots is a minimalist artificial life laboratory. By rebuilding the original simulator with rigorously deterministic Rust systems, we can observe, measure, and reproduce emergent behavior at scale—without undefined behavior or global state muddying results.
 - **What we learn**: How simple sensory channels and local rules produce complex population dynamics—cooperation vs. predation, resource gradients shaping migration, lineage divergence under different mutation schedules, and the role of perception in survival.
@@ -37,7 +61,7 @@ rust_scriptbots/
 │   ├── scriptbots-core       # Simulation core (WorldState, AgentState, tick pipeline, config)
 │   ├── scriptbots-runtime    # Sole-owner HostCore, protocol, fixed-deadline lifecycle, null frontend
 │   ├── scriptbots-brain      # Brain trait + base implementations (mlp, dwraon, assembly)
-│   ├── scriptbots-brain-ml   # Candle tensors, Tract/tch probes, optional Frankentorch FtBrain
+│   ├── scriptbots-brain-ml   # Candle tensors, Tract probe, optional Frankentorch FtBrain
 │   ├── scriptbots-brain-neuro# NeuroFlow brain (optional), feature-gated
 │   ├── scriptbots-index      # Uniform-grid index; alternate backends are not implemented
 │   ├── scriptbots-storage    # FrankenSQLite persistence worker & analytics snapshots
@@ -123,7 +147,7 @@ Data flows left-to-right; control surfaces are orthogonal and non-invasive:
 - **`scriptbots-core`**: Simulation core with `WorldState`, `AgentState`, deterministic staged tick pipeline, config, sensor/actuation scaffolding, and brain registry bindings.
 - **`scriptbots-runtime`**: Renderer-neutral command, immutable lifecycle evidence, two-axis status, snapshot, and event-cursor contracts with typed revision domains; the sole-owner `HostCore`; a pure injected-time fixed-deadline adapter; and an optional Asupersync `=0.5.0` native lifecycle (migration validation pending). It depends on core but not storage, servers, or renderers. The default and WASM-facing surface remains runtime-neutral; Asupersync is activated only by `native-asupersync` on native targets.
 - **`scriptbots-brain`**: `Brain` trait + baseline implementations and adapters; experimental `assembly` behind a feature.
-- **`scriptbots-brain-ml`**: Feature-gated Candle tensor inference and the retained `ml.placeholder` sensor-copy fallback for Tract, tch and no-backend builds, plus the non-default code-first Frankentorch `FtBrain` family. Candle is not registered as a production heritable family. FtBrain is wired under `brain-ft`; its pinned DSR compile, determinism, and benchmark proof remains pending under `bd-2z0.3.12.3`.
+- **`scriptbots-brain-ml`**: Feature-gated Candle tensor inference and the retained `ml.placeholder` sensor-copy fallback for Tract and no-backend builds, plus the non-default code-first Frankentorch `FtBrain` family. Candle is not registered as a production heritable family. FtBrain is wired under `brain-ft`; its pinned DSR compile, determinism, and benchmark proof remains pending under `bd-2z0.3.12.3`.
 - **`scriptbots-brain-neuro`**: Optional NeuroFlow-based brain; controllable at runtime via config/env (see below).
 - **`scriptbots-index`**: Production uniform-grid neighborhood index. Alternate backends are not advertised until they have real implementations and conformance coverage.
 - **`scriptbots-storage`**: FrankenSQLite persistence with transactional batched writes, bounded admission, explicit flush/shutdown commit receipts, and immutable latest-value analytics snapshots for frontends.
@@ -221,21 +245,56 @@ RUST_LOG=info cargo run -p scriptbots-app
   envelope; application and journal durability are shown separately. Under render pressure,
   the runtime may select a labeled reduced-detail view. These paths are implemented; their
   current native and cross-platform qualification is tracked in the linked reality check.
-- In Experiments (`6`), select a variant row and press Enter to pin it as the
-  baseline, then select a different variant and press `C` to compare their
-  verified final populations across matched seeds. Without a pinned baseline,
-  `C` compares the selected variant with the next distinct variant, skipping its
-  other seed rows. The result shows the endpoint tick, paired sample count,
-  challenger-minus-baseline difference, available 95% interval and paired
-  statistical evidence. A single seed is descriptive only; undefined effect
-  sizes remain unavailable. Verification and analysis run in the background;
-  `x`, Escape or navigation discards a pending result. Live simulation controls
+- In Experiments (`6`), browse the retained catalog with Up/Down and Enter.
+  `]` opens the next catalog page; `[` returns to the first. Inspect a batch to
+  see completed, running and failed counts for each arm across all its seeds.
+  Up/Down reaches every admitted arm, including those beyond the visible rows.
+  Press `B` or Enter to pin a baseline and `V` to select a challenger. `M` cycles
+  population, total energy, average energy, average health, mean age, maximum
+  age, maximum generation and total food. In the detail view, `[` / `]` also
+  choose the previous or next metric. `C` compares the selected metric's
+  verified endpoints across matched seeds. Results show the metric's units,
+  endpoint tick, paired sample count, challenger-minus-baseline difference,
+  available 95% interval and paired statistical evidence. A single seed is
+  descriptive only; missing endpoints and undefined effect sizes remain
+  unavailable. Age counters use age increments, not elapsed ticks. Separate
+  endpoint requests do not imply a jointly corrected family of tests. Results
+  must match the selected metric, experiment plan and source generation;
+  changing the metric discards pending evidence, and returning to an earlier
+  metric does not revive it. `R` refreshes while retaining evidence only for an
+  unchanged source. PgUp/PgDn scrolls, and `A` or Escape returns from
+  the detail view to the catalog. `X` discards a pending result while its worker
+  finishes. The terminal shares the application Lab provider with GPUI and Bevy;
+  verification and analysis run outside painting, and live simulation controls
   continue to address the live owner.
+- In an experiment's detail view, `D` requests cooperative stop and `U` resumes
+  unfinished runs. The acknowledgement reports the observed batch status and
+  progress; a `cancelling` acknowledgement does not mean the runs have finished.
+- Press `N` in Experiments to create a matched-seed study. Choose either a
+  brain-family comparison or a single ecological treatment, then set the brain
+  families, first seed, number of seed pairs and transitions per run. Ecological
+  studies also expose the coefficient, percentage of its baseline value and
+  assignment tick. Up/Down selects a field, Left/Right changes it, and Enter
+  opens exact numeric editing. The composer shows the runner's actual choices,
+  configuration, limits and scientific question. Each seed starts independent
+  fresh worlds using those disclosed settings.
+  `S` submits or retries the exact frozen request. An unconfirmed submission
+  keeps its original identity and choices; `F` explicitly forgets that local
+  retry identity after its worker finishes. An already admitted experiment
+  remains in the catalog. Creation, stop and resume wait until their pending
+  identity has actually been displayed. `X` can deny an unpresented request or
+  discard a submitted request's result; admitted work continues independently.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
-  catalog row. It shows that saved cut's population and first twelve characters
-  of its `WorldDigestV1`, separately from the live tick and artifact checksums.
-  The full selected checkpoint ID appears below the comparison section; table
-  IDs are shortened to keep measured columns visible in an 80-column terminal.
+  catalog row. `[` returns to the first page and `]` opens the next page;
+  `R` refreshes and Page Up/Page Down scroll the visible evidence. Each row
+  shows the saved cut's population, checkpoint ID and scientific digest,
+  separately from the observed live tick and artifact checksums.
+  `B` opens retained branch studies and `A` returns to saved checkpoints.
+  In the study catalog, Enter opens details; Enter or `V` in those details
+  reads the verified report, including actual control/treatment endpoints,
+  differences, first divergence and provenance. The report labels the result
+  as one saved seed with descriptive outcomes. A failed verification clears
+  the previous report. Browsing a study clears the hidden saved-cut selection.
   REST/MCP checkpoint metadata carries `agent_count` and the full
   `world_digest_v1`. These values describe the saved cut even after the world
   advances or an identical capture request is retried. Viewing the catalog
@@ -281,6 +340,16 @@ RUST_LOG=info cargo run -p scriptbots-app
   slot as direct checkpoint review. Live controls continue to address the owner.
   Native-window/PTY
   and full DSR acceptance remain open.
+- Saved-checkpoint review, event reconstruction and managed branch studies recognize
+  the configured versioned NeuroFlow registry when the application is built with
+  `neuro`. The saved constructor identity must match exactly, including hidden
+  layers and activation; changing those settings after installing the registry
+  does not authorize reconstructing it from the newer settings. These consumers
+  share the application's compiled checkpoint-preset catalog. The `reel` command
+  and montage library use that catalog too, supporting exact checkpoint replay
+  for MLP, DWRAON, Assembly, Mixed, and the optional Frankentorch and configured
+  NeuroFlow presets. Custom registries and the existing restrictions on raw
+  scientific checkpoints still apply.
 - Auto selection: `SCRIPTBOTS_MODE=auto` (default) chooses only a renderer compiled into the binary—GPUI first, then Bevy—and only in a real native graphical session; otherwise it uses the terminal. Linux/Unix sessions require a display environment; local macOS sessions use the native window system without X11 variables, while SSH sessions choose the terminal.
 - Auto-mode policy overrides:
   - `SCRIPTBOTS_FORCE_TERMINAL=1` → choose terminal in Auto mode even when a display server is present.
@@ -476,20 +545,23 @@ cargo check --target wasm32-unknown-unknown -p scriptbots-web
   - `ml` → enable `scriptbots-brain-ml`
   - `brain-ft` → propagate the non-default pinned Frankentorch dependencies and code-first `FtBrain` family through `scriptbots-brain-ml`
   - `neuro` → enable `scriptbots-brain-neuro`
+  - `audio` → enable the shared native soundscape for a selected `gui` or `bevy_render` frontend; this flag does not select a frontend or open a device by itself
   - `fast-alloc` → enable mimalloc as the global allocator for improved multithreaded performance
   - Example: `cargo run -p scriptbots-app --features neuro`
   - Frankentorch compile, determinism, and benchmark acceptance is DSR-only through the pinned `rust_scriptbots` profile; GitHub Actions and direct Cargo invocations are not acceptance evidence.
   - Note: default features enable `ml`, `neuro`, and `fast-alloc`. To disable defaults, use `--no-default-features` and opt-in explicitly.
-- **`scriptbots-render`**:
-  - `audio` → enable Kira-driven audio in the UI layer
+- **`scriptbots-render` and `scriptbots-bevy`**:
+  - `audio` → enable the shared Kira soundscape, initially off until the user enables it
 - **`scriptbots-index`**: the uniform-grid backend is unconditional; there are no backend-selection feature flags.
 - **`scriptbots-brain-ml`**:
   - `candle` enables real tensor forward/batch inference, without production heritable-family registration.
-  - `tract`, `tch`, and no-backend builds retain the sensor-copy `ml.placeholder` fallback.
+  - `tract` and no-backend builds retain the sensor-copy `ml.placeholder` fallback.
   - `brain-ft` exposes `FtBrainConfig`, `FtBrainFamily`, and `FT_BRAIN_KIND`.
-  - The pinned Frankentorch `vector_to_parameters` path is not F32-safe, so FtBrain keeps a canonical flat F32 genome and materializes its layer slices without widening through F64. Resolution of that upstream gap and all compile/benchmark proof remain part of `bd-2z0.3.12.3`.
+  - FtBrain also exposes architecture-scoped canonical bias, weight and source-target loci to shared heredity/genome inspection. Activity inspection reconstructs the exact feed-forward computation from recorded owner inputs and verifies recorded output bits; its provenance explicitly says reconstructed. Unrecorded/indistinguishable-zero or mismatched observations are typed unavailable results. Producer work and retained graphs are bounded, and clipped weights remain visible without claiming a complete input explanation. Genome/state codecs and the adapter identity are unchanged. The exact libraries and Ft test source passed a pinned DSR type check; executable regressions remain unqualified because code generation hit the host memory limit.
+  - FtBrain cohorts retain distinct weights for every agent and evaluate one packed F32 batched matrix contraction per layer. Core retains successful cohort evaluators across ticks while the exact factory, architecture, ordered stable identities, genomes/provenance and scalar checkpoints still match. This preserves packed weights and scratch between ticks. Membership changes or failures evict cached evaluators; checkpoints and scientific digests omit this execution cache. Scalar preimages and complete successor reconstruction still enforce atomic rejection, so this is not an end-to-end throughput claim. Adapter semantic version 3 identifies the packed executor; canonical genome and evaluator-state codecs are unchanged. Targeted DSR checks cover eight evolving scalar/cohort stages with one cohort construction, mutation/rebind/factory invalidation, warmed failure rollback and checkpoint continuation, plus the scalar-only feature lane.
+  - The pinned Frankentorch `vector_to_parameters` path is not F32-safe, so FtBrain keeps a canonical flat F32 genome and materializes its layer slices without widening through F64. Resolution of that upstream gap and full benchmark qualification remain part of `bd-2z0.3.12.3`.
 
-Note: NeuroFlow and the native brain implementations are functional. Candle has real library inference; Tract/tch inference and alternate spatial-index backends remain unimplemented. The ML disposition keeps placeholders out of production populations and selects FtBrain as the app-level ML family. FtBrain has real code-first inference, but is not accepted as complete until its pinned DSR evidence is green.
+Note: NeuroFlow and the native brain implementations are functional. Candle has real library inference; Tract inference and alternate spatial-index backends remain unimplemented. The ML disposition keeps placeholders out of production populations and selects FtBrain as the app-level ML family. FtBrain has real code-first inference, but is not accepted as complete until its pinned DSR evidence is green.
 
 ### NeuroFlow runtime configuration (optional)
 If built with the `neuro` feature, runtime toggles can be applied via env vars before launch:
@@ -560,6 +632,9 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
    populations through sole-owner hosts in one new database. Requires an explicit
    `rng_seed` and `persistence_interval=1`. Islands step in ascending order with separate
    derived seeds; the inner Rayon pool defaults to one thread and honors `--threads`.
+   Each island executes the selected founder recipe: scenario-free runs use 20
+   seeded uniform founders, and explicit scenarios use the 16-founder corner grid.
+   The executed recipe must match the launch manifest before storage is created.
    Each complete tick is atomically applied and flushed before the next tick begins.
    Genomes, narrative records, interaction edges, and lineage edges retain island IDs; genome read APIs
    require an explicit island, and narrative search results include it in each event identity.
@@ -575,19 +650,38 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
    Tick summaries describe the tick before migration; final membership and world digests
    describe the state after migration. Result fields label these phases and report the
    number of moves persisted, which can be zero if no migration falls within the run.
-   This mode currently has no scheduled interventions, bootstrap, or host-session
-   checkpoint resume. The JSON result reports the observed durability watermarks.
+   This mode currently has no scheduled interventions or bootstrap. The JSON result
+   reports the observed database durability watermarks.
+   Add `--archipelago-checkpoint FILE` to save a complete portable owner cut after the
+   last recorded barrier. It includes all islands, inherited genomes and evaluator state,
+   RNG streams, migration policy and epoch, command identities and retained volatile
+   journals. Existing files are preserved; a successful save reports its byte count,
+   BLAKE3 checksum and file-sync acknowledgement.
    The manifest's `archipelago` extension records all island configs and the common root seed;
    its ordinary world fields describe island zero. For example:
 
    ```bash
    cargo run -p scriptbots-app -- --run-archipelago 3 \
      --archipelago-db runs/islands.sqlite --archipelago-ticks 100 \
+     --archipelago-checkpoint runs/islands-t100.checkpoint \
      --brain mlp --set rng_seed=42 --set persistence_interval=1
    # Add --migration-interval 25 --migration-selection random for gene flow.
    cargo run -p scriptbots-app -- report-archipelago runs/islands.sqlite \
      --verify-conservation --json runs/islands-report.json
+   cargo run -p scriptbots-app -- continue-archipelago runs/islands-t100.checkpoint \
+     --barriers 100 --brain mlp --threads 2 --output runs/islands-t200.checkpoint
    ```
+
+   `continue-archipelago` advances exactly the requested additional barriers using
+   the saved cadence and migration policy. Choose the original `--brain` preset;
+   executable registry mismatches refuse restoration. The result names the source
+   checksum, source/final ticks and epochs, final island digests, populations and
+   actual migration count. The original checkpoint and database remain unchanged:
+   continuation saves another portable cut and does not append science to the old
+   database. Retained host journal receipts remain `committed_volatile`; the saved
+   file does not turn them into a complete durable event history. Inputs are bounded
+   to 256 MiB and 64 islands, with at most 10 million aggregate island transitions
+   per invocation. Deterministic comparisons remain within the same executable lane.
 
  - `--set PATH=VALUE`: dotted-path configuration override in TOML syntax, repeatable (e.g., `--set world_width=800 --set neuroflow.enabled=true`; string values use TOML quotes). Configuration layers apply defaults → `--config` files (in order) → environment → CLI; every applied layer appends a kind-tagged content digest to the run manifest's `scenario.ordered_config_layer_digests`, and any field where one explicit layer displaced another is recorded in the manifest's `config_overrides`.
 - `--quality TIER`: visual quality shortcut for `--set render.quality=TIER`, validated at parse time (`auto|potato|low|medium|high|ultra`). The unified `render.*` settings (quality tier, post stack bloom/vignette/fog/AA, day/night cycle, TUI theme, accessibility palette) are consumed by every frontend; `None` values defer to per-tier frontend defaults.
@@ -607,6 +701,20 @@ both the live renderer and offscreen scene capture. Each chunk selects its most
 common biome and shares that biome's cached texture; quality changes filter the
 same 64×64 source grain. Vertex colors still supply terrain hue and accessibility
 palettes. This detail path does not blend biome albedo textures per pixel.
+
+Bevy creature motion interpolates position, heading and spike extension between
+two producer-observed scientific snapshots, keyed by stable agent identity.
+Toroidal crossings take the short path; render timing selects a bounded fraction
+over the measured publication interval without advancing science or extrapolating.
+This introduces up to one observed interval of pose presentation delay.
+Pausing, reduced motion, a changed owner/configuration, rewinds, births and
+ambiguous teleports use the committed pose immediately.
+Picking and camera follow use the displayed creature position. The offscreen
+`OffscreenCapture::render_interpolated` API accepts an explicit fraction and records
+both endpoint ticks and science digests; an interpolated image has no single
+`world_digest` attribution. It does not certify independently supplied worlds as
+one replay. Terrain, population and other state cues use the later cut. Ordinary
+endpoint captures keep their existing contract.
 
 ### Environment variables (quick reference)
 - `RUST_LOG` — logging filter (e.g., `info`, `trace`, `scriptbots_core=debug`).
@@ -735,7 +843,8 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 ### Legacy parity (what matches the C++ original and what does not)
 - **Transcribed from the C++:** the exact two-rotation locomotion (the default model), the 25-input sensor layout (four eyes, smell, sound, hearing, blood, clocks, temperature), carcass sharing (spiked kills only, maturity multiplier, `numaround^1.25` split) and the temperature-discomfort formula.
 - **Deliberately different:** combat runs every tick with reach `spike radius + spike length`, multiplicative damage bonuses and partial spike retraction, where the C++ checks every second tick for `d < 2r` within π/8 and snaps the spike to zero; health and energy are separate budgets; reproduction may take a partner (with probability `partner_chance`, the oldest other agent) and yields one child, where the C++ is asexual with `BABIES=2`; the population floor defaults to `population_minimum = 0` instead of topping up to `NUMBOTS=70`; food also regrows continuously in every cell (`food_growth_rate = 0.05`), where the C++ only refills one random cell to `FOODMAX` every 15 ticks.
-- **Launch ecology vs core defaults:** a launch without `--scenario` (`scriptbots-app-default-v2` / `-layered-v2`) makes reproduction food-driven, as in the C++, lowers food regrowth to `0.0005`, sets a floor of 20 agents, and places its 20 founders at seeded uniform positions across the whole world (`seeded-uniform-spread-20-registered-brain-v1`) instead of the 4x4 corner grid that scenario documents keep. Measured with spread founders (seeds 11, 42, 137): 185–290 agents at tick 30,000, with 45–63 births per 1,000 ticks (the grid founders gave 180–288 and 42–73). A 60,000-tick run reached 449–575 agents and was still growing slowly, so no plateau has been observed yet. The core `ScriptBotsConfig::default()`, which every scenario document builds on, still advances the reproduction counter every tick and gives each child full energy at no cost to the parent; with the same founders it passes 3,000 agents between ticks ~5,900 and ~7,900. `scenarios/meadow.scenario.toml` passes its 360-tick envelope but passes 3,000 agents by tick ~1,200 on all three declared seeds. Tracked in `bd-vgsx`.
+- **Launch ecology vs core defaults:** a launch without `--scenario` (`scriptbots-app-default-v2` / `-layered-v2`) uses predominantly food-driven reproduction, retaining a small timer contribution of `0.0001` per tick for both diets, lowers food regrowth to `0.0005`, sets a floor of 20 agents, and places its 20 founders at seeded uniform positions across the whole world (`seeded-uniform-spread-20-registered-brain-v1`) instead of the 4x4 corner grid that scenario documents keep. Measured with spread founders (seeds 11, 42, 137): 185–290 agents at tick 30,000, with 45–63 births per 1,000 ticks (the grid founders gave 180–288 and 42–73). A 60,000-tick run reached 449–575 agents and was still growing slowly, so no plateau has been observed yet. The core `ScriptBotsConfig::default()`, which every scenario document builds on, still advances the reproduction counter every tick and gives each child full energy at no cost to the parent; with the same founders it passes 3,000 agents between ticks ~5,900 and ~7,900. `scenarios/meadow.scenario.toml` passes its 360-tick envelope but passes 3,000 agents by tick ~1,200 on all three declared seeds. Tracked in `bd-vgsx`.
+- **Explicit food-funded experiment:** select `--scenario scenarios/food_funded_meadow_v1.scenario.toml` to make both reproduction rates exactly zero. Grazing and spiked-carcass rewards must earn the seven progress units required for a birth; elapsed ticks contribute nothing. This closed scenario has no population-floor or scheduled injections, no random food respawn, regrowth `0.0005`, and a parent debit equal to the child's `0.25` starting energy. Its declared 10,000-tick envelope across seeds 11/42/137 is an acceptance study awaiting execution, permits extinction, and makes no equilibrium claim. Five production core tests cover earned births, food-free waiting, carcass eligibility, newborn reset, separate injection accounting and unchanged timed arithmetic. Custom configurations must set both diet rates to zero or both positive; mixed zero/positive pairs are rejected. Existing defaults and the original meadow remain unchanged.
 - There is no C++ oracle harness yet, so parity beyond the transcribed pieces is not measured.
 
 ### Design principles & determinism
@@ -753,6 +862,89 @@ Deterministic, staged tick pipeline (six seeded, domain-separated RNG streams; e
 - `WorldState::step_traced()` is an opt-in, clock-free diagnostic API using `scriptbots.world-step-trace.v1.7`/codec-7. It records exactly six semantic checkpoints—Sense, Brains, Actuation, Food, DeathCleanup, and Population—with separate world, ordered deferred-work, pending output-tail, and resource-ledger hashes. The embedded world and transition lanes bind the same agent-substream protocol, UID-ordered counters, selected locomotion model, and queued offspring identities as the final digest. The trace has its own aggregate hash, typed capture failures, and `validate_contract()` enforcement for schema, cardinality, order, ticks, coverage, digest shape, and nested aggregate hashes.
 - Both V1 and trace validation prove protocol self-consistency, not artifact authenticity. Their FNV-1a64 hashes are diagnostic first-divergence aids, not signatures or collision-resistant attestations; a durable run bundle will require separate provenance/authentication.
 - DeathCleanup and Population retain the ordered queue state immediately before consumption, while the final completed-boundary V1 and resource report prove traced/untraced parity after finalization. The literal six-point golden is enabled only by the `SCRIPTBOTS_WORLD_DIGEST_GOLDEN=1` environment guard in its pinned DSR test lane, so ordinary `--all-features` tests remain portable; there is no product CLI or replay-file claim yet.
+
+#### Paired checkpoint branch studies
+
+Run a study directly from an editable JSON plan:
+
+```bash
+cargo run -p scriptbots-app --no-default-features --bin scriptbots-app -- \
+  branch-study --example > study-plan.json
+# Edit the seed, checkpoint, horizon, configuration and interventions as needed.
+cargo run -p scriptbots-app --no-default-features --bin scriptbots-app -- \
+  branch-study --plan study-plan.json --out runs/checkpoint-study
+```
+
+The example includes a control and five treatments: drought, resource shock,
+temperature shift, closed-world policy and cooperation. The command prints its
+summary and saves `study_plan.json`, `study_report.json`, `study_summary.md`, and
+one `bundle_<branch_id>` directory per branch containing trajectory CSV and
+intervention evidence. Use a new or empty output directory. Completed and partial
+studies are preserved; a second writer or rerun cannot replace their artifacts.
+To repeat a study, choose a different output directory.
+
+JSON plans reject unknown fields. Before reserving output, the runner validates
+the configuration, brain support, schedules and resource envelope: at most 32
+branches, 10,000 transitions per branch, 1,000,000 total baseline-plus-branch
+transitions, and 262,144 grid cells. History capacity, population floors and
+per-tick injection counts are each limited to 10,000; enabled archives are
+limited to 64 MiB. Resolved configuration treatments receive the same checks and
+cannot change world geometry or enable persistence. Execution stops with an
+explicit error if an observed population exceeds 10,000, retaining any partial
+artifacts. Plans must be regular files no larger than 1 MiB. These limits bound
+individual resources, not total memory use or completion time.
+
+The command uses the library's `branch_study::BranchStudyOrchestrator`, which
+restores each branch from one shared checkpoint. `base_seed` controls world and
+founder initialization, and persistence is disabled for the study. An
+intervention's `scheduled_tick` names the completed
+boundary after which it applies, before the next transition. It must fall in
+`[checkpoint_tick, checkpoint_tick + horizon_ticks)`; omitting it applies at the
+checkpoint. The report records the observed application tick. Divergence compares
+control and treatment digests at the same tick and identifies a differing digest
+lane, without claiming to identify an internal transition stage.
+
+Branch reports use schema **3**, including an exact `terminal_sample` in both the
+report and branch evidence JSON. Each trajectory comparison declares
+`analysis_basis.kind = "single_seed_trajectory"`: one seed supplies one independent
+pair, even when many ticks are recorded. The report includes trajectory mean
+differences and temporal spread, and omits confidence intervals, standardized
+inferential effects and p-values. Recovery and extinction use the observed
+population at the actual intervention boundary.
+
+To compare terminal outcomes across independently initialized matched seed pairs,
+add an explicit seed list to the same plan:
+
+```bash
+scriptbots-app branch-study --plan study-plan.json \
+  --out runs/replicated-checkpoint-study --seeds 42,137,999
+```
+
+Each seed constructs its own founders and checkpoint, then restores its control
+and treatment branches from that checkpoint. The list accepts at most 32 unique
+`u64` seeds; duplicates are refused because rerunning the same seed does not add an
+independent pair. With `--seeds`, the plan's `base_seed` controls deterministic
+statistical resampling and is not added to the replicate list. Execution follows
+the declared seed order and runs one seed at a time. The existing 1,000,000
+transition budget covers **all seeds combined**.
+
+Replicated runs save `study_plan.json`, `replicated_report.json` (schema **1**),
+`replicated_summary.md`, and the complete per-seed studies under
+`seed_<16-digit-hex-seed>/`. The aggregate retains each seed's checkpoint digest,
+terminal observations and report location. For each treatment, exactly one final
+population, food-total and total-energy observation per seed enters the paired
+analysis; the statistical sample count is the seed count. Two or more seeds
+enable 95% paired bootstrap intervals and two-sided sign-flip p-values, each with
+1,000 seeded resamples. These are individual endpoint comparisons without a
+multiple-comparison correction or automatic winner decision. A one-seed list
+produces descriptive effects without inferential intervals or p-values.
+
+The aggregate success report is written only after every requested seed and its
+branch bundles complete. A failed or cancelled study retains its exact inputs
+and completed or partial seed outputs; reruns require a new output directory.
+
+Branch bundle verification checks retained artifact integrity. It does not claim
+to restore a complete application owner or reproduce the study from the bundle.
 
 #### Reproducible runs (seed control)
 - Set a fixed seed in config: `rng_seed = <u64>`. At runtime you can apply via REST:
@@ -973,6 +1165,115 @@ unconfirmed. Paused and single-step snapshots settle agent positions, headings,
 spikes, and idle-body deformation immediately at their recorded poses; camera
 navigation remains available while paused.
 
+### Native Lab experiments, saved checkpoints, and event timeline
+
+In Bevy, use **Lab (F6)** to open the experiment pane, **F7** to open saved
+checkpoints, or **F8** to open the event timeline. Tab or Up/Down selects an enabled action, Enter activates it, and
+PageUp/PageDown or the mouse wheel scrolls the panel. Escape closes the panel.
+
+The event timeline reads the canonical narrative records from the newest live
+publication, including while a saved world is being reviewed. It shows 12 events
+per page and preserves a selected event and pinned page as new events arrive.
+Selecting an event exposes its recorded tick, subject, severity, magnitude,
+before/after values, and observation window. Retention gaps are explicit: if
+an event leaves the bounded history, its selection is cleared rather than
+reassigned to a different event. Changing the owner session clears old selections.
+This read-only timeline also works without application services; the retained
+ring is not presented as a complete or durable run history.
+
+With application services available, choose **Review selected event tick in the
+world** to reconstruct that event's historical world. Review requires a retained
+checkpoint at or before the target tick and its replay evidence. **EVENT REVIEW**
+names the event, target tick, owner session, source checkpoint, and source tick.
+The request is checked against the complete selected record before and after
+reconstruction; changing or losing that evidence refuses the stale result.
+The live simulation keeps its current world. The historical view disables live
+organism picking and simulation commands, and **Return live** restores the newest
+publication. You can save a source checkpoint through F7 before observing later
+events. Background narrative eviction leaves unrelated checkpoint saves and
+experiment requests intact.
+
+Both native experiment panes can create fresh matched-seed batches. Choose
+**New matched-seed experiment**, then **Compare brain families** for two different families
+under identical conditions, or **Compare ecological treatment** for one shared
+family with one scheduled coefficient change. The ecological choices are food
+regrowth, basal metabolism and movement cost. Review the actual fresh-run baseline,
+challenger value, seed cohort, horizon and completed-tick application boundary
+before launching. Percentage controls range from 0% to 400%; 100% is an explicit
+unchanged-value control. Both arms start from fresh experiment defaults and use
+the same independent seed pairs. Their configuration is separate from the live
+world. A shortened horizon does not silently move a requested treatment boundary.
+
+If admission is unconfirmed, the complete scientific question and request identity
+stay frozen for an exact retry. The application verifies the returned run matrix
+and canonical plan digest, including the treatment value and timing. The pane
+also lists retained batches, pages through variants and reports completed, running
+and failed runs. Select baseline and challenger arms to compare verified endpoints:
+population, total or mean live-agent energy, mean health, mean or maximum age
+counter, maximum living generation, and total food. Comparisons retain the plan
+digest, source generation, endpoint and available statistical results. Stop and
+resume use the existing runner's observed status. The experiment CLI and API
+remain available for larger scripted designs.
+
+The saved-checkpoint pane can **save the current live world**, list retained
+scientific cuts and reconstruct a selected cut for inspection. A completed save
+reports its exact checkpoint ID, tick and world digest and selects that saved cut
+for review, even when it is outside the current catalog page. Saving uses the
+existing owner service without advancing the simulation. If the result is
+uncertain, **Retry previous checkpoint save** retains the original request identity; a retry
+does not silently request a second cut. Return to live before starting a save
+from a historical view. **SAVED CHECKPOINT** and a return-live banner identify
+historical presentation while the independent live owner continues running.
+Live organism picking and simulation commands are disabled during review. Click
+the banner, choose **Return live**, or press Escape with the panel closed to
+restore the newest live publication. Review does not replace or rewind the owner.
+
+A selected scientific cut can also seed a saved-checkpoint study: choose an
+unchanged continuation or the offered whole-world treatment, review its source
+and future horizon, then launch it through the application service. Retained
+studies can be reopened and their cancellation state observed. Completed outcomes
+come from verified report artifacts and show terminal population, food, energy
+and health, extinction/recovery and available first-divergence evidence. These
+outcomes describe one saved founding seed. Fresh matched-seed experiments provide
+the independent founding-seed replication.
+
+Both native frontends share one bounded workflow model. Discarding a pending
+result keeps its worker slot occupied until the operation finishes; changing
+session, panel or selection invalidates its result. File reads and experiment
+verification run outside the render loop. Bevy retains at most one saved
+presentation and one newest live publication, and reuses a bounded pool of UI
+rows.
+
+These panes cover experiment creation/comparison, saved-checkpoint studies and
+review, and reconstruction at a selected narrative event tick under `bd-2z0.7.6.1`
+and `bd-ji3a`. General replay seeking, native artifact export and full native/GPU
+acceptance remain unfinished parts of those workflows.
+Normal simulation epoch progression preserves a saved view; a change of host
+session invalidates stale observations and results.
+
+### Bevy shared creature appearance
+
+Live Bevy rendering and offscreen capture now use the same shared PBR appearance
+plugin. Four material classes cover the existing creature alpha, lighting and
+sidedness combinations. Stable per-part slots hold linear color and emission in
+a resident storage buffer, while `MeshTag` selects each instance's row. Identical
+mesh/material handles let Bevy batch eligible creatures using its normal paths.
+
+Changed colors upload coalesced dirty ranges. Storage grows only when retained
+capacity is exceeded, and an actual GPU-buffer replacement receives a full
+upload. Per-row revisions preserve changes across skipped publications; slot
+generations reject stale ownership after population turnover or capture reset.
+The actual device binding limit and an independent application ceiling bound
+storage. Existing geometry, per-part entities, terrain contact, interpolation,
+picking, accessibility palettes, lighting and alpha/shadow behavior are retained.
+
+This is an implemented, independently reviewed source increment. Changed Rust
+formatting passed DSR. Native Cargo checks progressed after genuine system
+prerequisites were supplied, then the 8 GiB host memory limit killed the unchanged
+`bevy_render` dependency before project compilation. Six new CPU regressions and
+GPU capture acceptance remain unexecuted. Entity elimination, measured draw-call
+reduction and throughput qualification remain open under `bd-2z0.7.3`.
+
 ### Keyboard shortcuts (GUI)
 
 Simulation controls and retained-history playback are separate. The unmodified `S` shortcut returns the invoking view to live and queues one scientific step; when that isolated step succeeds, it advances exactly once and leaves the simulation paused. `space`, `G`, and `1`/`2`/`3` apply in Lab. Canvas presentation shortcuts (`N`, `Ctrl+P`, `D`, `F`, `Ctrl+Shift+O`, `Shift+S`, `O`, `Shift+F`, `0`, and `,`) apply in World. Simulation and canonical selection commands work from either window.
@@ -1015,8 +1316,51 @@ Simulation controls and retained-history playback are separate. The unmodified `
 - Persistence safety: a spawn shortcut is refused after the current tick is admitted under the selected storage guarantee; advance to the next open tick boundary before spawning. An unresolved admission is reported separately and must be resolved by retrying the exact retained batch before either the world or an external arrival can advance. Both typed reasons are logged without consuming simulation RNG.
 
 ### Audio system
-- Optional `kira`-backed mixer (feature `audio`) with event-driven cues (births, deaths, spikes) and accessibility toggles.
-- Channels planned for ambience/effects; platform caveats apply on Linux/WSL2. Audio is disabled in wasm; use Web Audio API from JS if needed.
+
+The native soundscape connects completed simulation snapshots to a real Kira audio
+callback. Population drives a continuous drone; births, deaths and combat drive
+bounded bell, thud and transient cues. The soundscape is optional at build time and
+starts **off** in both native frontends.
+
+Select one of these application feature sets in the DSR build profile, then launch
+the resulting application with the indicated mode:
+
+| Frontend | Application features | Launch mode | Enable and mix |
+|---|---|---|---|
+| GPUI | `gui,audio` | `--mode gui` | Settings → Soundscape → Enable soundscape; master and four layer gain controls |
+| Bevy | `bevy_render,audio` | `--mode bevy` | Display settings → Sound, or F9; master volume and layer buttons cycling full, half and off |
+
+World and Lab share one GPUI device and projector. Bevy keeps its unrelated default
+audio plugin disabled, so enabling this feature does not create an eager second
+device. Merely starting the application, painting a window or updating controls
+while sound is off does not open audio.
+
+Audio reads immutable owner publications and never advances science or accesses
+storage. Repeated control publications do not repeat events; adjacent ticks with
+equal event counts remain distinct observations. A latest-value subscriber may miss
+ticks, and the controls show skipped ticks and transport drops without reconstructing
+unobserved cues. The input queue holds eight frames, each observation admits at most
+eight one-shots, and the synthesizer caps concurrent voices at 32.
+
+Pause, frozen playback speed, unhealthy owners and saved-world review silence the
+soundscape. Background playback is muted by default; Bevy also exposes an explicit
+background preference. Resuming or changing owners starts with current ambience and
+discards old event tails. Master and layer controls apply to active output; muted
+event layers cannot consume the cue budget of audible layers.
+
+A frontend attempts device initialization once after explicit opt-in. Initialization
+failure, a reported native backend error, invalid snapshot values or a disconnected
+consumer disables sound with a persistent reason and restart instruction. Kira may
+attempt internal device recovery before its backend reports an error to the frontend.
+
+Current native output is mono, duplicated to the device's stereo frames. Spatial
+positioning and the original 10k-agent performance acceptance remain open under
+`bd-16g.14` and `bd-2z0.14.1.11`. Canonical offline soundtrack export remains a separate
+fixed-point rendering path; live callbacks are not claimed to reproduce its PCM bytes.
+The new callback, projector and frontend regressions are authored but have not run:
+DSR dependency checks and repeated workspace outages blocked executable qualification.
+No physical-device, native-journey or performance pass is claimed. The browser frontend
+does not enable this native audio feature.
 
 ### Terminal mode
 The interactive frontend runs FrankenTUI's `Program` and retains Ratatui widgets; headless mode uses its buffer adapter. Automatic selection chooses terminal mode only before launch; an explicit GPUI/Bevy request or a native window launch failure is surfaced rather than silently changing products.
@@ -1099,6 +1443,29 @@ order by kind;
 
 JSON replay payloads are validated by ScriptBots and stored as ordinary `TEXT`. Integer flags are decoded at the storage boundary into Rust booleans.
 
+### Search narratives from a selected run
+
+`control_cli narrative search` reads the stored full-text index, and
+`control_cli narrative around` reads a chronological window. Select a run in a
+multi-run database with its canonical 32-character lowercase hexadecimal ID:
+
+```bash
+control_cli narrative search population --db runs/example.sqlite --run-id 00000000000000000000000000000001 --from-tick 100 --to-tick 500 --limit 32 --json
+control_cli narrative around 250 --db runs/example.sqlite --run-id 00000000000000000000000000000001 --window 50 --json
+```
+
+Replace the example ID with the retained run's actual ID. Omit `--db` to query
+the running service; `--run-id` is forwarded in that mode too. REST accepts
+`run_id` on `GET /api/narrative/search` and
+`GET /api/narrative/around/{tick}`. MCP tools `narrative_search` and
+`narrative_around` accept the same optional `run_id` string.
+
+An omitted selector is accepted for a single-run database. A multi-run database
+requires a selection; an unknown or malformed ID is an error. Explicit run
+selection always requires accessible stored evidence and never falls back to
+the live event ring. Search `limit: 0` still verifies an explicitly selected
+run; an around-query `window: 0` selects the exact tick.
+
 ### Offline narrative timelines
 
 Use the finished database printed by the application to read the actual emergent-event
@@ -1136,12 +1503,16 @@ bounded pages, preserves the recorded cadence and history, and returns the newes
 events in canonical order. Its event counts cover the complete run, including
 events evicted from the live event ring. The default output limit is 1,024 and the
 maximum is 4,096; `limit=0` still validates and reconstructs the entire input stream.
-The JSON includes input provenance, coverage, output truncation and eviction counts.
-Missing or corrupt inputs are refused, so older databases without canonical detector
-inputs cannot use this report. Changes to detector interval, history capacity or
-event capacity during a run are also refused; unrelated authenticated configuration
-revisions are supported. The report does not use saved narrative outputs to supply
-its reconstructed events.
+The version-2 JSON includes input provenance, coverage, output truncation, eviction
+counts, the number of effective policy changes and the final detector policy.
+Journal-authenticated changes to detector interval, history capacity and event
+capacity are applied at their completed tick boundaries. Shrinking a buffer keeps
+its newest entries; growing it preserves the available history. Disabling and
+re-enabling narration preserves event cooldowns and pending persistence records.
+Missing, corrupt or unauthenticated inputs are refused, so older databases without
+canonical detector inputs cannot use this report. Reconstruction uses the current
+detector implementation and does not assert historical equality across source
+revisions. Saved narrative outputs never supply its reconstructed events.
 
 ### Streaming demographic and metric summaries
 
@@ -1231,9 +1602,15 @@ null p-values and no FDR discoveries. Unknown or mismatched seed provenance is
 explicit in `seed_pairing`. Differences use shared endpoint metrics; conditionally
 emitted metrics found in only one run are disclosed in `control_only_metrics` or
 `treatment_only_metrics` and retained in that source's values. `compare-runs` now
-uses report envelope schema **2**
-and machine schema `scriptbots.run-comparison.v2`; consumers of the old
-trajectory-based inference must migrate to the cohort contract.
+uses report envelope schema **2** and machine schema `scriptbots.run-comparison.v3`.
+Each inferential row records `p_value_procedure` and `sign_assignments_evaluated`:
+cohorts of at most twelve independent seed pairs enumerate all `2^n` sign
+assignments; larger cohorts retain seeded Monte Carlo sampling. The configured
+`n_permutations` is the requested Monte Carlo budget, distinct from the actual
+evaluation count. Descriptive rows have no procedure and evaluate zero assignments.
+Both paired tests require within-pair exchangeability under the null; matched
+seeds alone do not establish that assumption. Consumers of the old trajectory-based
+inference must migrate to the cohort contract.
 
 ### Pipeline and maintenance
 
@@ -1426,6 +1803,57 @@ per consumer. Same-revision polls produce nothing. If the source becomes
 unavailable or changes session after connection, the stream emits a typed
 `error` record and closes; clients must handle that refusal explicitly.
 
+#### Browser creature selection and inspection
+
+Click a creature in either Canvas 2D or WebGPU, or enter its stable decimal UID
+in **Creature Inspector**. Both renderers highlight the selected creature.
+The panel reports health, age, generation, energy, lifetime net food balance,
+reproduction progress, lineage, sensory traits, and the brain's recorded inputs
+and outputs. Selection and inspection are presentation operations and do not
+advance the simulation.
+
+Local viewing reads the WASM owner's completed boundary through
+`SimHandle.inspectAgent(uid)`. Remote viewing uses
+`GET /api/agents/inspect?uid=UID&session_id=SESSION&epoch=EPOCH` under the existing
+Host and Origin policy. The result identifies its owner, epoch, inspected tick,
+publication and scientific revisions with exact decimal strings. The panel
+distinguishes an owner observation from the displayed frame and discards replies
+from a previous selection, reset, owner or epoch. Missing creatures and source
+changes are explicit states.
+
+Automatic refresh is limited to four reads per second, with one current request;
+remote reads have a two-second client timeout and a 16 KiB response limit.
+The native owner query has a 250 ms deadline. The projection contains fixed
+signal arrays and a bounded brain label; it does not load genomes or histories,
+so basic inspection also works for brains without a genome-locus browser schema.
+
+Expand **Brain activity and output explanations** to inspect the selected
+creature's named layers, signed activation heatmap, exact node values, actual
+connection weights and canonical output channels. Connection pages retain the
+original weights, and view navigation does not request another observation.
+Local WASM uses `SimHandle.inspectBrain(uid)`; remote viewing uses
+`GET /api/agents/brain?uid=UID&session_id=SESSION&epoch=EPOCH`. Both expose the same
+bounded owner projection and explicitly identify retained evaluator state versus
+verified feed-forward reconstruction.
+
+Brain reads stop while the panel or page is hidden. The panel permits one current
+request, refreshes at most four times per second when publications advance, and
+rejects late selection/source replies. Remote brain responses have a separate
+512 KiB streamed ceiling. Heatmaps contain at most 64 by 64 cells. Core graph
+clipping, unavailable activity, numerical overflow and exhausted explanation
+work are visible outcomes; none is presented as a complete input explanation.
+Path attribution additionally caps edge examinations, pending paths and retained
+contribution rows, so dense cyclic graphs cannot expand without a fixed bound.
+
+DSR passed all 36 Node tests, JavaScript syntax checks and changed Rust formatting.
+It type-checked the current core library and complete runtime test source using
+the pinned compiler and retained locked Cargo dependencies. All 16 tests in the
+actual final attribution module passed against verified unchanged shared types;
+this isolated module lane does not qualify current-core integration. Full web
+and app Cargo checks were attempted but killed by the host memory limit in core
+and asupersync respectively. WASM, actual DOM/WebGPU journeys, HTTP integration
+and the authored native owner execution regressions remain unqualified.
+
 #### Remote browser viewing and stream subscriptions
 
 The web demo's **Remote Server** controls connect its existing Canvas 2D or WebGPU
@@ -1451,31 +1879,48 @@ Send a subscription as JSON text:
 ```
 
 The server acknowledges with `type: "subscribed"`, the correlation `request_id`,
-`protocol_version: 1`, `stream_protocol_version: 1`, decimal-string `session_id`,
+`protocol_version: 1`, `stream_protocol_version: 2`, decimal-string `session_id`,
 selected `channels`, and `max_fps`. Ignore any initial binary summaries until
 that acknowledgment. Every subsequent binary message begins with ASCII `SBWS`,
-a little-endian `u16` version (`1`), and exactly one Postcard `RemoteFrame` from
+a little-endian `u16` version (`2`), and exactly one Postcard `RemoteFrame` from
 `scriptbots_runtime::remote`. Its identity contains the actual host session,
 publication, scientific, control and configuration revisions, and completed tick.
 Every frame also carries observed playback state and `coalesced_publications`.
 The WASM `decode_remote_frame_binary` export validates this envelope and exposes
 all identity/cursor integers as decimal strings under
-`schema: "scriptbots.remote-frame.v1"`. The dynamic canvas payload preserves the
-existing world-v2 schema used by both renderers.
+`schema: "scriptbots.remote-frame.v2"`. The dynamic canvas payload preserves the
+existing world-v2 schema used by both renderers. Stream v2 also carries a bounded
+environment overview from that same publication. JSON controls, subscriptions and
+consumption acknowledgments remain protocol version 1. Rebuild the server, WASM
+decoder and browser together; binary stream v1 is rejected explicitly.
 
 | Channel | Payload and delivery behavior |
 | --- | --- |
 | `telemetry` | Canonical `TickSummaryDto` from one host publication; latest value only. |
-| `canvas` | Complete dynamic-world snapshot from that same publication; latest value only, including paused control changes. |
+| `canvas` | Complete dynamic-world snapshot plus coherent terrain, food and water-depth overview; latest value only, including paused control changes. |
 | `events` | Up to 64 canonical narrative records, oldest first, with session-bound sequence numbers and an exact missing-prefix gap when retention overtakes a reader. Backlogged pages drain even while science is paused. |
 
 Subscriptions contain one through three unique channels. Omitted channels do no
 projection work. `max_fps` defaults to 60 and accepts 1–120; it bounds sampling
-frequency, not simulation speed. Binary frames are capped at 8 MiB, canvas frames
+frequency, not simulation speed. Negotiated streams wake when the owner publishes,
+when a client returns consumption credit, or when its subscription changes. They
+use a one-shot delay only when pending work must wait for the current rate limit;
+an idle stream does not poll for snapshots. Publications coalesce while a client
+has no credit, and an acknowledgement can release another narrative page from
+the same publication without advancing science. Each negotiated connection uses
+one of the owner's 128 bounded publication observers; exhausted observer capacity
+returns a service-unavailable response without replacing a valid subscription.
+The pre-negotiation legacy summary lane retains its 50 ms cadence.
+Binary frames are capped at 8 MiB, canvas frames
 at 65,536 agents, and narrative pages at 64 records with bounded text. An
 unrepresentable source is refused instead of silently truncated. The shared
 decoder rejects unknown versions, trailing data, invalid lengths, non-finite
-presentation values, mismatched ticks and noncontiguous event pages.
+presentation values, mismatched ticks and noncontiguous event pages. Environment
+overviews contain at most 128 × 128 cells and must cover the exact source world.
+Small grids retain every cell; larger grids select the source cell at each
+overview cell's center. This sampling is labelled and does not replace metrics
+with inferred averages. Terrain, food and hydrology revisions remain exact decimal
+strings at the JavaScript boundary. Other stream channels carry no environment.
 
 Each channel has one consumption credit. After consuming a frame, acknowledge its
 exact identity before another frame in that channel can be sent:
@@ -1504,16 +1949,20 @@ publication and has one socket write in flight. Until the browser consumes that
 frame, newer publications coalesce in the host's latest-value slot. This also
 bounds traffic entering a browser whose main thread has fallen behind. No per-tick
 snapshot queue or simulation lock is retained. Projection, socket writes and
-consumption acknowledgments each have a five-second deadline; expired credit is
-checked at the next sampling boundary. Queued blocking preparation is cancelled
-when the connection closes or its preparation deadline expires. Missed timer
-intervals are skipped. Preparation/write work or observed consumption round trips
+consumption acknowledgments each have a five-second deadline. An independent
+one-shot deadline expires the oldest outstanding credit even while the owner is
+paused, no new publications arrive, or all selected channels await consumption.
+Queued blocking preparation is cancelled when the connection closes or its
+preparation deadline expires. Preparation/write work or observed consumption round trips
 exceeding the current sample interval back sampling off to twice the observed
 duration, capped at one second. Eight cheap samples permit a 25% recovery toward
 the requested rate. A `stream_rate`
 JSON notice reports the requested/effective intervals in microseconds and the
 `slow_consumer` or `recovering` decision. Snapshot frames report skipped revisions;
 narrative frames preserve contiguous records or explicitly declare retention loss.
+Publication-triggered scheduling does not establish a measured frame-latency or
+throughput guarantee; those claims require the pinned clean-source DSR performance
+and multi-client qualification described by the original streaming acceptance.
 
 For reconnect, retain only frames successfully consumed by the client and send
 their session-bound cursors:
@@ -1600,12 +2049,60 @@ Omitting `brain_families` selects the existing MLP default. The proposal tool li
 the canonical families installed in the current build; accepted aliases resolve
 through the runner's registry. Unknown or unavailable families and duplicate aliases
 are refused before execution. Configuration-factor combinations expand in declaration
-order, with the requested families inside each combination, and every arm receives
-the same seed cohort. Run and tick budgets include the full product, subject to the
-existing 32-arm ceiling. Empty `factors` requires at least two distinct families.
-The first expanded arm is the statistical control; every later arm is compared
-with it through the existing matched-seed analysis. Result ingestion and notebook
-reproduction bind each arm to its actual family and launch configuration.
+order, with families and then intervention schedules inside each combination.
+Every arm receives the same seed cohort. Run and tick budgets include the full
+product, subject to the existing 32-arm ceiling. Empty `factors` requires at least
+two distinct families or schedules. The first expanded arm is the statistical
+control; every later arm is compared with it through the existing matched-seed
+analysis. Result ingestion and notebook reproduction bind each arm to its actual
+family, launch configuration and exact ordered schedule.
+
+To ask whether two treatment axes change each other's effects, set
+`include_pairwise_interactions` in the proposal before execution. For example:
+
+```json
+{
+  "hypothesis": "Food growth affects MLP and DWRAON populations differently",
+  "falsifier": "The matched-seed interaction remains compatible with zero",
+  "factors": [{"knob_path": "food_growth_rate", "values": [0.01, 0.05]}],
+  "brain_families": ["mlp", "dwraon"],
+  "seeds": {"base": 41, "count": 8},
+  "ticks_per_run": 1000,
+  "metrics": ["alive_agents", "total_food"],
+  "include_pairwise_interactions": true,
+  "budget": {"runs": 32, "ticks": 32000}
+}
+```
+
+This predeclares every two-axis contrast between nonbaseline levels of configuration,
+family, and ordered-schedule axes. At least two axes must vary, and the complete
+treatment grid must fit the existing 32-arm limit. Each seed contributes one
+unscaled difference-in-differences: `both - first - second + baseline`. Other axes
+stay at their first declared levels, so the result is conditional on those levels.
+It is not averaged over the remaining factorial cells. The notebook names the
+exact levels, all four source arms, and their verified run evidence.
+
+Baseline comparisons and interaction tests share one multiple-comparison family;
+bootstrap intervals resample whole seed contrasts. Sign-flip inference requires
+independent seed contrasts symmetric about zero under the null. Matching seeds
+does not establish that assumption. Reproduction schema 4 retains the declared
+design separately from the result table and rederives both from verified source
+treatments and outcomes. Missing cells, changed labels, omitted contrasts, and
+inconsistent results are refused. Omitting the flag preserves baseline-only
+analysis and existing proposal identities.
+
+Builds with the `neuro` feature also admit `neuro`, `neuroflow`, and
+`ml.neuroflow`, recording the canonical family as `ml.neuroflow`. For example,
+`"brain_families": ["mlp", "neuroflow"]` compares the two executable families
+under the same seed schedule. The browser's remote experiment form exposes this
+choice too. Feature-disabled hosts refuse it before reserving execution capacity
+or creating artifacts.
+
+These isolated experiments use their own default NeuroFlow architecture and
+activation; they do not inherit the live host's settings, and the existing
+numeric-factor API does not sweep those fields. Resume and portable-bundle
+verification reconstruct the adapter from the immutable launch manifest, so later
+raw configuration changes cannot replace the family's original constructor.
 
 The experiment REST API (`POST /api/v1/experiments`) and MCP `experiment_create`
 also accept timed configuration treatments on each variant:
@@ -1644,9 +2141,41 @@ configuration stays in the manifest alongside the full treatment declaration.
 Resume verifies completed input receipts and the exact remaining queue, then
 continues it without reapplying completed treatments. Portable verification checks
 that same evidence and the resulting config before recomputing the final science
-digest and endpoint summary. Lab proposal arms currently describe brain families
-and launch factors only, so Lab ingestion and reproduction explicitly refuse
-scheduled bundles rather than discard their treatment provenance.
+digest and endpoint summary.
+
+Lab proposals expose the same treatments through `intervention_schedules`, an
+ordered list of at most eight schedules. Omission defaults to `[[]]`, one
+untreated schedule. Put an empty schedule first to compare delayed treatments
+against an untreated control. For example:
+
+```json
+{
+  "hypothesis": "Pausing food growth changes final food availability",
+  "falsifier": "Matched-seed total-food differences remain compatible with zero",
+  "factors": [],
+  "brain_families": ["mlp"],
+  "intervention_schedules": [
+    [],
+    [
+      {"tick": 0, "set": {"food_growth_rate": 0.0}},
+      {"tick": 500, "set": {"food_growth_rate": 0.04}}
+    ]
+  ],
+  "seeds": {"base": 41, "count": 8},
+  "ticks_per_run": 1000,
+  "metrics": ["total_food", "alive_agents"],
+  "budget": {"runs": 16, "ticks": 16000}
+}
+```
+
+The runner preflights every expanded treatment before execution. Lab ingestion
+requires the bundle's schedule to equal the planned arm, and notebook reproduction
+re-executes that schedule. Lab scientific-row provenance is now version **4** and
+the reproduction input envelope is version **3**, binding the paired p-value
+procedure and actual sign-assignment count. Lab notebooks show those fields
+separately from the requested Monte Carlo budget. Earlier provenance is explicitly
+not comparable; changing a schedule cannot be hidden by retaining the same launch
+configuration. Reproduction inputs are bounded to 32 MiB before output is written.
 
 The summary now declares `schema_version=2`, bound by
 `scriptbots.experiment-run-evidence.v2`. Verification and completed-run recovery
@@ -1680,6 +2209,15 @@ status, or an invalid checkpoint produces a refusal and preserves the evidence.
 Existing final bundle directories are never overwritten; legacy incomplete
 final directories still require explicit reconciliation.
 
+An empty or truncated temporary status write can also recover from the existing
+valid committed status. Running work requires a restorable continuation cut or
+independently verified completed bundle; completed work requires its verified
+bundle. A pending record cannot hide an advanced cut or unfinished publication.
+Recovery preserves the exact truncated bytes in one exclusively created
+`status.json.interrupted/status.tmp` directory before normal execution resumes.
+Missing evidence, invalid complete JSON, aliases and a second retained incident
+remain refusals. Recovery does not reset an already started run to tick zero.
+
 Completed experiment files also reappear through artifact list/get/download after
 restart, using their original IDs. A first request verifies the saved scientific
 evidence and complete bundle before publishing its files; no create or resume
@@ -1693,6 +2231,37 @@ host or checkpoint operation finishes. A successfully stopped unfinished batch
 reports `cancelled`; its unfinished run records retain `running`, with actual
 progress in validated owner/journal cuts for resume. A batch that finishes before
 the request takes effect still reports `completed`.
+
+Read per-run checkpoint progress through `GET /api/v1/experiments/{id}`, MCP
+`experiment_status`, or `control_cli experiment status ID`. Each run includes
+`target_ticks`, the validated plan's requested horizon, and a separate typed
+`checkpoint_progress`:
+
+- `state: "observed"` supplies the saved `tick`, a `checkpoint_digest` containing
+  the BLAKE3 of the complete encoded checkpoint, and its observation `source`.
+  `source: "published"` means the runner successfully wrote, synced and published
+  that cut. `source: "recovered"` means the runner read an existing committed cut,
+  validated its plan/run/build/family identities, and restored its world, owner
+  and journal without advancing science.
+- `state: "unavailable"` identifies not-started work, a pending publication or
+  recovery, or a missing committed checkpoint. It does not imply tick zero.
+- `state: "refused"` distinguishes invalid or unreadable checkpoints and
+  conflicting observations. Explicit resume retries repaired cuts through the
+  existing validation path.
+
+`total_ticks` remains terminal status evidence and stays zero for pending and
+running records, including cancelled unfinished runs. For example, a running
+record can have `total_ticks: 0`, `target_ticks: 1000`, and an observed checkpoint
+at tick 317. The terminal Experiments screen displays this as **Saved/Target**;
+an unavailable observation stays unavailable instead of becoming a zero estimate.
+
+Active status polls read a bounded latest-value cache. A stopped detail request
+recovers at most one cold checkpoint, with at most one recovery in flight per
+runner; repeat detail requests to observe additional retained cuts. Summary
+listings perform no checkpoint recovery. These bounds do not impose a filesystem
+deadline. An observation describes the exact previously seen cut, not continuous
+integrity verification of its current file; downloads and resume retain their
+own validation. Progress reads neither advance science nor rewrite saved status.
 
 Experiment create and resume share one execution budget across REST, MCP and
 cloned control handles. Each worker reserves the smaller of its concurrency and
@@ -1855,6 +2424,167 @@ against. If another client changes it before application, the owner returns
 `config_revision_conflict`; read the current configuration and submit a fresh patch
 to retain the intervening edit. Playback-only changes do not invalidate that guard.
 
+#### Experiments from the shell
+
+Run a matched-seed experiment directly with the application binary:
+
+```bash
+cargo run -p scriptbots-app --bin scriptbots-app -- experiment --example > experiment-plan.json
+cargo run -p scriptbots-app --bin scriptbots-app -- experiment \
+  --plan experiment-plan.json --out runs/matched-experiment
+```
+
+The example is an editable MLP/DWRAON study. Its strict version-1 plan declares
+`experiment_id`, `cohort_id`, exact integer `seeds`, `variants`, `ticks_per_run`,
+and `max_concurrency`. Variants use the same configuration overrides and ordered
+interventions as the existing experiment runner. Input is limited to a regular
+JSON file of at most 1 MiB, and the runner validates the entire plan before
+creating output. This command runs locally without a control server or LLM.
+
+A batch admits at most 4,096 variant/seed pairs and 10,000,000 scientific tick
+transitions across the entire cohort: `variants × seeds × ticks_per_run`.
+For example, two variants and twenty seeds can each run for at most 250,000 ticks.
+The same total limit applies at every `max_concurrency` setting and on resume.
+Oversized requests are rejected with their requested work and the limit; the
+runner preserves the declared horizon and retained artifacts. Read-only catalog,
+status and completed-evidence validation retain their existing provenance rules
+without applying the new execution limit. This counts logical work; it does not
+establish a wall-clock, heap or retained-disk bound.
+REST/MCP requests require `ticks_per_run` in `1..=10,000,000`; omitting it selects
+1,000 ticks. Values outside that range are rejected before catalog admission.
+
+The output directory contains canonical `status.json`, resumable checkpoint cuts,
+and portable per-run artifacts under `bundles/`. Repeat the identical command to
+continue unfinished work from its validated cuts. Already completed runs have
+their bundles verified and retain their original output. A changed plan, malformed
+saved state, or unrelated nonempty output directory is refused with retained
+artifacts preserved. Successful stdout is the canonical status JSON; failed or
+incomplete batches exit with a nonzero status. Inspect `failed_runs`, individual
+run errors, and retained files before retrying.
+
+For a running control server, use the control CLI:
+
+The control CLI exposes the same matched-seed experiment service as REST and MCP.
+Save an experiment request such as the `food-pause-recovery` example above to
+`experiment.json`, then submit it to a running server:
+
+```bash
+cargo run -p scriptbots-app --bin control_cli -- \
+  --idempotency-key food-study-1 experiment create --file experiment.json
+cargo run -p scriptbots-app --bin control_cli -- experiment list --limit 20
+cargo run -p scriptbots-app --bin control_cli -- experiment status food-pause-recovery
+cargo run -p scriptbots-app --bin control_cli -- experiment compare food-pause-recovery \
+  --baseline control --challenger pause-recovery --metric alive_agents
+```
+
+`create --file -` reads one bounded JSON request from standard input. List output
+retains the server's opaque `next_cursor`; pass that value unchanged with
+`--cursor` to request the next page. Successful commands print the complete JSON
+result so scripts can inspect run state, execution capacity and comparison
+provenance. Server refusals retain their status and response body in the reported
+error. Comparison requires both selected cohorts to be complete and passes
+through the existing bundle and checkpoint verification.
+
+Use `experiment cancel ID` to request a cooperative stop and `experiment resume ID`
+to continue the saved batch. Cancellation can return `cancelling`, and a batch
+that already finished can still report `completed`; inspect `experiment status ID`
+for the observed outcome. Resume uses the validated saved owner/journal cuts and
+does not start an unrelated run. Reuse the original create payload and
+`--idempotency-key` after a lost create response.
+
+#### Checkpoints and artifacts from the shell
+
+The same control CLI captures checkpoints and discovers retained artifacts. Use
+the identifiers returned in the JSON output for status and download requests:
+
+```bash
+cargo run -p scriptbots-app --bin control_cli -- \
+  --idempotency-key baseline-cut-1 checkpoint create --description "Before treatment"
+cargo run -p scriptbots-app --bin control_cli -- checkpoint list --limit 20
+cargo run -p scriptbots-app --bin control_cli -- checkpoint status CHECKPOINT_ID
+cargo run -p scriptbots-app --bin control_cli -- checkpoint download CHECKPOINT_ID \
+  --out runs/baseline.checkpoint
+cargo run -p scriptbots-app --bin control_cli -- artifact list --limit 20
+cargo run -p scriptbots-app --bin control_cli -- artifact status ARTIFACT_ID
+cargo run -p scriptbots-app --bin control_cli -- artifact download ARTIFACT_ID \
+  --out runs/retained-artifact.bin
+cargo run -p scriptbots-app --bin control_cli -- schema
+```
+
+Checkpoint and artifact lists preserve opaque cursors with the same `--cursor`
+option as experiment lists. Downloads require an explicit new `--out` path,
+enforce the server's 64 MiB ceiling, and verify the returned identity, byte count,
+content type, BLAKE3 and SHA-256 checksums before creating the output. Checkpoint
+downloads additionally bind the artifact to the checkpoint metadata. Success
+prints the path, byte count and both hashes as JSON.
+
+Existing files and symlinks are refused, including a destination created during
+the request. Validation failures create no destination file; write or sync errors
+report and preserve any partial output. A downloaded checkpoint contains the core
+science state; complete application-owner continuation remains a separate workflow.
+
+#### Run a future from a saved checkpoint
+
+Start an independent scientific future from a checkpoint while the live simulation
+continues under its existing owner. Save this request as `branch.json`, replacing
+`CHECKPOINT_ID` with an identifier returned by `checkpoint create` or `checkpoint list`:
+
+```json
+{
+  "checkpoint_id": "CHECKPOINT_ID",
+  "branch_name": "food-treatment",
+  "ticks": 240,
+  "intervention": {"type": "ConfigPatch", "params": {"food_growth_rate": 0.0}},
+  "idempotency_key": "food-treatment-1"
+}
+```
+
+```bash
+cargo run -p scriptbots-app --bin control_cli -- checkpoint branch create --file branch.json
+cargo run -p scriptbots-app --bin control_cli -- checkpoint branch status BRANCH_ID
+cargo run -p scriptbots-app --bin control_cli -- checkpoint branch cancel BRANCH_ID
+# After status reports completed, download its artifact_id:
+cargo run -p scriptbots-app --bin control_cli -- artifact download ARTIFACT_ID \
+  --out runs/branch-report.json
+```
+
+Omit `intervention` for one unchanged future; supplying it runs matched control
+and treatment branches from the same saved state. `ticks` is an additional horizon
+of 1–10,000 transitions. Requests are limited to 16 KiB, branch names to 64 ASCII
+letters/digits/underscores/hyphens, and the required retry key to 1,024 bytes.
+Repeat the exact request and key after an uncertain response. An optional global
+`--idempotency-key` must match the JSON key.
+
+REST uses the same JSON with `POST /api/v1/checkpoints/branches` (HTTP 202),
+`GET /api/v1/checkpoints/branches/{branch_id}` and
+`POST /api/v1/checkpoints/branches/{branch_id}/cancel`. MCP exposes
+`checkpoint_branch_create`, `checkpoint_branch_status` and `checkpoint_branch_cancel`.
+Admission does not establish completion: poll until `completed`, `cancelled` or
+`failed`. Cancellation can first report `cancelling`; completion may win the race.
+`world_digest_v1` identifies the source cut, and only completion publishes the report
+`artifact_id`. Jobs belong to the current control-service process; retained files
+are preserved, but branch execution/status is not resumed after a service restart.
+
+In the simulation terminal, open **Replay** (`7`), select a saved checkpoint, and
+press **N**. Choose the horizon with **Up/Down** or **+/-** and the treatment with
+**Left/Right**, then press **Enter** to start. **Esc/X** discards the draft; **X**
+in Replay requests cancellation of an active study. The status panel identifies
+the source and target ticks, observed execution state, and completed report artifact.
+Press **B** to browse retained studies, **Enter** to select one, then **Enter/V**
+to read its verified report. **[ / ]** navigate the first/next catalog page,
+**R** refreshes, and **Page Up/Page Down** scroll long results. **A/Esc** returns
+to saved checkpoints. The active study owned by this terminal is labelled
+separately from the retained study being inspected.
+
+The report compares one source trajectory and does not count its ticks as independent
+replicates. The saved cut restores science state; the original owner's pending commands,
+session and storage ownership remain with the live run.
+
+The published `study_plan.json` names the retained `source_checkpoint.bin`, allowing
+offline study execution to reproduce the same saved cut. If you download or move
+these files, update the plan's `source_checkpoint` to the source file's new path
+before running it into a fresh output directory.
+
 Interactive dashboard:
 ```bash
 # Live TUI dashboard of knobs and their current values; press 'q' to quit, 'r' to refresh
@@ -1973,6 +2703,14 @@ Runtime constraints:
 We maintain a sibling browser-targeted crate, `scriptbots-web`, that reuses core crates without invasive changes. See `PLAN_TO_CREATE_SIBLING_APP_CRATE_TARGETING_WASM.md` and `docs/wasm/` (ADRs, audits, capability matrix). Initial MVP runs single-threaded by disabling `scriptbots-core`’s `parallel` feature on wasm; WebGPU vs Canvas2D rendering is under evaluation.
 
 > Quick peek: `crates/scriptbots-web/web/` ships a Canvas demo harness that consumes the wasm snapshots, surfaces live metrics, and can be served locally via `python -m http.server`. Binary snapshots (`snapshot_format: "binary"`) and custom seeding strategies are already wired in for experimentation.
+
+The **World layers** selector offers combined terrain/food/water, terrain, food
+availability, water depth and agents-only views in both Canvas and WebGPU.
+Environment and agents come from the same immutable owner publication in local
+and remote mode. Layer switching does not tick or edit the world. The status line
+identifies exact cells versus a bounded center-sampled overview and reports disabled
+hydrology or unavailable layers. Empty or extinct populations still show their
+environment, and missing observations clear the previous background.
 
 The browser supports explicit saved continuations for MLP and Unbound worlds.
 Choose the brain for a new world, Reset, then use **Save in This Browser** to
@@ -2145,6 +2883,35 @@ lane evidence, and uploads its raw logs and observations even after a failed run
 Unprovisioned controllers leave execution pending; workflow wiring does not prove
 that CI ran. The original wire-level control probe remains a separate CI job.
 This matrix covers bounded tournament smoke, not the full publication protocol.
+
+### Comparing FtBrain with MLP
+
+The tournament runner accepts the versioned FtBrain family when the application
+is built with `brain-ft`. The bundled opt-in profile exercises real founding
+genomes, both spawn orders, equal founder cohorts, result rows and leaderboard
+generation:
+
+```bash
+cargo run -p scriptbots-app --features brain-ft -- tournament \
+  --spec tournament/ft_comparison.toml --smoke --out runs/ft-comparison
+```
+
+The smoke profile uses two seeds, two orders, eight founders and 32 ticks per
+match; omit `--smoke` for four seeds, 16 founders and 240 ticks. Both require an
+identical rerun. These are bounded architecture comparisons, not evidence of
+long-horizon evolution or a superior family. Ft uses its default dense hidden
+layers `[48, 32, 24]`; the existing MLP architecture differs. The report retains
+the actual initial genome digests and source-scalar counts. Ft's initial count
+comes from validated genome structure, without claiming recorded activity before
+the first scientific tick.
+
+`ft` and `frankentorch` select the same family in CLI/spec inputs. Explicit labels
+such as `ft-control` remain distinct experimental arms. A build without `brain-ft`
+refuses the family before starting matches. NeuroFlow remains unavailable to this
+heritable tournament because its legacy runner lacks the canonical
+genome/evaluator adapter. The canonical `tournament/spec.toml` retains its existing
+200-source-scalar requirement; the new mixed-architecture profile explicitly
+omits that requirement instead of weakening it globally.
 
 ## Roadmap (condensed)
 1. Core data structures and config (done); expand parity (metabolism, locomotion, food math, carcass sharing).

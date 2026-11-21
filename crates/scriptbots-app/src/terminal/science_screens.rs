@@ -16,6 +16,7 @@ use super::frankentui_shell::SHELL_FOOTER_ROWS;
 use ftui::render::cell::Cell;
 use ftui::render::drawing::Draw;
 use ftui::render::frame::Frame;
+use scriptbots_runtime::lab_workflows::LabMetric;
 use serde::{Deserialize, Serialize};
 
 /// Bounded, cancellable query state for a routed science screen.
@@ -196,6 +197,7 @@ pub struct ExperimentArmView {
     pub variant_id: String,
     pub brain_family: String,
     pub seed: u64,
+    /// Last observed sealed checkpoint, or terminal completed tick; never an estimate.
     pub current_tick: Option<u64>,
     pub target_ticks: u64,
     pub mean_fitness: Option<f32>,
@@ -210,29 +212,64 @@ pub type ExperimentComparisonSummary = crate::control::ExperimentComparisonDto;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExperimentsViewData {
     pub experiment_id: String,
+    /// Immutable plan identity observed with this batch status.
+    pub plan_digest: String,
+    /// Exact status generation used to bind asynchronous comparison results.
+    pub status_generation: u64,
     pub batch_status: String,
     pub active_arms: Vec<ExperimentArmView>,
     pub selected_arm_index: usize,
     /// Optional baseline pinned with Enter; C compares the selected variant against it.
     #[serde(default)]
     pub comparison_baseline: Option<String>,
-    pub comparison_summary: Option<Box<ExperimentComparisonSummary>>,
+    /// Final-state endpoint requested by C, with the shared native scientific units.
+    #[serde(default)]
+    pub comparison_metric: LabMetric,
+    pub comparison_summary: Option<ExperimentComparisonSummary>,
 }
 
 impl Default for ExperimentsViewData {
     fn default() -> Self {
         Self {
             experiment_id: String::new(),
+            plan_digest: String::new(),
+            status_generation: 0,
             batch_status: "Idle".into(),
             active_arms: Vec::new(),
             selected_arm_index: 0,
             comparison_baseline: None,
+            comparison_metric: LabMetric::default(),
             comparison_summary: None,
         }
     }
 }
 
 impl ExperimentsViewData {
+    /// Evidence is displayed only for the chosen endpoint and observed batch source.
+    pub fn current_comparison(&self) -> Option<&ExperimentComparisonSummary> {
+        self.comparison_summary.as_ref().filter(|comparison| {
+            comparison.experiment_id == self.experiment_id
+                && comparison.plan_digest == self.plan_digest
+                && comparison.status_generation == self.status_generation
+                && comparison.metric == self.comparison_metric.key()
+        })
+    }
+
+    /// Move through the shared endpoint catalog and discard the previous observation.
+    pub fn cycle_comparison_metric(&mut self, forward: bool) {
+        let index = LabMetric::ALL
+            .iter()
+            .position(|metric| *metric == self.comparison_metric)
+            .unwrap_or_default();
+        let next = if forward {
+            (index + 1) % LabMetric::ALL.len()
+        } else {
+            (index + LabMetric::ALL.len() - 1) % LabMetric::ALL.len()
+        };
+        self.comparison_metric = LabMetric::ALL[next];
+        self.comparison_summary = None;
+    }
+
     /// Resolve two distinct variants, never two seed rows of the same treatment.
     pub fn comparison_pair(&self) -> Option<(String, String)> {
         let selected = &self.active_arms.get(self.selected_arm_index)?.variant_id;
@@ -756,6 +793,175 @@ pub fn render_brain_arena_screen(
     }
 }
 
+/// Render the shared application-owned Lab model in the actual terminal.
+/// Catalog rows and variants retain distinct identities; no run-row truncation
+/// can hide a challenger or silently substitute the first experiment.
+pub(super) fn render_live_experiments_screen(
+    frame: &mut ratatui::Frame<'_>,
+    lab: &super::TerminalExperimentLab,
+    style: ratatui::style::Style,
+) {
+    use ratatui::{
+        layout::Rect,
+        text::Line,
+        widgets::{Clear, Paragraph, Wrap},
+    };
+    use scriptbots_runtime::lab_workflows::comparison_lines;
+
+    let workflows = &lab.workflows;
+    let selected = lab.selected_row.as_deref();
+    let scroll = lab.scroll;
+    let area = frame.area();
+    let body = Rect::new(
+        area.x,
+        area.y + area.height.min(3),
+        area.width,
+        area.height.saturating_sub(3 + SHELL_FOOTER_ROWS),
+    );
+    frame.render_widget(Clear, body);
+    let mut lines = vec!["EXPERIMENT LAB — matched-seed studies".to_owned()];
+    if !workflows.composing_experiment {
+        lines.push("Up/Down select · Enter inspect · R refresh · PgUp/PgDn scroll".into());
+    }
+    if workflows.submit.is_none() {
+        lines.push("Experiment services are unavailable on this source.".into());
+    } else if workflows.composing_experiment {
+        lines.extend(lab.composer_lines());
+    } else if let Some(batch) = &workflows.batch {
+        lines.push("A catalog · B baseline · V challenger · M or [/] metric · C compare · X discard pending result".into());
+        lines.push("N new experiment · D cancel batch · U resume retained batch".into());
+        lines.push(format!(
+            "Experiment {}: {}",
+            batch.summary.experiment_id, batch.summary.status
+        ));
+        lines.push(format!(
+            "Completed {}/{}; failed {} · observed generation {}",
+            batch.summary.completed_runs,
+            batch.summary.total_runs,
+            batch.summary.failed_runs,
+            batch.generation
+        ));
+        if let Some(error) = &batch.error_reason {
+            lines.push(format!("Execution error: {error}"));
+        }
+        lines.push(format!(
+            "Baseline: {} · Challenger: {} · {} ({})",
+            workflows.baseline.as_deref().unwrap_or("unselected"),
+            workflows.challenger.as_deref().unwrap_or("unselected"),
+            workflows.metric.label(),
+            workflows.metric.unit()
+        ));
+        let selected_index = selected
+            .and_then(|id| batch.variants.iter().position(|row| row.variant_id == id))
+            .unwrap_or(0);
+        let first = first_visible_table_index(selected_index, SCIENCE_TABLE_ROWS);
+        lines.push(format!(
+            "Arms {}–{} of {} (all admitted seeds counted)",
+            first.saturating_add(1).min(batch.variants.len()),
+            (first + SCIENCE_TABLE_ROWS).min(batch.variants.len()),
+            batch.variants.len()
+        ));
+        for row in batch.variants.iter().skip(first).take(SCIENCE_TABLE_ROWS) {
+            let marker = if selected == Some(row.variant_id.as_str()) {
+                ">"
+            } else {
+                " "
+            };
+            lines.push(format!(
+                "{marker} {} · {} · completed {}/{} · running {} · failed {}",
+                row.variant_id,
+                row.brain_family,
+                row.completed_runs,
+                row.total_runs,
+                row.running_runs,
+                row.failed_runs
+            ));
+        }
+        if let Some(comparison) = &workflows.comparison {
+            lines.push(String::new());
+            lines.extend(comparison_lines(comparison));
+        } else {
+            lines.push(
+                "Comparison appears only after both selected arms have verified matched endpoints."
+                    .into(),
+            );
+        }
+        lines.push(format!("Admitted plan: {}", batch.plan_digest));
+    } else if workflows.selected_experiment.is_some() {
+        lines.push(format!(
+            "Selected experiment: {}",
+            workflows.selected_experiment.as_deref().unwrap_or_default()
+        ));
+        lines.push("Loading experiment details… A returns to the catalog.".into());
+    } else {
+        lines.push(
+            "N new experiment · [ first catalog page · ] next page · X discard pending result"
+                .into(),
+        );
+        if let Some(page) = &workflows.experiments {
+            lines.push(format!(
+                "Catalog {}–{} of {} · reserved run slots {}/{}",
+                page.offset.saturating_add(1).min(page.total),
+                page.offset + page.items.len(),
+                page.total,
+                page.reserved_run_slots,
+                page.max_run_slots
+            ));
+            let selected_index = selected
+                .and_then(|id| page.items.iter().position(|row| row.experiment_id == id))
+                .unwrap_or(0);
+            let first = first_visible_table_index(selected_index, SCIENCE_TABLE_ROWS);
+            for row in page.items.iter().skip(first).take(SCIENCE_TABLE_ROWS) {
+                let marker = if selected == Some(row.experiment_id.as_str()) {
+                    ">"
+                } else {
+                    " "
+                };
+                lines.push(format!("{marker} {}", row.experiment_id));
+                lines.push(format!(
+                    "  {} · completed {}/{} · failed {}",
+                    row.status, row.completed_runs, row.total_runs, row.failed_runs
+                ));
+            }
+            if page.items.is_empty() {
+                lines.push("No retained experiments on this page.".into());
+            }
+        } else {
+            lines.push("Loading the experiment catalog…".into());
+        }
+    }
+    if let Some(mutation) = &lab.mutation
+        && !mutation.finished
+    {
+        let started = mutation
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .started;
+        lines.push(if started {
+            "Awaiting the experiment service result.".into()
+        } else {
+            "Request awaits a complete visible receipt before submission.".into()
+        });
+    } else if workflows.is_busy() {
+        lines.push("Loading experiment data…".into());
+    }
+    if let Some(notice) = &workflows.notice {
+        lines.push(notice.clone());
+    }
+    let paragraph = Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+        .style(style)
+        .wrap(Wrap { trim: false });
+    let maximum_scroll = paragraph
+        .line_count(body.width)
+        .saturating_sub(usize::from(body.height));
+    let scroll = usize::from(scroll)
+        .min(maximum_scroll)
+        .min(usize::from(u16::MAX)) as u16;
+    frame.render_widget(paragraph.scroll((scroll, 0)), body);
+}
+
 /// Render Experiments science screen (variants, confidence intervals, comparison).
 pub fn render_experiments_screen(
     frame: &mut Frame,
@@ -783,6 +989,16 @@ pub fn render_experiments_screen(
             render_state_banner(frame, y_start + 2, None, None, Some((*query_id, error)));
         }
         ScreenDataState::Data(data) => {
+            print_text(
+                frame,
+                2,
+                y_start + 1,
+                &format!(
+                    "  [ / ] endpoint: {} ({})",
+                    data.comparison_metric.label(),
+                    data.comparison_metric.unit()
+                ),
+            );
             let status = format!(
                 "  Experiment ID: {:<16} Batch Status: {}",
                 data.experiment_id, data.batch_status
@@ -804,7 +1020,7 @@ pub fn render_experiments_screen(
                 frame,
                 4,
                 y_start + 5,
-                "  Arm Variant    Family     Seed    Ticks/Target  Fitness  95% Conf Interval",
+                "  Arm Variant    Family     Seed    Saved/Target  Fitness  95% Conf Interval",
             );
             print_text(
                 frame,
@@ -853,7 +1069,7 @@ pub fn render_experiments_screen(
 
             let comp_y = y_start + 12;
             print_text(frame, 2, comp_y, "  MATCHED-SEED ENDPOINT COMPARISON:");
-            if let Some(comp) = &data.comparison_summary {
+            if let Some(comp) = data.current_comparison() {
                 print_text(
                     frame,
                     4,
@@ -863,17 +1079,15 @@ pub fn render_experiments_screen(
                         comp.baseline_variant, comp.challenger_variant
                     ),
                 );
-                let metric = if comp.metric == "alive_agents" {
-                    "Population (agents)"
-                } else {
-                    &comp.metric
-                };
+                let metric = data.comparison_metric;
                 print_text(
                     frame,
                     4,
                     comp_y + 2,
                     &format!(
-                        "{metric} at tick {}: paired n={}",
+                        "{} ({}) at tick {}: paired n={}",
+                        metric.label(),
+                        metric.unit(),
                         comp.endpoint_tick,
                         comp.matched_seeds.len()
                     ),
@@ -885,8 +1099,9 @@ pub fn render_experiments_screen(
                     4,
                     comp_y + 3,
                     &format!(
-                        "Challenger - baseline: {:+.3}; 95% CI: {interval}",
-                        comp.mean_difference
+                        "Challenger - baseline: {:+.3}; 95% CI: {interval} ({})",
+                        comp.mean_difference,
+                        metric.unit()
                     ),
                 );
                 print_text(
@@ -917,6 +1132,22 @@ pub fn render_experiments_screen(
                 {
                     print_text(frame, 4, comp_y + 6, reason);
                 }
+                print_text(
+                    frame,
+                    4,
+                    comp_y + 7,
+                    &format!(
+                        "Plan {} | status generation {}",
+                        comp.plan_digest.get(..12).unwrap_or(&comp.plan_digest),
+                        comp.status_generation
+                    ),
+                );
+                print_text(
+                    frame,
+                    4,
+                    comp_y + 8,
+                    "Metric requests are separate comparisons, not one jointly corrected analysis.",
+                );
             } else {
                 print_text(
                     frame,
@@ -927,6 +1158,201 @@ pub fn render_experiments_screen(
             }
         }
     }
+}
+
+/// Render saved checkpoints and verified study outcomes from the shared Lab.
+/// The terminal's existing branch composer and mutation receipts stay separate.
+pub(super) fn render_live_replay_screen(
+    frame: &mut ratatui::Frame<'_>,
+    lab: &super::TerminalReplayLab,
+    active_study: Option<&crate::control::CheckpointBranchStatusDto>,
+    live_tick: u64,
+    style: ratatui::style::Style,
+) {
+    use ratatui::{
+        layout::Rect,
+        text::Line,
+        widgets::{Clear, Paragraph, Wrap},
+    };
+    use scriptbots_runtime::lab_workflows::{LabCheckpointView, branch_report_lines};
+
+    let workflows = &lab.workflows;
+    let selected = lab.selected_row.as_deref();
+    let area = frame.area();
+    let body = Rect::new(
+        area.x,
+        area.y + area.height.min(3),
+        area.width,
+        area.height.saturating_sub(3 + SHELL_FOOTER_ROWS),
+    );
+    frame.render_widget(Clear, body);
+    let mut lines = vec![
+        "SAVED CHECKPOINTS & BRANCH STUDIES".to_owned(),
+        "Up/Down select · R refresh · PgUp/PgDn scroll · G live canvas".into(),
+        format!("Observed live tick: {live_tick}. Browsing leaves the live owner unchanged."),
+    ];
+    if let Some(study) = active_study {
+        lines.push(format!(
+            "This terminal's study {}: {} · saved {} -> target {}",
+            study.branch_name, study.status, study.source_tick, study.target_tick
+        ));
+        lines.push(format!(
+            "Study ID: {} · source digest: {}",
+            study.branch_id, study.world_digest_v1
+        ));
+        if matches!(study.status.as_str(), "running" | "cancelling") {
+            lines.push(
+                "X requests a stop of this terminal's active study and discards a pending read."
+                    .into(),
+            );
+        } else if let Some(artifact) = &study.artifact_id {
+            lines.push(format!(
+                "Completed report artifact: {artifact} · B opens retained study results."
+            ));
+        } else if let Some(error) = &study.error_reason {
+            lines.push(format!("Study outcome: {error}"));
+        }
+    }
+    let heading_rows = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(5);
+    let table_rows =
+        usize::from(body.height.saturating_sub(heading_rows) / 2).clamp(1, SCIENCE_TABLE_ROWS);
+    match workflows.checkpoint_view {
+        LabCheckpointView::SavedCuts => {
+            lines.push(
+                "Enter reviews saved canvas · K save · N new study · B retained studies".into(),
+            );
+            lines.push("[ first checkpoint page · ] next page".into());
+            if let Some(page) = &workflows.checkpoints {
+                lines.push(format!(
+                    "Saved cuts {}–{} of {} · retained bytes {}/{}",
+                    page.offset.saturating_add(1).min(page.total),
+                    page.offset + page.items.len(),
+                    page.total,
+                    page.retained_bytes,
+                    page.max_bytes,
+                ));
+                let index = selected
+                    .and_then(|id| page.items.iter().position(|row| row.checkpoint_id == id))
+                    .unwrap_or(0);
+                let first = first_visible_table_index(index, table_rows);
+                for row in page.items.iter().skip(first).take(table_rows) {
+                    let marker = if selected == Some(row.checkpoint_id.as_str()) {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!(
+                        "{marker} {} · tick {} · {} agents · {} bytes",
+                        row.checkpoint_id, row.tick, row.agent_count, row.byte_size
+                    ));
+                    lines.push(format!("  Scientific digest: {}", row.world_digest));
+                }
+                if page.items.is_empty() {
+                    lines.push(
+                        "No saved checkpoints on this page. K saves the current owner cut.".into(),
+                    );
+                }
+            } else {
+                lines.push("No checkpoint catalog page is loaded. R requests it.".into());
+            }
+        }
+        LabCheckpointView::BranchCatalog => {
+            lines.push(
+                "Enter inspects a study · A saved checkpoints · [ first study page · ] next page"
+                    .into(),
+            );
+            if let Some(page) = &workflows.checkpoint_branches {
+                lines.push(format!(
+                    "Retained studies {}–{} of {}",
+                    page.offset.saturating_add(1).min(page.total),
+                    page.offset + page.items.len(),
+                    page.total
+                ));
+                let index = selected
+                    .and_then(|id| page.items.iter().position(|row| row.branch_id == id))
+                    .unwrap_or(0);
+                let first = first_visible_table_index(index, table_rows);
+                for row in page.items.iter().skip(first).take(table_rows) {
+                    let marker = if selected == Some(row.branch_id.as_str()) {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!(
+                        "{marker} {} · {} · {}",
+                        row.branch_name, row.status, row.branch_id
+                    ));
+                    lines.push(format!(
+                        "  Saved tick {} -> target {} · checkpoint {}",
+                        row.source_tick, row.target_tick, row.checkpoint_id
+                    ));
+                }
+                if page.items.is_empty() {
+                    lines.push(
+                        "No retained studies on this page. A returns to saved sources.".into(),
+                    );
+                }
+            } else {
+                lines.push("No retained-study page is loaded. R requests it.".into());
+            }
+        }
+        LabCheckpointView::BranchDetail => {
+            lines.push(
+                "Enter or V reads verified results · B study catalog · A saved checkpoints".into(),
+            );
+            if let Some(study) = &workflows.branch {
+                lines.push(format!(
+                    "Study {}: {} · {}",
+                    study.branch_name, study.status, study.branch_id
+                ));
+                lines.push(format!(
+                    "Saved checkpoint {} at tick {} -> target tick {}",
+                    study.checkpoint_id, study.source_tick, study.target_tick
+                ));
+                lines.push(format!("Saved scientific digest: {}", study.world_digest));
+                if let Some(error) = &study.error_reason {
+                    lines.push(format!("Execution outcome: {error}"));
+                }
+                if let Some(artifact) = &study.artifact_id {
+                    lines.push(format!("Report artifact: {artifact}"));
+                }
+                if let Some(report) = &workflows.branch_report {
+                    lines.push(String::new());
+                    lines.extend(branch_report_lines(report));
+                } else {
+                    lines.push(
+                        "No verified endpoint report is loaded. Read results after completion."
+                            .into(),
+                    );
+                }
+            } else {
+                lines.push(
+                    "Selected study details are unavailable. R refreshes its receipt.".into(),
+                );
+            }
+        }
+        LabCheckpointView::BranchComposer => {
+            lines.push(
+                "A returns to saved checkpoints; N opens the terminal study composer.".into(),
+            );
+        }
+    }
+    if workflows.is_busy() {
+        lines.push("Loading checkpoint or study evidence…".into());
+    }
+    if let Some(notice) = &workflows.notice {
+        lines.push(notice.clone());
+    }
+    let paragraph = Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+        .style(style)
+        .wrap(Wrap { trim: false });
+    let maximum_scroll = paragraph
+        .line_count(body.width)
+        .saturating_sub(usize::from(body.height));
+    let scroll = u16::try_from(usize::from(lab.scroll).min(maximum_scroll)).unwrap_or(u16::MAX);
+    frame.render_widget(paragraph.scroll((scroll, 0)), body);
 }
 
 /// Render Replay science screen (checkpoints, divergence, export).
@@ -1555,6 +1981,7 @@ mod tests {
             ShellRoute::Experiments,
             ShellMessage::SetExperimentsData(ScreenDataState::Data(data.clone())),
         );
+        assert!(frame.contains("Saved/Target"));
         assert!(row(&frame, "measured-arm").contains("0/100"));
         assert!(row(&frame, "measured-arm").contains("[0.00, 0.00]"));
         assert!(!row(&frame, "measured-arm").contains("unavailable"));

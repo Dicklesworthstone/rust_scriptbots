@@ -8,7 +8,7 @@
 use scriptbots_app::BuildProvenanceV0;
 use scriptbots_app::lab::llm::{PROPOSE_EXPERIMENT_TOOL_NAME, ScriptedClient, ScriptedTurn};
 use scriptbots_app::lab::notebook::{
-    NotebookContext, NotebookRenderer, claims_from_analysis, run_refs,
+    NotebookContext, NotebookRenderer, claims_from_analysis_with_interactions, run_refs,
 };
 use scriptbots_app::lab_assistant::{LabBudget, LabPhase, LabStateMachine};
 
@@ -29,6 +29,23 @@ fn spec_input() -> serde_json::Value {
     })
 }
 
+fn interaction_spec_input() -> serde_json::Value {
+    let mut input = spec_input();
+    input["hypothesis"] = "food growth and decay jointly change final food availability".into();
+    input["falsifier"] = "the matched-seed conditional interaction is zero".into();
+    input["factors"] = serde_json::json!([
+        {"knob_path": "food_growth_rate", "values": [0.01, 0.02]},
+        {"knob_path": "food_decay_rate", "values": [0.0, 0.01]},
+        {"knob_path": "world_width", "values": [100]},
+        {"knob_path": "world_height", "values": [100]}
+    ]);
+    input["include_pairwise_interactions"] = true.into();
+    // Deliberately nonalphabetical: reproduction retains the declared family order.
+    input["metrics"] = serde_json::json!(["total_food", "alive_agents"]);
+    input["budget"] = serde_json::json!({"runs": 8, "ticks": 16});
+    input
+}
+
 /// Runs the REAL pipeline end-to-end: validated spec -> real worlds -> real
 /// analysis -> materialized notebook. No provider and no mocks anywhere.
 fn real_notebook(root: &std::path::Path) -> std::path::PathBuf {
@@ -42,6 +59,8 @@ fn materialize_real_notebook(
 ) -> std::path::PathBuf {
     let hypothesis = input["hypothesis"].as_str().unwrap().to_owned();
     let falsifier = input["falsifier"].as_str().unwrap().to_owned();
+    let max_runs = usize::try_from(input["budget"]["runs"].as_u64().unwrap()).unwrap();
+    let max_ticks = input["budget"]["ticks"].as_u64().unwrap();
     let turn = ScriptedTurn::from_body(serde_json::json!({
         "stop_reason": "tool_use",
         "usage": {"input_tokens": 4, "output_tokens": 6},
@@ -54,8 +73,8 @@ fn materialize_real_notebook(
     let mut lab = LabStateMachine::new(
         Box::new(ScriptedClient::new("offline-scripted", vec![turn])),
         LabBudget {
-            max_runs: 4,
-            max_ticks: 8,
+            max_runs,
+            max_ticks,
             max_tokens: 1_000,
             max_iterations: 10,
         },
@@ -72,15 +91,22 @@ fn materialize_real_notebook(
     }
     let summaries = lab.run_summaries.clone();
     let analysis = lab.analysis.clone().expect("canonical analysis");
-    let claims = claims_from_analysis(&analysis, &summaries, &hypothesis, &falsifier)
-        .expect("claims rederive");
+    let declaration = &lab.validated_spec.as_ref().unwrap().interaction_contrasts;
+    let claims = claims_from_analysis_with_interactions(
+        &analysis,
+        &summaries,
+        declaration,
+        &hypothesis,
+        &falsifier,
+    )
+    .expect("claims rederive");
     let context = NotebookContext {
         model_id: "offline-scripted".to_owned(),
         build: BuildProvenanceV0::current(),
-        max_runs: 4,
-        runs_charged: 4,
-        max_ticks: 8,
-        ticks_charged: 8,
+        max_runs,
+        runs_charged: lab.runs_spent,
+        max_ticks,
+        ticks_charged: lab.ticks_spent,
         max_tokens: 1_000,
         tokens_charged: 10,
         max_iterations: 10,
@@ -190,8 +216,16 @@ fn repin_input(notebook: &std::path::Path, input: &serde_json::Value) {
 }
 
 fn assert_semantic_refusal(mutate: impl FnOnce(&mut serde_json::Value), diagnostic: &str) {
+    assert_spec_semantic_refusal(spec_input(), mutate, diagnostic);
+}
+
+fn assert_spec_semantic_refusal(
+    proposal: serde_json::Value,
+    mutate: impl FnOnce(&mut serde_json::Value),
+    diagnostic: &str,
+) {
     let temp = tempfile::tempdir().expect("temp root");
-    let notebook = real_notebook(temp.path());
+    let notebook = materialize_real_notebook(temp.path(), false, proposal);
     let mut input = read_json(&notebook.join("reproduction.json"));
     mutate(&mut input);
     repin_input(&notebook, &input);
@@ -215,6 +249,126 @@ fn assert_semantic_refusal(mutate: impl FnOnce(&mut serde_json::Value), diagnost
         retained_files(temp.path()),
         retained,
         "refusal rewrote evidence or began a rerun"
+    );
+}
+
+#[test]
+fn conditional_interactions_reproduce_four_observed_cells_and_the_joint_family() {
+    let temp = tempfile::tempdir().expect("temporary interaction root");
+    let notebook = materialize_real_notebook(temp.path(), true, interaction_spec_input());
+    let input = read_json(&notebook.join("reproduction.json"));
+    assert_eq!(input["schema"], 4);
+    assert_eq!(
+        input["interaction_contrasts"],
+        input["analysis"]["interaction_contrasts"]
+    );
+    assert_eq!(
+        input["analysis"]["metrics"],
+        serde_json::json!(["total_food", "alive_agents"])
+    );
+    let design = &input["interaction_contrasts"][0];
+    assert_eq!(design["first"]["axis"]["knob_path"], "food_decay_rate");
+    assert_eq!(design["second"]["axis"]["knob_path"], "food_growth_rate");
+    assert_eq!(design["arm_ids"], serde_json::json!([0, 1, 2, 3]));
+    let effects = input["analysis"]["effects"].as_array().unwrap();
+    let interactions = input["analysis"]["interactions"].as_array().unwrap();
+    assert_eq!(effects.len(), 6);
+    assert_eq!(interactions.len(), 2);
+    let runs = input["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 8);
+    for (index, interaction) in interactions.iter().enumerate() {
+        let metric = interaction["metric"].as_str().unwrap();
+        let mut observed = Vec::new();
+        for seed in [41, 42] {
+            let mut values = [0.0; 4];
+            for (arm_id, value) in values.iter_mut().enumerate() {
+                let row = runs
+                    .iter()
+                    .find(|row| {
+                        row["reference"]["arm_id"].as_u64() == Some(u64::try_from(arm_id).unwrap())
+                            && row["reference"]["seed"] == seed
+                    })
+                    .unwrap();
+                let path = std::path::Path::new(row["reference"]["summary_path"].as_str().unwrap());
+                let bundle = path.parent().unwrap().parent().unwrap();
+                let verified =
+                    scriptbots_app::experiment_runner::verify_portable_run_bundle(bundle).unwrap();
+                let endpoint = verified.final_state.unwrap();
+                *value = endpoint.summary.available_metrics()[metric];
+            }
+            observed.push((values[3] - values[2]) - (values[1] - values[0]));
+        }
+        let expected = (observed[0] + observed[1]) / 2.0;
+        assert_eq!(
+            interaction["mean_difference_in_differences"].as_f64(),
+            Some(expected)
+        );
+        assert_eq!(interaction["n_seeds"], 2);
+        assert_eq!(
+            interaction["adjusted"]["original_index"],
+            effects.len() + index
+        );
+    }
+    let markdown = std::fs::read_to_string(notebook.join("notebook.md")).unwrap();
+    assert!(markdown.contains("conditional difference-in-differences"));
+    assert!(markdown.contains("Independent Matched Seeds**: 2"));
+    assert!(markdown.contains("other axes held at their first levels"));
+    let output = run_script(&notebook);
+    assert_eq!(output.status.code(), Some(0), "{}", log(&output));
+    let regenerated = notebook.join("rerun-000000");
+    assert_eq!(
+        read_json(&regenerated.join("analysis.json")),
+        input["analysis"],
+        "the complete ordered baseline and interaction correction family must reproduce"
+    );
+    assert_eq!(
+        read_json(&regenerated.join("summaries.json"))
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+}
+
+#[test]
+fn forged_interaction_labels_are_refused_even_when_result_and_declaration_agree() {
+    assert_spec_semantic_refusal(
+        interaction_spec_input(),
+        |input| {
+            input["interaction_contrasts"][0]["first"]["treatment"] = 0.9.into();
+            input["analysis"]["interaction_contrasts"] = input["interaction_contrasts"].clone();
+            let contrast = input["interaction_contrasts"][0].clone();
+            for effect in input["analysis"]["interactions"].as_array_mut().unwrap() {
+                effect["contrast"] = contrast.clone();
+            }
+        },
+        "declared contrasts must equal the complete family derived from the observed treatment grid",
+    );
+}
+
+#[test]
+fn removing_interaction_results_cannot_downgrade_an_enabled_reproduction() {
+    assert_spec_semantic_refusal(
+        interaction_spec_input(),
+        |input| {
+            let analysis = input["analysis"].as_object_mut().unwrap();
+            analysis.remove("interaction_contrasts");
+            analysis.remove("interactions");
+        },
+        "retained analysis differs from the declared interaction family",
+    );
+}
+
+#[test]
+fn reproduction_requires_an_explicit_design_even_for_baseline_only_studies() {
+    assert_semantic_refusal(
+        |input| {
+            input
+                .as_object_mut()
+                .unwrap()
+                .remove("interaction_contrasts");
+        },
+        "missing field `interaction_contrasts`",
     );
 }
 
@@ -283,7 +437,7 @@ fn tampered_build_identity_is_refused_before_execution() {
 }
 
 #[test]
-fn scheduled_treatment_is_refused_before_reproduction_allocates_any_worker_output() {
+fn unrecorded_scheduled_treatment_is_refused_before_reproduction_allocates_any_worker_output() {
     assert_semantic_refusal(
         |input| {
             input["variants"][0]["interventions"] = serde_json::json!([{
@@ -291,7 +445,42 @@ fn scheduled_treatment_is_refused_before_reproduction_allocates_any_worker_outpu
                 "set": {"food_growth_rate": 0.01}
             }]);
         },
-        "Lab reproduction cannot execute scheduled interventions",
+        "reproduction intervention schedule differs from retained run=",
+    );
+}
+
+#[test]
+fn rehashed_plan_and_summary_schedule_must_still_match_retained_run_manifests() {
+    assert_semantic_refusal(
+        |input| {
+            let schedule = serde_json::json!([{
+                "tick": 0,
+                "set": {"food_growth_rate": 0.01}
+            }]);
+            input["variants"][0]["interventions"] = schedule.clone();
+            for row in input["runs"].as_array_mut().unwrap() {
+                if row["reference"]["arm_id"] == 0 {
+                    row["reference"]["interventions"] = schedule.clone();
+                }
+            }
+        },
+        "intervention schedule differs from Lab arm provenance",
+    );
+}
+
+#[test]
+fn older_summary_provenance_is_refused_explicitly_after_missing_schedule_decodes() {
+    assert_semantic_refusal(
+        |input| {
+            for row in input["runs"].as_array_mut().unwrap() {
+                row["reference"]["provenance_version"] = 3.into();
+                row["reference"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("interventions");
+            }
+        },
+        "Lab run-summary provenance schema mismatch",
     );
 }
 
@@ -434,6 +623,103 @@ fn family_only_cohort_reproduces_each_executed_family_at_every_matched_seed() {
     assert_eq!(
         actual, expected,
         "all scientific family provenance must reproduce"
+    );
+}
+
+#[test]
+fn scheduled_control_and_treatment_reproduce_exact_ordered_inputs_and_scientific_effects() {
+    let temp = tempfile::tempdir().expect("temporary scheduled experiment root");
+    let root = temp.path().canonicalize().expect("canonical fixture root");
+    let schedule = serde_json::json!([
+        {"tick": 0, "set": {"metabolism_drain": 0.1}},
+        {"tick": 0, "set": {"metabolism_drain": 0.2}},
+        {"tick": 1, "set": {"metabolism_drain": 0.1}}
+    ]);
+    let mut proposal = spec_input();
+    proposal["hypothesis"] = "timed metabolic stress reduces final energy at matched seeds".into();
+    proposal["falsifier"] = "final total energy is unchanged by the timed treatment".into();
+    proposal["factors"] = serde_json::json!([]);
+    proposal["intervention_schedules"] = serde_json::json!([[], schedule]);
+    proposal["metrics"] = serde_json::json!(["total_energy"]);
+    let notebook = materialize_real_notebook(&root, false, proposal);
+    let input = read_json(&notebook.join("reproduction.json"));
+    assert_eq!(input["schema"], 4);
+    assert_eq!(input["variants"][1]["interventions"], schedule);
+    assert_eq!(
+        input["variants"][0]["config_overrides"],
+        input["variants"][1]["config_overrides"]
+    );
+    let markdown = std::fs::read_to_string(notebook.join("notebook.md")).unwrap();
+    assert!(markdown.contains("Ordered intervention schedule"));
+    for index in 0..4 {
+        let config =
+            std::fs::read_to_string(notebook.join(format!("config-{index:04}.toml"))).unwrap();
+        let config: serde_json::Value = toml::from_str(&config).unwrap();
+        assert_eq!(
+            config["persistence_interval"], 1,
+            "exported launch config must carry the actual runner recording policy"
+        );
+    }
+    let output = run_script(&notebook);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "scheduled emitted-script reproduction must pass:\n{}",
+        log(&output)
+    );
+    let regenerated = notebook.join("rerun-000000");
+    assert_eq!(
+        read_json(&regenerated.join("analysis.json")),
+        read_json(&notebook.join("analysis.json"))
+    );
+    let mut expected = read_json(&notebook.join("summaries.json"));
+    let mut actual = read_json(&regenerated.join("summaries.json"));
+    let expected_rows = expected.as_array_mut().unwrap();
+    let actual_rows = actual.as_array_mut().unwrap();
+    assert_eq!(actual_rows.len(), 4);
+    for (index, (arm, seed)) in [(0, 41), (0, 42), (1, 41), (1, 42)].into_iter().enumerate() {
+        let reference = &actual_rows[index]["reference"];
+        assert_eq!(reference["arm_id"], arm);
+        assert_eq!(reference["seed"], seed);
+        assert_eq!(reference["provenance_version"], 4);
+        assert_eq!(
+            reference["interventions"],
+            if arm == 0 {
+                serde_json::json!([])
+            } else {
+                schedule.clone()
+            }
+        );
+        let record = read_json(&regenerated.join(format!("record-{index:04}.json")));
+        assert_eq!(record["state"], "Completed");
+        assert_eq!(record["final_digest"], reference["digest"]);
+    }
+    for (control, treatment) in [(0, 2), (1, 3)] {
+        assert_eq!(
+            actual_rows[control]["reference"]["config_digest"],
+            actual_rows[treatment]["reference"]["config_digest"]
+        );
+        assert_ne!(
+            actual_rows[control]["reference"]["digest"],
+            actual_rows[treatment]["reference"]["digest"]
+        );
+        assert_ne!(
+            actual_rows[control]["metrics"]["total_energy"],
+            actual_rows[treatment]["metrics"]["total_energy"],
+            "the scheduled treatment must change the observed endpoint"
+        );
+    }
+    for rows in [expected_rows, actual_rows] {
+        for row in rows {
+            assert!(
+                std::path::Path::new(row["reference"]["summary_path"].as_str().unwrap()).is_file()
+            );
+            row["reference"]["summary_path"] = serde_json::Value::Null;
+        }
+    }
+    assert_eq!(
+        actual, expected,
+        "every scheduled scientific row must reproduce"
     );
 }
 

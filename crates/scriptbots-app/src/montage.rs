@@ -6,7 +6,7 @@
 
 use scriptbots_core::narrative::EventRecord;
 use scriptbots_core::reel::{Clip, SelectionConfig, select_clips};
-use scriptbots_core::{BrainRegistry, TerrainKind, WorldCheckpointV1, WorldState};
+use scriptbots_core::{TerrainKind, WorldCheckpointV1, WorldState};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::File;
@@ -238,34 +238,15 @@ impl ReplayProvider for CheckpointReplaySeeker {
         };
 
         if needs_restore {
-            let registry_candidates = [
-                crate::create_brain_registry_for_config(
-                    crate::BrainPreset::Mixed,
-                    best_cp.config(),
-                ),
-                crate::create_brain_registry_for_config(crate::BrainPreset::Mlp, best_cp.config()),
-                Ok(BrainRegistry::new()),
-            ];
-
-            let mut restored_world = None;
-            let mut last_err = None;
-
-            for reg in registry_candidates.into_iter().flatten() {
-                match WorldState::restore_checkpoint_v1(best_cp, reg) {
-                    Ok(w) => {
-                        restored_world = Some(w);
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                    }
-                }
-            }
-
-            let world = restored_world.ok_or_else(|| {
+            let registry = crate::brains::create_brain_registry_for_checkpoint(best_cp)
+                .map_err(|error| {
+                    ReelReplayError::Storage(format!(
+                        "checkpoint at tick {base_tick} does not match the compiled application adapters: {error}"
+                    ))
+                })?;
+            let world = WorldState::restore_checkpoint_v1(best_cp, registry).map_err(|error| {
                 ReelReplayError::Storage(format!(
-                    "failed to restore checkpoint: {}",
-                    last_err.map_or_else(|| "no matching registry".to_string(), |e| e.to_string())
+                    "failed to restore checkpoint at tick {base_tick}: {error}"
                 ))
             })?;
             self.current_world = Some(world);
@@ -891,6 +872,176 @@ mod tests {
             subject: None,
             human_text: format!("{kind:?} at tick {tick}"),
         }
+    }
+
+    fn checkpoint_world(preset: Option<crate::BrainPreset>) -> WorldState {
+        let mut config = ScriptBotsConfig {
+            rng_seed: Some(42_103),
+            persistence_interval: 0,
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            closed: true,
+            population_minimum: 0,
+            reproduction_rate_herbivore: 0.0,
+            reproduction_rate_carnivore: 0.0,
+            ..ScriptBotsConfig::default()
+        };
+        config.neuroflow.enabled = false;
+        config.neuroflow.hidden_layers = vec![7, 3];
+        config.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Sigmoid;
+        let mut world = WorldState::new(config).unwrap();
+        let brain = preset.map(|preset| crate::install_brains(&mut world, preset).unwrap());
+        let agent = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(50.0, 50.0),
+                ..AgentData::default()
+            })
+            .unwrap();
+        if let Some(brain) = brain {
+            assert!(
+                world
+                    .bind_agent_brain(agent, brain.population()[0])
+                    .unwrap()
+            );
+        }
+        for _ in 0..3 {
+            world.step().unwrap();
+        }
+        world
+    }
+
+    #[test]
+    fn checkpoint_replay_restores_every_compiled_preset_and_exact_next_states() {
+        let mut presets = vec![
+            None,
+            Some(crate::BrainPreset::Mlp),
+            Some(crate::BrainPreset::Dwraon),
+            Some(crate::BrainPreset::Assembly),
+            Some(crate::BrainPreset::Mixed),
+        ];
+        if cfg!(feature = "brain-ft") {
+            presets.push(Some(crate::BrainPreset::Ft));
+        }
+        if cfg!(feature = "neuro") {
+            presets.push(Some(crate::BrainPreset::Neuro));
+        }
+        for preset in presets {
+            let mut uninterrupted = checkpoint_world(preset);
+            let checkpoint = uninterrupted.checkpoint_v1().unwrap();
+            let original = checkpoint.encode().unwrap();
+            let mut seeker = CheckpointReplaySeeker::new(vec![checkpoint.clone()], 9);
+            let mut expected = Vec::new();
+            expected.push(uninterrupted.world_digest_v1().unwrap());
+            for _ in 3..9 {
+                uninterrupted.step().unwrap();
+                expected.push(uninterrupted.world_digest_v1().unwrap());
+            }
+            // Exercise cached forward progress and actual backwards reconstruction.
+            for tick in [3, 4, 6, 5, 9, 3, 7] {
+                let replayed = seeker.seek_to_exact(tick).unwrap();
+                assert_eq!(
+                    replayed.world_digest_v1().unwrap(),
+                    expected[(tick - 3) as usize],
+                    "checkpoint replay changed science for {preset:?} at tick {tick}"
+                );
+            }
+            assert_eq!(checkpoint.encode().unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn checkpoint_replay_preserves_saved_family_subset_and_order() {
+        let mut uninterrupted = checkpoint_world(Some(crate::BrainPreset::Dwraon));
+        uninterrupted
+            .register_brain_family(
+                scriptbots_brain::mlp::MlpBrain::KIND.as_str(),
+                Box::new(scriptbots_brain::mlp::MlpBrainFamily::new()),
+            )
+            .unwrap();
+        let checkpoint = uninterrupted.checkpoint_v1().unwrap();
+        let original = checkpoint.encode().unwrap();
+        let registry = checkpoint.required_brain_registry();
+        assert_eq!(registry.entries.len(), 2);
+        assert_eq!(
+            registry.entries[0].kind,
+            scriptbots_brain::dwraon::DwraonBrain::KIND.as_str()
+        );
+        let mut expected = vec![uninterrupted.world_digest_v1().unwrap()];
+        for _ in 3..9 {
+            uninterrupted.step().unwrap();
+            expected.push(uninterrupted.world_digest_v1().unwrap());
+        }
+        let mut seeker = CheckpointReplaySeeker::new(vec![checkpoint.clone()], 9);
+        for tick in [3, 4, 6, 5, 9, 3, 7] {
+            let replayed = seeker.seek_to_exact(tick).unwrap();
+            assert_eq!(
+                replayed.world_digest_v1().unwrap(),
+                expected[usize::try_from(tick - 3).unwrap()]
+            );
+            assert_eq!(
+                replayed.checkpoint_v1().unwrap().required_brain_registry(),
+                registry
+            );
+        }
+        assert_eq!(checkpoint.encode().unwrap(), original);
+    }
+
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn checkpoint_replay_refuses_changed_neuro_constructor_identity() {
+        let mut world = checkpoint_world(Some(crate::BrainPreset::Neuro));
+        let mut changed = world.config().clone();
+        changed.neuroflow.hidden_layers = vec![11, 5];
+        scriptbots_core::apply_control_command(
+            &mut world,
+            crate::ControlCommand::UpdateConfig(Box::new(changed)),
+        )
+        .unwrap();
+        let checkpoint = world.checkpoint_v1().unwrap();
+        let original = checkpoint.encode().unwrap();
+        let mut seeker = CheckpointReplaySeeker::new(vec![checkpoint.clone()], 4);
+        assert!(matches!(
+            seeker.seek_to_exact(3),
+            Err(ReelReplayError::Storage(reason))
+                if reason.contains("does not match the compiled application adapters")
+        ));
+        assert!(seeker.current_world.is_none());
+        assert_eq!(checkpoint.encode().unwrap(), original);
+    }
+
+    #[test]
+    fn dwraon_checkpoint_encodes_reproducible_ascii_and_gif_without_mutating_source() {
+        let world = checkpoint_world(Some(crate::BrainPreset::Dwraon));
+        let original = world.checkpoint_v1().unwrap().encode().unwrap();
+        let events = [sample_event(5, EventKind::PopulationBoom, 30.0)];
+        let directory = tempfile::tempdir().unwrap();
+        for format in [ReelFormat::Ascii, ReelFormat::Gif] {
+            let mut outputs = Vec::new();
+            for repetition in 0..2 {
+                let options = MontageOptions {
+                    format,
+                    output_path: directory.path().join(format!("{format}-{repetition}")),
+                    stride: 1,
+                    selection: SelectionConfig {
+                        pre_window_ticks: 1,
+                        post_window_ticks: 1,
+                        ..SelectionConfig::default()
+                    },
+                    width: 16,
+                    height: 8,
+                };
+                let summary = encode_montage(&world, &events, 6, &options).unwrap();
+                assert_eq!(summary.total_frames, 3);
+                assert_eq!(summary.clips_count, 1);
+                let bytes = std::fs::read(&options.output_path).unwrap();
+                assert!(!bytes.is_empty());
+                assert_eq!(summary.bytes_written, bytes.len() as u64);
+                outputs.push(bytes);
+            }
+            assert_eq!(outputs[0], outputs[1]);
+        }
+        assert_eq!(world.checkpoint_v1().unwrap().encode().unwrap(), original);
     }
 
     #[test]

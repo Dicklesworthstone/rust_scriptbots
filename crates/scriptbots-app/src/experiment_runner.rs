@@ -10,6 +10,8 @@ use scriptbots_brain::{
 };
 #[cfg(feature = "brain-ft")]
 use scriptbots_brain_ml::{FT_BRAIN_KIND, FtBrainFamily};
+#[cfg(feature = "neuro")]
+use scriptbots_brain_neuro::{NeuroflowBrain, NeuroflowBrainConfig, NeuroflowFamilyAdapter};
 use scriptbots_core::{
     BrainFamilyAdapter, BrainRegistry, NullPersistence, ScriptBotsConfig, Tick, WorldState,
     knob_range,
@@ -28,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{error, info};
@@ -41,8 +44,26 @@ pub(crate) const MAX_EXPERIMENT_SUMMARY_BYTES: usize = 4_096;
 const EXPERIMENT_SUMMARY_SCHEMA_VERSION: u16 = 2;
 const MAX_BATCH_RUNS: usize = 4_096;
 pub(crate) const MAX_RUN_COMPONENT_BYTES: usize = 128;
-const MAX_TICKS_PER_RUN: u64 = 10_000_000;
+pub(crate) const MAX_TICKS_PER_RUN: u64 = 10_000_000;
+// A cohort shares one scientific-work allowance; adding seeds or variants must
+// not multiply the largest admitted single-run horizon. This counts logical
+// tick transitions, not elapsed time, heap use or retained artifact bytes.
+pub(crate) const MAX_BATCH_TOTAL_TICKS: u64 = MAX_TICKS_PER_RUN;
 pub(crate) const MAX_CONCURRENT_RUNS: usize = 64;
+// Admission limits for the shared dense food/terrain grid dimensions. Each cell
+// also feeds profiles, tick scratch and checkpoint state, so bounding only each
+// world dimension admits prohibitive products. These are cardinality policies,
+// not measurements or guarantees of total memory, population or artifact bytes.
+const MAX_RUN_GRID_CELLS: u64 = 262_144;
+pub(crate) const MAX_CONCURRENT_GRID_CELLS: u64 = 1_048_576;
+// Match the managed branch-study population policy. These are per-owner
+// cardinality limits, not a total heap bound: a tick can cross the population
+// ceiling before the runner observes it. Refuse further work and checkpoint
+// capture at that boundary rather than truncating or changing the science.
+const MAX_RUN_POPULATION: u64 = crate::branch_study::MAX_STUDY_POPULATION;
+// WorldState preallocates its history ring from this value. The same ceiling
+// also bounds retained narrative events; both are copied into owner cuts.
+const MAX_RUN_HISTORY_ENTRIES: u64 = 10_000;
 pub(crate) const MAX_EXPERIMENT_INTERVENTIONS: usize = 64;
 pub(crate) const MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES: usize = 4_096;
 const HOST_RECEIPT_DRIVE_LIMIT: usize = 16;
@@ -58,12 +79,71 @@ const REQUIRED_EXPERIMENT_ARTIFACTS: &[(&str, &str)] = &[
     FINAL_CHECKPOINT_ARTIFACT,
 ];
 
+// Public entry points always choose MAX_RUN_POPULATION. Carrying the bound
+// alongside cancellation lets the real execution path exercise a small crossing
+// population in regression tests without allocating 10,001 complete brains.
+#[derive(Clone, Copy)]
+struct RunExecutionBudget<'a> {
+    cancel: &'a std::sync::atomic::AtomicBool,
+    population_limit: u64,
+}
+
 /// Typed failure from matched-seed planning, status recovery, execution, or bundle verification.
 #[derive(Debug, Error)]
 pub enum ExperimentRunnerError {
     /// A declarative experiment cannot produce an unambiguous bounded plan.
     #[error("invalid experiment plan: {reason}")]
     InvalidPlan { reason: String },
+    /// The complete seed-by-variant cohort exceeds its scientific-work allowance.
+    #[error(
+        "experiment's {runs} runs at {ticks_per_run} ticks each require {total_ticks} scientific tick transitions, exceeding the per-batch limit {limit}; reduce the horizon, seeds or variants"
+    )]
+    BatchTickCapacityExceeded {
+        runs: usize,
+        ticks_per_run: u64,
+        total_ticks: u64,
+        limit: u64,
+    },
+    /// One normalized world would allocate too many dense grid cells.
+    #[error(
+        "variant `{variant_id}` requires {cells} dense grid cells, exceeding the per-run limit {limit}; reduce world dimensions or increase food_cell_size"
+    )]
+    RunGridCapacityExceeded {
+        variant_id: String,
+        cells: u64,
+        limit: u64,
+    },
+    /// Concurrent owners in one plan would exceed the shared dense-grid budget.
+    #[error(
+        "experiment's largest {concurrent_runs} concurrent runs require {cells} dense grid cells, exceeding the limit {limit}; reduce max_concurrency or grid dimensions, or increase food_cell_size"
+    )]
+    ConcurrentGridCapacityExceeded {
+        concurrent_runs: usize,
+        cells: u64,
+        limit: u64,
+    },
+    /// An initial configuration or resolved intervention exceeds an owner budget.
+    #[error(
+        "variant `{variant_id}` configuration step {configuration_step} requests {requested} {resource}, exceeding the per-run limit {limit}; step 0 is the initial configuration"
+    )]
+    RunConfigCapacityExceeded {
+        variant_id: String,
+        configuration_step: u64,
+        resource: &'static str,
+        requested: u64,
+        limit: u64,
+    },
+    /// A completed boundary exceeded the population budget before checkpoint capture.
+    #[error(
+        "run `{run_id}` reached population {population} at tick {tick}, exceeding the per-run limit {limit}; last retained checkpoint tick: {retained_checkpoint_tick:?}; no successor checkpoint was published"
+    )]
+    RunPopulationCapacityExceeded {
+        run_id: String,
+        tick: u64,
+        population: u64,
+        limit: u64,
+        retained_checkpoint_tick: Option<u64>,
+    },
     /// A variant names no registered protocol family supported by this runner.
     #[error("variant `{variant_id}` requests unknown brain family `{brain_family}`")]
     UnknownBrainFamily {
@@ -149,6 +229,45 @@ pub enum ExperimentRunnerError {
     WorkerPanicked { run_id: String },
 }
 
+fn validate_experiment_run_count(
+    variant_count: usize,
+    seed_count: usize,
+) -> Result<usize, ExperimentRunnerError> {
+    variant_count
+        .checked_mul(seed_count)
+        .filter(|count| *count <= MAX_BATCH_RUNS)
+        .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
+            reason: format!(
+                "variant x seed expansion exceeds the bounded {MAX_BATCH_RUNS}-run capacity"
+            ),
+        })
+}
+
+/// Validate cohort cardinality and total logical ticks before admission side effects.
+/// Concurrency changes scheduling only; completed runs still belong to this plan.
+pub(crate) fn validate_experiment_workload(
+    variant_count: usize,
+    seed_count: usize,
+    ticks_per_run: u64,
+) -> Result<usize, ExperimentRunnerError> {
+    let runs = validate_experiment_run_count(variant_count, seed_count)?;
+    let total_ticks = u64::try_from(runs)
+        .ok()
+        .and_then(|count| count.checked_mul(ticks_per_run))
+        .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
+            reason: "total scientific tick transitions overflow u64".to_owned(),
+        })?;
+    if total_ticks > MAX_BATCH_TOTAL_TICKS {
+        return Err(ExperimentRunnerError::BatchTickCapacityExceeded {
+            runs,
+            ticks_per_run,
+            total_ticks,
+            limit: MAX_BATCH_TOTAL_TICKS,
+        });
+    }
+    Ok(runs)
+}
+
 /// Matched-seed cohort specifying the identical seed schedule shared across scenario variants.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MatchedSeedCohort {
@@ -197,6 +316,81 @@ pub struct RunRecord {
     pub error_reason: Option<String>,
 }
 
+/// How the last complete checkpoint was actually observed. Neither observation
+/// continuously re-verifies the current file or certifies the completed run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointProgressSource {
+    /// The runner successfully wrote, synced and published this exact cut.
+    Published,
+    /// An existing committed cut was read, validated and restored to an owner.
+    Recovered,
+}
+
+/// An absent progress observation is distinct from an observed tick zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointProgressUnavailable {
+    NotStarted,
+    AwaitingPublication,
+    RecoveryPending,
+    NoCommittedCheckpoint,
+}
+
+/// Typed refusal of a checkpoint progress observation, without inventing ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointProgressRefusal {
+    InvalidCheckpoint,
+    UnreadableCheckpoint,
+    ConflictingObservation,
+}
+
+/// Last successfully observed checkpoint for the enclosing source-bound plan/run.
+///
+/// This is observational progress, separate from terminal `RunRecord::total_ticks`.
+/// Its digest identifies the complete encoded checkpoint bytes. Cached observations
+/// describe that exact historical cut; downloads and resume still perform their own
+/// complete validation. A stopped reader recovers at most one cut per status read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ExperimentCheckpointProgress {
+    Observed {
+        tick: u64,
+        checkpoint_digest: String,
+        #[schema(inline)]
+        source: CheckpointProgressSource,
+    },
+    Unavailable {
+        #[schema(inline)]
+        reason: CheckpointProgressUnavailable,
+    },
+    Refused {
+        #[schema(inline)]
+        reason: CheckpointProgressRefusal,
+    },
+}
+
+impl ExperimentCheckpointProgress {
+    #[must_use]
+    pub const fn observed_tick(&self) -> Option<u64> {
+        match self {
+            Self::Observed { tick, .. } => Some(*tick),
+            Self::Unavailable { .. } | Self::Refused { .. } => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CheckpointProgressCache {
+    plan_digest: String,
+    output_dir: PathBuf,
+    /// Exactly the admitted run IDs, bounded by `MAX_BATCH_RUNS`; no history.
+    runs: BTreeMap<String, Option<ExperimentCheckpointProgress>>,
+    /// Across concurrent status readers, at most one bounded recovery is active.
+    recovering_run: Option<String>,
+}
+
 /// Complete experiment batch status report supporting atomic checkpointing and resume.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -231,6 +425,8 @@ pub(crate) const EXPERIMENT_BRAIN_FAMILIES: &[&str] = &[
     AssemblyBrain::KIND.as_str(),
     #[cfg(feature = "brain-ft")]
     FT_BRAIN_KIND,
+    #[cfg(feature = "neuro")]
+    NeuroflowBrain::KIND.as_str(),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -240,6 +436,8 @@ enum ResolvedBrainFamily {
     Assembly,
     #[cfg(feature = "brain-ft")]
     FrankenTorch,
+    #[cfg(feature = "neuro")]
+    Neuroflow,
 }
 
 impl ResolvedBrainFamily {
@@ -257,11 +455,15 @@ impl ResolvedBrainFamily {
                 reason: "FrankenTorch experiments require a build with the brain-ft feature"
                     .to_owned(),
             }),
-            "neuroflow" => {
+            #[cfg(feature = "neuro")]
+            "neuro" | "neuroflow" | "ml.neuroflow" => Ok(Self::Neuroflow),
+            #[cfg(not(feature = "neuro"))]
+            "neuro" | "neuroflow" | "ml.neuroflow" => {
                 Err(ExperimentRunnerError::UnavailableBrainFamily {
                     variant_id: variant.variant_id.clone(),
                     brain_family: variant.brain_family.clone(),
-                    reason: "this runner build has no canonical family installation for that feature; execution is refused instead of substituting another family".to_owned(),
+                    reason: "NeuroFlow experiments require a build with the neuro feature"
+                        .to_owned(),
                 })
             }
             _ => Err(ExperimentRunnerError::UnknownBrainFamily {
@@ -278,10 +480,18 @@ impl ResolvedBrainFamily {
             Self::Assembly => AssemblyBrain::KIND.as_str(),
             #[cfg(feature = "brain-ft")]
             Self::FrankenTorch => FT_BRAIN_KIND,
+            #[cfg(feature = "neuro")]
+            Self::Neuroflow => NeuroflowBrain::KIND.as_str(),
         }
     }
 
-    fn adapter(self, run_id: &str) -> Result<Box<dyn BrainFamilyAdapter>, ExperimentRunnerError> {
+    fn adapter(
+        self,
+        constructor_config: &ScriptBotsConfig,
+        run_id: &str,
+    ) -> Result<Box<dyn BrainFamilyAdapter>, ExperimentRunnerError> {
+        #[cfg(not(feature = "neuro"))]
+        let _ = constructor_config;
         Ok(match self {
             Self::Mlp => Box::new(MlpBrainFamily::new()),
             Self::Dwraon => Box::new(DwraonFamilyAdapter::default()),
@@ -296,12 +506,23 @@ impl ResolvedBrainFamily {
             }
             #[cfg(feature = "brain-ft")]
             Self::FrankenTorch => Box::new(FtBrainFamily::default()),
+            #[cfg(feature = "neuro")]
+            Self::Neuroflow => Box::new(
+                NeuroflowFamilyAdapter::new(NeuroflowBrainConfig::from_settings(
+                    &constructor_config.neuroflow,
+                ))
+                .map_err(|source| ExperimentRunnerError::Construction {
+                    run_id: run_id.to_owned(),
+                    reason: format!("configured NeuroFlow family construction failed: {source}"),
+                })?,
+            ),
         })
     }
 
     fn register(self, world: &mut WorldState, run_id: &str) -> Result<u64, ExperimentRunnerError> {
+        let adapter = self.adapter(world.config(), run_id)?;
         world
-            .register_brain_family(self.canonical_name(), self.adapter(run_id)?)
+            .register_brain_family(self.canonical_name(), adapter)
             .map_err(|source| ExperimentRunnerError::Construction {
                 run_id: run_id.to_owned(),
                 reason: format!(
@@ -317,6 +538,7 @@ struct ValidatedPlan {
     digest: String,
     runs: Vec<RunRecord>,
     variants: BTreeMap<String, (ScenarioVariant, ResolvedBrainFamily)>,
+    concurrent_grid_cells: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,15 +641,120 @@ fn invalid_checkpoint(path: &Path, reason: impl std::fmt::Display) -> Experiment
     }
 }
 
+fn validate_run_config_capacity(
+    variant_id: &str,
+    config: &ScriptBotsConfig,
+    configuration_step: u64,
+) -> Result<(), ExperimentRunnerError> {
+    for (resource, requested, limit) in [
+        (
+            "history entries",
+            u64::try_from(config.history_capacity).unwrap_or(u64::MAX),
+            MAX_RUN_HISTORY_ENTRIES,
+        ),
+        (
+            "narrative events",
+            u64::try_from(config.narrative_capacity).unwrap_or(u64::MAX),
+            MAX_RUN_HISTORY_ENTRIES,
+        ),
+        (
+            "population floor",
+            u64::try_from(config.population_minimum).unwrap_or(u64::MAX),
+            MAX_RUN_POPULATION,
+        ),
+        (
+            "population injection count",
+            u64::from(config.population_spawn_count),
+            MAX_RUN_POPULATION,
+        ),
+    ] {
+        if requested > limit {
+            return Err(ExperimentRunnerError::RunConfigCapacityExceeded {
+                variant_id: variant_id.to_owned(),
+                configuration_step,
+                resource,
+                requested,
+                limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn enforce_run_population(
+    world: &WorldState,
+    run_id: &str,
+    limit: u64,
+    retained_checkpoint_tick: Option<u64>,
+) -> Result<(), ExperimentRunnerError> {
+    let population = u64::try_from(world.agents().len()).unwrap_or(u64::MAX);
+    if population > limit {
+        return Err(ExperimentRunnerError::RunPopulationCapacityExceeded {
+            run_id: run_id.to_owned(),
+            tick: world.tick().0,
+            population,
+            limit,
+            retained_checkpoint_tick,
+        });
+    }
+    Ok(())
+}
+
+fn validate_run_checkpoint_capacity(
+    checkpoint: &RunCheckpointV1,
+    path: &Path,
+    population_limit: u64,
+) -> Result<(), ExperimentRunnerError> {
+    // Apply the same per-owner policy before executable restore and before a
+    // recovered temporary cut can replace the preceding admitted checkpoint.
+    let host = checkpoint.owner.host_checkpoint();
+    validate_run_config_capacity(
+        checkpoint
+            .metadata
+            .manifest
+            .identity
+            .variant_id
+            .as_deref()
+            .unwrap_or(&checkpoint.metadata.run_id),
+        host.config(),
+        host.completed_schedule_sequence().unwrap_or(0),
+    )
+    .map_err(|error| invalid_checkpoint(path, error))?;
+    let population = u64::try_from(host.world_checkpoint().agent_count()).unwrap_or(u64::MAX);
+    if population > population_limit {
+        return Err(invalid_checkpoint(
+            path,
+            format!(
+                "checkpoint population {population} exceeds the per-run limit {population_limit}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn restore_run_owner(
     checkpoint: &RunCheckpointV1,
     family: ResolvedBrainFamily,
     run_id: &str,
     path: &Path,
 ) -> Result<HostCore, ExperimentRunnerError> {
+    validate_run_checkpoint_capacity(checkpoint, path, MAX_RUN_POPULATION)?;
+    // Adapter identity belongs to the original constructor recipe. Current raw
+    // world settings can change without replacing the installed genome family.
+    let constructor_config: ScriptBotsConfig =
+        serde_json::from_value(checkpoint.metadata.manifest.normalized_config.clone())
+            .map_err(|error| invalid_checkpoint(path, error))?;
+    constructor_config
+        .validate()
+        .map_err(|error| invalid_checkpoint(path, error))?;
     let mut registry = BrainRegistry::new();
     registry
-        .register_family(family.canonical_name(), family.adapter(run_id)?)
+        .register_family(
+            family.canonical_name(),
+            family
+                .adapter(&constructor_config, run_id)
+                .map_err(|error| invalid_checkpoint(path, error))?,
+        )
         .map_err(|error| invalid_checkpoint(path, error))?;
     let world = checkpoint
         .owner
@@ -703,16 +1030,8 @@ struct RunEvidenceV2 {
 ///
 /// These describe one completed boundary. They are not time averages, cumulative
 /// lifecycle counts, or observations over the run's unretained history.
-pub const EXPERIMENT_ENDPOINT_METRICS: [&str; 8] = [
-    "alive_agents",
-    "total_energy",
-    "average_energy",
-    "average_health",
-    "mean_age",
-    "max_age",
-    "max_generation",
-    "total_food",
-];
+pub const EXPERIMENT_ENDPOINT_METRICS: [&str; 8] =
+    scriptbots_runtime::lab_workflows::LabMetric::keys();
 
 /// Canonical V2 experiment summary, recomputable from the final checkpoint alone.
 ///
@@ -1069,6 +1388,7 @@ fn verify_restored_final_checkpoint(
         .validate()
         .map_err(|error| invalid_checkpoint(&path, error))?;
     let interventions = PreparedInterventions::new(
+        &evidence.variant_id,
         &initial_config,
         &manifest.scenario.interventions,
         evidence.total_ticks,
@@ -1154,6 +1474,7 @@ pub struct MatchedSeedExperimentRunner {
     pub max_ticks: u64,
     pub max_concurrency: usize,
     pub output_dir: PathBuf,
+    checkpoint_progress: Mutex<CheckpointProgressCache>,
 }
 
 impl MatchedSeedExperimentRunner {
@@ -1172,7 +1493,254 @@ impl MatchedSeedExperimentRunner {
             max_ticks,
             max_concurrency,
             output_dir: output_dir.into(),
+            checkpoint_progress: Mutex::new(CheckpointProgressCache::default()),
         }
+    }
+
+    fn progress_cache(&self, plan: &ValidatedPlan) -> MutexGuard<'_, CheckpointProgressCache> {
+        let mut cache = self
+            .checkpoint_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.plan_digest != plan.digest || cache.output_dir != self.output_dir {
+            *cache = CheckpointProgressCache {
+                plan_digest: plan.digest.clone(),
+                output_dir: self.output_dir.clone(),
+                runs: plan
+                    .runs
+                    .iter()
+                    .map(|run| (run.run_id.clone(), None))
+                    .collect(),
+                recovering_run: None,
+            };
+        }
+        cache
+    }
+
+    fn prepare_progress_for_execution(&self, plan: &ValidatedPlan) {
+        let mut cache = self.progress_cache(plan);
+        // An explicit resume retries unavailable/refused observations. Preserve
+        // earlier observed cuts until the owner publishes a verified successor.
+        for progress in cache.runs.values_mut() {
+            if !matches!(
+                progress,
+                Some(ExperimentCheckpointProgress::Observed { .. })
+            ) {
+                *progress = None;
+            }
+        }
+    }
+
+    fn observe_checkpoint_progress(
+        &self,
+        plan_digest: &str,
+        run_id: &str,
+        tick: u64,
+        checkpoint_digest: String,
+        source: CheckpointProgressSource,
+    ) {
+        let mut cache = self
+            .checkpoint_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.plan_digest != plan_digest || cache.output_dir != self.output_dir {
+            return;
+        }
+        let Some(progress) = cache.runs.get_mut(run_id) else {
+            return;
+        };
+        if matches!(
+            progress,
+            Some(ExperimentCheckpointProgress::Refused {
+                reason: CheckpointProgressRefusal::ConflictingObservation,
+            })
+        ) {
+            // A contradictory same-tick observation cannot erase the previous
+            // high-water mark and then admit an older cut. Explicit resume must
+            // revalidate the committed owner before observations can restart.
+            return;
+        }
+        if let Some(ExperimentCheckpointProgress::Observed {
+            tick: previous,
+            checkpoint_digest: previous_digest,
+            ..
+        }) = progress
+        {
+            if tick < *previous {
+                return;
+            }
+            if tick == *previous {
+                if checkpoint_digest != *previous_digest {
+                    *progress = Some(ExperimentCheckpointProgress::Refused {
+                        reason: CheckpointProgressRefusal::ConflictingObservation,
+                    });
+                }
+                return;
+            }
+        }
+        *progress = Some(ExperimentCheckpointProgress::Observed {
+            tick,
+            checkpoint_digest,
+            source,
+        });
+    }
+
+    /// Observe bounded checkpoint progress without changing status or science.
+    /// Active polls only read the latest-value cache. Cold stopped jobs recover
+    /// one committed cut per call, with one recovery in flight across readers;
+    /// valid observations and typed refusals are cached until explicit resume.
+    pub(crate) fn checkpoint_progress_snapshot(
+        &self,
+        state_file: &Path,
+        status: &ExperimentBatchStatus,
+        running: bool,
+    ) -> Result<BTreeMap<String, ExperimentCheckpointProgress>, ExperimentRunnerError> {
+        let plan = self.validated_plan()?;
+        self.validate_status(state_file, status, &plan)?;
+        let recover = {
+            let mut cache = self.progress_cache(&plan);
+            let candidate = if !running && cache.recovering_run.is_none() {
+                // Suspended runs precede terminal ones so large completed
+                // cohorts cannot hide the remaining live work after restart.
+                [RunState::Running, RunState::Failed, RunState::Completed]
+                    .into_iter()
+                    .find_map(|state| {
+                        status
+                            .runs
+                            .iter()
+                            .find(|run| run.state == state && cache.runs[&run.run_id].is_none())
+                    })
+                    .cloned()
+            } else {
+                None
+            };
+            if let Some(run) = &candidate {
+                cache.recovering_run = Some(run.run_id.clone());
+                cache.runs.insert(
+                    run.run_id.clone(),
+                    Some(ExperimentCheckpointProgress::Unavailable {
+                        reason: CheckpointProgressUnavailable::RecoveryPending,
+                    }),
+                );
+            }
+            candidate
+        };
+        if let Some(run) = recover {
+            let path = self.run_checkpoint_path(&run.run_id);
+            let recovered = self.recover_checkpoint_progress(&path, &run, &plan);
+            let mut cache = self.progress_cache(&plan);
+            if cache.recovering_run.as_deref() == Some(run.run_id.as_str()) {
+                cache.recovering_run = None;
+                let entry = cache.runs.get_mut(&run.run_id).expect("admitted run");
+                // A runner may have started and published a newer observation
+                // while this read was in flight. Never replace that publication.
+                if matches!(
+                    entry,
+                    Some(ExperimentCheckpointProgress::Unavailable { .. }) | None
+                ) {
+                    *entry = Some(recovered);
+                }
+            }
+        }
+        let cache = self.progress_cache(&plan);
+        Ok(status
+            .runs
+            .iter()
+            .map(|run| {
+                let observation = if run.state == RunState::Pending {
+                    ExperimentCheckpointProgress::Unavailable {
+                        reason: CheckpointProgressUnavailable::NotStarted,
+                    }
+                } else {
+                    cache.runs[&run.run_id].clone().unwrap_or(
+                        ExperimentCheckpointProgress::Unavailable {
+                            reason: if running {
+                                CheckpointProgressUnavailable::AwaitingPublication
+                            } else {
+                                CheckpointProgressUnavailable::RecoveryPending
+                            },
+                        },
+                    )
+                };
+                (run.run_id.clone(), observation)
+            })
+            .collect())
+    }
+
+    fn recover_checkpoint_progress(
+        &self,
+        path: &Path,
+        run: &RunRecord,
+        plan: &ValidatedPlan,
+    ) -> ExperimentCheckpointProgress {
+        let read = || -> Result<Option<ExperimentCheckpointProgress>, ExperimentRunnerError> {
+            let Some(checkpoint) = read_optional_run_checkpoint(path)? else {
+                return Ok(None);
+            };
+            let (variant, family) = &plan.variants[&run.variant_id];
+            self.validate_run_checkpoint(
+                path,
+                &checkpoint,
+                variant,
+                run.seed,
+                &run.run_id,
+                &plan.digest,
+            )?;
+            // Framing and metadata are insufficient: verify the actual executable
+            // world/owner/journal cut without advancing a tick or promoting a tmp.
+            let owner = restore_run_owner(&checkpoint, *family, &run.run_id, path)?;
+            let tick = owner.world_tick().0;
+            if run.state == RunState::Completed && tick != run.total_ticks {
+                return Err(invalid_checkpoint(
+                    path,
+                    "completed status and cut ticks differ",
+                ));
+            }
+            Ok(Some(ExperimentCheckpointProgress::Observed {
+                tick,
+                checkpoint_digest: blake3::hash(&checkpoint.encode(path)?).to_hex().to_string(),
+                source: CheckpointProgressSource::Recovered,
+            }))
+        };
+        match read() {
+            Ok(Some(observation)) => observation,
+            Ok(None) => ExperimentCheckpointProgress::Unavailable {
+                reason: CheckpointProgressUnavailable::NoCommittedCheckpoint,
+            },
+            Err(error) => {
+                tracing::warn!(
+                    experiment_id = %self.experiment_id,
+                    run_id = %run.run_id,
+                    %error,
+                    "experiment checkpoint progress refused"
+                );
+                ExperimentCheckpointProgress::Refused {
+                    reason: if matches!(error, ExperimentRunnerError::Io { .. }) {
+                        CheckpointProgressRefusal::UnreadableCheckpoint
+                    } else {
+                        CheckpointProgressRefusal::InvalidCheckpoint
+                    },
+                }
+            }
+        }
+    }
+
+    fn publish_run_checkpoint(
+        &self,
+        path: &Path,
+        checkpoint: &RunCheckpointV1,
+        bytes: &[u8],
+    ) -> Result<String, ExperimentRunnerError> {
+        write_run_checkpoint(path, bytes)?;
+        let digest = blake3::hash(bytes).to_hex().to_string();
+        self.observe_checkpoint_progress(
+            &checkpoint.metadata.plan_digest,
+            &checkpoint.metadata.run_id,
+            checkpoint.owner.host_checkpoint().tick().0,
+            digest.clone(),
+            CheckpointProgressSource::Published,
+        );
+        Ok(digest)
     }
 
     /// Run a canonical CLI worker with a wall-clock bound and reap every exit path.
@@ -1224,7 +1792,24 @@ impl MatchedSeedExperimentRunner {
     /// Returns a typed refusal before any filesystem mutation when the plan is
     /// ambiguous, unsupported, or exceeds the runner's explicit resource bounds.
     pub fn plan_batch(&self) -> Result<Vec<RunRecord>, ExperimentRunnerError> {
+        self.validate_execution_workload()?;
         self.validated_plan().map(|plan| plan.runs)
+    }
+
+    /// Admission policy for new or resumed execution, separate from evidence validity.
+    /// Read-only status, progress and completed-bundle verification retain their
+    /// existing provenance checks even for cohorts above the current work limit.
+    pub(crate) fn validate_execution_workload(&self) -> Result<(), ExperimentRunnerError> {
+        validate_experiment_workload(self.variants.len(), self.cohort.seeds.len(), self.max_ticks)
+            .map(|_| ())
+    }
+
+    /// Dense grid cells reserved by the largest executable concurrent run set.
+    ///
+    /// The same preflight guards initial admission, status recovery and resume.
+    /// Service callers reserve this amount across batches as well as run slots.
+    pub(crate) fn concurrent_grid_cells(&self) -> Result<u64, ExperimentRunnerError> {
+        self.validated_plan().map(|plan| plan.concurrent_grid_cells)
     }
 
     /// Bind a saved definition to the same source-aware plan as status and cuts.
@@ -1238,11 +1823,15 @@ impl MatchedSeedExperimentRunner {
     ///
     /// Recovers a complete interrupted publication only when it is the exact
     /// initial plan or a valid immediate successor of the committed generation.
+    /// A torn JSON prefix can instead retain the validated committed generation
+    /// when every started run has executable continuation or completed-bundle
+    /// evidence. The prefix is preserved in one exclusive incident directory.
     /// Malformed, stale, or plan-incompatible state never permits a tick-zero restart.
     pub fn load_or_create_status(
         &self,
         state_file: &Path,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        self.validate_execution_workload()?;
         let plan = self.validated_plan()?;
         let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
         self.load_or_create_status_locked(state_file, &plan)
@@ -1419,8 +2008,13 @@ impl MatchedSeedExperimentRunner {
             committed: state_file.to_path_buf(),
         };
         let bytes = read_experiment_file_bounded(temporary, MAX_STATUS_BYTES)?;
-        let candidate =
-            serde_json::from_slice::<ExperimentBatchStatus>(&bytes).map_err(|_| interrupted())?;
+        let candidate = match serde_json::from_slice::<ExperimentBatchStatus>(&bytes) {
+            Ok(candidate) => candidate,
+            Err(error) if error.is_eof() => {
+                return self.recover_torn_status_locked(state_file, temporary, &bytes, plan);
+            }
+            Err(_) => return Err(interrupted()),
+        };
         self.validate_status(temporary, &candidate, plan)?;
         if canonical_status_bytes(&candidate)? != bytes {
             return Err(interrupted());
@@ -1501,6 +2095,182 @@ impl MatchedSeedExperimentRunner {
         Ok(candidate)
     }
 
+    /// Keep the last committed generation after a torn successor write, but only
+    /// after independently establishing how every already-started run can recover.
+    /// This does not promote any prefix fields, advance a world, publish a status,
+    /// or repair a missing owner cut. The caller holds the batch's writer lease.
+    fn recover_torn_status_locked(
+        &self,
+        state_file: &Path,
+        temporary: &Path,
+        torn_bytes: &[u8],
+        plan: &ValidatedPlan,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        let interrupted = || ExperimentRunnerError::InterruptedStatusWrite {
+            temporary: temporary.to_path_buf(),
+            committed: state_file.to_path_buf(),
+        };
+        let committed_bytes = match read_experiment_file_bounded(state_file, MAX_STATUS_BYTES) {
+            Ok(bytes) => bytes,
+            Err(ExperimentRunnerError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Err(interrupted());
+            }
+            Err(error) => return Err(error),
+        };
+        let committed = self.decode_status(state_file, &committed_bytes, plan)?;
+        if canonical_status_bytes(&committed)? != committed_bytes {
+            return Err(interrupted());
+        }
+
+        for record in &committed.runs {
+            let (variant, family) = &plan.variants[&record.variant_id];
+            match record.state {
+                RunState::Completed => {
+                    self.verify_completed_bundle(record, variant, *family, &plan.digest)?;
+                }
+                RunState::Running => {
+                    match self.recover_completed_run(record, variant, *family, &plan.digest) {
+                        Ok(_) => continue,
+                        Err(ExperimentRunnerError::ResumeCheckpointUnavailable { .. }) => {}
+                        Err(error) => return Err(error),
+                    }
+                    let path = self.run_checkpoint_path(&record.run_id);
+                    if !experiment_path_exists(
+                        &path,
+                        "inspect running checkpoint during status recovery",
+                    )? {
+                        return Err(ExperimentRunnerError::ResumeCheckpointUnavailable {
+                            run_id: record.run_id.clone(),
+                            completed_ticks: record.total_ticks,
+                        });
+                    }
+                    let _lease = ExperimentStatusWriterLease::acquire(&path)?;
+                    let checkpoint = read_optional_run_checkpoint(&path)?.ok_or_else(|| {
+                        ExperimentRunnerError::ResumeCheckpointUnavailable {
+                            run_id: record.run_id.clone(),
+                            completed_ticks: record.total_ticks,
+                        }
+                    })?;
+                    self.validate_run_checkpoint(
+                        &path,
+                        &checkpoint,
+                        variant,
+                        record.seed,
+                        &record.run_id,
+                        &plan.digest,
+                    )?;
+                    drop(restore_run_owner(
+                        &checkpoint,
+                        *family,
+                        &record.run_id,
+                        &path,
+                    )?);
+                }
+                RunState::Pending => {
+                    // A pending arm may have its prepared tick-zero cut, but it
+                    // must not hide prior scientific execution. Do not turn an
+                    // inconsistent pending status into a fresh-world restart.
+                    let path = self.run_checkpoint_path(&record.run_id);
+                    if experiment_path_exists(
+                        &self.output_dir.join(&record.run_id),
+                        "inspect pending run bundle during status recovery",
+                    )? || experiment_path_exists(
+                        &self.staged_bundle_path(&record.run_id),
+                        "inspect pending bundle staging during status recovery",
+                    )? || experiment_path_exists(
+                        &status_temporary_path(&path)?,
+                        "inspect pending checkpoint staging during status recovery",
+                    )? {
+                        return Err(interrupted());
+                    }
+                    if let Some(checkpoint) = read_optional_run_checkpoint(&path)? {
+                        self.validate_run_checkpoint(
+                            &path,
+                            &checkpoint,
+                            variant,
+                            record.seed,
+                            &record.run_id,
+                            &plan.digest,
+                        )?;
+                        if checkpoint.owner.host_checkpoint().tick().0 != 0 {
+                            return Err(interrupted());
+                        }
+                        drop(restore_run_owner(
+                            &checkpoint,
+                            *family,
+                            &record.run_id,
+                            &path,
+                        )?);
+                    }
+                }
+                RunState::Failed => {}
+            }
+        }
+
+        // The one fixed incident directory bounds retained recovery history.
+        // Creating it exclusively ensures an earlier incident, symlink, or other
+        // caller-owned path is never replaced. Moving inside that fresh directory
+        // preserves the exact torn bytes without deleting an evidence file.
+        if read_experiment_file_bounded(temporary, MAX_STATUS_BYTES)? != torn_bytes
+            || read_experiment_file_bounded(state_file, MAX_STATUS_BYTES)? != committed_bytes
+        {
+            return Err(interrupted());
+        }
+        let incident = temporary.with_extension("interrupted");
+        let mut directory = fs::DirBuilder::new();
+        directory.recursive(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory
+            .create(&incident)
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "reserve torn status incident directory",
+                path: incident.clone(),
+                source,
+            })?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(cfg!(windows));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        options
+            .open(temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "sync torn status evidence",
+                path: temporary.to_path_buf(),
+                source,
+            })?;
+        fs::rename(temporary, incident.join("status.tmp")).map_err(|source| {
+            ExperimentRunnerError::Io {
+                operation: "retain torn status evidence",
+                path: temporary.to_path_buf(),
+                source,
+            }
+        })?;
+        sync_parent_directory(&incident)?;
+        sync_parent_directory(
+            state_file
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        info!(
+            experiment_id = %self.experiment_id,
+            generation = committed.generation,
+            incident = %incident.display(),
+            "retained torn status prefix; validated committed generation remains authoritative"
+        );
+        Ok(committed)
+    }
+
     /// Atomically and durably flushes a validated status update to disk.
     ///
     /// # Errors
@@ -1540,6 +2310,7 @@ impl MatchedSeedExperimentRunner {
         variant: &ScenarioVariant,
         seed: u64,
     ) -> Result<RunRecord, ExperimentRunnerError> {
+        self.validate_execution_workload()?;
         validate_path_component("experiment_id", &self.experiment_id)?;
         validate_path_component("variant_id", &variant.variant_id)?;
         let family = ResolvedBrainFamily::resolve(variant)?;
@@ -1575,6 +2346,7 @@ impl MatchedSeedExperimentRunner {
                 ),
             });
         }
+        self.prepare_progress_for_execution(&plan);
         self.prepare_run_checkpoint(
             planned_variant,
             *planned_family,
@@ -1588,7 +2360,10 @@ impl MatchedSeedExperimentRunner {
             seed,
             &run_id,
             &plan.digest,
-            &std::sync::atomic::AtomicBool::new(false),
+            RunExecutionBudget {
+                cancel: &std::sync::atomic::AtomicBool::new(false),
+                population_limit: MAX_RUN_POPULATION,
+            },
         )
     }
 
@@ -1627,9 +2402,25 @@ impl MatchedSeedExperimentRunner {
         state_file: &Path,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        self.execute_batch_with_budget(
+            state_file,
+            RunExecutionBudget {
+                cancel,
+                population_limit: MAX_RUN_POPULATION,
+            },
+        )
+    }
+
+    fn execute_batch_with_budget(
+        &self,
+        state_file: &Path,
+        budget: RunExecutionBudget<'_>,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        self.validate_execution_workload()?;
         let plan = self.validated_plan()?;
         let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
         let mut status = self.load_or_create_status_locked(state_file, &plan)?;
+        self.prepare_progress_for_execution(&plan);
 
         let mut recovered = false;
         let mut recovery_error = None;
@@ -1654,6 +2445,7 @@ impl MatchedSeedExperimentRunner {
                                     record.seed,
                                     &record.run_id,
                                     &plan.digest,
+                                    budget.population_limit,
                                 )
                             });
                             match resumed {
@@ -1726,7 +2518,7 @@ impl MatchedSeedExperimentRunner {
             .collect::<Vec<_>>();
 
         for chunk in pending.chunks(self.max_concurrency) {
-            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            if budget.cancel.load(std::sync::atomic::Ordering::Acquire) {
                 info!(
                     experiment_id = %self.experiment_id,
                     "matched-seed batch cancelled before admitting the next wave"
@@ -1784,7 +2576,7 @@ impl MatchedSeedExperimentRunner {
                                 seed,
                                 &run_id,
                                 &plan_digest,
-                                cancel,
+                                budget,
                             )
                         }),
                     ));
@@ -1898,19 +2690,11 @@ impl MatchedSeedExperimentRunner {
             });
         }
 
-        let total_runs = self
-            .cohort
-            .seeds
-            .len()
-            .checked_mul(self.variants.len())
-            .filter(|count| *count <= MAX_BATCH_RUNS)
-            .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
-                reason: format!(
-                    "variant x seed expansion exceeds the bounded {MAX_BATCH_RUNS}-run capacity"
-                ),
-            })?;
+        let total_runs =
+            validate_experiment_run_count(self.variants.len(), self.cohort.seeds.len())?;
 
         let mut variants = BTreeMap::new();
+        let mut run_grid_cells = Vec::with_capacity(total_runs);
         let mut semantic_arms = BTreeSet::new();
         for variant in &self.variants {
             validate_path_component("variant_id", &variant.variant_id)?;
@@ -1929,17 +2713,48 @@ impl MatchedSeedExperimentRunner {
                         ),
                     }
                 })?;
+            // Check the configured executable family before any owner, output or
+            // worker exists. NeuroFlow's versioned envelope bounds are stricter
+            // than the general world configuration's architecture bounds.
+            drop(
+                family
+                    .adapter(&normalized_config, &variant.variant_id)
+                    .map_err(|error| ExperimentRunnerError::InvalidPlan {
+                        reason: format!(
+                            "variant `{}` has an invalid configured brain family: {error}",
+                            variant.variant_id
+                        ),
+                    })?,
+            );
+            // Use the constructor's validated dimensions, not a copied rounding
+            // rule. WorldState::build uses this exact grid for food and terrain.
+            let (width, height) = normalized_config.food_dimensions().map_err(|error| {
+                ExperimentRunnerError::InvalidPlan {
+                    reason: format!(
+                        "variant `{}` has invalid grid dimensions: {error}",
+                        variant.variant_id
+                    ),
+                }
+            })?;
+            let cells = u64::from(width)
+                .checked_mul(u64::from(height))
+                .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
+                    reason: format!("variant `{}` grid cell count overflows", variant.variant_id),
+                })?;
+            if cells > MAX_RUN_GRID_CELLS {
+                return Err(ExperimentRunnerError::RunGridCapacityExceeded {
+                    variant_id: variant.variant_id.clone(),
+                    cells,
+                    limit: MAX_RUN_GRID_CELLS,
+                });
+            }
+            run_grid_cells.extend(std::iter::repeat_n(cells, self.cohort.seeds.len()));
             let interventions = PreparedInterventions::new(
+                &variant.variant_id,
                 &normalized_config,
                 &variant.interventions,
                 self.max_ticks,
-            )
-            .map_err(|reason| ExperimentRunnerError::InvalidPlan {
-                reason: format!(
-                    "variant `{}` is not executable: {reason}",
-                    variant.variant_id
-                ),
-            })?;
+            )?;
             let config_bytes = serde_json::to_vec(&(&normalized_config, &interventions.patches))
                 .map_err(|source| ExperimentRunnerError::Json {
                     operation: "serialize normalized scenario arm",
@@ -1956,6 +2771,27 @@ impl MatchedSeedExperimentRunner {
                 });
             }
             variants.insert(variant.variant_id.clone(), (variant.clone(), family));
+        }
+
+        // Completed runs disappear from the resume queue, so its new waves can
+        // combine arms that occupied different initial waves. Reserve the largest
+        // possible concurrent subset instead of trusting the original chunking.
+        run_grid_cells.sort_unstable();
+        let concurrent_runs = self.max_concurrency.min(total_runs);
+        let concurrent_grid_cells = run_grid_cells
+            .iter()
+            .rev()
+            .take(concurrent_runs)
+            .try_fold(0_u64, |total, cells| total.checked_add(*cells))
+            .ok_or_else(|| ExperimentRunnerError::InvalidPlan {
+                reason: "concurrent grid cell count overflows".to_owned(),
+            })?;
+        if concurrent_grid_cells > MAX_CONCURRENT_GRID_CELLS {
+            return Err(ExperimentRunnerError::ConcurrentGridCapacityExceeded {
+                concurrent_runs,
+                cells: concurrent_grid_cells,
+                limit: MAX_CONCURRENT_GRID_CELLS,
+            });
         }
 
         let mut runs = Vec::with_capacity(total_runs);
@@ -1998,6 +2834,7 @@ impl MatchedSeedExperimentRunner {
             digest: blake3::hash(&digest_bytes).to_hex().to_string(),
             runs,
             variants,
+            concurrent_grid_cells,
         })
     }
 
@@ -2274,15 +3111,20 @@ impl MatchedSeedExperimentRunner {
         run_id: &str,
         plan_digest: &str,
     ) -> Result<(), ExperimentRunnerError> {
+        validate_run_checkpoint_capacity(checkpoint, path, MAX_RUN_POPULATION)?;
         let family = ResolvedBrainFamily::resolve(variant)?;
         let metadata = &checkpoint.metadata;
         let manifest = &metadata.manifest;
         let host = checkpoint.owner.host_checkpoint();
         let expected_config = config_for_run(&variant.config_overrides, seed)
             .map_err(|error| invalid_checkpoint(path, error))?;
-        let interventions =
-            PreparedInterventions::new(&expected_config, &variant.interventions, self.max_ticks)
-                .map_err(|error| invalid_checkpoint(path, error))?;
+        let interventions = PreparedInterventions::new(
+            &variant.variant_id,
+            &expected_config,
+            &variant.interventions,
+            self.max_ticks,
+        )
+        .map_err(|error| invalid_checkpoint(path, error))?;
         let expected_config = serde_json::to_value(&expected_config)
             .map_err(|error| invalid_checkpoint(path, error))?;
         if metadata.plan_digest != plan_digest
@@ -2338,10 +3180,12 @@ impl MatchedSeedExperimentRunner {
         seed: u64,
         run_id: &str,
         plan_digest: &str,
+        population_limit: u64,
     ) -> Result<Option<RunCheckpointV1>, ExperimentRunnerError> {
         let path = self.run_checkpoint_path(run_id);
         let committed = read_optional_run_checkpoint(&path)?;
         if let Some(checkpoint) = &committed {
+            validate_run_checkpoint_capacity(checkpoint, &path, population_limit)?;
             self.validate_run_checkpoint(&path, checkpoint, variant, seed, run_id, plan_digest)?;
         }
         let temporary = status_temporary_path(&path)?;
@@ -2394,6 +3238,7 @@ impl MatchedSeedExperimentRunner {
                 });
             }
         };
+        validate_run_checkpoint_capacity(&candidate, &temporary, population_limit)?;
         self.validate_run_checkpoint(&temporary, &candidate, variant, seed, run_id, plan_digest)?;
         let expected_parent = committed
             .as_ref()
@@ -2414,6 +3259,13 @@ impl MatchedSeedExperimentRunner {
                 "temporary cut does not extend the exact committed parent by one tick",
             ));
         }
+        // Decoding validates the data envelope, but executable adapters and the
+        // recomputed scientific digest are checked only by restoring the owner.
+        // Refuse an unrestorable successor while the exact committed parent and
+        // temporary evidence still exist. Ordinary reads without a temporary cut
+        // keep their existing single-restore path.
+        let family = ResolvedBrainFamily::resolve(variant)?;
+        drop(restore_run_owner(&candidate, family, run_id, &temporary)?);
         File::open(&temporary)
             .and_then(|file| file.sync_all())
             .map_err(|source| ExperimentRunnerError::Io {
@@ -2454,7 +3306,9 @@ impl MatchedSeedExperimentRunner {
                 path: bundle,
             });
         }
-        if let Some(checkpoint) = self.load_run_checkpoint(variant, seed, run_id, plan_digest)? {
+        if let Some(checkpoint) =
+            self.load_run_checkpoint(variant, seed, run_id, plan_digest, MAX_RUN_POPULATION)?
+        {
             if checkpoint.owner.host_checkpoint().tick().0 != 0 {
                 return Err(invalid_checkpoint(
                     &path,
@@ -2465,7 +3319,8 @@ impl MatchedSeedExperimentRunner {
         }
         let checkpoint = self.initial_run_checkpoint(variant, family, seed, run_id, plan_digest)?;
         self.validate_run_checkpoint(&path, &checkpoint, variant, seed, run_id, plan_digest)?;
-        write_run_checkpoint(&path, &checkpoint.encode(&path)?)
+        self.publish_run_checkpoint(&path, &checkpoint, &checkpoint.encode(&path)?)
+            .map(|_| ())
     }
 
     fn initial_run_checkpoint(
@@ -2482,13 +3337,12 @@ impl MatchedSeedExperimentRunner {
                 reason,
             }
         })?;
-        let interventions =
-            PreparedInterventions::new(&config, &variant.interventions, self.max_ticks).map_err(
-                |reason| ExperimentRunnerError::Construction {
-                    run_id: run_id.to_owned(),
-                    reason,
-                },
-            )?;
+        let interventions = PreparedInterventions::new(
+            &variant.variant_id,
+            &config,
+            &variant.interventions,
+            self.max_ticks,
+        )?;
         let mut world =
             WorldState::new(config).map_err(|source| ExperimentRunnerError::Construction {
                 run_id: run_id.to_owned(),
@@ -2501,6 +3355,7 @@ impl MatchedSeedExperimentRunner {
                 reason: format!("founder seeding failed: {source}"),
             }
         })?;
+        enforce_run_population(&world, run_id, MAX_RUN_POPULATION, None)?;
 
         let stable_run_id = Self::bundle_run_id(run_id);
         let mut identity = RunIdentityV1::new(
@@ -2576,21 +3431,25 @@ impl MatchedSeedExperimentRunner {
         seed: u64,
         run_id: &str,
         plan_digest: &str,
-        cancel: &std::sync::atomic::AtomicBool,
+        budget: RunExecutionBudget<'_>,
     ) -> Result<RunRecord, ExperimentRunnerError> {
         let path = self.run_checkpoint_path(run_id);
         let _lease = ExperimentStatusWriterLease::acquire(&path)?;
         let mut checkpoint = self
-            .load_run_checkpoint(variant, seed, run_id, plan_digest)?
+            .load_run_checkpoint(variant, seed, run_id, plan_digest, budget.population_limit)?
             .ok_or_else(|| ExperimentRunnerError::ResumeCheckpointUnavailable {
                 run_id: run_id.to_owned(),
                 completed_ticks: 0,
             })?;
         let initial_config = config_for_run(&variant.config_overrides, seed)
             .map_err(|error| invalid_checkpoint(&path, error))?;
-        let interventions =
-            PreparedInterventions::new(&initial_config, &variant.interventions, self.max_ticks)
-                .map_err(|error| invalid_checkpoint(&path, error))?;
+        let interventions = PreparedInterventions::new(
+            &variant.variant_id,
+            &initial_config,
+            &variant.interventions,
+            self.max_ticks,
+        )
+        .map_err(|error| invalid_checkpoint(&path, error))?;
         if experiment_path_exists(
             &self.staged_bundle_path(run_id),
             "inspect bundle staging before continuation",
@@ -2605,6 +3464,19 @@ impl MatchedSeedExperimentRunner {
             .to_hex()
             .to_string();
         let mut core = restore_run_owner(&checkpoint, family, run_id, &path)?;
+        enforce_run_population(
+            core.world(),
+            run_id,
+            budget.population_limit,
+            Some(checkpoint.owner.host_checkpoint().tick().0),
+        )?;
+        self.observe_checkpoint_progress(
+            plan_digest,
+            run_id,
+            core.world_tick().0,
+            parent_digest.clone(),
+            CheckpointProgressSource::Recovered,
+        );
         let (_, client_namespace) = host_identifiers(run_id);
         let mut frontend = NullFrontend::new(core.local_port(), client_namespace);
         let mut next_nanos = 0_u64;
@@ -2616,7 +3488,7 @@ impl MatchedSeedExperimentRunner {
 
         let mut cancelled = false;
         for expected_tick in core.world_tick().0 + 1..=self.max_ticks {
-            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            if budget.cancel.load(std::sync::atomic::Ordering::Acquire) {
                 cancelled = true;
                 break;
             }
@@ -2640,6 +3512,15 @@ impl MatchedSeedExperimentRunner {
                 interventions.due_at(expected_tick - 1),
                 &mut next_nanos,
             )?;
+            // Observe the actual completed science before any new flush/capture
+            // or encoding. A crossing tick remains a failed, uncheckpointed
+            // attempt; the previous committed cut is left byte-for-byte intact.
+            enforce_run_population(
+                core.world(),
+                run_id,
+                budget.population_limit,
+                Some(checkpoint.owner.host_checkpoint().tick().0),
+            )?;
             seal_run_checkpoint(run_id, &mut frontend, &mut core, &mut next_nanos)?;
             checkpoint.owner = core
                 .capture_volatile_host_checkpoint_v1()
@@ -2651,8 +3532,7 @@ impl MatchedSeedExperimentRunner {
             )?;
             checkpoint.metadata.parent_digest = Some(parent_digest);
             let bytes = checkpoint.encode(&path)?;
-            write_run_checkpoint(&path, &bytes)?;
-            parent_digest = blake3::hash(&bytes).to_hex().to_string();
+            parent_digest = self.publish_run_checkpoint(&path, &checkpoint, &bytes)?;
         }
 
         let completed_ticks = core.world_tick().0;
@@ -3702,71 +4582,83 @@ struct PreparedInterventions {
 
 impl PreparedInterventions {
     fn new(
+        variant_id: &str,
         initial: &ScriptBotsConfig,
         interventions: &[ScenarioInterventionV1],
         max_ticks: u64,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExperimentRunnerError> {
+        let invalid = |reason: String| ExperimentRunnerError::InvalidPlan {
+            reason: format!("variant `{variant_id}` is not executable: {reason}"),
+        };
+        validate_run_config_capacity(variant_id, initial, 0)?;
         if interventions.len() > MAX_EXPERIMENT_INTERVENTIONS {
-            return Err(format!(
+            return Err(invalid(format!(
                 "intervention count exceeds the {MAX_EXPERIMENT_INTERVENTIONS}-statement cap"
-            ));
+            )));
         }
         if interventions.len() > HostCoreOptions::default().archived_command_capacity {
-            return Err(
+            return Err(invalid(
                 "intervention schedule exceeds complete owner receipt retention".to_owned(),
-            );
+            ));
         }
         let mut current = initial.clone();
         let mut current_value =
-            serde_json::to_value(&current).map_err(|error| error.to_string())?;
+            serde_json::to_value(&current).map_err(|error| invalid(error.to_string()))?;
         let mut prepared = Self {
             patches: Vec::with_capacity(interventions.len()),
-            config_digests: vec![config_value_digest(&current_value)?],
+            config_digests: vec![config_value_digest(&current_value).map_err(invalid)?],
             changed_paths: Vec::with_capacity(interventions.len()),
         };
         let mut previous_tick = 0;
         for (index, intervention) in interventions.iter().enumerate() {
             if intervention.tick >= max_ticks {
-                return Err(format!(
+                return Err(invalid(format!(
                     "intervention {} tick {} must precede the {max_ticks}-tick completion boundary",
                     index + 1,
                     intervention.tick
-                ));
+                )));
             }
             if intervention.tick < previous_tick {
-                return Err(
+                return Err(invalid(
                     "intervention ticks must be nondecreasing; same-tick order is preserved"
                         .to_owned(),
-                );
+                ));
             }
-            let sequence = u64::try_from(index + 1).map_err(|error| error.to_string())?;
+            let sequence = u64::try_from(index + 1).map_err(|error| invalid(error.to_string()))?;
             let patch = ScheduledConfigPatch::new(
                 sequence,
                 Tick(intervention.tick),
                 intervention.set.clone(),
-            )?;
+            )
+            .map_err(invalid)?;
             if patch.patch.len() > MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES {
-                return Err(format!(
+                return Err(invalid(format!(
                     "intervention {sequence} exceeds the {MAX_EXPERIMENT_INTERVENTION_PATCH_BYTES}-byte canonical patch cap"
-                ));
+                )));
             }
-            validate_live_intervention_patch(&intervention.set, "")?;
-            let next = resolve_scheduled_config_patch(&current, &intervention.set)
-                .map_err(|error| format!("intervention {sequence} cannot resolve: {error}"))?;
+            validate_live_intervention_patch(&intervention.set, "").map_err(invalid)?;
+            let next =
+                resolve_scheduled_config_patch(&current, &intervention.set).map_err(|error| {
+                    invalid(format!("intervention {sequence} cannot resolve: {error}"))
+                })?;
             next.validate().map_err(|error| {
-                format!("intervention {sequence} produces an invalid config: {error}")
+                invalid(format!(
+                    "intervention {sequence} produces an invalid config: {error}"
+                ))
             })?;
+            validate_run_config_capacity(variant_id, &next, sequence)?;
             if next.rng_seed != initial.rng_seed
                 || next.persistence_interval != initial.persistence_interval
             {
-                return Err(
+                return Err(invalid(
                     "interventions cannot change the matched seed or recording policy".to_owned(),
-                );
+                ));
             }
-            let next_value = serde_json::to_value(&next).map_err(|error| error.to_string())?;
+            let next_value =
+                serde_json::to_value(&next).map_err(|error| invalid(error.to_string()))?;
             prepared
                 .config_digests
-                .push(config_value_digest(&next_value)?);
+                .push(config_value_digest(&next_value).map_err(invalid)?);
             prepared
                 .changed_paths
                 .push(scriptbots_runtime::host_core::config_changed_paths(
@@ -3939,6 +4831,299 @@ pub(crate) fn insert_dotted_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn progress_runner(directory: &Path, seeds: Vec<u64>) -> MatchedSeedExperimentRunner {
+        MatchedSeedExperimentRunner::new(
+            "checkpoint-progress",
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds,
+            },
+            vec![ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::from([
+                    ("world_width".into(), serde_json::json!(40)),
+                    ("world_height".into(), serde_json::json!(40)),
+                    ("food_cell_size".into(), serde_json::json!(10)),
+                ]),
+                interventions: Vec::new(),
+            }],
+            3,
+            2,
+            directory.join("bundles"),
+        )
+    }
+
+    #[test]
+    fn checkpoint_progress_follows_successful_publication_not_attempted_science() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = progress_runner(&directory, vec![7]);
+        let state_file = directory.join("status.json");
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        let pending = runner
+            .checkpoint_progress_snapshot(&state_file, &status, true)
+            .unwrap();
+        assert_eq!(
+            pending[&record.run_id],
+            ExperimentCheckpointProgress::Unavailable {
+                reason: CheckpointProgressUnavailable::NotStarted,
+            }
+        );
+        runner.prepare_progress_for_execution(&plan);
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        status.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut status).unwrap();
+        let status_bytes = fs::read(&state_file).unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let initial_bytes = fs::read(&path).unwrap();
+        let initial = runner
+            .checkpoint_progress_snapshot(&state_file, &status, true)
+            .unwrap();
+        assert_eq!(
+            initial[&record.run_id],
+            ExperimentCheckpointProgress::Observed {
+                tick: 0,
+                checkpoint_digest: blake3::hash(&initial_bytes).to_hex().to_string(),
+                source: CheckpointProgressSource::Published,
+            }
+        );
+
+        let mut checkpoint = RunCheckpointV1::decode(&initial_bytes, &path).unwrap();
+        let mut owner = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+        let command = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::Step,
+            ))
+            .unwrap();
+        let mut now = 0;
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "progress test step",
+            &mut frontend,
+            &mut owner,
+            command.command_id(),
+            1,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+        checkpoint.owner = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        checkpoint.metadata.parent_digest = Some(blake3::hash(&initial_bytes).to_hex().to_string());
+        let advanced_bytes = checkpoint.encode(&path).unwrap();
+        let temporary = status_temporary_path(&path).unwrap();
+        fs::write(&temporary, b"injected incomplete checkpoint write").unwrap();
+        assert!(
+            runner
+                .publish_run_checkpoint(&path, &checkpoint, &advanced_bytes)
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), initial_bytes);
+        assert_eq!(
+            runner
+                .checkpoint_progress_snapshot(&state_file, &status, true)
+                .unwrap(),
+            initial,
+            "an advanced owner and failed write cannot publish progress"
+        );
+        fs::rename(&temporary, path.with_extension("preserved-write-fault")).unwrap();
+        runner
+            .publish_run_checkpoint(&path, &checkpoint, &advanced_bytes)
+            .unwrap();
+        let observed = runner
+            .checkpoint_progress_snapshot(&state_file, &status, true)
+            .unwrap();
+        assert_eq!(
+            observed[&record.run_id],
+            ExperimentCheckpointProgress::Observed {
+                tick: 1,
+                checkpoint_digest: blake3::hash(&advanced_bytes).to_hex().to_string(),
+                source: CheckpointProgressSource::Published,
+            }
+        );
+        runner.observe_checkpoint_progress(
+            &plan.digest,
+            &record.run_id,
+            0,
+            blake3::hash(&initial_bytes).to_hex().to_string(),
+            CheckpointProgressSource::Recovered,
+        );
+        assert_eq!(
+            runner
+                .checkpoint_progress_snapshot(&state_file, &status, true)
+                .unwrap(),
+            observed
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+        assert_eq!(status.runs[0].total_ticks, 0);
+        assert_eq!(status.runs[0].state, RunState::Running);
+        runner.observe_checkpoint_progress(
+            &plan.digest,
+            &record.run_id,
+            1,
+            blake3::hash(&initial_bytes).to_hex().to_string(),
+            CheckpointProgressSource::Recovered,
+        );
+        runner.observe_checkpoint_progress(
+            &plan.digest,
+            &record.run_id,
+            0,
+            blake3::hash(&initial_bytes).to_hex().to_string(),
+            CheckpointProgressSource::Recovered,
+        );
+        assert_eq!(
+            runner
+                .checkpoint_progress_snapshot(&state_file, &status, true)
+                .unwrap()[&record.run_id],
+            ExperimentCheckpointProgress::Refused {
+                reason: CheckpointProgressRefusal::ConflictingObservation,
+            },
+            "conflicting evidence cannot reset the monotonicity guard"
+        );
+    }
+
+    #[test]
+    fn checkpoint_progress_cold_recovery_is_bounded_read_only_and_rejects_foreign_cuts() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = progress_runner(&directory, vec![7, 9]);
+        let state_file = directory.join("status.json");
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        for record in &mut status.runs {
+            let (variant, family) = &plan.variants[&record.variant_id];
+            runner
+                .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+                .unwrap();
+            record.state = RunState::Running;
+        }
+        runner.save_status(&state_file, &mut status).unwrap();
+        let status_bytes = fs::read(&state_file).unwrap();
+        let paths = status
+            .runs
+            .iter()
+            .map(|run| runner.run_checkpoint_path(&run.run_id))
+            .collect::<Vec<_>>();
+        let cuts = paths
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let names = fs::read_dir(&runner.output_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        let cold = progress_runner(&directory, vec![7, 9]);
+        let active = cold
+            .checkpoint_progress_snapshot(&state_file, &status, true)
+            .unwrap();
+        assert!(
+            active.values().all(|progress| matches!(
+                progress,
+                ExperimentCheckpointProgress::Unavailable {
+                    reason: CheckpointProgressUnavailable::AwaitingPublication,
+                }
+            )),
+            "active polling must not decode existing files"
+        );
+        let first = cold
+            .checkpoint_progress_snapshot(&state_file, &status, false)
+            .unwrap();
+        assert_eq!(
+            first
+                .values()
+                .filter(|progress| progress.observed_tick().is_some())
+                .count(),
+            1
+        );
+        let second = cold
+            .checkpoint_progress_snapshot(&state_file, &status, false)
+            .unwrap();
+        for (index, record) in status.runs.iter().enumerate() {
+            assert_eq!(
+                second[&record.run_id],
+                ExperimentCheckpointProgress::Observed {
+                    tick: 0,
+                    checkpoint_digest: blake3::hash(&cuts[index]).to_hex().to_string(),
+                    source: CheckpointProgressSource::Recovered,
+                }
+            );
+        }
+        assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+        assert_eq!(
+            names,
+            fs::read_dir(&runner.output_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect()
+        );
+        for (path, bytes) in paths.iter().zip(&cuts) {
+            assert_eq!(fs::read(path).unwrap(), *bytes);
+        }
+
+        // Cached progress is explicitly an observation of a past cut, not a
+        // substitute for current readback or resume validation.
+        fs::copy(&paths[0], paths[0].with_extension("preserved-original")).unwrap();
+        fs::write(&paths[0], b"corrupt checkpoint").unwrap();
+        assert_eq!(
+            cold.checkpoint_progress_snapshot(&state_file, &status, false)
+                .unwrap(),
+            second
+        );
+        let refused = progress_runner(&directory, vec![7, 9]);
+        let corrupt = refused
+            .checkpoint_progress_snapshot(&state_file, &status, false)
+            .unwrap();
+        assert_eq!(
+            corrupt[&status.runs[0].run_id],
+            ExperimentCheckpointProgress::Refused {
+                reason: CheckpointProgressRefusal::InvalidCheckpoint,
+            }
+        );
+        fs::copy(&paths[1], paths[1].with_extension("preserved-original")).unwrap();
+        fs::write(&paths[1], &cuts[0]).unwrap();
+        let foreign = refused
+            .checkpoint_progress_snapshot(&state_file, &status, false)
+            .unwrap();
+        assert!(
+            foreign.values().all(|progress| matches!(
+                progress,
+                ExperimentCheckpointProgress::Refused {
+                    reason: CheckpointProgressRefusal::InvalidCheckpoint,
+                }
+            )),
+            "a byte-valid cut for another seed must refuse"
+        );
+        for (path, bytes) in paths.iter().zip(&cuts) {
+            fs::write(path, bytes).unwrap();
+        }
+        assert_eq!(
+            refused
+                .checkpoint_progress_snapshot(&state_file, &status, false)
+                .unwrap(),
+            foreign
+        );
+        let completed = refused.execute_batch(&state_file).unwrap();
+        assert_eq!(
+            completed.completed_runs, 2,
+            "explicit resume retries repaired cuts"
+        );
+        let resumed = refused
+            .checkpoint_progress_snapshot(&state_file, &completed, false)
+            .unwrap();
+        assert!(
+            resumed
+                .values()
+                .all(|progress| progress.observed_tick() == Some(3))
+        );
+    }
 
     #[test]
     fn endpoint_summary_reports_observed_state_and_preserves_unavailable_empty_statistics() {
@@ -4383,6 +5568,77 @@ mod tests {
     }
 
     #[test]
+    fn neuroflow_arm_admission_matches_the_compiled_family() {
+        let directory = tempfile::tempdir().unwrap();
+        for requested_family in ["neuro", "neuroflow", "ml.neuroflow"] {
+            let variant = ScenarioVariant {
+                variant_id: "neuro".into(),
+                brain_family: requested_family.into(),
+                config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
+            };
+            let runner = MatchedSeedExperimentRunner::new(
+                "neuro-plan",
+                MatchedSeedCohort {
+                    cohort_id: "cohort".into(),
+                    seeds: vec![71],
+                },
+                vec![variant.clone()],
+                2,
+                1,
+                directory.path().join("bundles"),
+            );
+            #[cfg(feature = "neuro")]
+            {
+                assert_eq!(
+                    canonical_experiment_brain_family(&variant.variant_id, requested_family)
+                        .unwrap(),
+                    "ml.neuroflow"
+                );
+                assert!(EXPERIMENT_BRAIN_FAMILIES.contains(&"ml.neuroflow"));
+                let plan = runner.plan_batch().expect("compiled family is executable");
+                assert_eq!(plan[0].brain_family, "ml.neuroflow");
+
+                let duplicate = MatchedSeedExperimentRunner {
+                    variants: vec![
+                        variant,
+                        ScenarioVariant {
+                            variant_id: "same-science".into(),
+                            brain_family: "ml.neuroflow".into(),
+                            config_overrides: BTreeMap::new(),
+                            interventions: Vec::new(),
+                        },
+                    ],
+                    ..runner
+                };
+                assert!(matches!(
+                    duplicate.plan_batch(),
+                    Err(ExperimentRunnerError::InvalidPlan { .. })
+                ));
+            }
+            #[cfg(not(feature = "neuro"))]
+            {
+                assert!(!EXPERIMENT_BRAIN_FAMILIES.contains(&"ml.neuroflow"));
+                for result in [
+                    validate_experiment_brain_family(&variant.variant_id, requested_family),
+                    runner.plan_batch().map(|_| ()),
+                    runner
+                        .load_or_create_status(&directory.path().join("status.json"))
+                        .map(|_| ()),
+                ] {
+                    let error = result.expect_err("missing family must not silently fall back");
+                    assert!(matches!(
+                        error,
+                        ExperimentRunnerError::UnavailableBrainFamily { .. }
+                    ));
+                    assert!(error.to_string().contains("neuro feature"));
+                }
+            }
+        }
+        assert!(directory.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
     fn single_run_refuses_an_arm_changed_after_plan_validation() {
         let planned_variant = ScenarioVariant {
             variant_id: "mlp_base".into(),
@@ -4495,24 +5751,735 @@ mod tests {
             Err(ExperimentRunnerError::UnknownBrainFamily { .. })
         ));
 
-        let unavailable = MatchedSeedExperimentRunner::new(
-            "exp-unavailable",
+        #[cfg(not(feature = "neuro"))]
+        {
+            let unavailable = MatchedSeedExperimentRunner::new(
+                "exp-unavailable",
+                MatchedSeedCohort {
+                    cohort_id: "cohort".into(),
+                    seeds: vec![1],
+                },
+                vec![ScenarioVariant {
+                    brain_family: "neuroflow".into(),
+                    ..base_variant
+                }],
+                1,
+                1,
+                output,
+            );
+            assert!(matches!(
+                unavailable.plan_batch(),
+                Err(ExperimentRunnerError::UnavailableBrainFamily { .. })
+            ));
+        }
+    }
+
+    fn grid_test_variant(
+        variant_id: &str,
+        width: u32,
+        height: u32,
+        cell_size: u32,
+    ) -> ScenarioVariant {
+        ScenarioVariant {
+            variant_id: variant_id.to_owned(),
+            brain_family: "mlp".to_owned(),
+            config_overrides: BTreeMap::from([
+                ("world_width".to_owned(), serde_json::json!(width)),
+                ("world_height".to_owned(), serde_json::json!(height)),
+                ("food_cell_size".to_owned(), serde_json::json!(cell_size)),
+            ]),
+            interventions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn experiment_total_tick_preflight_counts_all_seeds_and_variants() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let mut runner = progress_runner(&directory, vec![7, 11, 13, 17]);
+        runner.variants = vec![
+            grid_test_variant("baseline", 40, 40, 10),
+            grid_test_variant("challenger", 60, 40, 10),
+        ];
+        runner.max_ticks = MAX_BATCH_TOTAL_TICKS / 8;
+        let boundary_ticks = runner.max_ticks;
+        for concurrency in [1, 2, MAX_CONCURRENT_RUNS] {
+            runner.max_concurrency = concurrency;
+            let runs = runner.plan_batch().unwrap();
+            assert_eq!(runs.len(), 8);
+            assert_eq!(runner.max_ticks, boundary_ticks);
+            assert_eq!(
+                runs.iter().map(|run| run.seed).collect::<Vec<_>>(),
+                vec![7, 11, 13, 17, 7, 11, 13, 17]
+            );
+
+            runner.max_ticks += 1;
+            assert!(matches!(
+                runner.plan_batch(),
+                Err(ExperimentRunnerError::BatchTickCapacityExceeded {
+                    runs: 8,
+                    ticks_per_run,
+                    total_ticks,
+                    limit,
+                }) if ticks_per_run == boundary_ticks + 1
+                    && total_ticks == MAX_BATCH_TOTAL_TICKS + 8
+                    && limit == MAX_BATCH_TOTAL_TICKS
+            ));
+            runner.max_ticks = boundary_ticks;
+        }
+
+        // Preserve the largest single-run horizon and intentional zero-tick
+        // library plans; the scientific horizon is rejected, never truncated.
+        runner.cohort.seeds = vec![7];
+        runner.variants.truncate(1);
+        runner.max_ticks = MAX_TICKS_PER_RUN;
+        assert_eq!(runner.plan_batch().unwrap().len(), 1);
+        assert_eq!(runner.max_ticks, MAX_TICKS_PER_RUN);
+        runner.max_ticks = 0;
+        assert_eq!(runner.plan_batch().unwrap().len(), 1);
+        assert_eq!(runner.max_ticks, 0);
+        assert!(!runner.output_dir.exists());
+    }
+
+    #[test]
+    fn experiment_total_tick_preflight_preserves_history_and_precedes_execution_io() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let mut runner = progress_runner(&directory, vec![7, 11]);
+        runner.max_ticks = MAX_TICKS_PER_RUN;
+        let state_file = directory.join("status.json");
+        // A historical pending cut is scientifically valid even though the
+        // current policy refuses further execution of its full declared cohort.
+        let plan = runner.validated_plan().unwrap();
+        let status = runner.initial_status(&plan);
+        let committed = canonical_status_bytes(&status).unwrap();
+        fs::write(&state_file, &committed).unwrap();
+        assert_eq!(runner.status_snapshot(&state_file).unwrap(), status);
+        assert_eq!(runner.plan_digest().unwrap(), status.plan_digest);
+        assert!(runner.concurrent_grid_cells().is_ok());
+
+        // Check the refusal first so the old-source negative control cannot
+        // proceed into a long execution after restoring the missing guard.
+        assert!(matches!(
+            runner.plan_batch(),
+            Err(ExperimentRunnerError::BatchTickCapacityExceeded { .. })
+        ));
+        let outcomes = [
+            runner.load_or_create_status(&state_file).map(|_| ()),
+            runner.execute_batch(&state_file).map(|_| ()),
+            runner
+                .execute_single_run(&runner.variants[0], 7)
+                .map(|_| ()),
+        ];
+        for outcome in outcomes {
+            assert!(matches!(
+                outcome,
+                Err(ExperimentRunnerError::BatchTickCapacityExceeded {
+                    runs: 2,
+                    total_ticks,
+                    limit,
+                    ..
+                }) if total_ticks == 2 * MAX_TICKS_PER_RUN
+                    && limit == MAX_BATCH_TOTAL_TICKS
+            ));
+        }
+        assert_eq!(runner.status_snapshot(&state_file).unwrap(), status);
+        assert_eq!(fs::read(&state_file).unwrap(), committed);
+        assert!(!status_temporary_path(&state_file).unwrap().exists());
+        assert!(!status_lock_path(&state_file).unwrap().exists());
+        assert!(!runner.output_dir.exists());
+
+        let unopened = directory.join("unopened").join("status.json");
+        assert!(matches!(
+            runner.load_or_create_status(&unopened),
+            Err(ExperimentRunnerError::BatchTickCapacityExceeded { .. })
+        ));
+        assert!(!unopened.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn experiment_grid_preflight_uses_actual_dimensions_and_rejects_one_cell_over() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("unallocated");
+        let boundary = grid_test_variant("boundary", 16_384, 16_384, 32);
+        let config = config_for_run(&boundary.config_overrides, 1).unwrap();
+        let (width, height) = config.food_dimensions().unwrap();
+        assert_eq!((width, height), (512, 512));
+        assert_eq!(u64::from(width) * u64::from(height), MAX_RUN_GRID_CELLS);
+        let mut runner = MatchedSeedExperimentRunner::new(
+            "grid-boundary",
             MatchedSeedCohort {
-                cohort_id: "cohort".into(),
+                cohort_id: "grid".to_owned(),
                 seeds: vec![1],
             },
+            vec![boundary],
+            1,
+            MAX_CONCURRENT_RUNS,
+            &output,
+        );
+        assert_eq!(runner.plan_batch().unwrap().len(), 1);
+        assert_eq!(runner.concurrent_grid_cells().unwrap(), MAX_RUN_GRID_CELLS);
+
+        // Both extents remain within the existing knob ranges; only their
+        // normalized product exceeds the new owner allocation limit.
+        runner.variants = vec![grid_test_variant("one-over", 65, 4_033, 1)];
+        assert!(matches!(
+            runner.plan_batch(),
+            Err(ExperimentRunnerError::RunGridCapacityExceeded { variant_id, cells, limit })
+                if variant_id == "one-over"
+                    && cells == MAX_RUN_GRID_CELLS + 1
+                    && limit == MAX_RUN_GRID_CELLS
+        ));
+        runner.variants = vec![grid_test_variant("huge", 20_000, 20_000, 1)];
+        assert!(matches!(
+            runner.plan_batch(),
+            Err(ExperimentRunnerError::RunGridCapacityExceeded {
+                cells: 400_000_000,
+                ..
+            })
+        ));
+        assert!(
+            !output.exists(),
+            "preflight must never construct a world or write a cut"
+        );
+    }
+
+    #[test]
+    fn experiment_grid_preflight_preserves_default_and_small_mixed_cohorts() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("unallocated");
+        let mut runner = MatchedSeedExperimentRunner::new(
+            "grid-default",
+            MatchedSeedCohort {
+                cohort_id: "grid".to_owned(),
+                seeds: (0..u64::try_from(MAX_CONCURRENT_RUNS).unwrap()).collect(),
+            },
             vec![ScenarioVariant {
-                brain_family: "neuroflow".into(),
-                ..base_variant
+                variant_id: "default".to_owned(),
+                brain_family: "mlp".to_owned(),
+                config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
             }],
             1,
-            1,
-            output,
+            MAX_CONCURRENT_RUNS,
+            &output,
         );
+        let (width, height) = ScriptBotsConfig::default().food_dimensions().unwrap();
+        let expected =
+            u64::from(width) * u64::from(height) * u64::try_from(MAX_CONCURRENT_RUNS).unwrap();
+        assert_eq!(runner.plan_batch().unwrap().len(), MAX_CONCURRENT_RUNS);
+        assert_eq!(runner.concurrent_grid_cells().unwrap(), expected);
+        assert!(expected <= MAX_CONCURRENT_GRID_CELLS);
+
+        runner.cohort.seeds = vec![1];
+        runner.variants = vec![
+            grid_test_variant("large", 512, 512, 1),
+            grid_test_variant("small", 32, 32, 32),
+        ];
+        assert_eq!(runner.plan_batch().unwrap().len(), 2);
+        assert_eq!(
+            runner.concurrent_grid_cells().unwrap(),
+            MAX_RUN_GRID_CELLS + 1
+        );
+        assert!(
+            !output.exists(),
+            "capacity discovery must not allocate owners or touch their artifact directory"
+        );
+    }
+
+    #[test]
+    fn experiment_grid_preflight_counts_matched_seeds_and_resume_wave_reordering() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("unallocated");
+        let mut runner = MatchedSeedExperimentRunner::new(
+            "grid-waves",
+            MatchedSeedCohort {
+                cohort_id: "grid".to_owned(),
+                seeds: vec![1, 2, 3, 4],
+            },
+            vec![
+                grid_test_variant("large", 512, 512, 1),
+                grid_test_variant("small", 32, 32, 32),
+            ],
+            1,
+            4,
+            &output,
+        );
+        assert_eq!(runner.plan_batch().unwrap().len(), 8);
+        assert_eq!(
+            runner.concurrent_grid_cells().unwrap(),
+            MAX_CONCURRENT_GRID_CELLS
+        );
+        let digest = runner.plan_digest().unwrap();
+        runner.max_concurrency = 3;
+        assert_eq!(
+            runner.concurrent_grid_cells().unwrap(),
+            3 * MAX_RUN_GRID_CELLS
+        );
+        assert_eq!(
+            runner.plan_digest().unwrap(),
+            digest,
+            "capacity does not change the science plan"
+        );
+
+        runner.max_concurrency = 5;
+        for _ in 0..2 {
+            assert!(matches!(
+                runner.plan_batch(),
+                Err(ExperimentRunnerError::ConcurrentGridCapacityExceeded {
+                    concurrent_runs: 5, cells, limit,
+                }) if cells == MAX_CONCURRENT_GRID_CELLS + 1
+                    && limit == MAX_CONCURRENT_GRID_CELLS
+            ));
+            // When the small arm comes first, the original five-run wave holds
+            // only one large world. Filtering completed companions on resume
+            // can pack all four large worlds with a small one into the same wave.
+            runner.variants.reverse();
+        }
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn experiment_grid_preflight_guards_status_recovery_and_execution_before_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("unallocated");
+        let state_file = directory.path().join("status.json");
+        let mut runner = MatchedSeedExperimentRunner::new(
+            "grid-recovery",
+            MatchedSeedCohort {
+                cohort_id: "grid".to_owned(),
+                seeds: vec![1, 2, 3, 4],
+            },
+            vec![
+                grid_test_variant("large", 512, 512, 1),
+                grid_test_variant("small", 32, 32, 32),
+            ],
+            1,
+            4,
+            &output,
+        );
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        status.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut status).unwrap();
+        let committed = fs::read(&state_file).unwrap();
+        runner.max_concurrency = 5;
+        let outcomes = [
+            runner.plan_digest().map(|_| ()),
+            runner.status_snapshot(&state_file).map(|_| ()),
+            runner.load_or_create_status(&state_file).map(|_| ()),
+            runner.save_status(&state_file, &mut status),
+            runner.verify_completed_status(&state_file, &status),
+            runner.execute_batch(&state_file).map(|_| ()),
+            runner
+                .execute_single_run(&runner.variants[0], 1)
+                .map(|_| ()),
+        ];
+        for result in outcomes {
+            assert!(matches!(
+                result,
+                Err(ExperimentRunnerError::ConcurrentGridCapacityExceeded { .. })
+            ));
+        }
+        assert_eq!(fs::read(&state_file).unwrap(), committed);
+        assert!(!status_temporary_path(&state_file).unwrap().exists());
+        assert!(
+            !output.exists(),
+            "oversized resume must not allocate a world or write a cut"
+        );
+
+        let unopened_state = directory.path().join("unopened").join("status.json");
         assert!(matches!(
-            unavailable.plan_batch(),
-            Err(ExperimentRunnerError::UnavailableBrainFamily { .. })
+            runner.load_or_create_status(&unopened_state),
+            Err(ExperimentRunnerError::ConcurrentGridCapacityExceeded { .. })
         ));
+        assert!(!unopened_state.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn experiment_population_preflight_checks_initial_and_every_scheduled_prefix_before_io() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let mut runner = progress_runner(&directory, vec![7]);
+        let state_file = directory.join("unopened").join("status.json");
+        for floor in [MAX_RUN_POPULATION - 1, MAX_RUN_POPULATION] {
+            runner.variants[0]
+                .config_overrides
+                .insert("population_minimum".into(), serde_json::json!(floor));
+            assert_eq!(runner.plan_batch().unwrap().len(), 1);
+        }
+        runner.variants[0].config_overrides.insert(
+            "population_minimum".into(),
+            serde_json::json!(MAX_RUN_POPULATION + 1),
+        );
+        let outcomes = [
+            runner.plan_batch().map(|_| ()),
+            runner.load_or_create_status(&state_file).map(|_| ()),
+            runner.execute_batch(&state_file).map(|_| ()),
+            runner
+                .execute_single_run(&runner.variants[0], 7)
+                .map(|_| ()),
+        ];
+        for outcome in outcomes {
+            assert!(matches!(
+                outcome,
+                Err(ExperimentRunnerError::RunConfigCapacityExceeded {
+                    variant_id,
+                    configuration_step: 0,
+                    resource: "population floor",
+                    requested,
+                    limit,
+                }) if variant_id == "mlp"
+                    && requested == MAX_RUN_POPULATION + 1
+                    && limit == MAX_RUN_POPULATION
+            ));
+        }
+        runner.variants[0]
+            .config_overrides
+            .insert("population_minimum".into(), serde_json::json!(0));
+        runner.variants[0].interventions = vec![
+            ScenarioInterventionV1 {
+                tick: 0,
+                set: serde_json::json!({"population_minimum": MAX_RUN_POPULATION}),
+            },
+            ScenarioInterventionV1 {
+                tick: 1,
+                set: serde_json::json!({"population_minimum": MAX_RUN_POPULATION + 1}),
+            },
+            ScenarioInterventionV1 {
+                tick: 2,
+                set: serde_json::json!({"population_minimum": 0}),
+            },
+        ];
+        for outcome in [
+            runner.plan_batch().map(|_| ()),
+            runner.execute_batch(&state_file).map(|_| ()),
+        ] {
+            assert!(matches!(
+                outcome,
+                Err(ExperimentRunnerError::RunConfigCapacityExceeded {
+                    configuration_step: 2,
+                    resource: "population floor",
+                    requested,
+                    ..
+                }) if requested == MAX_RUN_POPULATION + 1
+            ));
+        }
+        assert!(!runner.output_dir.exists());
+        assert!(!state_file.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn experiment_config_capacity_checks_the_allocating_history_and_population_fields() {
+        let history_limit = usize::try_from(MAX_RUN_HISTORY_ENTRIES).unwrap();
+        let population_limit = usize::try_from(MAX_RUN_POPULATION).unwrap();
+        let accepted = ScriptBotsConfig {
+            history_capacity: history_limit,
+            narrative_capacity: history_limit,
+            population_minimum: population_limit,
+            population_spawn_count: u32::try_from(MAX_RUN_POPULATION).unwrap(),
+            ..ScriptBotsConfig::default()
+        };
+        PreparedInterventions::new("boundary", &accepted, &[], 1).unwrap();
+        for (resource, config) in [
+            (
+                "history entries",
+                ScriptBotsConfig {
+                    history_capacity: history_limit + 1,
+                    ..accepted.clone()
+                },
+            ),
+            (
+                "narrative events",
+                ScriptBotsConfig {
+                    narrative_capacity: history_limit + 1,
+                    ..accepted.clone()
+                },
+            ),
+            (
+                "population injection count",
+                ScriptBotsConfig {
+                    population_spawn_count: u32::try_from(MAX_RUN_POPULATION + 1).unwrap(),
+                    ..accepted.clone()
+                },
+            ),
+        ] {
+            assert!(matches!(
+                PreparedInterventions::new("oversized", &config, &[], 1),
+                Err(ExperimentRunnerError::RunConfigCapacityExceeded {
+                    resource: observed,
+                    configuration_step: 0,
+                    requested,
+                    limit,
+                    ..
+                }) if observed == resource && requested == limit + 1
+            ));
+        }
+    }
+
+    fn population_budget_runner(directory: &Path) -> MatchedSeedExperimentRunner {
+        let mut runner = progress_runner(directory, vec![7]);
+        runner.variants[0].config_overrides.extend([
+            ("population_spawn_interval".into(), serde_json::json!(1)),
+            ("reproduction_attempt_chance".into(), serde_json::json!(0.0)),
+            ("spike_damage".into(), serde_json::json!(0.0)),
+            ("metabolism_drain".into(), serde_json::json!(0.0)),
+            ("movement_drain".into(), serde_json::json!(0.0)),
+        ]);
+        runner
+    }
+
+    #[test]
+    fn experiment_population_crossing_retains_the_last_cut_and_terminal_failure() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = population_budget_runner(&directory);
+        let state_file = directory.join("status.json");
+        runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let retained = fs::read(&path).unwrap();
+        let checkpoint = RunCheckpointV1::decode(&retained, &path).unwrap();
+        let population_limit = u64::try_from(
+            checkpoint
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .agent_count(),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let budget = RunExecutionBudget {
+            cancel: &cancel,
+            population_limit,
+        };
+        let error = runner
+            .execute_validated_run(
+                variant,
+                *family,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+                budget,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ExperimentRunnerError::RunPopulationCapacityExceeded {
+                    run_id,
+                    tick: 1,
+                    population,
+                    limit,
+                    retained_checkpoint_tick: Some(0),
+                } if run_id == &record.run_id
+                    && *population == population_limit + 1
+                    && *limit == population_limit
+            ),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), retained);
+        assert!(!status_temporary_path(&path).unwrap().exists());
+        assert!(!runner.output_dir.join(&record.run_id).exists());
+
+        let failed = runner
+            .execute_batch_with_budget(&state_file, budget)
+            .unwrap();
+        assert_eq!(failed.completed_runs, 0);
+        assert_eq!(failed.failed_runs, 1);
+        assert_eq!(failed.runs[0].state, RunState::Failed);
+        assert_eq!(failed.runs[0].total_ticks, 0);
+        assert_eq!(
+            failed.runs[0].error_reason.as_deref(),
+            Some(error.to_string().as_str())
+        );
+        assert_eq!(fs::read(&path).unwrap(), retained);
+        assert_eq!(
+            runner
+                .checkpoint_progress_snapshot(&state_file, &failed, false)
+                .unwrap()[&record.run_id]
+                .observed_tick(),
+            Some(0),
+        );
+        let status_bytes = fs::read(&state_file).unwrap();
+        assert_eq!(
+            runner
+                .execute_batch_with_budget(&state_file, budget)
+                .unwrap(),
+            failed
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+        assert_eq!(fs::read(&path).unwrap(), retained);
+        assert!(!runner.output_dir.join(&record.run_id).exists());
+    }
+
+    #[test]
+    fn experiment_recovery_refuses_population_growth_before_promoting_the_next_cut() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = population_budget_runner(&directory);
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let temporary = status_temporary_path(&path).unwrap();
+        let retained = fs::read(&path).unwrap();
+        let mut checkpoint = RunCheckpointV1::decode(&retained, &path).unwrap();
+        let mut owner = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let population_limit = u64::try_from(owner.world().agents().len()).unwrap();
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+        let submitted = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::Step,
+            ))
+            .unwrap();
+        let mut now = 0;
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "over-cap temporary checkpoint step",
+            &mut frontend,
+            &mut owner,
+            submitted.command_id(),
+            1,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+        checkpoint.owner = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        checkpoint.metadata.parent_digest = Some(blake3::hash(&retained).to_hex().to_string());
+        assert_eq!(checkpoint.owner.host_checkpoint().tick().0, 1);
+        assert_eq!(
+            u64::try_from(
+                checkpoint
+                    .owner
+                    .host_checkpoint()
+                    .world_checkpoint()
+                    .agent_count()
+            )
+            .unwrap(),
+            population_limit + 1,
+        );
+        // This is a real, canonical next-tick cut with the exact parent. Only
+        // the smaller execution budget should prevent its atomic promotion.
+        runner
+            .validate_run_checkpoint(
+                &temporary,
+                &checkpoint,
+                variant,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .unwrap();
+        let candidate = checkpoint.encode(&temporary).unwrap();
+        fs::write(&temporary, &candidate).unwrap();
+        let _lease = ExperimentStatusWriterLease::acquire(&path).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                runner.load_run_checkpoint(
+                    variant,
+                    record.seed,
+                    &record.run_id,
+                    &plan.digest,
+                    population_limit,
+                ),
+                Err(ExperimentRunnerError::InvalidCheckpoint { path: rejected, reason })
+                    if rejected == temporary && reason.contains("checkpoint population")
+            ));
+            assert_eq!(fs::read(&path).unwrap(), retained);
+            assert_eq!(fs::read(&temporary).unwrap(), candidate);
+        }
+    }
+
+    #[test]
+    fn experiment_population_budget_preserves_exact_resume_and_admits_the_boundary() {
+        let uninterrupted_dir = tempfile::tempdir().unwrap().keep();
+        let uninterrupted = population_budget_runner(&uninterrupted_dir);
+        let expected = uninterrupted
+            .execute_single_run(&uninterrupted.variants[0], 7)
+            .unwrap();
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let runner = population_budget_runner(&directory);
+        let state_file = directory.join("status.json");
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let initial_bytes = fs::read(&path).unwrap();
+        let mut checkpoint = RunCheckpointV1::decode(&initial_bytes, &path).unwrap();
+        let mut owner = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let population_limit =
+            u64::try_from(owner.world().agents().len()).unwrap() + runner.max_ticks;
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+        let command = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::Step,
+            ))
+            .unwrap();
+        let mut now = 0;
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "population budget oracle step",
+            &mut frontend,
+            &mut owner,
+            command.command_id(),
+            1,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+        checkpoint.owner = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        checkpoint.metadata.parent_digest = Some(blake3::hash(&initial_bytes).to_hex().to_string());
+        runner
+            .publish_run_checkpoint(&path, &checkpoint, &checkpoint.encode(&path).unwrap())
+            .unwrap();
+        status.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut status).unwrap();
+        drop(frontend);
+        drop(owner);
+
+        let actual = runner
+            .execute_batch_with_budget(
+                &state_file,
+                RunExecutionBudget {
+                    cancel: &std::sync::atomic::AtomicBool::new(false),
+                    population_limit,
+                },
+            )
+            .unwrap();
+        assert_eq!(actual.completed_runs, 1, "{actual:?}");
+        assert_eq!(actual.failed_runs, 0);
+        assert_eq!(actual.runs[0].final_digest, expected.final_digest);
+        assert_eq!(actual.runs[0].total_ticks, expected.total_ticks);
+        let final_cut = RunCheckpointV1::decode(&fs::read(&path).unwrap(), &path).unwrap();
+        assert_eq!(final_cut.owner.host_checkpoint().tick().0, runner.max_ticks);
+        assert_eq!(
+            u64::try_from(
+                final_cut
+                    .owner
+                    .host_checkpoint()
+                    .world_checkpoint()
+                    .agent_count()
+            )
+            .unwrap(),
+            population_limit,
+        );
+        runner
+            .verify_completed_status(&state_file, &actual)
+            .unwrap();
     }
 
     #[test]
@@ -4757,9 +6724,16 @@ mod tests {
 
     #[test]
     fn scheduled_interventions_resume_before_and_after_exact_due_boundaries() {
-        for completed_ticks in [0_u64, 1, 2, 3, 4] {
+        for (family_name, completed_ticks) in [
+            "mlp",
+            #[cfg(feature = "neuro")]
+            "neuroflow",
+        ]
+        .into_iter()
+        .flat_map(|family| [0_u64, 1, 2, 3, 4].map(|tick| (family, tick)))
+        {
             let directory = tempfile::tempdir().unwrap();
-            let variant = intervention_test_variant(
+            let mut variant = intervention_test_variant(
                 "drought-recovery",
                 vec![
                     ScenarioInterventionV1 {
@@ -4776,6 +6750,7 @@ mod tests {
                     },
                 ],
             );
+            variant.brain_family = family_name.into();
             let mut runner = MatchedSeedExperimentRunner::new(
                 "scheduled-continuation",
                 MatchedSeedCohort {
@@ -4797,6 +6772,7 @@ mod tests {
             let mut checkpoint = read_optional_run_checkpoint(&path).unwrap().unwrap();
             let original_manifest = checkpoint.metadata.manifest.clone();
             let prepared = PreparedInterventions::new(
+                &variant.variant_id,
                 &config_for_run(&variant.config_overrides, record.seed).unwrap(),
                 &variant.interventions,
                 runner.max_ticks,
@@ -5076,6 +7052,331 @@ mod tests {
             1,
             directory.join("bundles"),
         )
+    }
+
+    #[test]
+    fn torn_status_prefix_preserves_a_nonzero_owner_cut_and_resumes_exact_science() {
+        let reference_dir = tempfile::tempdir().unwrap();
+        let reference = progress_runner(reference_dir.path(), vec![7]);
+        let expected = reference
+            .execute_single_run(&reference.variants[0], reference.cohort.seeds[0])
+            .unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let incident = temporary.with_extension("interrupted");
+        let mut running = runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        running.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut running).unwrap();
+        let committed_bytes = fs::read(&state_file).unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let initial_bytes = fs::read(&path).unwrap();
+        let mut checkpoint = RunCheckpointV1::decode(&initial_bytes, &path).unwrap();
+        let original_manifest = checkpoint.metadata.manifest.canonical_json_bytes().unwrap();
+        let mut owner = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+        let command = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::Step,
+            ))
+            .unwrap();
+        let mut now = 0;
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "torn status recovery test step",
+            &mut frontend,
+            &mut owner,
+            command.command_id(),
+            1,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+        checkpoint.owner = owner.capture_volatile_host_checkpoint_v1().unwrap();
+        checkpoint.metadata.parent_digest = Some(blake3::hash(&initial_bytes).to_hex().to_string());
+        let saved_cut = checkpoint.encode(&path).unwrap();
+        runner
+            .publish_run_checkpoint(&path, &checkpoint, &saved_cut)
+            .unwrap();
+        drop(frontend);
+        drop(owner);
+
+        let mut successor = running.clone();
+        successor.generation += 1;
+        let mut prefix = canonical_status_bytes(&successor).unwrap();
+        prefix.truncate(prefix.len() / 2);
+        assert!(
+            serde_json::from_slice::<ExperimentBatchStatus>(&prefix)
+                .unwrap_err()
+                .is_eof()
+        );
+        fs::write(&temporary, &prefix).unwrap();
+
+        assert_eq!(runner.load_or_create_status(&state_file).unwrap(), running);
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+        assert_eq!(fs::read(&path).unwrap(), saved_cut);
+        assert_eq!(fs::read(incident.join("status.tmp")).unwrap(), prefix);
+        assert!(!temporary.exists());
+        assert_eq!(runner.load_or_create_status(&state_file).unwrap(), running);
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+
+        let completed = runner.execute_batch(&state_file).unwrap();
+        assert_eq!(completed.completed_runs, 1, "{completed:?}");
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(completed.runs[0].final_digest, expected.final_digest);
+        assert_eq!(completed.runs[0].total_ticks, runner.max_ticks);
+        let final_cut = read_optional_run_checkpoint(&path).unwrap().unwrap();
+        assert_eq!(
+            final_cut.metadata.manifest.canonical_json_bytes().unwrap(),
+            original_manifest,
+        );
+        assert_eq!(fs::read(incident.join("status.tmp")).unwrap(), prefix);
+    }
+
+    #[test]
+    fn torn_status_completion_recovers_the_verified_bundle_without_another_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let incident = temporary.with_extension("interrupted");
+        let mut running = runner.load_or_create_status(&state_file).unwrap();
+        running.runs[0].state = RunState::Running;
+        runner.save_status(&state_file, &mut running).unwrap();
+        let record = runner
+            .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let final_cut = fs::read(&path).unwrap();
+        let retained_cut = directory.path().join("retained-final.checkpoint");
+        fs::rename(&path, &retained_cut).unwrap();
+        let summary_path = runner
+            .output_dir
+            .join(&record.run_id)
+            .join("exports/summary.csv");
+        let summary = fs::read(&summary_path).unwrap();
+        let committed_bytes = fs::read(&state_file).unwrap();
+        let mut completed = running.clone();
+        completed.generation += 1;
+        completed.runs[0] = record;
+        recompute_status_counts(&mut completed);
+        let mut prefix = canonical_status_bytes(&completed).unwrap();
+        prefix.truncate(prefix.len() / 2);
+        fs::write(&temporary, &prefix).unwrap();
+
+        fs::write(&summary_path, b"corrupt completed evidence\n").unwrap();
+        assert!(matches!(
+            runner.load_or_create_status(&state_file),
+            Err(ExperimentRunnerError::Bundle { .. }),
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+        assert_eq!(fs::read(&temporary).unwrap(), prefix);
+        assert!(!incident.exists());
+
+        fs::write(&summary_path, &summary).unwrap();
+        assert_eq!(runner.execute_batch(&state_file).unwrap(), completed);
+        let completed_bytes = fs::read(&state_file).unwrap();
+        assert_eq!(runner.execute_batch(&state_file).unwrap(), completed);
+        assert_eq!(fs::read(&state_file).unwrap(), completed_bytes);
+        assert_eq!(fs::read(incident.join("status.tmp")).unwrap(), prefix);
+        assert_eq!(fs::read(&retained_cut).unwrap(), final_cut);
+        assert_eq!(fs::read(&summary_path).unwrap(), summary);
+        assert!(!path.exists(), "a finished bundle must not be reexecuted");
+    }
+
+    #[test]
+    fn torn_status_refuses_missing_cuts_corrupt_status_and_retention_conflicts() {
+        for case in [
+            "missing-cut",
+            "corrupt-cut",
+            "corrupt-committed",
+            "previous-incident",
+            "complete-invalid-json",
+            "oversized-prefix",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = progress_runner(directory.path(), vec![7]);
+            let state_file = directory.path().join("status.json");
+            let temporary = status_temporary_path(&state_file).unwrap();
+            let incident = temporary.with_extension("interrupted");
+            let mut status = runner.load_or_create_status(&state_file).unwrap();
+            if matches!(case, "missing-cut" | "corrupt-cut") {
+                status.runs[0].state = RunState::Running;
+                runner.save_status(&state_file, &mut status).unwrap();
+            }
+            let checkpoint_path = runner.run_checkpoint_path(&status.runs[0].run_id);
+            if case == "corrupt-cut" {
+                fs::create_dir_all(&runner.output_dir).unwrap();
+                fs::write(&checkpoint_path, b"invalid executable owner cut").unwrap();
+            }
+            if case == "corrupt-committed" {
+                fs::write(&state_file, b"{").unwrap();
+            }
+            if case == "previous-incident" {
+                fs::create_dir(&incident).unwrap();
+                fs::write(incident.join("status.tmp"), b"earlier incident").unwrap();
+            }
+            let committed_bytes = fs::read(&state_file).unwrap();
+            let prefix = if case == "complete-invalid-json" {
+                b"{invalid}".as_slice()
+            } else {
+                b"{\"schema_version\":".as_slice()
+            };
+            fs::write(&temporary, prefix).unwrap();
+            if case == "oversized-prefix" {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&temporary)
+                    .unwrap()
+                    .set_len(MAX_STATUS_BYTES + 1)
+                    .unwrap();
+            }
+
+            assert!(runner.load_or_create_status(&state_file).is_err(), "{case}");
+            assert_eq!(fs::read(&state_file).unwrap(), committed_bytes, "{case}");
+            let mut retained_prefix = vec![0; prefix.len()];
+            File::open(&temporary)
+                .unwrap()
+                .read_exact(&mut retained_prefix)
+                .unwrap();
+            assert_eq!(retained_prefix, prefix, "{case}");
+            assert_eq!(
+                fs::metadata(&temporary).unwrap().len(),
+                if case == "oversized-prefix" {
+                    MAX_STATUS_BYTES + 1
+                } else {
+                    u64::try_from(prefix.len()).unwrap()
+                },
+                "{case}",
+            );
+            if case == "previous-incident" {
+                assert_eq!(
+                    fs::read(incident.join("status.tmp")).unwrap(),
+                    b"earlier incident"
+                );
+            } else {
+                assert!(!incident.exists(), "{case}");
+            }
+            if case == "corrupt-cut" {
+                assert_eq!(
+                    fs::read(&checkpoint_path).unwrap(),
+                    b"invalid executable owner cut"
+                );
+            } else {
+                assert!(!runner.output_dir.exists(), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn torn_initial_successor_preserves_pending_status_without_creating_a_world() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let committed = runner.load_or_create_status(&state_file).unwrap();
+        let committed_bytes = fs::read(&state_file).unwrap();
+        fs::write(&temporary, b"").unwrap();
+
+        assert_eq!(
+            runner.load_or_create_status(&state_file).unwrap(),
+            committed
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), committed_bytes);
+        assert_eq!(
+            fs::read(temporary.with_extension("interrupted").join("status.tmp")).unwrap(),
+            b"",
+        );
+        assert!(!runner.output_dir.exists());
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn torn_status_cannot_restart_an_advanced_cut_disguised_as_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let pending = runner.load_or_create_status(&state_file).unwrap();
+        let completed = runner
+            .execute_single_run(&runner.variants[0], runner.cohort.seeds[0])
+            .unwrap();
+        let checkpoint_path = runner.run_checkpoint_path(&completed.run_id);
+        let advanced_cut = fs::read(&checkpoint_path).unwrap();
+        // Remove bundle discovery from this probe without deleting its evidence:
+        // the inconsistent advanced owner cut alone must refuse a fresh launch.
+        fs::rename(
+            runner.output_dir.join(&completed.run_id),
+            directory.path().join("retained-completed-bundle"),
+        )
+        .unwrap();
+        let status_bytes = fs::read(&state_file).unwrap();
+        fs::write(&temporary, b"{").unwrap();
+
+        assert!(matches!(
+            runner.load_or_create_status(&state_file),
+            Err(ExperimentRunnerError::InterruptedStatusWrite { .. }),
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), advanced_cut);
+        assert_eq!(fs::read(&temporary).unwrap(), b"{");
+        assert_eq!(pending.runs[0].state, RunState::Pending);
+        assert!(!temporary.with_extension("interrupted").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn torn_status_refuses_aliases_and_preserves_an_external_incident_path() {
+        use std::os::unix::fs::symlink;
+
+        for case in [
+            "temporary-symlink",
+            "temporary-hard-link",
+            "incident-symlink",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runner = progress_runner(directory.path(), vec![7]);
+            let state_file = directory.path().join("status.json");
+            let temporary = status_temporary_path(&state_file).unwrap();
+            let incident = temporary.with_extension("interrupted");
+            runner.load_or_create_status(&state_file).unwrap();
+            let status_bytes = fs::read(&state_file).unwrap();
+            let external = directory.path().join("external");
+            fs::create_dir(&external).unwrap();
+            fs::write(external.join("status.tmp"), b"{").unwrap();
+            match case {
+                "temporary-symlink" => symlink(external.join("status.tmp"), &temporary).unwrap(),
+                "temporary-hard-link" => {
+                    fs::hard_link(external.join("status.tmp"), &temporary).unwrap();
+                }
+                _ => {
+                    fs::write(&temporary, b"{").unwrap();
+                    symlink(&external, &incident).unwrap();
+                }
+            }
+
+            assert!(runner.load_or_create_status(&state_file).is_err(), "{case}");
+            assert_eq!(fs::read(&state_file).unwrap(), status_bytes, "{case}");
+            assert_eq!(fs::read(&temporary).unwrap(), b"{", "{case}");
+            assert_eq!(
+                fs::read(external.join("status.tmp")).unwrap(),
+                b"{",
+                "{case}"
+            );
+            assert_eq!(fs::read_dir(&external).unwrap().count(), 1, "{case}");
+            assert!(!runner.output_dir.exists(), "{case}");
+        }
     }
 
     #[test]
@@ -5600,6 +7901,131 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "neuro")]
+    #[test]
+    fn neuroflow_checkpoint_restore_preserves_the_original_constructor_recipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = progress_runner(directory.path(), vec![71]);
+        runner.variants[0].variant_id = "neuro".into();
+        runner.variants[0].brain_family = "neuroflow".into();
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let mut checkpoint = runner
+            .initial_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let original_manifest = checkpoint.metadata.manifest.canonical_json_bytes().unwrap();
+        let mut oracle = restore_run_owner(&checkpoint, *family, &record.run_id, &path).unwrap();
+        let original_registry = checkpoint
+            .owner
+            .host_checkpoint()
+            .world_checkpoint()
+            .required_brain_registry();
+        assert!(oracle.world().agent_count() > 0);
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(oracle.local_port(), namespace);
+        let mut now = 0;
+
+        // A live owner accepts complete settings edits without replacing its
+        // already installed family. This tests restore identity directly; it
+        // does not add new architecture knobs to the experiment proposal API.
+        let mut edited = oracle.world().config().clone();
+        edited.neuroflow.hidden_layers = vec![11, 5];
+        edited.neuroflow.activation = scriptbots_core::NeuroflowActivationKind::Relu;
+        edited.validate().unwrap();
+        let submitted = frontend
+            .submit_envelope(CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, 1),
+                HostCommand::UpdateConfig(Box::new(edited.clone())),
+            ))
+            .unwrap();
+        drive_command_to_volatile_commit(
+            &record.run_id,
+            "update raw NeuroFlow settings",
+            &mut frontend,
+            &mut oracle,
+            submitted.command_id(),
+            0,
+            0,
+            &mut now,
+        )
+        .unwrap();
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut oracle, &mut now).unwrap();
+        checkpoint.owner = oracle.capture_volatile_host_checkpoint_v1().unwrap();
+        assert_eq!(checkpoint.owner.host_checkpoint().config(), &edited);
+        assert_eq!(
+            checkpoint.metadata.manifest.canonical_json_bytes().unwrap(),
+            original_manifest
+        );
+        assert_eq!(
+            checkpoint
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry(),
+            original_registry
+        );
+        let encoded = checkpoint.encode(&path).unwrap();
+        let mut decoded = RunCheckpointV1::decode(&encoded, &path).unwrap();
+        let mut restored = restore_run_owner(&decoded, *family, &record.run_id, &path)
+            .expect("the launch manifest retains the installed NeuroFlow constructor");
+        assert_eq!(
+            restored.scientific_digest_v1().unwrap(),
+            oracle.scientific_digest_v1().unwrap()
+        );
+        assert_eq!(restored.world().config(), &edited);
+
+        // Substituting the current raw settings supplies a different valid
+        // adapter, whose identity must be rejected before any continued science.
+        let constructor = decoded.metadata.manifest.normalized_config.clone();
+        decoded.metadata.manifest.normalized_config = serde_json::to_value(&edited).unwrap();
+        let error = restore_run_owner(&decoded, *family, &record.run_id, &path)
+            .err()
+            .expect("current settings cannot replace the original constructor recipe");
+        assert!(matches!(
+            error,
+            ExperimentRunnerError::InvalidCheckpoint { .. }
+        ));
+        assert!(error.to_string().contains("prepared brain registry"));
+        decoded.metadata.manifest.normalized_config = constructor;
+        assert_eq!(
+            decoded.metadata.manifest.canonical_json_bytes().unwrap(),
+            original_manifest
+        );
+
+        let mut resumed_frontend = NullFrontend::new(restored.local_port(), namespace);
+        let mut resumed_now = 0;
+        for tick in 1..=2 {
+            let command = CommandEnvelope::new(
+                CommandId::from_client_sequence(namespace, tick + 1),
+                HostCommand::Step,
+            );
+            for (owner, client, clock) in [
+                (&mut oracle, &mut frontend, &mut now),
+                (&mut restored, &mut resumed_frontend, &mut resumed_now),
+            ] {
+                let submitted = client.submit_envelope(command.clone()).unwrap();
+                drive_command_to_volatile_commit(
+                    &record.run_id,
+                    "continue configured NeuroFlow owner",
+                    client,
+                    owner,
+                    submitted.command_id(),
+                    tick,
+                    0,
+                    clock,
+                )
+                .unwrap();
+                seal_run_checkpoint(&record.run_id, client, owner, clock).unwrap();
+            }
+            assert_eq!(
+                restored.scientific_digest_v1().unwrap(),
+                oracle.scientific_digest_v1().unwrap()
+            );
+        }
+    }
+
     #[test]
     fn running_checkpoint_continues_real_families_and_retains_original_owner_cut() {
         for family_name in [
@@ -5607,6 +8033,8 @@ mod tests {
             "dwraon",
             #[cfg(feature = "brain-ft")]
             "ft",
+            #[cfg(feature = "neuro")]
+            "neuroflow",
         ] {
             for completed_ticks in [0_u64, 2, 4] {
                 let directory = tempfile::tempdir().expect("continuation directory");
@@ -5876,6 +8304,8 @@ mod tests {
             "dwraon",
             #[cfg(feature = "brain-ft")]
             "ft",
+            #[cfg(feature = "neuro")]
+            "neuroflow",
         ]
         .map(|family| ScenarioVariant {
             variant_id: family.into(),
@@ -5930,6 +8360,159 @@ mod tests {
         assert_eq!(
             outcomes[0].values().collect::<BTreeSet<_>>().len(),
             outcomes[0].len()
+        );
+    }
+
+    #[test]
+    fn checkpoint_recovery_restores_candidate_before_replacing_the_committed_cut() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7]);
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let temporary = status_temporary_path(&path).unwrap();
+        let parent_bytes = fs::read(&path).unwrap();
+        let parent = RunCheckpointV1::decode(&parent_bytes, &path).unwrap();
+        let parent_digest = blake3::hash(&parent_bytes).to_hex().to_string();
+        let _lease = ExperimentStatusWriterLease::acquire(&path).unwrap();
+
+        // Capture actual one-tick owners from both executable families. Their
+        // metadata and outer checksums cannot prove the expected family was run.
+        let next_owner = |checkpoint: &RunCheckpointV1, chosen: ResolvedBrainFamily| {
+            let mut owner = restore_run_owner(checkpoint, chosen, &record.run_id, &path).unwrap();
+            let (_, namespace) = host_identifiers(&record.run_id);
+            let mut frontend = NullFrontend::new(owner.local_port(), namespace);
+            let mut now = 0;
+            let submitted = frontend
+                .submit_envelope(CommandEnvelope::new(
+                    CommandId::from_client_sequence(namespace, 1),
+                    HostCommand::Step,
+                ))
+                .unwrap();
+            drive_command_to_volatile_commit(
+                &record.run_id,
+                "candidate owner step",
+                &mut frontend,
+                &mut owner,
+                submitted.command_id(),
+                1,
+                0,
+                &mut now,
+            )
+            .unwrap();
+            seal_run_checkpoint(&record.run_id, &mut frontend, &mut owner, &mut now).unwrap();
+            owner.capture_volatile_host_checkpoint_v1().unwrap()
+        };
+        let mut valid = RunCheckpointV1 {
+            metadata: parent.metadata.clone(),
+            owner: next_owner(&parent, *family),
+        };
+        valid.metadata.parent_digest = Some(parent_digest.clone());
+        let other_family = runner
+            .initial_run_checkpoint(
+                variant,
+                ResolvedBrainFamily::Dwraon,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .unwrap();
+        let mut wrong_family = RunCheckpointV1 {
+            metadata: parent.metadata.clone(),
+            owner: next_owner(&other_family, ResolvedBrainFamily::Dwraon),
+        };
+        wrong_family.metadata.parent_digest = Some(parent_digest);
+        let wrong_bytes = wrong_family.encode(&temporary).unwrap();
+        let decoded = RunCheckpointV1::decode(&wrong_bytes, &temporary).unwrap();
+        runner
+            .validate_run_checkpoint(
+                &temporary,
+                &decoded,
+                variant,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+            )
+            .expect("the authentic owner passes framing, metadata, capacity and schedule checks");
+        assert_ne!(
+            decoded
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry(),
+            parent
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .required_brain_registry()
+        );
+        assert!(
+            restore_run_owner(&decoded, *family, &record.run_id, &temporary).is_err(),
+            "the declared MLP executable cannot restore the real DWRAON owner"
+        );
+        fs::write(&temporary, &wrong_bytes).unwrap();
+
+        for _ in 0..2 {
+            let error = runner
+                .load_run_checkpoint(
+                    variant,
+                    record.seed,
+                    &record.run_id,
+                    &plan.digest,
+                    MAX_RUN_POPULATION,
+                )
+                .err()
+                .expect("an unrestorable successor must not replace the recoverable parent");
+            assert!(
+                matches!(
+                    &error,
+                    ExperimentRunnerError::InvalidCheckpoint { path: refused, reason }
+                        if refused == &temporary && reason.contains("prepared brain registry")
+                ),
+                "{error}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), parent_bytes);
+            assert_eq!(fs::read(&temporary).unwrap(), wrong_bytes);
+            assert!(!path.with_extension("checkpoint.interrupted").exists());
+            assert_eq!(
+                restore_run_owner(&parent, *family, &record.run_id, &path)
+                    .unwrap()
+                    .world_tick()
+                    .0,
+                0
+            );
+        }
+
+        // The same recovery path still admits a genuine, executable successor.
+        let valid_bytes = valid.encode(&temporary).unwrap();
+        let expected = restore_run_owner(&valid, *family, &record.run_id, &temporary)
+            .unwrap()
+            .scientific_digest_v1()
+            .unwrap();
+        fs::write(&temporary, &valid_bytes).unwrap();
+        let recovered = runner
+            .load_run_checkpoint(
+                variant,
+                record.seed,
+                &record.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.owner.host_checkpoint().tick().0, 1);
+        assert_eq!(fs::read(&path).unwrap(), valid_bytes);
+        assert!(!temporary.exists());
+        assert_eq!(
+            restore_run_owner(&recovered, *family, &record.run_id, &path)
+                .unwrap()
+                .scientific_digest_v1()
+                .unwrap(),
+            expected
         );
     }
 
@@ -5995,7 +8578,7 @@ mod tests {
             }
             fs::write(&temporary, changed.encode(&path).unwrap()).unwrap();
             assert!(
-                matches!(runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+                matches!(runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest, MAX_RUN_POPULATION),
                 Err(ExperimentRunnerError::InvalidCheckpoint { reason, .. }) if reason.contains("validated plan")),
                 "{field}"
             );
@@ -6082,7 +8665,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION
+            ),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), original);
@@ -6090,13 +8679,25 @@ mod tests {
         checkpoint.metadata.parent_digest = Some("0".repeat(blake3::OUT_LEN * 2));
         fs::write(&temporary, checkpoint.encode(&path).unwrap()).unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION
+            ),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), original);
         fs::write(&temporary, &candidate).unwrap();
         let promoted = runner
-            .load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest)
+            .load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(promoted.owner.host_checkpoint().tick().0, 1);
@@ -6106,7 +8707,13 @@ mod tests {
         fs::write(&temporary, partial).unwrap();
         assert_eq!(
             runner
-                .load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest)
+                .load_run_checkpoint(
+                    variant,
+                    first.seed,
+                    &first.run_id,
+                    &plan.digest,
+                    MAX_RUN_POPULATION
+                )
                 .unwrap()
                 .unwrap()
                 .owner
@@ -6124,7 +8731,13 @@ mod tests {
         // it cannot silently overwrite evidence or create unbounded forensic files.
         fs::write(&temporary, partial).unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION
+            ),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&temporary).unwrap(), partial);
@@ -6134,7 +8747,13 @@ mod tests {
         corrupt[RUN_CHECKPOINT_MAGIC.len()] ^= 1;
         fs::write(&path, &corrupt).unwrap();
         assert!(matches!(
-            runner.load_run_checkpoint(variant, first.seed, &first.run_id, &plan.digest),
+            runner.load_run_checkpoint(
+                variant,
+                first.seed,
+                &first.run_id,
+                &plan.digest,
+                MAX_RUN_POPULATION
+            ),
             Err(ExperimentRunnerError::InvalidCheckpoint { .. })
         ));
         assert_eq!(fs::read(&path).unwrap(), corrupt);
@@ -6721,6 +9340,28 @@ mod tests {
                                 .is_some_and(|cut| cut.owner.host_checkpoint().tick().0 > 0)
                         });
                         if all_started {
+                            let status = runner.status_snapshot(&state_file).unwrap();
+                            let progress = runner
+                                .checkpoint_progress_snapshot(&state_file, &status, true)
+                                .unwrap();
+                            if !active_ids
+                                .iter()
+                                .all(|id| progress[id].observed_tick().is_some_and(|tick| tick > 0))
+                            {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "published progress never appeared"
+                                );
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            assert!(
+                                status
+                                    .runs
+                                    .iter()
+                                    .filter(|run| run.state == RunState::Running)
+                                    .all(|run| run.total_ticks == 0)
+                            );
                             cancel.store(true, Ordering::Release);
                             break;
                         }
@@ -6740,6 +9381,9 @@ mod tests {
                     .count();
                 assert_eq!(active_count, concurrency);
                 observed_cells.insert((stopped.runs[1].brain_family.clone(), active_count));
+                let progress = runner
+                    .checkpoint_progress_snapshot(&state_file, &stopped, false)
+                    .unwrap();
                 let mut saved_cuts = Vec::new();
                 for (index, record) in stopped.runs.iter().enumerate().skip(1) {
                     if index <= concurrency {
@@ -6753,6 +9397,14 @@ mod tests {
                         let cut = RunCheckpointV1::decode(&bytes, &path).unwrap();
                         let tick = cut.owner.host_checkpoint().tick().0;
                         assert!(tick > 0 && tick < runner.max_ticks, "stopped tick {tick}");
+                        assert_eq!(
+                            progress[&record.run_id],
+                            ExperimentCheckpointProgress::Observed {
+                                tick,
+                                checkpoint_digest: blake3::hash(&bytes).to_hex().to_string(),
+                                source: CheckpointProgressSource::Published,
+                            }
+                        );
                         let restored = restore_run_owner(
                             &cut,
                             ResolvedBrainFamily::resolve(&runner.variants[0]).unwrap(),
@@ -6797,6 +9449,13 @@ mod tests {
                 assert!(resumed.is_finished());
                 assert_eq!(resumed.failed_runs, 0);
                 assert_eq!(resumed.completed_runs, resumed.total_runs);
+                assert!(
+                    runner
+                        .checkpoint_progress_snapshot(&state_file, &resumed, false)
+                        .unwrap()
+                        .values()
+                        .all(|progress| progress.observed_tick() == Some(runner.max_ticks))
+                );
                 assert_eq!(
                     fs::read(completed_bundle.join("bundle_manifest.json")).unwrap(),
                     original_manifest
@@ -6976,6 +9635,13 @@ mod tests {
                 config_overrides: BTreeMap::new(),
                 interventions: Vec::new(),
             },
+            #[cfg(feature = "neuro")]
+            ScenarioVariant {
+                variant_id: "variant_neuro".into(),
+                brain_family: "neuro".into(),
+                config_overrides: BTreeMap::new(),
+                interventions: Vec::new(),
+            },
         ];
 
         let expected_runs = variants.len() * cohort.seeds.len();
@@ -6992,6 +9658,16 @@ mod tests {
         assert_eq!(status.runs[2].brain_family, "assembly.experimental");
         #[cfg(feature = "brain-ft")]
         assert_eq!(status.runs[3].brain_family, "ft");
+        #[cfg(feature = "neuro")]
+        assert_eq!(
+            status
+                .runs
+                .iter()
+                .find(|run| run.variant_id == "variant_neuro")
+                .unwrap()
+                .brain_family,
+            "ml.neuroflow"
+        );
         assert_ne!(
             status.runs[0].final_digest, status.runs[1].final_digest,
             "real distinct family registries must produce distinct full world digests"

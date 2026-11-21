@@ -98,7 +98,6 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `slotmap` | Generational arena for agent handles (`AgentId`) |
 | `candle-core` + `candle-nn` | ML inference for neural network brains |
 | `tract-onnx` | ONNX model loading for brain inference |
-| `tch` | PyTorch bindings for brain training/inference |
 | `neuroflow` | Lightweight neural network library for agent brains |
 | `serde` + `serde_json` | Serialization |
 | `thiserror` | Ergonomic error type derivation |
@@ -249,7 +248,7 @@ cargo test --workspace --all-features
 |-------|-------------|
 | `scriptbots-core` | World simulation, agent lifecycle, tick processing, spatial indexing, food/terrain systems, evolution, genome serialization |
 | `scriptbots-brain` | Brain trait contracts, MLP forward pass, DWRAON network, Assembly brain, mutation/crossover |
-| `scriptbots-brain-ml` | Candle/Tract/Tch dependency probes and sensor-copy placeholder; model inference remains open |
+| `scriptbots-brain-ml` | Candle/Tract dependency probes and sensor-copy placeholder; model inference remains open |
 | `scriptbots-brain-neuro` | Neuroflow brain wrapper, training, serialization |
 | `scriptbots-index` | Uniform-grid neighbor queries and boundary conditions; R-tree/k-d backends remain open |
 | `scriptbots-storage` | FrankenSQLite persistence, metric/replay recording, bounded admission, flush/shutdown receipts, analytics snapshots |

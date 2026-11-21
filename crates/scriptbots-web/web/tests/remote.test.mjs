@@ -1,15 +1,96 @@
 // Consumer-state tests. The Rust codec tests exercise actual HostCore bytes;
 // these tests exercise the browser's cursor commits and request correlation.
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import test from "node:test";
 import { RemoteFrameTracker, RemoteStreamClient, consumeRemoteFrame } from "../remote.js";
+import { EXPERIMENT_LIMITS, prepareExperimentRequest } from "../experiment-protocol.js";
+import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
 
 const SESSION = "340282366920938463463374607431768211455";
 const COMMAND = "1234567890abcdef1234567890abcdef";
 
+function environment() {
+  return { width: 2, height: 2, sourceWidth: 2, sourceHeight: 2, cellSize: 40,
+    terrainRevision: "1", foodRevision: "2", hydrologyRevision: "3", foodMax: 0.5,
+    hydrologyEnabled: true, cells: [
+      { terrain: "Grass", elevation: 0, food: 0, waterDepth: 0 },
+      { terrain: "Sand", elevation: 1, food: 0.5, waterDepth: 0 },
+      { terrain: "DeepWater", elevation: 0, food: 0, waterDepth: 0.15 },
+      { terrain: "Rock", elevation: 0.5, food: 0.25, waterDepth: 1 },
+    ] };
+}
+
+test("environment modes show actual food and water while retaining the full source extent", () => {
+  const raster = new EnvironmentRaster();
+  const env = environment();
+  const world = { width: 80, height: 80 };
+  const identity = { sessionId: SESSION };
+  const food = raster.update(env, identity, world, "food");
+  assert.deepEqual(Array.from(food.pixels.slice(0, 8)), [18, 27, 37, 255, 120, 180, 48, 255]);
+  assert.deepEqual(food.coverage, [1, 1]);
+  const water = raster.update(env, identity, world, "water");
+  assert.deepEqual(Array.from(water.pixels.slice(8, 12)), [29, 80, 116, 255]);
+  const terrain = raster.update(env, identity, world, "terrain");
+  assert.deepEqual(Array.from(terrain.pixels.slice(0, 4)), [44, 65, 34, 255]);
+  assert.notDeepEqual(terrain.pixels, raster.update(env, identity, world, "combined").pixels);
+  assert.match(environmentDescription(env), /exact cell view/);
+});
+
+test("environment cache is bounded to one revisioned view and cannot leak another session", () => {
+  const raster = new EnvironmentRaster();
+  const env = environment();
+  const world = { width: 80, height: 80 };
+  const identity = { sessionId: SESSION };
+  const first = raster.update(env, identity, world);
+  assert.equal(raster.update(env, { ...identity, publicationRevision: "200" }, world), first);
+  const next = { ...env, foodRevision: "4", cells: env.cells.map((cell) => ({ ...cell, food: 0 })) };
+  const changed = raster.update(next, identity, world);
+  assert.notEqual(changed, first);
+  assert.notDeepEqual(changed.pixels, first.pixels);
+  const session = raster.update(next, { sessionId: "1" }, world);
+  assert.notEqual(session, changed);
+  assert.notEqual(raster.update(next, { sessionId: "1" }, world, "combined", 1), session);
+  assert.equal(raster.update(null, identity, world), null);
+  assert.equal(raster.current, null);
+  assert.equal(raster.update(env, identity, world, "agents"), null);
+  assert.match(environmentDescription(null), /unavailable/);
+});
+
+test("replacing a same-seed owner invalidates environment despite repeated revisions", () => {
+  const raster = new EnvironmentRaster();
+  const identity = { sessionId: "11" };
+  const world = { width: 80, height: 80 };
+  const first = raster.update(environment(), identity, world, "food", 0, 1);
+  const replacement = environment();
+  replacement.cells[1].food = 0;
+  const next = raster.update(replacement, identity, world, "food", 0, 2);
+  assert.notEqual(next, first);
+  assert.deepEqual(Array.from(next.pixels.slice(4, 8)), [18, 27, 37, 255]);
+  assert.equal(raster.update(replacement, identity, world, "food", 0, 2), next);
+});
+
+test("environment bounds reject shortened worlds, hostile cardinalities and invalid source values", () => {
+  const identity = { sessionId: SESSION };
+  const world = { width: 80, height: 80 };
+  const paint = (env) => new EnvironmentRaster().update(env, identity, world);
+  assert.throws(() => paint({ ...environment(), width: 1, sourceWidth: 1,
+    cells: environment().cells.slice(0, 2) }), /disagrees/);
+  assert.throws(() => paint({ ...environment(), cells: Array(128 * 128 + 1).fill(environment().cells[0]) }), /bounds/);
+  for (const value of [NaN, Infinity, -1]) {
+    const invalid = environment();
+    invalid.cells[0].food = value;
+    assert.throws(() => paint(invalid), /invalid source/);
+  }
+  assert.throws(() => paint({ ...environment(), terrainRevision: "18446744073709551616" }), /bounds/);
+  assert.throws(() => paint({ ...environment(), hydrologyEnabled: false }), /invalid source/);
+  const sampled = { ...environment(), width: 128, height: 128, sourceWidth: 1000, sourceHeight: 500 };
+  assert.match(environmentDescription(sampled), /center-sampled overview/);
+});
+
 function frame(kind, revision, { tick = 20, paused = true, payload } = {}) {
   return {
-    schema: "scriptbots.remote-frame.v1",
+    schema: "scriptbots.remote-frame.v2",
     kind,
     identity: { sessionId: SESSION, publicationRevision: String(revision),
       scientificRevision: String(tick), controlRevision: "4", configRevision: "2", tick: String(tick) },
@@ -166,7 +247,7 @@ test("publication identities and observed playback must remain coherent across s
   mismatchedTick.payload.tick = 19;
   assert.throws(() => value.accept(mismatchedTick, () => assert.fail()), /payload tick/);
   const wrongSchema = frame("canvas", "11");
-  wrongSchema.schema = "scriptbots.remote-frame.v2";
+  wrongSchema.schema = "scriptbots.remote-frame.v1";
   assert.throws(() => value.accept(wrongSchema, () => assert.fail()), /unnegotiated/);
   const rounded = frame("canvas", "11");
   rounded.identity.publicationRevision = 11;
@@ -253,7 +334,7 @@ test("subscription acknowledgement gates all binary decoding and refuses unrelat
   value.receive(JSON.stringify({ protocol_version: 1, type: "stream_rate",
     requested_interval_us: 16667, effective_interval_us: 66668, reason: "slow_consumer" }));
   assert.equal(value.state, "subscribing");
-  const ack = { protocol_version: 1, stream_protocol_version: 1, type: "subscribed",
+  const ack = { protocol_version: 1, stream_protocol_version: 2, type: "subscribed",
     request_id: "subscription-1", session_id: SESSION, channels: ["canvas", "events"], max_fps: 60 };
   assert.throws(() => value.receive(JSON.stringify({ ...ack, request_id: "unknown" })), /does not match/);
   assert.equal(value.state, "subscribing");
@@ -278,4 +359,193 @@ test("rate observations keep the connection usable and invalid mask changes are 
   assert.equal(value.maxFps, 60);
   assert.throws(() => value.setSubscriptions({ channels: ["events", "events"] }), /distinct/);
   assert.deepEqual(value.channels, ["canvas"]);
+});
+
+test("a paused owner reconnect refreshes unchanged snapshots once while preserving cursors and refusing rewinds", () => {
+  const originalSocket = globalThis.WebSocket;
+  const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  if (!globalThis.crypto) Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true });
+  const sockets = [], delivered = [];
+  let decoded;
+  class ControlledSocket {
+    constructor(url) {
+      this.url = url; this.readyState = 0; this.bufferedAmount = 0;
+      this.listeners = new Map(); this.sent = []; sockets.push(this);
+    }
+    addEventListener(kind, listener) { this.listeners.set(kind, listener); }
+    send(text) { this.sent.push(JSON.parse(text)); }
+    close() { this.readyState = 3; }
+    open() { this.readyState = 1; this.listeners.get("open")(); }
+    message(data) { this.listeners.get("message")({ data }); }
+  }
+  globalThis.WebSocket = ControlledSocket;
+  const value = new RemoteStreamClient({ url: "wss://lab.example/api/ws/stream", channels: ["canvas", "telemetry", "events"],
+    decodeFrame: () => decoded, onFrame: (source) => delivered.push(source) });
+  const subscribe = () => {
+    const socket = sockets.at(-1);
+    socket.open();
+    const request = socket.sent.find((message) => message.command === "subscribe");
+    socket.message(JSON.stringify({ protocol_version: 1, stream_protocol_version: 2, type: "subscribed",
+      request_id: request.request_id, session_id: SESSION, channels: request.channels, max_fps: request.max_fps }));
+    return { socket, request };
+  };
+  const receive = (socket, source) => { decoded = source; socket.message(new ArrayBuffer(1)); };
+  try {
+    value.connect();
+    const first = subscribe();
+    assert.equal(first.request.resume, undefined);
+    receive(first.socket, frame("canvas", "10"));
+    receive(first.socket, frame("telemetry", "10"));
+    receive(first.socket, eventPage("0", "1", "1", "1", 1, "10"));
+    assert.deepEqual(value.resume, { session_id: SESSION, after_event: "1", after_revision: "10" });
+    value.sendControl("pause", { requestId: "retained-pause" });
+    const retained = value.requests.get("retained-pause").text;
+
+    value.reconnect();
+    const second = subscribe();
+    assert.deepEqual(second.request.resume, { session_id: SESSION, after_event: "1" },
+      "omit only the snapshot cursor so an unchanged paused host can answer");
+    assert.equal(delivered.length, 3, "subscription acknowledgement is not a source observation");
+    receive(second.socket, frame("canvas", "10"));
+    assert.equal(delivered.length, 4, "one fresh equal-revision canvas must reach the consumer");
+    receive(second.socket, frame("canvas", "10"));
+    assert.equal(delivered.length, 4, "same-connection duplicate canvas delivery stays suppressed");
+    receive(second.socket, frame("telemetry", "10"));
+    receive(second.socket, frame("telemetry", "10"));
+    assert.equal(delivered.length, 5, "each subscribed snapshot channel has exactly one refresh");
+    assert.deepEqual(value.resume, { session_id: SESSION, after_event: "1", after_revision: "10" });
+    assert.equal(value.requests.get("retained-pause").text, retained);
+    assert.ok(second.socket.sent.every((message) => ["subscribe", "stream_ack"].includes(message.command)),
+      "reconnect never replays a retained command");
+
+    value.reconnect();
+    const third = subscribe();
+    receive(third.socket, frame("canvas", "9"));
+    assert.equal(value.state, "error", "refresh permission cannot admit an older publication");
+    assert.equal(delivered.length, 5);
+    assert.equal(value.tracker.observed.get("canvas").identity.publicationRevision, "10");
+    value.reconnect();
+    const fourth = subscribe();
+    const changed = frame("canvas", "10"); changed.identity.controlRevision = "5";
+    receive(fourth.socket, changed);
+    assert.equal(value.state, "error", "the same publication cannot acquire a different identity on reconnect");
+    assert.equal(delivered.length, 5);
+  } finally {
+    value.disconnect();
+    globalThis.WebSocket = originalSocket;
+    if (originalCrypto) Object.defineProperty(globalThis, "crypto", originalCrypto);
+    else delete globalThis.crypto;
+  }
+});
+
+test("a synchronous reconnect during consumption retains the new connection's fresh-snapshot allowance", () => {
+  const value = tracker(["canvas"]), source = frame("canvas", "10");
+  value.accept(source, () => {});
+  value.beginConnection();
+  assert.equal(value.accept(source, () => { value.beginConnection(); }), true);
+  assert.equal(value.resume().after_revision, undefined,
+    "consuming the previous connection's frame cannot spend the replacement connection's refresh");
+  assert.equal(value.accept(source, () => {}), true);
+  assert.equal(value.accept(source, () => {}), false);
+  assert.equal(value.resume().after_revision, "10");
+});
+
+function experimentTransport() {
+  const client = new RemoteStreamClient({ url: "wss://lab.example/prefix/api/ws/stream?discard=yes#fragment", decodeFrame() {} });
+  client.state = "connected";
+  client.tracker.acknowledge("18446744073709551610");
+  const prepared = prepareExperimentRequest({ experiment_id: "cohort.example", seeds: ["9007199254740993", "18446744073709551615"],
+    variants: [{ variant_id: "control", brain_family: "mlp" }, { variant_id: "treatment", brain_family: "dwraon" }],
+    ticks_per_run: 20, max_concurrency: 1, idempotency_key: "one-exact-cohort" });
+  return { client, prepared, sessionId: client.tracker.sessionId };
+}
+
+test("cohort transport keeps exact u64 seeds, unchanged retry bytes and the negotiated source", async () => {
+  const original = globalThis.fetch, requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url), ...options });
+    return new Response('{"seed":18446744073709551615,"matched_seeds":[9007199254740993,18446744073709551615]}');
+  };
+  try {
+    const { client, prepared, sessionId } = experimentTransport();
+    const create = { sessionId, ...prepared };
+    const result = await client.createExperiment(create);
+    assert.equal(result.seed, "18446744073709551615");
+    assert.deepEqual(result.matched_seeds, ["9007199254740993", "18446744073709551615"]);
+    await client.createExperiment(create);
+    await client.listExperiments({ sessionId, cursor: "12" });
+    await client.experimentStatus("cohort.example", { sessionId });
+    await client.cancelExperiment("cohort.example", { sessionId });
+    await client.resumeExperiment("cohort.example", { sessionId });
+    await client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control",
+      challenger_variant: "treatment", metric: "alive_agents" });
+    assert.deepEqual(requests.map((request) => [request.method, request.url.pathname]), [
+      ["POST", "/prefix/api/v1/experiments"], ["POST", "/prefix/api/v1/experiments"],
+      ["GET", "/prefix/api/v1/experiments"], ["GET", "/prefix/api/v1/experiments/cohort.example"],
+      ["POST", "/prefix/api/v1/experiments/cohort.example/cancel"],
+      ["POST", "/prefix/api/v1/experiments/cohort.example/resume"],
+      ["POST", "/prefix/api/v1/experiments/cohort.example/compare"],
+    ]);
+    for (const request of requests) {
+      assert.equal(request.headers["X-ScriptBots-Session"], sessionId);
+      assert.equal(request.credentials, "omit");
+      assert.equal(request.cache, "no-store");
+      assert.equal(request.url.protocol, "https:");
+      assert.equal(request.url.hash, "");
+    }
+    assert.equal(requests[0].body, requests[1].body);
+    assert.match(requests[0].body, /"seeds":\[9007199254740993,18446744073709551615\]/);
+    assert.ok(!requests[0].body.includes("sessionId"));
+    assert.equal(requests[2].url.search, "?limit=12&cursor=12");
+    assert.deepEqual(JSON.parse(requests[6].body), { baseline_variant: "control", challenger_variant: "treatment", metric: "alive_agents" });
+    const count = requests.length;
+    await assert.rejects(client.createExperiment({ ...create, body: create.body + " " }), /payload changed/);
+    await assert.rejects(client.experimentStatus("../escape", { sessionId }));
+    await assert.rejects(client.experimentStatus(".", { sessionId }));
+    await assert.rejects(client.cancelExperiment("cohort.example", { sessionId: "7" }));
+    await assert.rejects(client.listExperiments({ sessionId, cursor: "01" }));
+    await assert.rejects(client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control", challenger_variant: "control", metric: "alive_agents" }));
+    await assert.rejects(client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control", challenger_variant: "treatment", metric: "invented" }));
+    assert.equal(requests.length, count, "invalid source or payload never reached HTTP");
+  } finally { globalThis.fetch = original; }
+});
+
+test("experiment HTTP refusal differs from uncertain admission and cannot survive a changed connection", async () => {
+  const original = globalThis.fetch;
+  try {
+    const { client, prepared, sessionId } = experimentTransport();
+    for (const code of [400, 409, 422, 503, 500]) {
+      globalThis.fetch = async () => new Response('{"message":"bounded refusal"}', { status: code });
+      await assert.rejects(client.createExperiment({ sessionId, ...prepared }), (error) => {
+        assert.equal(error.status, code);
+        assert.equal(error.admission, [400, 409, 422].includes(code) ? "not_admitted" : "unknown");
+        return true;
+      });
+    }
+    let respond;
+    globalThis.fetch = () => new Promise((resolve) => { respond = resolve; });
+    const pending = client.createExperiment({ sessionId, ...prepared });
+    client.generation += 1;
+    respond(new Response("{}"));
+    await assert.rejects(pending, /connection changed.*unconfirmed/);
+  } finally { globalThis.fetch = original; }
+});
+
+test("experiment owner responses are actually byte-bounded and ambiguous numeric identities refuse", async () => {
+  const original = globalThis.fetch;
+  try {
+    const { client, sessionId } = experimentTransport();
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(EXPERIMENT_LIMITS.maxResponseBytes + 1)); },
+      cancel() { cancelled = true; },
+    }));
+    await assert.rejects(client.experimentStatus("cohort.example", { sessionId }), /exceeds/);
+    assert.equal(cancelled, true);
+    for (const wire of ['{"seed":18446744073709551616}', '{"generation":9007199254740993}',
+      '{"seed":1,"seed":2}', '{"seed":1e2}']) {
+      globalThis.fetch = async () => new Response(wire);
+      await assert.rejects(client.experimentStatus("cohort.example", { sessionId }));
+    }
+  } finally { globalThis.fetch = original; }
 });

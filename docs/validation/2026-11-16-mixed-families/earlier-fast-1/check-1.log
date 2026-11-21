@@ -1,0 +1,26 @@
+# dsr quality check
+# argv: cargo fmt --check
+# cwd: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_first
+# env: PATH=/workspace/scratch/59c449fc313c/tooling/bin:/workspace/scratch/59c449fc313c/tooling/cargo/bin:/home/agent/.codex/tmp/arg0-linux/codex-arg0wyO7Ne:/opt/codex/codex-path:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/opt/codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.local/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback
+# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs/rust_scriptbots_fast/20261115T210223-G81a6iFL
+# env: DSR_QUALITY_TIMEOUT=300
+# env: DSR_REPOS_FILE=/workspace/scratch/59c449fc313c/tooling/dsr-quality/repos.yaml
+# env: DSR_CURRENT_CMD=quality
+# env: DSR_CURRENT_HOST=
+# env: DSR_RUN_ID=run-1794794539-2
+# env: CARGO_HOME=/workspace/scratch/59c449fc313c/tooling/cargo
+# env: RUSTUP_HOME=/workspace/scratch/59c449fc313c/tooling/rustup
+# env: DSR_CURRENT_TOOL=
+# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/59c449fc313c/tooling/dsr-quality/logs
+# env: DSR_RUST_NATIVE_ENV_NAMES
+# started_monotonic_ms: 3651029
+# timeout_seconds: 300
+# ----
+info: syncing channel updates for nightly-2026-08-31-x86_64-unknown-linux-gnu
+info: latest update on 2026-08-31 for version 1.100.0-nightly (908501772 2026-08-30)
+info: component clippy is up to date
+info: component rust-std is up to date
+info: component rustfmt is up to date
+info: downloading component rust-analyzer
+
+# exit_code: 124

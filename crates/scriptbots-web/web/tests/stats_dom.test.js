@@ -95,6 +95,7 @@ const camelCaseWasmModule = `
         const avgHealth = 0.900 - (tick * 0.001);
         return {
           tick: tick,
+          epoch: "0",
           world: { width: 1280, height: 720, closed: true },
           summary: {
             agentCount: pop,
@@ -149,6 +150,7 @@ const snakeCaseWasmModule = `
         tick += steps;
         return {
           tick: tick,
+          epoch: "0",
           world: { width: 1280, height: 720, closed: true },
           summary: {
             agent_count: 256,
@@ -177,7 +179,7 @@ function createServer(packageInfo) {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/continuation-store.js", "/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/experiments.js", "/experiment-protocol.js", "/experiment-view.js", "/checkpoint-lab.js", "/study-report.js", "/continuation-store.js", "/inspector.js", "/genome.js", "/interventions.js", "/narrative.js", "/recipes.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else if (url.pathname.startsWith("/pkg/")
@@ -232,10 +234,18 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     await page.waitForFunction(() => document.getElementById("version").textContent !== "initializing…");
     await observeOwnerAndPause();
     const snapshot = () => page.evaluate(() => JSON.stringify(window.__continuationOwner.snapshot()));
-    const legacy = await snapshot();
-    await page.click("#checkpoint-save");
-    await page.waitForFunction(() => document.getElementById("checkpoint-status").textContent.startsWith("Save failed:"));
-    if (downloads !== 0 || await snapshot() !== legacy) throw new Error("Legacy refusal changed science or produced a file");
+    const defaultOwner = await page.evaluate(() => {
+      const owner = window.__continuationOwner;
+      const before = JSON.stringify(owner.snapshot());
+      const bytes = owner.checkpoint();
+      return { preset: owner.brainPreset(), selected: document.getElementById("brain-preset").value,
+        bytes: bytes.length, unchanged: before === JSON.stringify(owner.snapshot()),
+        canSave: !document.getElementById("checkpoint-save").disabled };
+    });
+    if (defaultOwner.preset !== "mlp" || defaultOwner.selected !== "mlp"
+        || !defaultOwner.bytes || !defaultOwner.unchanged || !defaultOwner.canSave) {
+      throw new Error(`Default browser world is not an evolvable, saveable MLP owner: ${JSON.stringify(defaultOwner)}`);
+    }
 
     await page.selectOption("#brain-preset", "mlp");
     await page.evaluate(() => {
@@ -320,9 +330,14 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     await page.waitForFunction(() => window.__continuationOwner !== window.__browserBeforeWanderReset
       && window.__continuationOwner?.brainPreset() === "wander");
     const legacyAfterReload = await snapshot();
-    await page.click("#checkpoint-browser-save");
-    await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Browser save failed:"));
-    if (await snapshot() !== legacyAfterReload) throw new Error("Unsupported browser save changed the Wander world");
+    const legacyRefusal = await page.evaluate(() => {
+      let refused = false;
+      try { window.__continuationOwner.checkpoint(); } catch (_) { refused = true; }
+      return { refused, disabled: ["checkpoint-save", "checkpoint-browser-save"].every((id) => document.getElementById(id).disabled),
+        explanation: document.getElementById("checkpoint-capability").textContent };
+    });
+    if (!legacyRefusal.refused || !legacyRefusal.disabled || !legacyRefusal.explanation.includes("Wander")
+        || await snapshot() !== legacyAfterReload) throw new Error("Legacy Wander continuation refusal is hidden or changes science");
     await page.click("#checkpoint-browser-restore");
     await page.waitForFunction(() => document.getElementById("checkpoint-browser-status").textContent.startsWith("Restored browser continuation at tick"));
     if (await snapshot() !== saved.snapshot || await page.inputValue("#steps-per-frame") !== "0") {
@@ -397,6 +412,39 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     if (await snapshot() !== beforeOversize || await page.evaluate(() => window.__continuationReads) !== 0) {
       throw new Error("Oversized file was read or changed the running world");
     }
+    const familyContinuations = [];
+    for (const preset of ["dwraon", "assembly"]) {
+      await page.selectOption("#brain-preset", preset);
+      await page.evaluate(() => { window.__ownerBeforeFamilyReset = window.__continuationOwner; });
+      await page.click("#reset-btn");
+      await page.waitForFunction((family) => window.__continuationOwner !== window.__ownerBeforeFamilyReset
+        && window.__continuationOwner.brainPreset() === family, preset);
+      const before = await page.evaluate(() => {
+        const owner = window.__continuationOwner;
+        owner.tick(3);
+        return { snapshot: JSON.stringify(owner.snapshot()), identity: owner.frame().identity };
+      });
+      const [familyDownload] = await Promise.all([page.waitForEvent("download"), page.click("#checkpoint-save")]);
+      const familyPath = path.join(proof, `${preset}.sbcheckpoint`);
+      await familyDownload.saveAs(familyPath);
+      const expected = await page.evaluate(() => {
+        window.__continuationOwner.tick(1);
+        return JSON.stringify(window.__continuationOwner.snapshot());
+      });
+      await page.setInputFiles("#checkpoint-load", familyPath);
+      await page.waitForFunction((family) => document.getElementById("checkpoint-status").textContent.startsWith("Loaded continuation")
+        && document.getElementById("brain-preset").value === family, preset);
+      if (await snapshot() !== before.snapshot || await page.inputValue("#steps-per-frame") !== "0") {
+        throw new Error(`${preset} continuation did not restore the exact paused source`);
+      }
+      const actual = await page.evaluate(() => {
+        window.__continuationOwner.tick(1);
+        return JSON.stringify(window.__continuationOwner.snapshot());
+      });
+      if (actual !== expected) throw new Error(`${preset} continuation lost recurrent/program evaluator state`);
+      familyContinuations.push({ preset, artifact: familyPath, bytes: fs.statSync(familyPath).size,
+        identity: before.identity, nextTick: JSON.parse(actual).tick });
+    }
     await page.evaluate(() => {
       const read = File.prototype.arrayBuffer;
       window.__ownerBeforeDelayedLoad = window.__continuationOwner;
@@ -417,7 +465,8 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
     const result = { passed: true, artifact, bytes: bytes.length, sourceIdentity: saved.identity,
       continuedIdentity: continued.identity, savedTick: JSON.parse(saved.snapshot).tick,
       nextTick: JSON.parse(continued.snapshot).tick, rejected, oversizedBytes: limit + 1,
-      oversizedReads: 0, staleReadPreservedReset: true, browserStorage, downloads, errors, consoleLogs: logs };
+      oversizedReads: 0, staleReadPreservedReset: true, defaultOwner, legacyRefusal, familyContinuations,
+      browserStorage, downloads, errors, consoleLogs: logs };
     fs.writeFileSync(path.join(proof, "result.json"), JSON.stringify(result, null, 2), { flag: "wx" });
     return result;
   } finally {
@@ -567,6 +616,26 @@ async function runRendererTests(browser, baseUrl) {
   });
   await page.goto(baseUrl);
   await page.waitForFunction(() => document.getElementById("renderer-status").dataset.renderer === "canvas");
+  await page.evaluate(async () => {
+    const wasm = await import("/pkg/scriptbots_web.js");
+    const frame = wasm.SimHandle.prototype.frame;
+    wasm.SimHandle.prototype.frame = function () {
+      window.__rendererSim = this;
+      return frame.call(this);
+    };
+    const inspect = wasm.SimHandle.prototype.inspectBrain;
+    window.__brainReadCount = 0;
+    wasm.SimHandle.prototype.inspectBrain = function (uid) {
+      window.__brainReadCount += 1;
+      const detail = inspect.call(this, uid);
+      window.__brainLastObservation = detail;
+      return detail;
+    };
+  });
+  await page.selectOption("#brain-preset", "mlp");
+  await page.click("#reset-btn");
+  await page.waitForFunction(() => window.__rendererSim?.brainPreset() === "mlp"
+    && window.__rendererSim.frame().snapshot.tick > 0);
   if (await page.inputValue("#renderer") !== "canvas") throw new Error("Unmeasured WebGPU became the default renderer");
   await page.selectOption("#renderer", "webgpu");
   await page.waitForFunction(() => Number(document.getElementById("renderer-status").dataset.snapshotTick) > 0);
@@ -575,6 +644,65 @@ async function runRendererTests(browser, baseUrl) {
     speed.value = "0";
     speed.dispatchEvent(new Event("input", { bubbles: true }));
   });
+  const selectedCreature = await page.evaluate(async () => {
+    const { pickAgent } = await import("/inspector.js");
+    const owner = window.__rendererSim;
+    const frame = owner.frame();
+    const first = frame.snapshot.agents[0];
+    if (!first || typeof first.uid !== "string") throw new Error("Packaged owner must expose exact creature UIDs");
+    const canvas = document.getElementById("sim-canvas");
+    const bounds = canvas.getBoundingClientRect();
+    const x = first.position[0] / frame.snapshot.world.width * bounds.width;
+    const y = first.position[1] / frame.snapshot.world.height * bounds.height;
+    const uid = pickAgent(frame.snapshot, x, y, { width: bounds.width, height: bounds.height,
+      canvasWidth: canvas.width, canvasHeight: canvas.height });
+    return { uid, x: bounds.left + x, y: bounds.top + y, before: JSON.stringify(owner.snapshot()) };
+  });
+  await page.mouse.click(selectedCreature.x, selectedCreature.y);
+  await page.waitForFunction((uid) => document.getElementById("agent-inspector").dataset.state === "ready"
+    && document.getElementById("agent-inspector").dataset.uid === uid, selectedCreature.uid);
+  if (await page.locator("#inspector-signals tr").count() !== 34) throw new Error("Inspector omitted canonical sensor/actuator rows");
+  await page.fill("#inspector-uid", "18446744073709551615");
+  await page.click("#inspector-refresh");
+  await page.waitForFunction(() => document.getElementById("agent-inspector").dataset.state === "ready");
+  if (await page.inputValue("#inspector-uid") !== "18446744073709551615") throw new Error("Inspector refresh overwrote an edited UID");
+  if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== selectedCreature.before) {
+    throw new Error("Creature picking or inspection changed the paused scientific snapshot");
+  }
+  if (await page.evaluate(() => window.__brainReadCount) !== 0) throw new Error("Closed brain panel performed an unsolicited evaluator read");
+  await page.click("#brain-inspector > summary");
+  await page.waitForFunction(() => document.getElementById("brain-inspector").dataset.state === "ready");
+  const activityObservation = await page.evaluate(async () => {
+    const { brainActivityColor } = await import("/inspector.js");
+    const detail = window.__brainLastObservation;
+    const layer = detail.activations.layers[0];
+    if (!layer?.values.length || !detail.activations.connections.length) throw new Error("Real MLP inspection omitted activity or retained weights");
+    if (detail.uid !== document.getElementById("agent-inspector").dataset.uid) throw new Error("Brain panel changed selected stable UID");
+    const canvas = document.getElementById("brain-heatmap");
+    const pixel = [...canvas.getContext("2d").getImageData(4, 4, 1, 1).data].slice(0, 3);
+    const expected = brainActivityColor(layer.values[0]);
+    if (pixel.some((value, index) => value !== expected[index])) throw new Error(`Brain heatmap differs from actual owner value: ${JSON.stringify({ pixel, expected })}`);
+    const first = detail.activations.connections[0];
+    const cells = [...document.querySelector("#brain-edges tr").children].map((cell) => cell.textContent);
+    if (JSON.stringify(cells) !== JSON.stringify([String(first.from), String(first.to), String(first.weight)])) throw new Error("Brain table did not expose the owner's exact retained connection");
+    return { uid: detail.uid, source: detail.source, values: detail.build.retained_values,
+      edges: detail.build.retained_edges, clipped: detail.build.truncated, pixel, expected, reads: window.__brainReadCount };
+  });
+  await page.fill("#brain-node", "1");
+  await page.selectOption("#brain-output", "6");
+  if (activityObservation.edges > 32) {
+    await page.click("#brain-edge-next");
+    if (!(await page.textContent("#brain-edge-page")).includes("33–")) throw new Error("Brain connection paging did not advance");
+    await page.click("#brain-edge-prev");
+  }
+  if (await page.evaluate(() => window.__brainReadCount) !== activityObservation.reads) throw new Error("Pure brain view navigation issued new owner reads");
+  if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== selectedCreature.before) throw new Error("Brain inspection or view navigation advanced paused science");
+  await page.click("#brain-inspector > summary");
+  await page.waitForFunction(() => document.getElementById("brain-inspector").dataset.state === "inactive");
+  console.log(JSON.stringify({ schema: "scriptbots.browser-brain-observation.v1", ...activityObservation }));
+  await page.click("#inspector-clear");
+  await page.waitForFunction(() => document.getElementById("agent-inspector").dataset.state === "empty");
+
   const screenshotControl = await page.evaluate(() => {
     const canvas = document.createElement("canvas");
     canvas.id = "screenshot-control";
@@ -623,13 +751,13 @@ async function runRendererTests(browser, baseUrl) {
       const snapshot = {
         tick: 0, world: { width: 2560, height: 1440 },
         agents: [
-          { position: [640, 360], health: 1, color: [0.2, 0.8, 0.2], boost: true },
-          { position: [1280, 720], health: 1, color: [0.9, 0.1, 0.1], boost: false },
+          { uid: "18446744073709551615", position: [640, 360], health: 1, color: [0.2, 0.8, 0.2], boost: true },
+          { uid: "9007199254740993", position: [1280, 720], health: 1, color: [0.9, 0.1, 0.1], boost: false },
         ],
       };
       let capturedPixels = null;
-      const read = async (input, points) => {
-        if (input) renderer.render(input);
+      const read = async (input, points, presentation) => {
+        if (input) renderer.render(input, presentation);
         const pendingPng = capturedPixels === null && input
           ? new Promise((resolve) => canvas.toBlob(resolve, "image/png")) : null;
         if (renderer.device) await renderer.device.queue.onSubmittedWorkDone();
@@ -664,6 +792,14 @@ async function runRendererTests(browser, baseUrl) {
             || ring[2] <= ring[0] + 70) {
           throw new Error(`${backend} failed world scaling, circular body or boost ring: ${JSON.stringify(pixels)}`);
         }
+        const selected = await read(snapshot, [[328, 180], [648, 360]], { selectedUid: "18446744073709551615" });
+        const selectedOther = await read(snapshot, [[328, 180], [648, 360]], { selectedUid: "9007199254740993" });
+        const unselected = await read(snapshot, [[328, 180], [648, 360]], { selectedUid: null });
+        const gold = (pixel) => pixel[0] > 180 && pixel[1] > 120 && pixel[2] < 80;
+        if (!gold(selected[0]) || gold(selected[1]) || gold(selectedOther[0]) || !gold(selectedOther[1])
+            || unselected.some(gold)) {
+          throw new Error(`${backend} selected UID highlight was stale or rounded: ${JSON.stringify({ selected, selectedOther, unselected })}`);
+        }
         const empty = await read({ ...snapshot, agents: [] }, [[320, 180]]);
         if (empty[0][0] > 15 || empty[0][1] > 22 || empty[0][2] > 38 || empty[0][3] !== 255) {
           throw new Error(`${backend} did not clear an empty frame: ${empty}`);
@@ -675,6 +811,49 @@ async function runRendererTests(browser, baseUrl) {
         const resized = await read(snapshot, [[128, 64], [256, 128]]);
         if (resized[0][1] <= resized[0][0] + 70 || resized[1][0] <= resized[1][1] + 70) {
           throw new Error(`${backend} did not rescale after resize: ${resized}`);
+        }
+        const environment = {
+          width: 2, height: 2, sourceWidth: 2, sourceHeight: 2, cellSize: 40,
+          terrainRevision: "1", foodRevision: "1", hydrologyRevision: "1", foodMax: 0.5,
+          hydrologyEnabled: true,
+          cells: [
+            { terrain: "Grass", elevation: 0, food: 0, waterDepth: 0 },
+            { terrain: "Sand", elevation: 1, food: 0.5, waterDepth: 0 },
+            { terrain: "DeepWater", elevation: 0, food: 0.25, waterDepth: 0.15 },
+            { terrain: "Rock", elevation: 0.5, food: 0, waterDepth: 1 },
+          ],
+        };
+        const emptyWorld = { ...snapshot, world: { width: 80, height: 80 }, agents: [] };
+        const observation = { environment, identity: { sessionId: "100" }, layer: "food" };
+        const centers = [[128, 64], [384, 64], [128, 192], [384, 192]];
+        const foodCells = await read(emptyWorld, centers, observation);
+        const close = (actual, expected) => actual.every((value, index) => Math.abs(value - expected[index]) <= 1);
+        if (!close(foodCells[0], [18, 27, 37, 255]) || !close(foodCells[1], [120, 180, 48, 255])) {
+          throw new Error(`${backend} lost food cells in an empty world: ${JSON.stringify(foodCells)}`);
+        }
+        const sameRaster = renderer.environment.current;
+        await read(emptyWorld, centers, observation);
+        if (renderer.environment.current !== sameRaster) throw new Error(`${backend} rebuilt unchanged environment`);
+        const waterCells = await read(emptyWorld, centers, { ...observation, layer: "water" });
+        if (!close(waterCells[2], [29, 80, 116, 255])) {
+          throw new Error(`${backend} lost actual water depth: ${JSON.stringify(waterCells)}`);
+        }
+        const depleted = { ...environment, foodRevision: "2",
+          cells: environment.cells.map((cell) => ({ ...cell, food: 0 })) };
+        const changedCells = await read(emptyWorld, centers, { ...observation, environment: depleted });
+        if (!close(changedCells[1], [18, 27, 37, 255])) throw new Error(`${backend} retained stale food`);
+        const sessionCells = await read(emptyWorld, centers, { ...observation, identity: { sessionId: "101" } });
+        if (!close(sessionCells[1], [120, 180, 48, 255])) throw new Error(`${backend} reused another session's grid`);
+        const replacementCells = await read(emptyWorld, centers, {
+          ...observation, identity: { sessionId: "101" }, generation: 1,
+          environment: { ...environment, cells: depleted.cells },
+        });
+        if (!close(replacementCells[1], [18, 27, 37, 255])) {
+          throw new Error(`${backend} reused a replaced same-seed owner's grid`);
+        }
+        const absentCells = await read(emptyWorld, centers);
+        if (absentCells.some((cell) => cell[0] > 15 || cell[1] > 22 || cell[2] > 38)) {
+          throw new Error(`${backend} displayed stale environment when layers were absent`);
         }
         let capacityError = null;
         if (renderer.device) {
@@ -740,7 +919,8 @@ async function runRendererTests(browser, baseUrl) {
             queue.writeBuffer = writeBuffer;
           }
         }
-        results[backend] = { pixels, capturedPixels, empty, resized, growthAgents: 513, capacityError, admission };
+        results[backend] = { pixels, capturedPixels, empty, resized, selected, selectedOther, unselected, growthAgents: 513, capacityError, admission,
+          environment: { foodCells, waterCells, changedCells, sessionCells, replacementCells, absentCells } };
       } finally {
         renderer.destroy();
       }
@@ -760,9 +940,9 @@ async function runRendererTests(browser, baseUrl) {
     const { CanvasRenderer } = await import("/renderers/canvas.js");
     const render = CanvasRenderer.prototype.render;
     window.__canvasRenderCalls = 0;
-    CanvasRenderer.prototype.render = function (snapshot) {
+    CanvasRenderer.prototype.render = function (snapshot, presentation) {
       if (this.canvas.id === "sim-canvas") window.__canvasRenderCalls += 1;
-      return render.call(this, snapshot);
+      return render.call(this, snapshot, presentation);
     };
     const frame = wasm.SimHandle.prototype.frame;
     wasm.SimHandle.prototype.frame = function () {
@@ -839,6 +1019,40 @@ async function runRendererTests(browser, baseUrl) {
   });
   if (pausedPaints.unchangedCalls !== 0 || pausedPaints.resizeCalls !== 1 || pausedPaints.restoreCalls !== 1
       || !pausedPaints.unchangedState) throw new Error(`Paused publication was repainted or resize ignored: ${JSON.stringify(pausedPaints)}`);
+  const observedEnvironment = await page.evaluate(() => {
+    const first = window.__rendererSim.frame();
+    const second = window.__rendererSim.frame();
+    const environment = first.environment;
+    if (!environment || environment !== second.environment
+        || environment.width !== Math.min(environment.sourceWidth, 128)
+        || environment.height !== Math.min(environment.sourceHeight, 128)
+        || environment.cells.length !== environment.width * environment.height
+        || environment.sourceWidth * environment.cellSize !== first.snapshot.world.width
+        || environment.sourceHeight * environment.cellSize !== first.snapshot.world.height) {
+      throw new Error("Local frames lost their coherent bounded environment or reused-object cache");
+    }
+    if (!Object.isFrozen(environment) || !Object.isFrozen(environment.cells)
+        || !Object.isFrozen(environment.cells[0])) {
+      throw new Error("Shared environment objects must be immutable");
+    }
+    const originalFood = environment.cells[0].food;
+    try { environment.cells[0].food = originalFood + 1; } catch {}
+    if (window.__rendererSim.frame().environment.cells[0].food !== originalFood) {
+      throw new Error("A caller poisoned the environment reused by a later frame");
+    }
+    return {
+      sourceWidth: environment.sourceWidth, sourceHeight: environment.sourceHeight,
+      width: environment.width, height: environment.height, cells: environment.cells.length,
+      shared: true, immutable: true,
+    };
+  });
+  await page.selectOption("#environment-layer", "food");
+  await page.waitForFunction(() => document.getElementById("environment-status").dataset.layer === "food");
+  if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) {
+    throw new Error("Changing the displayed environment layer changed the scientific snapshot");
+  }
+  await page.selectOption("#environment-layer", "combined");
+  await page.waitForFunction(() => document.getElementById("environment-status").dataset.layer === "combined");
   await page.locator("#sim-canvas").screenshot({ path: path.join(proof, "main-canvas.png") });
   exports.canvas = await saveFrame(page, "canvas");
   if (await page.evaluate(() => JSON.stringify(window.__rendererSim.snapshot())) !== snapshotBefore) throw new Error("Canvas switch changed exported snapshot");
@@ -1135,7 +1349,7 @@ async function runRendererTests(browser, baseUrl) {
   }
   if (errors.length !== 0) throw new Error(`Renderer page errors: ${JSON.stringify(errors)}`);
   const result = { schema: "scriptbots.browser-renderers.v2", status: "pass", browser: browser.version(), adapter,
-    geometry, aspect, pausedTick, pausedPaints, exportedSnapshotSha256: createHash("sha256").update(snapshotBefore).digest("hex"),
+    geometry, aspect, pausedTick, pausedPaints, observedEnvironment, exportedSnapshotSha256: createHash("sha256").update(snapshotBefore).digest("hex"),
     backpressure: { beforeHold, duringHold, afterHold,
       presentationControl: "one producer callback retained and invoked explicitly; real independent timer" },
     injectedCompletionRejection: { paintedPixels: rejectedCompletionPixels,
@@ -1164,7 +1378,9 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
   const port = reservation.address().port;
   await new Promise((resolve) => reservation.close(resolve));
   const endpoint = `http://127.0.0.1:${port}`;
-  const args = ["--mode", "server", "--storage", "file", "--threads", "1", "--bootstrap-ticks", "0", "--rng-seed", "17"];
+  // Use a family compiled into both the native application and the browser.
+  // The native Mixed preset may also register optional NeuroFlow adapters.
+  const args = ["--mode", "server", "--storage", "file", "--threads", "1", "--bootstrap-ticks", "0", "--rng-seed", "17", "--brain", "mlp"];
   const log = fs.openSync(path.join(proof, "native.log"), "wx");
   const child = spawn(binary, args, { stdio: ["ignore", log, log], env: { ...process.env,
     SCRIPTBOTS_STORAGE_PATH: path.join(proof, "run.sqlite"),
@@ -1264,7 +1480,8 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     observations.connected = await page.evaluate(() => ({ frames: window.__remoteWire.frames,
       sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
       disabled: ["steps-per-frame", "population", "reset-btn", "brain-preset", "checkpoint-save", "checkpoint-load",
-        "checkpoint-browser-save", "checkpoint-browser-restore"].map((id) => [id, document.getElementById(id)?.disabled]) }));
+        "checkpoint-browser-save", "checkpoint-browser-restore", "world-checkpoint-export", "world-checkpoint-import"]
+        .map((id) => [id, document.getElementById(id)?.disabled]) }));
     const { canvas, telemetry, events } = observations.connected.frames;
     for (const frame of [canvas, telemetry, events]) {
       if (frame.identity.tick !== String(observations.initial.tick)
@@ -1394,6 +1611,107 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
       throw new Error("Same-ID browser retry after a lost receipt/reconnect duplicated a native Step");
     }
     await control("#remote-refresh", "status");
+    // A saved scientific view must remain frozen while the real subscription
+    // consumes new frames, then return to the latest verified live publication.
+    await page.evaluate(() => { document.getElementById("checkpoint-lab").open = true; });
+    await page.waitForFunction(() => !document.getElementById("lab-checkpoint-save").disabled);
+    const [savedResponse] = await Promise.all([
+      page.waitForResponse((response) => new URL(response.url()).pathname === "/api/v1/checkpoints"
+        && response.request().method() === "POST"),
+      page.click("#lab-checkpoint-save"),
+    ]);
+    if (!savedResponse.ok()) throw new Error("The browser could not save the native checkpoint");
+    const saved = await savedResponse.json();
+    await page.waitForFunction((id) => document.getElementById("lab-checkpoint-select").value === id
+      && !document.getElementById("lab-checkpoint-review").disabled, saved.checkpoint_id);
+    const savedConfig = await request("/api/config");
+    if (savedConfig.tick !== saved.tick) throw new Error("Checkpoint configuration was not observed at its saved boundary");
+    const [sourceDownload] = await Promise.all([
+      page.waitForEvent("download"), page.click("#lab-checkpoint-download"),
+    ]);
+    const sourcePath = path.join(proof, "native-source.bin");
+    await sourceDownload.saveAs(sourcePath);
+    if (await sourceDownload.failure()) throw new Error("Native checkpoint download failed");
+    const sourceBytes = fs.readFileSync(sourcePath);
+    if (sourceBytes.length !== saved.byte_size
+        || createHash("sha256").update(sourceBytes).digest("hex") !== saved.checksum_sha256) {
+      throw new Error("Downloaded native checkpoint bytes disagree with the saved artifact");
+    }
+    const beforeReview = await request("/api/status");
+    const controlsBeforeReview = await page.evaluate(() => window.__remoteWire.sent.filter(
+      (message) => ["pause", "resume", "step", "speed"].includes(message.command)).length);
+    const [reviewResponse] = await Promise.all([
+      page.waitForResponse((response) => new URL(response.url()).pathname === `/api/v1/checkpoints/${saved.checkpoint_id}/canvas`),
+      page.click("#lab-checkpoint-review"),
+    ]);
+    if (!reviewResponse.ok()) throw new Error("The native checkpoint canvas reconstruction was refused");
+    const reviewEnvelope = await reviewResponse.json();
+    const rebuilt = await page.evaluate(async ({ moduleFile, encoded }) => {
+      const { decode_remote_frame_binary: decode } = await import(`/pkg/${moduleFile}`);
+      return decode(Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0)));
+    }, { moduleFile: packageInfo.moduleFile, encoded: reviewEnvelope.frameBase64 });
+    const savedEnvironment = (environment) => Object.fromEntries(
+      ["width", "height", "sourceWidth", "sourceHeight", "cellSize", "foodMax", "hydrologyEnabled", "cells"]
+        .map((key) => [key, environment[key]]));
+    const savedAgents = (snapshot) => snapshot.agents.map(({ uid, position, health, color }) => ({ uid, position, health, color }))
+      .sort((left, right) => BigInt(left.uid) < BigInt(right.uid) ? -1 : BigInt(left.uid) > BigInt(right.uid) ? 1 : 0);
+    if (rebuilt.identity.sessionId !== expectedPng.sessionId || rebuilt.identity.tick !== String(saved.tick)
+        || JSON.stringify(savedAgents(rebuilt.payload)) !== JSON.stringify(savedAgents(sourceFrame.payload))
+        || JSON.stringify(savedEnvironment(rebuilt.environment)) !== JSON.stringify(savedEnvironment(sourceFrame.environment))) {
+      throw new Error("Checkpoint reconstruction changed the saved agents or environment samples");
+    }
+    await page.waitForFunction((id) => document.getElementById("checkpoint-view-status").dataset.state === "ready"
+      && document.getElementById("renderer-status").dataset.view === "checkpoint"
+      && document.getElementById("renderer-status").dataset.checkpointId === id, saved.checkpoint_id);
+    observations.checkpointReview = { checkpoint: saved, sourceSessionId: reviewEnvelope.sourceSessionId, png: {} };
+    const reviewUi = await page.evaluate(() => ({
+      tick: document.getElementById("metric-tick").textContent,
+      births: document.getElementById("metric-births").textContent,
+      deaths: document.getElementById("metric-deaths").textContent,
+      tps: document.getElementById("metric-tps").textContent,
+      blocked: ["remote-pause", "remote-step", "remote-resume", "remote-retry", "inspector-uid",
+        "lab-checkpoint-save", "lab-branch-launch"].every((id) => document.getElementById(id).disabled),
+    }));
+    if (!reviewUi.blocked || reviewUi.tick !== saved.tick.toLocaleString()
+        || [reviewUi.births, reviewUi.deaths, reviewUi.tps].some((value) => value !== "—")) {
+      throw new Error("Saved-world review exposed live controls or invented original per-tick activity");
+    }
+    for (const backend of ["canvas", "webgpu"]) {
+      await page.selectOption("#renderer", backend);
+      await page.waitForFunction((backend) => document.getElementById("renderer-status").dataset.renderer === backend, backend);
+      const [download] = await Promise.all([page.waitForEvent("download"), page.click("#capture-btn")]);
+      await download.saveAs(path.join(proof, `checkpoint-${backend}.png`));
+      if (await download.failure()) throw new Error("Saved-world PNG download failed");
+      await page.waitForFunction(() => document.getElementById("capture-status").dataset.state === "ready");
+      const exported = await page.evaluate(() => ({ ...document.getElementById("capture-status").dataset }));
+      const expected = `scriptbots-checkpoint-${saved.checkpoint_id}-t${saved.tick}-${saved.world_digest_v1}-${backend}.png`;
+      if (exported.view !== "checkpoint" || exported.checkpointId !== saved.checkpoint_id
+          || exported.worldDigestV1 !== saved.world_digest_v1 || exported.tick !== String(saved.tick)
+          || download.suggestedFilename() !== expected) throw new Error("Saved-world PNG was labeled as a live publication");
+      observations.checkpointReview.png[backend] = exported;
+    }
+    const afterReview = await request("/api/status");
+    for (const field of ["tick", "scientific_revision", "control_revision", "config_revision", "paused"]) {
+      if (afterReview[field] !== beforeReview[field]) throw new Error("Saved-world review mutated the live owner");
+    }
+    if (await page.evaluate(() => window.__remoteWire.sent.filter(
+      (message) => ["pause", "resume", "step", "speed"].includes(message.command)).length) !== controlsBeforeReview) {
+      throw new Error("Review or PNG export submitted a live playback command");
+    }
+    const independentStep = await request("/api/control/step", { method: "POST" });
+    await until(() => request(`/api/control/status/${independentStep.command_id}`),
+      (receipt) => receipt.application_state === "applied" && receipt.journal_state === "durable", "live step during saved review");
+    const advanced = await request("/api/status");
+    await page.waitForFunction((tick) => window.__remoteWire.frames.canvas.identity.tick === String(tick), advanced.tick);
+    if (await page.evaluate(() => document.getElementById("renderer-status").dataset.snapshotTick) !== String(saved.tick)) {
+      throw new Error("Incoming live frame replaced the saved canvas");
+    }
+    await page.click("#checkpoint-return-live");
+    await page.waitForFunction((tick) => document.getElementById("renderer-status").dataset.view === "live"
+      && document.getElementById("renderer-status").dataset.snapshotTick === String(tick)
+      && !document.getElementById("remote-step").disabled
+      && document.getElementById("checkpoint-view").hidden, advanced.tick);
+    observations.checkpointReview.returnedLiveTick = advanced.tick;
     observations.resume = await control("#remote-resume", "resume");
     await until(() => request("/api/status"), (status) => !status.paused && status.tick > observations.afterStep.tick, "remote science after Resume");
     await control("#remote-pause", "pause");
@@ -1417,6 +1735,114 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     observations.returnedLocal = await page.evaluate(() => window.__remoteLocalHandle.frame().identity);
     if (observations.returnedLocal.sessionId !== observations.frozenLocal.sessionId
         || observations.returnedLocal.sessionId === expectedPng.sessionId) throw new Error("Return to Local replaced its saved owner or kept the native owner");
+
+    // Exercise the real saved-file controls and packaged WASM, then give its
+    // advanced raw cut to the same production native binary's study consumer.
+    // This observes two new owners, not continuation of the remote journal or
+    // equality of native and WASM trajectories after the transfer boundary.
+    const nativeBeforeTransfer = await request("/api/status");
+    if (!nativeBeforeTransfer.paused) throw new Error("Original native owner was not paused before scientific transfer");
+    await page.evaluate(() => { document.getElementById("world-checkpoint-transfer").open = true; });
+    await page.setInputFiles("#world-checkpoint-import", sourcePath);
+    await page.waitForFunction(() => document.getElementById("world-checkpoint-status").textContent.startsWith("Imported scientific state at tick"));
+    const imported = await page.evaluate(() => {
+      const owner = window.__remoteLocalHandle;
+      return { frame: owner.frame(), launch: owner.launchInfo(), preset: owner.brainPreset(),
+        sourceBytes: Array.from(owner.worldCheckpoint()) };
+    });
+    if (imported.frame.identity.tick !== String(saved.tick)
+        || imported.frame.identity.sessionId === expectedPng.sessionId
+        || imported.frame.identity.sessionId === observations.returnedLocal.sessionId
+        || !imported.frame.playback.paused || imported.preset !== "mlp"
+        || imported.launch.kind !== "scientific_checkpoint" || imported.launch.shareable
+        || imported.launch.semantics !== "scientific_cut_new_owner" || imported.launch.seed !== "17"
+        || await page.inputValue("#steps-per-frame") !== "0"
+        || !Buffer.from(imported.sourceBytes).equals(sourceBytes)) {
+      throw new Error("Native scientific import did not preserve the exact cut in a new paused browser owner");
+    }
+    delete imported.sourceBytes;
+    const advancedBrowser = await page.evaluate(() => {
+      const owner = window.__remoteLocalHandle;
+      owner.tick(2);
+      return owner.frame();
+    });
+    if (advancedBrowser.identity.tick !== String(saved.tick + 2)
+        || advancedBrowser.identity.sessionId !== imported.frame.identity.sessionId
+        || !advancedBrowser.playback.paused) throw new Error("Imported browser owner did not complete two explicit steps");
+    const [browserDownload] = await Promise.all([
+      page.waitForEvent("download"), page.click("#world-checkpoint-export"),
+    ]);
+    const browserPath = path.join(proof, "browser-advanced.sbworld");
+    await browserDownload.saveAs(browserPath);
+    if (await browserDownload.failure() || !browserDownload.suggestedFilename().endsWith(".sbworld")) {
+      throw new Error("Advanced browser scientific checkpoint download failed");
+    }
+    const browserBytes = fs.readFileSync(browserPath);
+    if (browserBytes.length === 0 || browserBytes.equals(sourceBytes)) {
+      throw new Error("Browser scientific export did not contain the advanced cut");
+    }
+    const checkpointTick = Number(advancedBrowser.identity.tick);
+    const studyPlan = {
+      study_id: "native-browser-native-transfer",
+      description: "Continue an advanced browser scientific cut in isolated native control and treatment owners",
+      base_seed: Number(imported.launch.seed), checkpoint_tick: checkpointTick, horizon_ticks: 2, brain_preset: "Mlp",
+      // WorldState::capture_checkpoint_quiescent normalizes this one host-only
+      // field to zero; /api/config still describes the original live recorder.
+      config: { ...savedConfig.config, persistence_interval: 0 }, source_checkpoint: browserPath,
+      branches: [
+        { branch_id: "control", description: "Continue the exported browser science", intervention: null, scheduled_tick: null },
+        { branch_id: "closure", description: "Change newcomer admission after one shared transition",
+          intervention: { type: "ClosedWorld", params: { closed: !savedConfig.config.closed } }, scheduled_tick: checkpointTick + 1 },
+      ],
+    };
+    const studyPlanPath = path.join(proof, "browser-study-plan.json");
+    const studyOutput = path.join(proof, "browser-study");
+    fs.writeFileSync(studyPlanPath, JSON.stringify(studyPlan, null, 2), { flag: "wx" });
+    const studyArgs = ["branch-study", "--plan", studyPlanPath, "--out", studyOutput];
+    const studyLog = fs.openSync(path.join(proof, "browser-study.log"), "wx");
+    const studyChild = spawn(binary, studyArgs, { cwd: proof, stdio: ["ignore", studyLog, studyLog],
+      env: { ...process.env, RAYON_NUM_THREADS: "1", SCRIPTBOTS_MAX_THREADS: "1", RUST_LOG: "warn" } });
+    fs.closeSync(studyLog);
+    let studyTimedOut = false;
+    const studyExit = await new Promise((resolve, reject) => {
+      const deadline = setTimeout(() => { studyTimedOut = true; studyChild.kill("SIGKILL"); }, 60_000);
+      studyChild.once("error", (error) => { clearTimeout(deadline); reject(error); });
+      studyChild.once("exit", (code, signal) => { clearTimeout(deadline); resolve({ code, signal }); });
+    });
+    if (studyTimedOut || studyExit.code !== 0 || studyExit.signal !== null) {
+      throw new Error(`Native study refused the browser scientific cut: ${JSON.stringify({ ...studyExit, timedOut: studyTimedOut })}`);
+    }
+    const studyReport = JSON.parse(fs.readFileSync(path.join(studyOutput, "study_report.json"), "utf8"));
+    const controlBranch = studyReport.branch_reports?.find((branch) => branch.branch_id === "control");
+    const treatmentBranch = studyReport.branch_reports?.find((branch) => branch.branch_id === "closure");
+    if (studyReport.study_id !== studyPlan.study_id || studyReport.checkpoint_tick !== checkpointTick
+        || studyReport.base_seed !== studyPlan.base_seed || studyReport.horizon_ticks !== studyPlan.horizon_ticks
+        || !studyReport.pre_intervention_digest_verified_for_all_branches
+        || studyReport.source?.kind !== "saved_checkpoint" || studyReport.source?.byte_size !== browserBytes.length
+        || !fs.readFileSync(path.join(studyOutput, "source_checkpoint.bin")).equals(browserBytes)
+        || studyReport.branch_reports.length !== 2 || !controlBranch?.bundle_verified || !treatmentBranch?.bundle_verified
+        || controlBranch.command_applied_tick !== null || controlBranch.first_divergence !== null
+        || treatmentBranch.command_applied_tick !== checkpointTick + 1
+        || treatmentBranch.first_divergence?.tick !== checkpointTick + 2
+        || controlBranch.terminal_sample.tick !== checkpointTick + 2 || treatmentBranch.terminal_sample.tick !== checkpointTick + 2
+        || treatmentBranch.final_digest === controlBranch.final_digest) {
+      throw new Error("Native study did not retain the browser source or apply an isolated control/treatment comparison");
+    }
+    const nativeAfterTransfer = await request("/api/status");
+    for (const field of ["tick", "scientific_revision", "config_revision", "paused", "last_applied_command"]) {
+      if (nativeAfterTransfer[field] !== nativeBeforeTransfer[field]) {
+        throw new Error("Scientific transfer or isolated native study mutated the original remote owner");
+      }
+    }
+    observations.scientificTransfer = {
+      sourcePath, sourceSha256: saved.checksum_sha256, sourceTick: saved.tick,
+      importedIdentity: imported.frame.identity, importedLaunch: imported.launch, advancedIdentity: advancedBrowser.identity,
+      browserPath, browserSha256: createHash("sha256").update(browserBytes).digest("hex"),
+      studyPlanPath, studyOutput, studyArgs, studyExit, source: studyReport.source,
+      preInterventionDigest: studyReport.pre_intervention_digest, controlDigest: controlBranch.final_digest,
+      treatmentDigest: treatmentBranch.final_digest, originalRemoteOwnerUnchanged: true,
+      scope: "Exact native cut imported by packaged WASM; browser advanced cut consumed by isolated native study. Cross-target future equivalence is not asserted.",
+    };
     const wire = await page.evaluate(() => ({ sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
       frames: window.__remoteWire.frames, decodeErrors: window.__remoteWire.decodeErrors, binaries: window.__remoteWire.binaries }));
     for (const [index, bytes] of wire.binaries.entries()) fs.writeFileSync(path.join(proof, `native-frame-${index}.bin`), new Uint8Array(bytes), { flag: "wx" });

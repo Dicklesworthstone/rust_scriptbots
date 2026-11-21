@@ -41,13 +41,21 @@ The crate exposes the following wasm-bindgen surface:
 - `init_sim(options: JsValue) -> SimHandle` — constructs a simulation using the supplied options. Recognised fields include:
   - `population` (usize): initial spawn count (defaults to 64).
   - `seed` (u64): explicit RNG seed. It overrides `config.rng_seed`; when omitted,
-    the nested config seed is preserved. If both are omitted, core seeds the world
-    from entropy.
+    the nested config seed is preserved. If both are omitted, the browser resolves
+    and records an entropy seed before creating the world.
   - `world_width` / `world_height`: override the world dimensions (pixels).
   - `config`: optional full `ScriptBotsConfig` override (rarely needed; defaults are usually sufficient).
   - `snapshot_format`: `"json"` (default) or `"binary"` (Postcard-encoded `Uint8Array`).
-  - `seed_strategy`: `"wander"` (default) to attach lightweight wander brains or `"none"` to start with passive agents for custom registry wiring.
-  - `default_brain`: `"mlp"` to pre-bind agents to the baseline MLP implementation during seeding.
+  - `default_brain`: `"mlp"`, `"dwraon"`, or `"assembly"` to bind agents to a
+    versioned, heritable brain family during seeding. Omitting the brain choices
+    starts with MLP. Assembly is an experimental evolving program family.
+  - `mixed_brains` (bool, default false): seed MLP, DWRAON and Assembly founders
+    in repeating order. All three families remain registered even for a zero
+    population. A selected `default_brain` or Wander strategy conflicts with this
+    option and is refused; clear `default_brain` when extending default options.
+  - `seed_strategy`: explicitly choose `"wander"` for the legacy movement demo or
+    `"none"` for unbound agents when `default_brain` is absent. A selected
+    `default_brain` takes precedence. Wander cannot export continuations.
 - `SimHandle::tick(steps: u32) -> JsValue` — advances the simulation and returns either JSON or a `Uint8Array` depending on `snapshot_format`.
 - `SimHandle::drive(elapsedMilliseconds: number) -> JsValue` — drives the existing
   `HostCore` at monotonic elapsed time since initialization/reset. Returns its
@@ -61,23 +69,159 @@ The crate exposes the following wasm-bindgen surface:
   Explicit `tick(steps)` still completes exactly the
   requested manual steps without advancing the elapsed clock or changing speed.
 - `SimHandle::snapshot() -> JsValue` — builds a snapshot without ticking (uses the same format toggle).
+- `SimHandle::frame() -> JsValue` — reads one immutable host publication with exact
+  decimal-string identities, its dynamic snapshot, and a bounded terrain/food/water
+  overview. The environment is cached by owner and layer revisions and frozen in
+  JavaScript; callers cannot mutate the shared cells. This does not tick the world.
+- `SimHandle::narrativePage(afterEvent: string, expectedSessionId: string)` — reads
+  up to 64 canonical narrative records from one immutable owner publication.
+  Start at cursor `"0"` with the session from `frame().identity.sessionId` and
+  continue after the last returned event sequence. The result uses the existing
+  `scriptbots.remote-frame.v2` events envelope, including an explicit unavailable
+  prefix if retention overtook the cursor. Cursors and source identities are exact
+  decimal strings; malformed, foreign-session and future cursors are refused.
+  An empty page still identifies the observed publication. This read neither
+  advances science nor confirms durable journal storage.
+- `SimHandle::inspectGenome(uid: string, locusOffset: number, deltaOffset: number)` —
+  reads a bounded page of canonical loci and retained primary-parent differences.
+  Start both offsets at zero and follow the returned independent page cursors.
+- `SimHandle::intervene(request)` — stages a source-bound intervention at an observed
+  paused boundary. Keep the exact request for an explicit idempotent retry after an
+  uncertain response; an applied receipt means queued for the next scientific tick.
+- `SimHandle::interventionStatus(commandId: string, sessionId: string)` — reads the
+  retained application and journal outcome. A null result means unknown.
+- `SimHandle::interventionHistory(sessionId: string, epoch: string, afterSeq: string, limit: number)` —
+  reads 1–64 global ecological effect records, including explicit retention gaps.
 - `SimHandle::reset(seed?: number)` — rebuilds the world. An explicit seed
   overrides the nested config for that reset; omitting it falls back to the
   original `config.rng_seed` (or entropy when the nested seed is also absent).
-- `SimHandle::registerBrain(kind: string)` — installs a brain preset for all agents (`"wander"`, `"mlp"`, or `"none"`).
+  An imported mixed-family continuation has no recorded founder distribution,
+  so reset refuses until `registerBrain` explicitly chooses a new-world preset.
+- `SimHandle::registerBrain(kind: string)` — rebuilds the world with `"mlp"`,
+  `"dwraon"`, `"assembly"`, `"mixed"`, `"wander"`, or `"none"`. Mixed starts the
+  fixed three-family founder recipe. Unknown or invalid presets leave the active
+  owner intact.
 - `SimHandle::checkpoint() -> Uint8Array` — settles the current volatile journal
   boundary and exports the existing full owner checkpoint: science, evaluators,
   command history and cadence credit. It does not advance elapsed time. Legacy
-  wander evaluators are refused; MLP and unbound worlds are supported.
+  wander evaluators are refused; MLP, DWRAON, Assembly, mixtures of these three
+  families, and unbound worlds are supported, including empty populations.
+  Fresh founders can be saved at tick zero; their pending origins and genome
+  declarations survive restore and reach the same first recording boundary.
+  Completed births do not block a save after their boundary has settled.
+  Registered families remain part of the saved state after their last agent dies.
 - `restore_checkpoint(bytes: Uint8Array) -> SimHandle` — validates and restores a
   new owner, with a new command namespace and rebased elapsed clock. Failed
   imports preserve existing handles. Future science matches the saved state;
-  offline wall time adds no ticks. Reset starts a new world using the loaded
-  configuration, checkpoint population and supported brain preset.
+  offline wall time adds no ticks. Restoration retains every registered family
+  in its exact key order and restores its exact registry and evaluator identity.
+  Unsupported families, mismatched adapters, noncanonical registry key layouts,
+  and worlds outside browser resource limits are refused before owner replacement.
+  A single-family reset uses the loaded configuration, checkpoint population and
+  saved brain family. A mixed continuation requires an explicit new-world preset
+  before reset because the checkpoint does not record its founder distribution.
+  The demo displays the retained roster and keeps Reset disabled until a new
+  preset is selected. Selecting a preset leaves the live continuation intact;
+  pressing Reset then creates the requested fresh world.
 - `checkpoint_byte_limit() -> number` — the canonical owner codec's file bound,
   also checked before the demo reads a selected file.
+- `SimHandle::worldCheckpoint() -> Uint8Array` — exports the canonical core
+  `WorldCheckpointV1` scientific cut used by native checkpoint tools. It settles
+  the current receipt boundary without advancing science. The cut contains the
+  world, RNG and evaluator state; it excludes the owner session, command journal,
+  retained history and pending host schedule. Fitness selection, unscrambled
+  communication and no imported map are required because this raw format omits
+  their auxiliary state.
+- `import_world_checkpoint(bytes: Uint8Array) -> SimHandle` — validates a raw
+  scientific cut and starts a fresh, paused browser owner at its saved tick.
+  MLP, DWRAON, Assembly, supported mixtures and unbound worlds are admitted only
+  with exact registry/evaluator identities and a matching restored world digest.
+  Browser resource limits also apply. Unsupported or corrupt files leave existing
+  handles untouched. This does not continue the source owner's commands, history
+  or pending schedule, and does not certify cross-target future equivalence.
+- `world_checkpoint_byte_limit() -> number` — the independent core scientific
+  file bound (128 MiB), checked before the demo materializes a selected file.
 - `SimHandle::brainPreset() -> string` — the new-world brain preset for this handle.
+  Both fresh mixed founders and imported mixed continuations report `"mixed"`;
+  `launchInfo()` distinguishes a restartable recipe from a saved continuation.
+- `SimHandle::brainFamilies() -> string[]` — the versioned family roster in registry
+  key order, including empty or extinct families. Unbound and Wander owners
+  return an empty array.
+- `SimHandle::launchInfo() -> JsValue` — describes the retained initial-world
+  recipe, its exact decimal-string seed, founder count and brain preset. A loaded
+  continuation has no original launch recipe and reports `shareable: false`.
+  A raw science import reports `kind: "scientific_checkpoint"` and
+  `semantics: "scientific_cut_new_owner"`, the actual restored RNG root seed, and
+  no founder recipe; it is likewise not shareable as an initial-world permalink.
+- `SimHandle::permalinkOf() -> string` — encodes the complete initial-world
+  recipe as a bounded `sbb1` link. This restarts the recorded founders at tick
+  zero; current tick, live interventions and evolved state require a checkpoint.
+- `init_from_permalink(link: string) -> SimHandle` — validates and constructs
+  either a browser `sbb1` launch or an existing `sbw1` gallery reference.
+- `permalink_info(link: string) -> JsValue` — reads launch metadata before
+  replacing an owner. `permalink_diff(link)` exposes recorded knob changes;
+  `fork(handle, changes)` creates another initial-condition recipe while retaining
+  the other configuration, founder count and selected brain recipe.
 - `decode_snapshot_binary(bytes: &[u8]) -> JsValue` — helper exposed for JS callers to convert binary snapshots back into structured data.
+
+### Mixed founder worlds
+
+Select **Mixed MLP + DWRAON + Assembly** and press Reset to create a new mixed
+world. The equivalent initialization is:
+
+```javascript
+const mixed = init_sim({
+  population: 151,
+  seed: 17,
+  mixed_brains: true,
+  default_brain: null,
+  seed_strategy: "none",
+});
+```
+
+Founders repeat the fixed order MLP, DWRAON, Assembly, so this example starts
+with 51, 50 and 50 agents respectively. Each founder has its family's real
+heritable genome and evaluator; reproduction and extinction then follow the
+ordinary scientific rules. The mixture specifies the founders, not a quota
+maintained during evolution.
+
+This explicit founder recipe uses version 2 of the existing `sbb1` envelope.
+Its links and forks retain the mixture and resolved seed. API resets retain the
+mixture with the seed rules above; the demo Reset creates a new seed. Reload the
+recipe link to restart its recorded initial conditions.
+Version 1 single-family and demo recipes keep their existing canonical bytes
+and meaning. Older packages refuse the unsupported mixed recipe. The demo also
+refuses to replace a live world if a stale package ignores the mixed choice or
+returns an incomplete family roster.
+
+Save a continuation to preserve evolved agents and evaluator state. Importing
+one resumes the actual saved mixture, including extinct registered families,
+without inventing its original founder distribution. The disabled **Mixed
+continuation** selection makes this distinction visible; choose any new-world
+preset, including Mixed, before pressing Reset.
+
+### Initial-world sharing
+
+Browser links retain the effective configuration, resolved root seed, founder
+population, brain family or mixed recipe or explicit Wander/Unbound strategy, and the versioned
+founder recipe. This fixes the former default-gallery substitution, which could
+not reconstruct an ordinary browser world's configuration. Reset and brain
+replacement record the newly constructed owner's recipe; failed replacements
+leave the existing owner intact. A world remains usable when its recipe exceeds
+the sharing bounds, but metadata explains why sharing is unavailable.
+
+`sbb1` has a canonical JSON payload, a corruption checksum and explicit admission
+bounds. Its checksum and build-input fingerprints are noncryptographic; they
+are not signatures. `check_build_match(link)` reports `recorded_match`,
+`mismatch` or `unavailable` for browser recipes by comparing captured source,
+lockfile, toolchain, compiler and target/profile inputs. Matching recorded inputs
+does not establish cross-target or cross-build scientific equivalence. Existing
+`sbw1` links retain their gallery identity scope and loading behavior. A malformed,
+oversized or inconsistent recipe is refused before a new world is installed.
+
+Loaded continuations preserve their saved state but cannot recreate a missing
+original founder recipe. Their share and initial-condition-fork operations
+therefore refuse explicitly; use the continuation file to share that saved world.
 
 Snapshots are deterministic and use camelCase field names at the JavaScript boundary. They include:
 
@@ -87,6 +231,22 @@ Snapshots are deterministic and use camelCase field names at the JavaScript boun
 
 The wasm crate depends on `scriptbots-core` with `default-features = false`, disabling Rayon on wasm targets. Native builds can re-enable parallelism via the `parallel` feature if needed.
 
+The demo's **World layers** selector works in Canvas 2D and WebGPU, locally and
+while connected to a native server. It offers combined terrain/food/water, terrain,
+food availability, water depth and agents-only views. Environment observations
+cover the exact world with at most 128 × 128 cells. Small grids preserve every
+source cell; larger grids use a labelled center-sampled overview, not statistical
+averages. Empty populations retain the world background. Missing environment
+observations clear it, and owner/epoch/revision changes invalidate cached pixels.
+
+Remote binary frames use `SBWS` version 2 and decode to
+`scriptbots.remote-frame.v2`; the unchanged dynamic-world payload keeps its v2
+codec. Only canvas frames carry the new environment field. JSON commands,
+subscriptions and frame acknowledgments remain protocol version 1. Build the
+viewer, WASM decoder and native server from matching sources; an old binary
+stream is explicitly refused. The standalone `snapshot()` and `tick()` codecs
+remain unchanged.
+
 The Canvas demo drives elapsed time from one independent timer. RAF only reads
 the latest immutable snapshot. Its speed slider and visibility changes use host
 commands; hidden pages pause and resume without catching up the hidden interval.
@@ -95,11 +255,14 @@ pages have no hard real-time guarantee. The receipt exposes skipped opportunitie
 Full packaged-browser/DSR acceptance remains with `bd-2z0.12.3` and `bd-azi3`;
 native unit tests alone do not establish browser scheduling or durability.
 
-The demo's **Brain for new worlds** selector takes effect on Reset. Wander remains
-the default. Select MLP or Unbound to use **Save Continuation File**; **Load
-Continuation File** validates a saved owner before replacing the current world,
-then pauses it. Local continuation controls are disabled while displaying a remote
-server. A delayed file read cannot replace a newer reset or remote session.
+The demo starts with **MLP**, with canonical inherited genomes and evaluator
+state. **Brain for new worlds** also offers DWRAON, experimental Assembly, Mixed,
+Unbound and the legacy Wander movement demo; the choice takes effect on Reset.
+All except Wander support saved continuations. Wander visibly disables both
+save controls. **Load Continuation File** validates a saved owner before replacing
+the current world, restores its saved family and pauses it. Local continuation
+controls are disabled while displaying a remote server. A delayed file read
+cannot replace a newer reset or remote session.
 
 **Save in This Browser** stores one complete owner continuation in IndexedDB for
 this site's origin and browser profile. The UI acknowledges the save only after
@@ -118,3 +281,90 @@ world intact. This saved continuation is separate from the owner's journal
 receipt state. It does not write a SQLite image or ordered batch journal, or
 promote volatile receipts to `Durable`; those original `bd-ywtv` requirements
 remain open. Multiple tabs share the slot: the last completed manual save wins.
+
+## Moving scientific worlds between browser and native tools
+
+Open **Transfer a scientific checkpoint** in local mode. **Export Scientific
+Checkpoint** downloads `scriptbots-scientific-tick-<tick>.sbworld` without stepping
+the world or changing its playback. **Import Scientific Checkpoint** accepts that
+raw format, including native checkpoint catalog downloads, validates it completely,
+and replaces the local world with a new paused owner at the saved tick. Loading a
+full browser continuation through this input is refused; use **Load Continuation
+File** for that format. File selection is bounded before reading, and a delayed
+read cannot replace a newer reset or remote connection.
+
+When connected to a native server, open its saved checkpoint catalog, select a
+checkpoint, and choose **Continue selected world locally (paused)**. This downloads
+and verifies the selected artifact, restores its science in WASM, and returns the
+viewer to local mode only after candidate validation succeeds. The retained local
+world is then replaced. The native server continues independently and receives no
+Pause, Step or other mutation from this transfer. A failed download, unsupported
+brain or invalid checkpoint leaves both the current view and local owner intact.
+Changing endpoint, session or panel visibility cancels a pending transfer;
+checkpoint selection stays locked while its bytes are being read.
+The catalog transfer retains its existing 64 MiB artifact ceiling;
+local file imports use the core codec's 128 MiB ceiling plus browser world limits.
+
+Supported science uses Fitness selection, disabled communication scrambling, and
+no imported map. Raw cuts omit the auxiliary state needed to continue novelty or
+curiosity selection, scrambling, and imported map profiles faithfully, so these
+cases are refused. Supported registered brain families retain their exact order
+and evaluator state even after extinction. A mixed import requires an explicit
+new-world brain preset before Reset because the saved science has no original
+founder distribution. Source commands, pending scheduled inputs, host history and
+durable journal receipts are not transferred. Save a **continuation** after import
+to preserve the new browser owner's subsequent command history and cadence.
+
+The exported bytes also work with native consumers of `WorldCheckpointV1`.
+For a checkpoint-based `branch-study`, set the plan's `source_checkpoint` to the
+downloaded file and select a native brain preset whose registry exactly matches
+the checkpoint. Single-family MLP, DWRAON and Assembly have matching native presets.
+An arbitrary mixed-family roster may not match a named native preset, and the
+study runner has no Unbound preset; those cuts are refused by that consumer.
+The source path is relative to the
+invocation's working directory; the existing example plan is available through
+`scriptbots-app branch-study --example`. Matching codec identities and a restored
+digest establish the imported cut, not general equivalence of future transitions
+across native/WASM targets or different builds.
+
+## Genome inspection and interventions
+
+Select a creature and open **Inherited genome & parent differences** to inspect its
+actual canonical genome. Loci and changed parent loci have separate page controls;
+the summary covers the full compared genome. Inspection reads on selection, page
+navigation and explicit refresh, without advancing the world or decoding a genome
+on every frame. Pages contain at most 64 loci and 32 differences, with a 64 KiB
+response ceiling and a pre-decode ceiling of 65,536 loci per genome. The parent must
+still be living and retain material matching the child's recorded provenance.
+Unavailable parent material is reported explicitly. Crossover comparisons describe
+differences from the primary parent, without attributing all differences to mutation.
+
+Open **Scientific intervention toolbox**, pause the world, and choose drought,
+embargo, bloom, meteor, or closed/open-world policy. Ecological actions can cover
+the whole world or a toroidal disc; the disc can be centered on the selected
+creature. **Stage intervention at paused boundary** records a command. **Step once**
+or **Resume** then advances science so the queued action can take effect. The
+toolbox displays command application and journal durability separately from the
+global observed-effects history. History rows have no per-command attribution.
+
+If delivery is uncertain, **Retry original request with same ID** preserves the
+original action and source guard. It does not construct a new experiment. Another
+intervention remains disabled while the previous result is unknown or a queued
+action has not reached a later tick. Session, epoch and control-revision guards
+refuse stale commands, including concurrent Resume or Step races.
+
+Switching to a remote server preserves the retained local world's request and
+receipt for **Return to Local**. Reconnecting to the same remote endpoint also
+retains its request until a fresh, painted owner frame confirms the source. A
+rewound same-session source disables intervention actions while retaining the
+original request. Resetting or replacing the local world explicitly starts a new
+toolbox context. Only one local and one remote view are retained.
+
+The same surfaces work against the connected native owner. Its HTTP endpoints are
+`GET /api/agents/genome`, `POST /api/control/browser-intervention`,
+`GET /api/control/browser-intervention/{command_id}` and
+`GET /api/interventions/browser`. Genome queries carry `uid`, `session_id`, `epoch`,
+`locus_offset` and `delta_offset`; history queries carry `session_id`, `epoch`,
+`after_seq` and `limit`. Preserve decimal strings for 64-bit source identities and
+counters, and the canonical 32-character hexadecimal command ID. Request and
+response sizes, owner work, page size and browser read time are bounded.

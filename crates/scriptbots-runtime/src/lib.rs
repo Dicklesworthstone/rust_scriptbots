@@ -8,14 +8,14 @@
 
 #![warn(missing_docs, unsafe_code)]
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use scriptbots_core::{
-    AgentUid, AppliedInterventionRecord, BirthRecord, BrainInspectionLimits,
-    BrainInspectionResponse, ConfigAuditEntry, ControlCommand, DeathRecord, DynamicAgentSnapshot,
-    DynamicAgentVisuals, DynamicWorldSnapshot, Generation, HydrologyFlowDirection,
-    PersistenceBatch, ResourceLedgerTick, ScientificStateError, ScriptBotsConfig, SelectionState,
-    SelectionUpdate, SimulationCommand, TerrainKind, Tick, TickCombatSummary, TickEvents,
-    TickSummary, toroidal_delta,
+    AgentUid, AppliedInterventionRecord, BirthOrigin, BirthRecord, BrainInspectionLimits,
+    BrainInspectionResponse, ConfigAuditEntry, ControlCommand, DeathCause, DeathRecord,
+    DynamicAgentSnapshot, DynamicAgentVisuals, DynamicWorldSnapshot, Generation,
+    HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScientificStateError,
+    ScriptBotsConfig, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, Tick,
+    TickCombatSummary, TickEvents, TickSummary, toroidal_delta,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,8 +23,14 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, VecDeque},
     fmt,
+    future::Future,
     mem::size_of,
-    sync::{Arc, Mutex},
+    pin::Pin,
+    sync::{
+        Arc, Mutex, TryLockError,
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+    },
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 use thiserror::Error;
@@ -77,8 +83,14 @@ mod serde_optional_arc {
 
 pub mod allopatry;
 pub mod archipelago;
+pub mod audio;
 pub mod channel;
 pub mod host_core;
+pub mod inspector;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod lab_guide;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod lab_workflows;
 pub mod migrator;
 pub mod native;
 pub mod remote;
@@ -665,6 +677,9 @@ pub struct RenderSnapshot {
     /// Located visual events from this completed world boundary for rendering and visual effects.
     #[serde(with = "serde_arc", default)]
     pub visual_events: Arc<Vec<scriptbots_core::LocatedWorldVisualEvent>>,
+    /// Actual resolved world root for deterministic presentation recipes.
+    /// This remains available when the original config requested entropy.
+    pub visual_seed: u64,
     /// Number of visual events dropped this boundary due to buffer limits.
     #[serde(default)]
     pub visual_dropped_events: u64,
@@ -1695,15 +1710,216 @@ impl ProjectionBroker {
     }
 }
 
+/// Maximum concurrent asynchronous publication watchers shared by every clone of a hub.
+///
+/// Scalar [`SnapshotSubscription`] readers do not consume these slots.
+pub const MAX_SNAPSHOT_WATCHERS: usize = 128;
+
+/// Refusal to allocate another bounded asynchronous publication watcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum SnapshotWatchError {
+    /// All notification slots for this host publication hub are occupied.
+    #[error("snapshot publication watcher capacity {capacity} is exhausted")]
+    CapacityExhausted {
+        /// Maximum simultaneous watchers shared by this hub's clones.
+        capacity: usize,
+    },
+}
+
+struct SnapshotWakeState {
+    // A publisher that cannot take the tiny registration lock leaves this bit
+    // for the registering task. There is never a queue of publication notices.
+    notified: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl SnapshotWakeState {
+    const fn new() -> Self {
+        Self {
+            notified: AtomicBool::new(false),
+            waker: Mutex::new(None),
+        }
+    }
+
+    fn register(&self, waker: &Waker) {
+        // RawWaker clone/drop hooks may reenter the hub. Neither executes under
+        // the observer lock, and publication never waits for this lock.
+        let candidate = waker.clone();
+        let retired = {
+            let mut registered = self
+                .waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if registered
+                .as_ref()
+                .is_some_and(|current| current.will_wake(waker))
+            {
+                Some(candidate)
+            } else {
+                registered.replace(candidate)
+            }
+        };
+        drop(retired);
+        if self.notified.swap(false, AtomicOrdering::AcqRel) {
+            self.wake_registered();
+        }
+    }
+
+    fn wake_registered(&self) {
+        let waker = match self.waker.try_lock() {
+            Ok(mut registered) => registered.take(),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn notify(&self) {
+        self.notified.store(true, AtomicOrdering::Release);
+        self.wake_registered();
+    }
+
+    fn clear(&self) {
+        let retired = self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(retired);
+    }
+}
+
+struct SnapshotWatchSlots {
+    active: AtomicUsize,
+    slots: [ArcSwapOption<SnapshotWakeState>; MAX_SNAPSHOT_WATCHERS],
+}
+
+impl SnapshotWatchSlots {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            slots: std::array::from_fn(|_| ArcSwapOption::empty()),
+        }
+    }
+
+    fn notify(&self) {
+        if self.active.load(AtomicOrdering::Acquire) == 0 {
+            return;
+        }
+        for slot in &self.slots {
+            // Release the ArcSwap read guard before calling an executor waker.
+            // A reentrant wake may allocate or release another observer slot.
+            if let Some(observer) = slot.load_full() {
+                observer.notify();
+            }
+        }
+    }
+}
+
+/// One bounded asynchronous reader of a hub's latest publication.
+///
+/// The watcher retains a scalar revision and one task waker, never a snapshot
+/// backlog. Dropping it immediately releases its slot even if the owner is idle.
+/// It is intentionally not cloneable: each concurrently awaited reader needs
+/// its own explicitly admitted slot.
+pub struct SnapshotWatcher {
+    hub: SnapshotHub,
+    slot: usize,
+    signal: Arc<SnapshotWakeState>,
+    last_seen: Option<SnapshotRevision>,
+}
+
+impl fmt::Debug for SnapshotWatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SnapshotWatcher")
+            .field("session_id", &self.hub.session_id)
+            .field("last_seen", &self.last_seen)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SnapshotWatcher {
+    /// Await the current initial publication or the newest revision after the last result.
+    ///
+    /// This future can be cancelled and recreated in an executor's select loop.
+    /// Cancellation removes its task waker without advancing the observation cursor.
+    /// Skipped publications coalesce in the hub; their snapshots are never queued.
+    #[must_use]
+    pub const fn changed(&mut self) -> SnapshotChanged<'_> {
+        SnapshotChanged { watcher: self }
+    }
+}
+
+impl Drop for SnapshotWatcher {
+    fn drop(&mut self) {
+        self.hub.watchers.slots[self.slot].store(None);
+        self.hub
+            .watchers
+            .active
+            .fetch_sub(1, AtomicOrdering::AcqRel);
+        self.signal.clear();
+    }
+}
+
+/// Cancel-safe wait for a newer immutable publication, independent of an async runtime.
+pub struct SnapshotChanged<'a> {
+    watcher: &'a mut SnapshotWatcher,
+}
+
+impl Future for SnapshotChanged<'_> {
+    type Output = Arc<RenderSnapshot>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let watcher = &mut *self.get_mut().watcher;
+        watcher.signal.notified.swap(false, AtomicOrdering::AcqRel);
+        let snapshot = watcher.hub.latest();
+        if watcher
+            .last_seen
+            .is_none_or(|revision| snapshot.revision > revision)
+        {
+            watcher.last_seen = Some(snapshot.revision);
+            watcher.signal.clear();
+            return Poll::Ready(snapshot);
+        }
+
+        watcher.signal.register(context.waker());
+        // Register before this authoritative recheck. A publisher blocked by
+        // registration sets `notified` first, so register also arranges a wake;
+        // a later publisher finds the installed waker. Neither race loses work.
+        let snapshot = watcher.hub.latest();
+        if watcher
+            .last_seen
+            .is_none_or(|revision| snapshot.revision > revision)
+        {
+            watcher.last_seen = Some(snapshot.revision);
+            watcher.signal.clear();
+            Poll::Ready(snapshot)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for SnapshotChanged<'_> {
+    fn drop(&mut self) {
+        self.watcher.signal.clear();
+    }
+}
+
 /// Cloneable, thread-safe latest-value read handle for render snapshots.
 ///
 /// The hub retains exactly one current `Arc`. Every subscriber owns only scalar cursor state, so
-/// a stalled subscriber may skip revisions but never creates a host-side backlog. Holding a
-/// previously returned `Arc` intentionally keeps that one immutable value alive.
+/// a stalled subscriber may skip revisions but never creates a host-side backlog. Optional
+/// asynchronous watchers use a separate bounded slot per reader. Holding a previously
+/// returned `Arc` intentionally keeps that one immutable value alive.
 #[derive(Clone)]
 pub struct SnapshotHub {
     session_id: HostSessionId,
     latest: Arc<ArcSwap<RenderSnapshot>>,
+    watchers: Arc<SnapshotWatchSlots>,
 }
 
 impl fmt::Debug for SnapshotHub {
@@ -1722,6 +1938,7 @@ impl SnapshotHub {
         Self {
             session_id: initial.session_id,
             latest: Arc::new(ArcSwap::from(initial)),
+            watchers: Arc::new(SnapshotWatchSlots::new()),
         }
     }
 
@@ -1747,6 +1964,33 @@ impl SnapshotHub {
     #[must_use]
     pub const fn resume_after(&self, revision: SnapshotRevision) -> SnapshotSubscription {
         SnapshotSubscription::after(self.session_id, revision)
+    }
+
+    /// Admit a bounded executor-neutral watcher without allocating a worker or snapshot queue.
+    ///
+    /// The first `changed()` yields the current publication. Subsequent waits
+    /// observe newer revisions, including changes at the same scientific tick.
+    ///
+    /// # Errors
+    /// Returns [`SnapshotWatchError::CapacityExhausted`] if all shared slots are occupied.
+    pub fn watch(&self) -> Result<SnapshotWatcher, SnapshotWatchError> {
+        let signal = Arc::new(SnapshotWakeState::new());
+        for (index, slot) in self.watchers.slots.iter().enumerate() {
+            let previous =
+                slot.compare_and_swap(&None::<Arc<SnapshotWakeState>>, Some(Arc::clone(&signal)));
+            if previous.is_none() {
+                self.watchers.active.fetch_add(1, AtomicOrdering::AcqRel);
+                return Ok(SnapshotWatcher {
+                    hub: self.clone(),
+                    slot: index,
+                    signal,
+                    last_seen: None,
+                });
+            }
+        }
+        Err(SnapshotWatchError::CapacityExhausted {
+            capacity: MAX_SNAPSHOT_WATCHERS,
+        })
     }
 
     /// Load the newest publication and advance only the supplied cursor.
@@ -1781,6 +2025,7 @@ impl SnapshotHub {
             ));
         }
         self.latest.store(snapshot);
+        self.watchers.notify();
         Ok(())
     }
 }
@@ -3449,12 +3694,13 @@ pub trait JournalPort {
         })
     }
 
-    /// Actual adapter-observed continued-session prefix, if this adapter was opened for restore.
+    /// Actual adapter-observed session prefix, when eligible for continuation.
     ///
-    /// Fresh adapters return `None`. A continuation adapter must return this only after checking
-    /// its real session, contiguous journal/event prefixes, commitment threshold, and absence of
-    /// completed shutdown or an advanced tail. The runtime compares this data with the exact
-    /// captured owner cut; this method itself performs no I/O or caller assertion of durability.
+    /// Unbound adapters return `None`. An explicitly session-bound volatile adapter may expose
+    /// its empty prefix before accepting any batch. A continuation adapter must return this only
+    /// after checking its real session, contiguous journal/event prefixes, commitment threshold,
+    /// and absence of completed shutdown or an advanced tail. The runtime compares this data with
+    /// the exact captured owner cut; this method itself performs no I/O or assertion of durability.
     fn continuation_cut(&self) -> Option<HostJournalCutV1> {
         None
     }
@@ -5105,6 +5351,10 @@ pub enum HostAccessError {
         /// Lifecycle observed when the caller attempted submission.
         lifecycle: HostLifecycle,
     },
+    /// An owner read did not complete within its bounded wait. The owner may
+    /// still be busy; this does not imply an ordering or protocol violation.
+    #[error("owner read timed out before the detail was available")]
+    OwnerReadTimeout,
     /// A host implementation violated the public ordering contract.
     #[error("host protocol violation: {message}")]
     ProtocolViolation {
@@ -5599,17 +5849,24 @@ fn validate_event_page(
 
 fn scientific_boundary_matches_event(event: &ScientificEvent) -> bool {
     let boundary = event.boundary.as_ref();
+    let previous_tick = event
+        .tick
+        .0
+        .checked_sub(1)
+        .filter(|tick| *tick != 0)
+        .map(Tick);
     boundary.events.tick == event.tick
         && boundary.summary.tick == event.tick
         && boundary.config_revision == event.revisions.config.get()
-        && boundary
-            .births
-            .iter()
-            .all(|record| record.tick == event.tick)
-        && boundary
-            .deaths
-            .iter()
-            .all(|record| record.tick == event.tick)
+        && boundary.births.iter().all(|record| {
+            record.tick == event.tick
+                || (record.origin == BirthOrigin::Injected && Some(record.tick) == previous_tick)
+        })
+        && boundary.deaths.iter().all(|record| {
+            record.tick == event.tick
+                || (record.cause == DeathCause::MapIncompatible
+                    && Some(record.tick) == previous_tick)
+        })
         && boundary
             .resource_tick
             .as_ref()
@@ -5953,6 +6210,7 @@ mod tests {
             narrative_events: Arc::new(Vec::new()),
             narrative_dropped_events: 0,
             visual_events: Arc::new(Vec::new()),
+            visual_seed: 0,
             visual_dropped_events: 0,
             hybrid_count: 0,
             config: Arc::new(ScriptBotsConfig::default()),
@@ -7902,6 +8160,7 @@ mod tests {
                 narrative_events: Arc::new(Vec::new()),
                 narrative_dropped_events: 0,
                 visual_events: Arc::new(Vec::new()),
+                visual_seed: 0,
                 visual_dropped_events: 0,
                 hybrid_count: 0,
                 config: Arc::new(ScriptBotsConfig::default()),
@@ -8651,6 +8910,329 @@ mod tests {
         assert_eq!(subscription.last_seen(), None);
     }
 
+    #[derive(Default)]
+    struct SnapshotCountingWake(AtomicUsize);
+
+    impl std::task::Wake for SnapshotCountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn newer_watch_snapshot(hub: &SnapshotHub, revision: u64) -> Arc<RenderSnapshot> {
+        let mut snapshot = (*hub.latest()).clone();
+        snapshot.revision = SnapshotRevision::new(revision);
+        Arc::new(snapshot)
+    }
+
+    fn consume_initial_watch(watcher: &mut SnapshotWatcher, waker: &Waker) {
+        let expected = watcher.hub.latest();
+        let mut future = watcher.changed();
+        let Poll::Ready(observed) = Pin::new(&mut future).poll(&mut Context::from_waker(waker))
+        else {
+            panic!("initial publication must be ready without a producer wake");
+        };
+        assert!(Arc::ptr_eq(&observed, &expected));
+    }
+
+    #[test]
+    fn snapshot_watch_coalesces_same_tick_publications_and_survives_cancelled_waits() {
+        let initial = Arc::new(projection_snapshot());
+        let hub = SnapshotHub::new(Arc::clone(&initial));
+        let mut fast = hub.watch().unwrap();
+        let mut slow = hub.watch().unwrap();
+        let fast_count = Arc::new(SnapshotCountingWake::default());
+        let slow_count = Arc::new(SnapshotCountingWake::default());
+        let fast_waker = Waker::from(Arc::clone(&fast_count));
+        let slow_waker = Waker::from(Arc::clone(&slow_count));
+        consume_initial_watch(&mut fast, &fast_waker);
+        consume_initial_watch(&mut slow, &slow_waker);
+        let mut fast_wait = fast.changed();
+        let mut slow_wait = slow.changed();
+        assert!(
+            Pin::new(&mut fast_wait)
+                .poll(&mut Context::from_waker(&fast_waker))
+                .is_pending()
+        );
+        assert!(
+            Pin::new(&mut slow_wait)
+                .poll(&mut Context::from_waker(&slow_waker))
+                .is_pending()
+        );
+        let superseded = newer_watch_snapshot(&hub, 8);
+        let weak = Arc::downgrade(&superseded);
+        hub.publish(superseded).unwrap();
+        let latest = newer_watch_snapshot(&hub, 9);
+        assert_eq!(
+            latest.world.tick, initial.world.tick,
+            "same-tick changes must wake readers"
+        );
+        hub.publish(Arc::clone(&latest)).unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "stalled watchers must not retain superseded snapshots"
+        );
+        assert_eq!(fast_count.0.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_count.0.load(Ordering::SeqCst), 1);
+        let Poll::Ready(observed) =
+            Pin::new(&mut fast_wait).poll(&mut Context::from_waker(&fast_waker))
+        else {
+            panic!("latest publication should be ready");
+        };
+        assert!(Arc::ptr_eq(&observed, &latest));
+        drop(fast_wait);
+        drop(slow_wait);
+        assert_eq!(
+            slow.last_seen,
+            Some(initial.revision),
+            "cancellation must not consume the pending revision"
+        );
+        let latest = newer_watch_snapshot(&hub, 10);
+        hub.publish(Arc::clone(&latest)).unwrap();
+        assert_eq!(
+            slow_count.0.load(Ordering::SeqCst),
+            1,
+            "cancelled waits release their executor waker"
+        );
+        let mut resumed = slow.changed();
+        let Poll::Ready(observed) =
+            Pin::new(&mut resumed).poll(&mut Context::from_waker(&slow_waker))
+        else {
+            panic!("a cancelled reader must observe publications made between waits");
+        };
+        assert!(Arc::ptr_eq(&observed, &latest));
+        drop(resumed);
+
+        let mut idle = slow.changed();
+        assert!(
+            Pin::new(&mut idle)
+                .poll(&mut Context::from_waker(&slow_waker))
+                .is_pending()
+        );
+        let mut wrong_session = (*newer_watch_snapshot(&hub, 11)).clone();
+        wrong_session.session_id = HostSessionId::new(1234);
+        assert!(hub.publish(Arc::new(wrong_session)).is_err());
+        assert!(hub.publish(newer_watch_snapshot(&hub, 10)).is_err());
+        assert_eq!(
+            slow_count.0.load(Ordering::SeqCst),
+            1,
+            "refused publications must not signal changes"
+        );
+        assert!(Arc::ptr_eq(&hub.latest(), &latest));
+        assert!(
+            Pin::new(&mut idle)
+                .poll(&mut Context::from_waker(&slow_waker))
+                .is_pending()
+        );
+        drop(idle);
+        assert_eq!(
+            Arc::strong_count(&slow_count),
+            2,
+            "idle cancellation must release the registered task"
+        );
+    }
+
+    #[test]
+    fn snapshot_watch_capacity_is_shared_and_released_without_another_publication() {
+        let initial = Arc::new(projection_snapshot());
+        let hub = SnapshotHub::new(Arc::clone(&initial));
+        let cloned_hub = hub.clone();
+        let mut watchers: Vec<_> = (0..MAX_SNAPSHOT_WATCHERS)
+            .map(|_| hub.watch().unwrap())
+            .collect();
+        let first_signal = Arc::downgrade(&watchers[0].signal);
+        drop(watchers[0].changed());
+        assert_eq!(
+            watchers[0].last_seen, None,
+            "dropping an unpolled future is inert"
+        );
+        assert!(
+            matches!(cloned_hub.watch(), Err(SnapshotWatchError::CapacityExhausted { capacity }) if capacity == MAX_SNAPSHOT_WATCHERS)
+        );
+        assert_eq!(
+            Arc::strong_count(&initial),
+            2,
+            "watchers retain no publication copy"
+        );
+        drop(watchers.pop());
+        let replacement = cloned_hub
+            .watch()
+            .expect("idle drop must immediately free its slot");
+        assert_eq!(
+            hub.watchers.active.load(AtomicOrdering::Acquire),
+            MAX_SNAPSHOT_WATCHERS
+        );
+        drop(replacement);
+        drop(watchers);
+        assert_eq!(hub.watchers.active.load(AtomicOrdering::Acquire), 0);
+        assert!(hub.watchers.slots.iter().all(|slot| slot.load().is_none()));
+        assert!(
+            first_signal.upgrade().is_none(),
+            "released slots retain neither task nor observer"
+        );
+        assert!(Arc::ptr_eq(&hub.latest(), &initial));
+    }
+
+    #[test]
+    fn snapshot_watch_publication_during_registration_never_waits_for_the_reader() {
+        let hub = SnapshotHub::new(Arc::new(projection_snapshot()));
+        let mut watcher = hub.watch().unwrap();
+        let counter = Arc::new(SnapshotCountingWake::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        consume_initial_watch(&mut watcher, &waker);
+        let signal = Arc::clone(&watcher.signal);
+        let registration = signal.waker.lock().unwrap();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            let result = hub.publish(newer_watch_snapshot(&hub, 8));
+            completed.send(result).unwrap();
+        });
+        // Model a task registering under its observer lock while publication
+        // completes. Release the lock before asserting so even a regressed
+        // blocking implementation is joined rather than leaving a test thread.
+        let completion_result = completion.recv_timeout(Duration::from_secs(2));
+        drop(registration);
+        publisher.join().unwrap();
+        completion_result
+            .expect("the publisher must not wait for an observer lock")
+            .unwrap();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        assert!(signal.notified.load(AtomicOrdering::Acquire));
+        signal.register(&waker);
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "registration must recover the missed try-lock wake"
+        );
+        let mut future = watcher.changed();
+        let Poll::Ready(observed) = Pin::new(&mut future).poll(&mut Context::from_waker(&waker))
+        else {
+            panic!("publication made during registration must remain observable");
+        };
+        assert_eq!(observed.revision, SnapshotRevision::new(8));
+    }
+
+    struct SnapshotReentrantWake {
+        signal: std::sync::Weak<SnapshotWakeState>,
+        hub: SnapshotHub,
+        safe: Arc<AtomicBool>,
+        wakes: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl SnapshotReentrantWake {
+        fn inspect(&self) {
+            let unlocked = self
+                .signal
+                .upgrade()
+                .is_some_and(|signal| signal.waker.try_lock().is_ok());
+            let slot_available = self.hub.watch().is_ok();
+            if !unlocked || !slot_available {
+                self.safe.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl std::task::Wake for SnapshotReentrantWake {
+        fn wake(self: Arc<Self>) {
+            self.inspect();
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for SnapshotReentrantWake {
+        fn drop(&mut self) {
+            self.inspect();
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn snapshot_watch_reentrant_wake_replacement_and_cancellation_run_outside_locks() {
+        let hub = SnapshotHub::new(Arc::new(projection_snapshot()));
+        let mut watcher = hub.watch().unwrap();
+        let safe = Arc::new(AtomicBool::new(true));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let signal = Arc::downgrade(&watcher.signal);
+        let reentrant = || {
+            Waker::from(Arc::new(SnapshotReentrantWake {
+                signal: signal.clone(),
+                hub: hub.clone(),
+                safe: Arc::clone(&safe),
+                wakes: Arc::clone(&wakes),
+                drops: Arc::clone(&drops),
+            }))
+        };
+        let ordinary_wakes = Arc::new(SnapshotCountingWake::default());
+        let ordinary = Waker::from(Arc::clone(&ordinary_wakes));
+        consume_initial_watch(&mut watcher, &ordinary);
+        let mut future = watcher.changed();
+        let first = reentrant();
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&first))
+                .is_pending()
+        );
+        drop(first);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&ordinary))
+                .is_pending()
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "replaced executor wakers must be released"
+        );
+        hub.publish(newer_watch_snapshot(&hub, 8)).unwrap();
+        assert_eq!(ordinary_wakes.0.load(Ordering::SeqCst), 1);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&ordinary))
+                .is_ready()
+        );
+        drop(future);
+
+        let mut future = watcher.changed();
+        let second = reentrant();
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&second))
+                .is_pending()
+        );
+        drop(second);
+        hub.publish(newer_watch_snapshot(&hub, 9)).unwrap();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(
+            Pin::new(&mut future)
+                .poll(&mut Context::from_waker(&ordinary))
+                .is_ready()
+        );
+        drop(future);
+
+        let mut cancelled = watcher.changed();
+        let third = reentrant();
+        assert!(
+            Pin::new(&mut cancelled)
+                .poll(&mut Context::from_waker(&third))
+                .is_pending()
+        );
+        drop(third);
+        drop(cancelled);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            3,
+            "cancellation releases its last task reference"
+        );
+        assert!(
+            safe.load(Ordering::SeqCst),
+            "wake/drop hooks must be free to reenter the hub"
+        );
+        assert_eq!(hub.watchers.active.load(AtomicOrdering::Acquire), 1);
+    }
+
     #[test]
     fn snapshot_read_handles_are_thread_safe_and_runtime_has_no_storage_dependency() {
         fn assert_send<T: Send>() {}
@@ -8658,6 +9240,8 @@ mod tests {
 
         assert_send_sync::<SnapshotHub>();
         assert_send::<SnapshotSubscription>();
+        assert_send::<SnapshotWatcher>();
+        assert_send::<SnapshotChanged<'static>>();
 
         let manifest = include_str!("../Cargo.toml");
         for forbidden in ["scriptbots-storage", "fsqlite"] {

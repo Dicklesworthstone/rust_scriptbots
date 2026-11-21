@@ -30,9 +30,8 @@
 //! completed barrier. Transient journal-capacity backpressure leaves the exact
 //! partial barrier private and is retried once by the next explicit barrier
 //! call. A terminal mid-barrier island fault latches the whole archipelago
-//! with a typed error naming the island; in either case exposed views and
-//! digests remain at the prior barrier rather than leaking a silently uneven
-//! epoch.
+//! with a typed error naming the island; in either case snapshots remain at
+//! the prior barrier and live science reads refuse the incomplete epoch.
 //!
 //! # Step topology (the parallelism dial)
 //!
@@ -89,7 +88,7 @@
 use crate::{
     ApplicationState, CommandAuthorityLookupFailure, CommandEnvelope, CommandId, CommandStatus,
     HostAccessError, HostBlocker, HostCommand, HostFault, HostHealth, HostPort, HostSessionId,
-    JournalPort, ManualHostDriver, ManualInstant, RenderSnapshot,
+    JournalPort, ManualHostDriver, ManualInstant, RenderSnapshot, VolatileHostCheckpointV1,
     host_core::{HostCore, HostCoreBuildError, HostCoreOptions, MigrationArrival},
     migrator::{
         CandidateAgent, EmigrantRecord, EmigrantSelectionRule, MigrationConfig, MigrationError,
@@ -97,8 +96,9 @@ use crate::{
     },
 };
 use scriptbots_core::{
-    AgentUid, CharacterizationError, MigratingAgent, ScriptBotsConfig, Tick, TickSummary,
-    WorldDigestV1, WorldState, WorldStateError, rng_domains::OrganismId,
+    AgentUid, BrainRegistry, CharacterizationError, MigratingAgent, NullPersistence,
+    ScriptBotsConfig, Tick, TickSummary, WorldDigestV1, WorldState, WorldStateError,
+    rng_domains::OrganismId,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -115,6 +115,11 @@ use thiserror::Error;
 /// hours into a run; every island's config is validated up front for the same
 /// reason.
 pub const MAX_ISLANDS: usize = 64;
+
+/// Aggregate encoded-byte ceiling for all owners and metadata in one portable archipelago cut.
+pub const MAX_ARCHIPELAGO_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_ARCHIPELAGO_CHECKPOINT_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const ARCHIPELAGO_CHECKPOINT_MAGIC: &[u8; 8] = b"SBARCH01";
 
 /// Client namespace for archipelago-issued commands.
 ///
@@ -330,7 +335,7 @@ impl ArchipelagoConfig {
 /// [`ArchipelagoConfig::topology`]: every undirected edge `{a, b}` becomes both
 /// `a -> b` and `b -> a`, since connectivity is symmetric but a move is not.
 /// One description cannot contradict itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchipelagoMigration {
     /// Ticks between migration barriers.
     ///
@@ -365,6 +370,297 @@ pub struct IslandMeta {
     /// Host session identity derived from `(master_seed, id)`; unique within
     /// the archipelago and stable across identical constructions.
     pub session_id: HostSessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IslandCheckpointMetadataV1 {
+    meta: IslandMeta,
+    next_command_sequence: u64,
+    time_cursor: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchipelagoCheckpointMetadataV1 {
+    version: u16,
+    islands: Vec<IslandCheckpointMetadataV1>,
+    edges: Vec<(IslandId, IslandId)>,
+    barrier_interval: NonZeroU64,
+    master_seed: u64,
+    start_tick: Tick,
+    barrier_tick: Tick,
+    epoch: u64,
+    migration: Option<ArchipelagoMigration>,
+}
+
+/// One settled archipelago barrier, including every complete owner and retained volatile journal.
+///
+/// Executable brain adapters and database ownership are not serialized. Restoring this
+/// artifact continues its original sessions with volatile journals; it does not reopen a
+/// database or turn retained history into a complete durable event log. Encoding alone does
+/// not save an artifact. Callers must publish the complete bytes before claiming a saved cut.
+#[derive(Debug, Clone)]
+pub struct ArchipelagoCheckpointV1 {
+    metadata: ArchipelagoCheckpointMetadataV1,
+    owners: Vec<VolatileHostCheckpointV1>,
+}
+
+fn checkpoint_error(detail: impl Into<String>) -> ArchipelagoError {
+    ArchipelagoError::Checkpoint {
+        detail: detail.into(),
+    }
+}
+
+impl ArchipelagoCheckpointV1 {
+    /// Original effective configuration and identity of each island, in ascending ID order.
+    pub fn island_metadata(&self) -> impl ExactSizeIterator<Item = &IslandMeta> {
+        self.metadata.islands.iter().map(|island| &island.meta)
+    }
+
+    /// Completed common scientific boundary.
+    #[must_use]
+    pub const fn barrier_tick(&self) -> Tick {
+        self.metadata.barrier_tick
+    }
+
+    /// Scientific transitions per island in each subsequent barrier.
+    #[must_use]
+    pub const fn barrier_interval_ticks(&self) -> u64 {
+        self.metadata.barrier_interval.get()
+    }
+
+    /// Original count of completed barriers; migration randomness continues from this epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.metadata.epoch
+    }
+
+    /// Root seed retained for migration selection and original island identities.
+    #[must_use]
+    pub const fn master_seed(&self) -> u64 {
+        self.metadata.master_seed
+    }
+
+    fn validate_metadata(
+        metadata: &ArchipelagoCheckpointMetadataV1,
+    ) -> Result<(), ArchipelagoError> {
+        let count = metadata.islands.len();
+        if metadata.version != 1 || count == 0 || count > MAX_ISLANDS {
+            return Err(checkpoint_error(
+                "unsupported checkpoint version or island count",
+            ));
+        }
+        let expected_tick = metadata
+            .epoch
+            .checked_mul(metadata.barrier_interval.get())
+            .and_then(|elapsed| metadata.start_tick.0.checked_add(elapsed));
+        if expected_tick != Some(metadata.barrier_tick.0) {
+            return Err(checkpoint_error(
+                "barrier tick does not match start, interval and epoch",
+            ));
+        }
+        let ids: Vec<_> = metadata
+            .islands
+            .iter()
+            .map(|island| island.meta.id)
+            .collect();
+        if !ids.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(checkpoint_error(
+                "island identities are duplicated or out of order",
+            ));
+        }
+        if metadata.edges.len() > count.saturating_mul(count.saturating_sub(1)) / 2
+            || normalized_edges(&Topology::Custom(metadata.edges.clone()), &ids)? != metadata.edges
+        {
+            return Err(checkpoint_error("checkpoint topology is not canonical"));
+        }
+        if let Some(migration) = &metadata.migration
+            && (migration.interval_ticks == 0
+                || !migration
+                    .interval_ticks
+                    .is_multiple_of(metadata.barrier_interval.get()))
+        {
+            return Err(checkpoint_error(
+                "migration cadence is not aligned to barriers",
+            ));
+        }
+        let reference = &metadata.islands[0].meta;
+        let mut sessions = BTreeSet::new();
+        for island in &metadata.islands {
+            let meta = &island.meta;
+            meta.effective_config.validate().map_err(|source| {
+                ArchipelagoError::InvalidIslandConfig {
+                    island: meta.id,
+                    label: meta.label.clone(),
+                    source,
+                }
+            })?;
+            let config = serde_json::to_vec(&meta.effective_config)
+                .map_err(|error| checkpoint_error(error.to_string()))?;
+            if meta.config_hash != fnv1a64(FNV1A64_OFFSET_BASIS, &config)
+                || meta.session_id.get()
+                    != derive_island_value(ISLAND_SESSION_TAG, metadata.master_seed, meta.id)
+                || !sessions.insert(meta.session_id)
+                || meta.effective_config.rng_seed.is_none()
+                || meta.effective_config.neuroflow != reference.effective_config.neuroflow
+                || island.next_command_sequence == 0
+                || island.time_cursor == u64::MAX
+            {
+                return Err(checkpoint_error(format!(
+                    "island {} has inconsistent configuration, session or owner counters",
+                    meta.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ArchipelagoError> {
+        Self::validate_metadata(&self.metadata)?;
+        if self.owners.len() != self.metadata.islands.len() {
+            return Err(checkpoint_error("island metadata and owner counts differ"));
+        }
+        let mut registry = None;
+        for (island, owner) in self.metadata.islands.iter().zip(&self.owners) {
+            let host = owner.host_checkpoint();
+            let host_config = serde_json::to_vec(host.config())
+                .map_err(|error| checkpoint_error(error.to_string()))?;
+            let declared_config = serde_json::to_vec(&island.meta.effective_config)
+                .map_err(|error| checkpoint_error(error.to_string()))?;
+            if host.tick() != self.metadata.barrier_tick
+                || host.session_id() != island.meta.session_id
+                || !host.playback().paused
+                || host.has_schedule()
+                || host_config != declared_config
+                || !host.matches_exclusive_command_cursor(
+                    ARCHIPELAGO_COMMAND_NAMESPACE,
+                    island.next_command_sequence,
+                )
+            {
+                return Err(checkpoint_error(format!(
+                    "island {} owner does not match the settled archipelago cut",
+                    island.meta.id
+                )));
+            }
+            let lane = &host.world_checkpoint().source_digest().brain_registry;
+            if registry.is_some_and(|reference| reference != lane) {
+                return Err(checkpoint_error(
+                    "island executable registry contracts differ",
+                ));
+            }
+            registry = Some(lane);
+        }
+        Ok(())
+    }
+
+    /// Encode canonical metadata and length-delimited owner artifacts under one BLAKE3 checksum.
+    pub fn encode(&self) -> Result<Vec<u8>, ArchipelagoError> {
+        self.validate()?;
+        let metadata = serde_json::to_vec(&self.metadata)
+            .map_err(|error| checkpoint_error(error.to_string()))?;
+        if metadata.len() > MAX_ARCHIPELAGO_CHECKPOINT_METADATA_BYTES {
+            return Err(checkpoint_error(
+                "archipelago metadata exceeds its byte limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(ARCHIPELAGO_CHECKPOINT_MAGIC);
+        bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&metadata);
+        for owner in &self.owners {
+            let payload = owner
+                .encode()
+                .map_err(|error| checkpoint_error(error.to_string()))?;
+            let length = bytes
+                .len()
+                .checked_add(size_of::<u64>())
+                .and_then(|length| length.checked_add(payload.len()))
+                .and_then(|length| length.checked_add(blake3::OUT_LEN));
+            if length.is_none_or(|length| length > MAX_ARCHIPELAGO_CHECKPOINT_BYTES) {
+                return Err(checkpoint_error(
+                    "archipelago checkpoint exceeds its aggregate byte limit",
+                ));
+            }
+            bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+        }
+        let checksum = blake3::hash(&bytes);
+        bytes.extend_from_slice(checksum.as_bytes());
+        Ok(bytes)
+    }
+
+    /// Decode bounded canonical bytes and validate the complete union before constructing owners.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ArchipelagoError> {
+        let header = ARCHIPELAGO_CHECKPOINT_MAGIC.len() + size_of::<u64>();
+        if bytes.len() > MAX_ARCHIPELAGO_CHECKPOINT_BYTES
+            || bytes.len() < header + blake3::OUT_LEN
+            || !bytes.starts_with(ARCHIPELAGO_CHECKPOINT_MAGIC)
+        {
+            return Err(checkpoint_error(
+                "invalid archipelago checkpoint framing or size",
+            ));
+        }
+        let end = bytes.len() - blake3::OUT_LEN;
+        if blake3::hash(&bytes[..end]).as_bytes() != &bytes[end..] {
+            return Err(checkpoint_error("archipelago checkpoint checksum differs"));
+        }
+        let mut cursor = ARCHIPELAGO_CHECKPOINT_MAGIC.len();
+        let metadata_bytes = checkpoint_component(
+            bytes,
+            &mut cursor,
+            end,
+            MAX_ARCHIPELAGO_CHECKPOINT_METADATA_BYTES,
+        )?;
+        let metadata: ArchipelagoCheckpointMetadataV1 = serde_json::from_slice(metadata_bytes)
+            .map_err(|error| checkpoint_error(error.to_string()))?;
+        Self::validate_metadata(&metadata)?;
+        let mut owners = Vec::with_capacity(metadata.islands.len());
+        for _ in &metadata.islands {
+            let payload = checkpoint_component(
+                bytes,
+                &mut cursor,
+                end,
+                crate::MAX_VOLATILE_HOST_CHECKPOINT_BYTES,
+            )?;
+            owners.push(
+                VolatileHostCheckpointV1::decode(payload)
+                    .map_err(|error| checkpoint_error(error.to_string()))?,
+            );
+        }
+        if cursor != end {
+            return Err(checkpoint_error("unconsumed archipelago checkpoint bytes"));
+        }
+        let checkpoint = Self { metadata, owners };
+        checkpoint.validate()?;
+        if checkpoint.encode()? != bytes {
+            return Err(checkpoint_error("noncanonical archipelago checkpoint"));
+        }
+        Ok(checkpoint)
+    }
+}
+
+fn checkpoint_component<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    end: usize,
+    maximum: usize,
+) -> Result<&'a [u8], ArchipelagoError> {
+    let length_end = cursor
+        .checked_add(size_of::<u64>())
+        .filter(|length| *length <= end)
+        .ok_or_else(|| checkpoint_error("truncated checkpoint component length"))?;
+    let raw: [u8; size_of::<u64>()] = bytes[*cursor..length_end]
+        .try_into()
+        .map_err(|_| checkpoint_error("invalid checkpoint component length"))?;
+    let length = usize::try_from(u64::from_le_bytes(raw))
+        .map_err(|_| checkpoint_error("checkpoint component length overflows"))?;
+    let component_end = length_end
+        .checked_add(length)
+        .filter(|component_end| length <= maximum && *component_end <= end)
+        .ok_or_else(|| checkpoint_error("checkpoint component exceeds its bounds"))?;
+    *cursor = component_end;
+    Ok(&bytes[length_end..component_end])
 }
 
 /// The recorded island step-ordering policy of one barrier.
@@ -672,6 +968,20 @@ pub struct IslandBarrierReport {
 /// Typed archipelago failure naming the exact island and boundary.
 #[derive(Debug, Error)]
 pub enum ArchipelagoError {
+    /// Portable owner state is invalid, unsupported, unsettled or exceeds a declared bound.
+    #[error("archipelago checkpoint refused: {detail}")]
+    Checkpoint {
+        /// Exact refusal, including the affected island where applicable.
+        detail: String,
+    },
+    /// The caller could not prepare the executable registry required by a saved island.
+    #[error("island {island} checkpoint registry preparation failed: {detail}")]
+    CheckpointRegistry {
+        /// Island requiring executable adapters.
+        island: IslandId,
+        /// Original caller-supplied preparation error.
+        detail: String,
+    },
     /// The configuration declared no islands.
     #[error("archipelago requires at least one island")]
     NoIslands,
@@ -1018,6 +1328,157 @@ pub struct Archipelago {
 }
 
 impl Archipelago {
+    /// Capture every complete owner at the last committed barrier.
+    ///
+    /// Ordinary journal acknowledgements are driven within the existing bounded attempt
+    /// budget, without admitting commands or advancing science. Partial barriers, terminal
+    /// faults, unsupported journals and unresolved output are refused. Every journal must
+    /// support the existing volatile-checkpoint contract; file-backed authority is never
+    /// weakened to make a checkpoint. Saving the returned bytes is the caller's responsibility.
+    pub fn checkpoint_v1(&mut self) -> Result<ArchipelagoCheckpointV1, ArchipelagoError> {
+        self.ensure_barrier_readable()?;
+        let mut owners = Vec::with_capacity(self.islands.len());
+        let mut total_bytes = 0_usize;
+        for island in &mut self.islands {
+            if island.core.world_tick() != self.barrier_tick {
+                return Err(checkpoint_error(format!(
+                    "island {} is not at the committed barrier",
+                    island.meta.id
+                )));
+            }
+            let mut captured = None;
+            for attempt in 0..=STEP_DRIVE_ATTEMPTS {
+                match island.core.capture_volatile_host_checkpoint_v1() {
+                    Ok(owner) => {
+                        captured = Some(owner);
+                        break;
+                    }
+                    Err(error)
+                        if error.is_retryable_quiescence() && attempt < STEP_DRIVE_ATTEMPTS =>
+                    {
+                        let now = island.next_instant();
+                        island
+                            .core
+                            .drive(now)
+                            .map_err(|source| ArchipelagoError::Access {
+                                island: island.meta.id,
+                                source,
+                            })?;
+                        Self::verify_island_health(island)?;
+                        if island.core.world_tick() != self.barrier_tick {
+                            return Err(checkpoint_error("checkpoint settling advanced science"));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(checkpoint_error(format!(
+                            "island {} cannot capture its complete owner: {error}",
+                            island.meta.id
+                        )));
+                    }
+                }
+            }
+            let owner = captured.ok_or_else(|| checkpoint_error("owner capture did not settle"))?;
+            let payload = owner
+                .encode()
+                .map_err(|error| checkpoint_error(error.to_string()))?;
+            total_bytes = total_bytes
+                .checked_add(payload.len())
+                .filter(|total| *total <= MAX_ARCHIPELAGO_CHECKPOINT_BYTES)
+                .ok_or_else(|| {
+                    checkpoint_error("archipelago owners exceed aggregate byte limit")
+                })?;
+            owners.push(owner);
+        }
+        let checkpoint = ArchipelagoCheckpointV1 {
+            metadata: ArchipelagoCheckpointMetadataV1 {
+                version: 1,
+                islands: self
+                    .islands
+                    .iter()
+                    .map(|island| IslandCheckpointMetadataV1 {
+                        meta: island.meta.clone(),
+                        next_command_sequence: island.next_command_sequence,
+                        time_cursor: island.time_cursor,
+                    })
+                    .collect(),
+                edges: self.edges.clone(),
+                barrier_interval: self.barrier_interval,
+                master_seed: self.master_seed,
+                start_tick: self.start_tick,
+                barrier_tick: self.barrier_tick,
+                epoch: self.epoch,
+                migration: self.migration.clone(),
+            },
+            owners,
+        };
+        // Include metadata and length prefixes in the same aggregate admission, not only owners.
+        checkpoint.encode()?;
+        for island in &mut self.islands {
+            island.committed_snapshot = island.core.latest_snapshot();
+        }
+        Ok(checkpoint)
+    }
+
+    /// Restore a complete settled barrier with independently prepared executable brain registries.
+    ///
+    /// The entire data union is validated before calling `registry_factory`. Each owner then
+    /// reconstructs its full world, original session, command authority and retained journal;
+    /// no island is exposed unless all owners succeed. Continuation uses `NullPersistence`
+    /// and the captured volatile journals. This does not reopen or append to a prior run database.
+    pub fn restore_checkpoint_v1<F>(
+        checkpoint: &ArchipelagoCheckpointV1,
+        mut registry_factory: F,
+    ) -> Result<Self, ArchipelagoError>
+    where
+        F: FnMut(&IslandMeta) -> Result<BrainRegistry, String>,
+    {
+        checkpoint.validate()?;
+        let mut islands = Vec::with_capacity(checkpoint.owners.len());
+        for (saved, owner) in checkpoint.metadata.islands.iter().zip(&checkpoint.owners) {
+            let registry = registry_factory(&saved.meta).map_err(|detail| {
+                ArchipelagoError::CheckpointRegistry {
+                    island: saved.meta.id,
+                    detail,
+                }
+            })?;
+            let world = owner
+                .host_checkpoint()
+                .restore_world(registry)
+                .map_err(|error| checkpoint_error(format!("island {}: {error}", saved.meta.id)))?;
+            let persistence = world
+                .bind_persistence(Box::new(NullPersistence))
+                .map_err(|error| checkpoint_error(format!("island {}: {error}", saved.meta.id)))?;
+            let core = HostCore::restore_volatile_host_checkpoint_v1(
+                owner,
+                world,
+                persistence,
+                None,
+                ManualInstant::from_nanos(saved.time_cursor),
+            )
+            .map_err(|error| checkpoint_error(format!("island {}: {error}", saved.meta.id)))?;
+            let committed_snapshot = core.latest_snapshot();
+            islands.push(Island {
+                meta: saved.meta.clone(),
+                core,
+                next_command_sequence: saved.next_command_sequence,
+                time_cursor: saved.time_cursor,
+                committed_snapshot,
+            });
+        }
+        let metadata = &checkpoint.metadata;
+        Ok(Self {
+            islands,
+            edges: metadata.edges.clone(),
+            barrier_interval: metadata.barrier_interval,
+            master_seed: metadata.master_seed,
+            start_tick: metadata.start_tick,
+            barrier_tick: metadata.barrier_tick,
+            epoch: metadata.epoch,
+            latched: None,
+            migration: metadata.migration.clone(),
+        })
+    }
+
     /// Construct an archipelago whose islands use default worlds and
     /// per-island in-memory volatile journals.
     ///
@@ -1374,17 +1835,10 @@ impl Archipelago {
     /// epoch; the fault error already names the failed island and tick), and
     /// [`ArchipelagoError::Digest`] when the digest cannot be computed.
     pub fn island_digest(&self, island: IslandId) -> Result<WorldDigestV1, ArchipelagoError> {
-        if let Some(detail) = &self.latched {
-            return Err(ArchipelagoError::Latched {
-                detail: detail.clone(),
-            });
-        }
+        self.ensure_barrier_readable()?;
         let index = self
             .island_index(island)
             .ok_or(ArchipelagoError::UnknownIsland { island })?;
-        if let Some(blocked) = self.islands.iter().find_map(Self::journal_full_error) {
-            return Err(blocked);
-        }
         self.islands[index]
             .core
             .scientific_digest_v1()
@@ -1400,21 +1854,18 @@ impl Archipelago {
     /// about digests.
     ///
     /// Takes `&self`, so it cannot be called while [`Self::step_to_barrier`] holds
-    /// `&mut self`. The partially-stepped world stays unobservable by construction, which
-    /// is the invariant this module's header commits to.
+    /// `&mut self`. If a barrier returns with retained journal backpressure, reads
+    /// remain blocked until every island completes that same barrier. The closure
+    /// is never invoked while the archipelago is blocked or latched.
     ///
-    /// Errors identically to [`Self::island_digest`] on a latched archipelago or an
-    /// unknown island: a caller must not be able to read science out of a failed run.
+    /// Errors identically to [`Self::island_digest`] on a blocked or latched
+    /// archipelago or an unknown island.
     pub fn with_island_world<R>(
         &self,
         island: IslandId,
         read: impl FnOnce(&WorldState) -> R,
     ) -> Result<R, ArchipelagoError> {
-        if let Some(detail) = &self.latched {
-            return Err(ArchipelagoError::Latched {
-                detail: detail.clone(),
-            });
-        }
+        self.ensure_barrier_readable()?;
         let index = self
             .island_index(island)
             .ok_or(ArchipelagoError::UnknownIsland { island })?;
@@ -1439,21 +1890,36 @@ impl Archipelago {
     /// genuinely wants a cross-island gene pool has to discard the island axis
     /// deliberately, which is a decision someone can review.
     ///
-    /// The set is barrier-consistent: it reads committed island worlds through
-    /// `&self`, so it cannot interleave with [`Self::step_to_barrier`].
+    /// The set is barrier-consistent: it cannot interleave with
+    /// [`Self::step_to_barrier`] and refuses an incomplete retained barrier.
     ///
     /// # Errors
     ///
-    /// Returns [`ArchipelagoError::Latched`] once an island fault has latched the
-    /// archipelago — a census taken then would describe a partially-stepped
-    /// epoch — or [`ArchipelagoError::Digest`] if an island's per-agent identity
-    /// state cannot be read.
+    /// Returns [`ArchipelagoError::JournalBlocked`] while transient journal
+    /// backpressure retains an incomplete barrier, [`ArchipelagoError::Latched`]
+    /// once an island fault has latched the archipelago, or
+    /// [`ArchipelagoError::Digest`] if an island's per-agent identity state cannot
+    /// be read.
     pub fn organism_census(&self) -> Result<BTreeSet<OrganismId>, ArchipelagoError> {
+        self.ensure_barrier_readable()?;
+        self.current_organism_census()
+    }
+
+    fn ensure_barrier_readable(&self) -> Result<(), ArchipelagoError> {
         if let Some(detail) = &self.latched {
             return Err(ArchipelagoError::Latched {
                 detail: detail.clone(),
             });
         }
+        if let Some(blocked) = self.islands.iter().find_map(Self::journal_full_error) {
+            return Err(blocked);
+        }
+        Ok(())
+    }
+
+    /// Inspect current owners for internal migration conservation and recovery.
+    /// This does not certify a committed barrier; public reads use the guard above.
+    fn current_organism_census(&self) -> Result<BTreeSet<OrganismId>, ArchipelagoError> {
         let mut census = BTreeSet::new();
         for island in &self.islands {
             let id = island.meta.id;
@@ -1692,7 +2158,7 @@ impl Archipelago {
         // production, not only in tests, because the failure it catches is
         // silent and a run that has corrupted its population must stop rather
         // than keep producing plausible science.
-        let census_after = self.organism_census()?;
+        let census_after = self.current_organism_census()?;
         verify_migration(&census_before, &census_after, &moves).map_err(|violation| {
             ArchipelagoError::MigrationCorrupted {
                 tick: barrier_tick.0,
@@ -2283,6 +2749,212 @@ mod tests {
     use scriptbots_core::{BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
+    fn checkpoint_archipelago(migration: bool) -> Archipelago {
+        let worlds = (0..3)
+            .map(|id| {
+                let config = ScriptBotsConfig {
+                    world_width: 200 + id * 100,
+                    world_height: 200,
+                    food_cell_size: 20,
+                    rng_seed: (id == 1).then_some(913),
+                    persistence_interval: 0,
+                    closed: true,
+                    population_minimum: 0,
+                    population_spawn_interval: 0,
+                    reproduction_energy_threshold: f32::MAX,
+                    ..ScriptBotsConfig::default()
+                };
+                spec(id, config)
+            })
+            .collect();
+        let mut config = archipelago_config(worlds, 2);
+        if migration {
+            config.migration = Some(ArchipelagoMigration {
+                interval_ticks: 4,
+                emigrants_per_edge: 1,
+                selection_rule: EmigrantSelectionRule::Random,
+            });
+        }
+        Archipelago::with_factories(
+            config,
+            |meta| {
+                let mut world = WorldState::new(meta.effective_config.clone())?;
+                for _ in 0..4 {
+                    world
+                        .try_spawn_agent(scriptbots_core::AgentData::default())
+                        .expect("founder before host ownership");
+                }
+                Ok(world)
+            },
+            |_| None,
+        )
+        .unwrap()
+    }
+
+    fn assert_same_checkpoint_science(left: &Archipelago, right: &Archipelago) {
+        assert_eq!(left.barrier_tick, right.barrier_tick);
+        assert_eq!(left.epoch, right.epoch);
+        assert_eq!(
+            left.organism_census().unwrap(),
+            right.organism_census().unwrap()
+        );
+        for island in left.islands() {
+            assert_eq!(
+                left.island_digest(island.id).unwrap(),
+                right.island_digest(island.id).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn archipelago_checkpoint_continues_nonempty_owners_and_future_random_migrations() {
+        for migration in [false, true] {
+            for completed in [0, 3] {
+                let mut source = checkpoint_archipelago(migration);
+                let initial = source.island_digest(IslandId(0)).unwrap();
+                for _ in 0..completed {
+                    source.step_to_barrier().unwrap();
+                }
+                let census = source.organism_census().unwrap();
+                assert!(
+                    !census.is_empty(),
+                    "continuation must retain living organisms"
+                );
+                let checkpoint = source.checkpoint_v1().unwrap();
+                assert_eq!(checkpoint.epoch(), completed);
+                assert_eq!(checkpoint.barrier_interval_ticks(), 2);
+                let encoded = checkpoint.encode().unwrap();
+                let decoded = ArchipelagoCheckpointV1::decode(&encoded).unwrap();
+                assert_eq!(decoded.encode().unwrap(), encoded);
+                let mut restored =
+                    Archipelago::restore_checkpoint_v1(&decoded, |_| Ok(BrainRegistry::new()))
+                        .unwrap();
+                assert_same_checkpoint_science(&source, &restored);
+                if completed > 0 {
+                    assert_ne!(source.island_digest(IslandId(0)).unwrap(), initial);
+                }
+                let mut migrations = 0;
+                for _ in 0..5 {
+                    let original = source.step_to_barrier().unwrap();
+                    let continued = restored.step_to_barrier().unwrap();
+                    assert_eq!(
+                        original.migration, continued.migration,
+                        "migration selection must retain original epoch and organism identities"
+                    );
+                    migrations += continued.migration.map_or(0, |report| report.moves.len());
+                    assert_same_checkpoint_science(&source, &restored);
+                }
+                assert_eq!(migrations > 0, migration);
+            }
+        }
+    }
+
+    #[test]
+    fn archipelago_checkpoint_rejects_inconsistent_union_before_registry_construction() {
+        let mut source = checkpoint_archipelago(true);
+        source.step_to_barrier().unwrap();
+        let valid = source.checkpoint_v1().unwrap();
+        let mut invalid = Vec::new();
+        let mut cut = valid.clone();
+        cut.metadata.epoch += 1;
+        invalid.push(cut);
+        let mut cut = valid.clone();
+        cut.metadata.master_seed ^= 1;
+        invalid.push(cut);
+        let mut cut = valid.clone();
+        cut.metadata.islands[1].meta.id = cut.metadata.islands[0].meta.id;
+        invalid.push(cut);
+        let mut cut = valid.clone();
+        cut.metadata.islands[0].meta.config_hash ^= 1;
+        invalid.push(cut);
+        let mut cut = valid.clone();
+        cut.metadata.islands[0].next_command_sequence = 1;
+        invalid.push(cut);
+        let mut cut = valid.clone();
+        cut.owners.swap(0, 1);
+        invalid.push(cut);
+        let mut cut = valid;
+        cut.metadata.edges.push((IslandId(0), IslandId(999)));
+        invalid.push(cut);
+        for cut in invalid {
+            let mut prepared = false;
+            assert!(
+                Archipelago::restore_checkpoint_v1(&cut, |_| {
+                    prepared = true;
+                    Ok(BrainRegistry::new())
+                })
+                .is_err()
+            );
+            assert!(
+                !prepared,
+                "invalid union must refuse before executable preparation"
+            );
+        }
+    }
+
+    #[test]
+    fn archipelago_checkpoint_refuses_corruption_truncation_and_hostile_lengths() {
+        let mut source = checkpoint_archipelago(false);
+        let bytes = source.checkpoint_v1().unwrap().encode().unwrap();
+        for length in [0, 8, 15, bytes.len() - 1] {
+            assert!(ArchipelagoCheckpointV1::decode(&bytes[..length]).is_err());
+        }
+        let mut corrupt = bytes.clone();
+        corrupt[20] ^= 1;
+        assert!(ArchipelagoCheckpointV1::decode(&corrupt).is_err());
+        let mut oversized = bytes.clone();
+        oversized[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        let end = oversized.len() - blake3::OUT_LEN;
+        let hash = blake3::hash(&oversized[..end]);
+        oversized[end..].copy_from_slice(hash.as_bytes());
+        assert!(
+            ArchipelagoCheckpointV1::decode(&oversized).is_err(),
+            "valid checksum must not allow a hostile component allocation"
+        );
+        let mut trailing = bytes;
+        let end = trailing.len() - blake3::OUT_LEN;
+        trailing.insert(end, 0);
+        let hash = blake3::hash(&trailing[..=end]);
+        trailing[end + 1..].copy_from_slice(hash.as_bytes());
+        assert!(ArchipelagoCheckpointV1::decode(&trailing).is_err());
+    }
+
+    #[test]
+    fn archipelago_checkpoint_refuses_partial_barriers_and_unprepared_registries() {
+        let mut source = checkpoint_archipelago(false);
+        let before = source.island_snapshot(IslandId(0)).unwrap();
+        Archipelago::step_island_to(&mut source.islands[0], Tick(1)).unwrap();
+        assert!(source.checkpoint_v1().is_err());
+        assert!(Arc::ptr_eq(
+            &source.island_snapshot(IslandId(0)).unwrap(),
+            &before
+        ));
+        let mut source = checkpoint_archipelago(false);
+        let checkpoint = source.checkpoint_v1().unwrap();
+        let refusal = Archipelago::restore_checkpoint_v1(&checkpoint, |_| {
+            Err("required compiled adapter unavailable".to_owned())
+        });
+        assert!(matches!(
+            refusal,
+            Err(ArchipelagoError::CheckpointRegistry {
+                island: IslandId(0),
+                ..
+            })
+        ));
+        assert!(
+            Archipelago::restore_checkpoint_v1(&checkpoint, |_| {
+                let mut registry = BrainRegistry::new();
+                registry.register_with_state_digest(
+                    TEST_BRAIN_KIND,
+                    TEST_BRAIN_FACTORY_DIGEST,
+                    |_rng| Ok(Box::new(TestBrain { weight: 0.5 }) as Box<dyn BrainRunner>),
+                );
+                Ok(registry)
+            })
+            .is_err(),
+            "an executable registry with different identity must be refused"
+        );
+    }
     #[test]
     fn migration_population_count_writer_preserves_valid_aggregate_above_u32() {
         let maximum = usize::try_from(u32::MAX).expect("island maximum fits target usize");
@@ -2617,7 +3289,16 @@ mod tests {
             panic!("application before journal refusal must remain visible: {error:?}");
         };
         assert_eq!(observed.island, IslandId(1));
-        let after = archipelago.organism_census().expect("after census");
+        assert!(matches!(
+            archipelago.organism_census(),
+            Err(ArchipelagoError::JournalBlocked {
+                island: IslandId(1),
+                ..
+            })
+        ));
+        let after = archipelago
+            .current_organism_census()
+            .expect("internal interrupted-arrival census");
         assert_eq!(after.len(), before.len());
         assert!(!after.contains(&origin));
         assert!(after.contains(&observed));
@@ -3145,17 +3826,46 @@ mod tests {
                     ..
                 })
             ));
+            let mut read_called = false;
+            let read = archipelago.with_island_world(id, |_| {
+                read_called = true;
+            });
+            assert!(matches!(
+                read,
+                Err(ArchipelagoError::JournalBlocked {
+                    island: IslandId(1),
+                    ..
+                })
+            ));
+            assert!(!read_called, "a blocked science closure must not execute");
         }
+        assert!(matches!(
+            archipelago.organism_census(),
+            Err(ArchipelagoError::JournalBlocked {
+                island: IslandId(1),
+                ..
+            })
+        ));
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one barrier scenario: the full journal, its retry and the no-duplicate checks"
+    )]
     fn transient_journal_full_retries_same_barrier_without_duplicate_science() {
         let state = Rc::new(RefCell::new(FullOnceJournalState::default()));
         let journal_state = Rc::clone(&state);
-        let islands = vec![spec(0, test_config(None)), spec(1, test_config(None))];
+        let config = ScriptBotsConfig {
+            population_spawn_interval: 1,
+            ..populated_config(None)
+        };
+        let islands = vec![spec(0, config.clone()), spec(1, config)];
+        let mut uninterrupted = populated_archipelago(archipelago_config(islands.clone(), 5))
+            .expect("uninterrupted reference archipelago");
         let mut archipelago = Archipelago::with_factories(
             archipelago_config(islands, 5),
-            |meta| WorldState::new(meta.effective_config.clone()),
+            populated_world_factory,
             move |meta| {
                 (meta.id == IslandId(1)).then(|| {
                     Box::new(FullOnceJournal {
@@ -3165,6 +3875,15 @@ mod tests {
             },
         )
         .expect("archipelago with transient journal backpressure");
+        let previous_snapshots: Vec<_> = [IslandId(0), IslandId(1)]
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    archipelago.island_snapshot(id).expect("initial snapshot"),
+                )
+            })
+            .collect();
 
         let first_error = archipelago
             .step_to_barrier()
@@ -3177,6 +3896,12 @@ mod tests {
             }
         ));
         assert_partial_barrier_stays_private(&archipelago);
+        for (id, previous) in &previous_snapshots {
+            assert!(Arc::ptr_eq(
+                previous,
+                &archipelago.island_snapshot(*id).expect("retained snapshot"),
+            ));
+        }
 
         let first_batch = {
             let state = state.borrow();
@@ -3197,8 +3922,17 @@ mod tests {
         let report = archipelago
             .step_to_barrier()
             .expect("the next explicit barrier retries retained backpressure");
+        uninterrupted
+            .step_to_barrier()
+            .expect("uninterrupted reference barrier");
         assert_eq!(report.epoch, 1);
         assert_eq!(report.barrier_tick, Tick(5));
+        assert!(
+            report
+                .islands
+                .iter()
+                .all(|island| island.ticks_stepped == 5)
+        );
         assert_eq!(archipelago.barrier_tick(), Tick(5));
         assert_eq!(archipelago.epoch(), 1);
         assert!(archipelago.latched().is_none());
@@ -3210,21 +3944,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Tick(5), Tick(5)]
         );
-        assert_eq!(
-            archipelago.islands[1].next_command_sequence, 6,
-            "retrying the retained batch must not duplicate the applied tick"
-        );
-        for id in [IslandId(0), IslandId(1)] {
+        for island in &archipelago.islands {
+            assert_eq!(
+                island.next_command_sequence, 6,
+                "retrying the retained barrier must not duplicate any island's steps"
+            );
+        }
+        for (id, previous) in &previous_snapshots {
+            let current = archipelago
+                .island_snapshot(*id)
+                .expect("committed snapshot");
+            assert_eq!(current.world.tick, 5);
+            assert!(!Arc::ptr_eq(previous, &current));
+            assert_eq!(previous.world.tick, 0, "held prior snapshots are immutable");
             assert_eq!(
                 archipelago
-                    .island_snapshot(id)
-                    .expect("committed snapshot")
-                    .world
-                    .tick,
-                5
+                    .with_island_world(*id, WorldState::tick)
+                    .expect("committed world"),
+                Tick(5),
             );
-            archipelago.island_digest(id).expect("committed digest");
+            assert_eq!(
+                archipelago.island_digest(*id).expect("committed digest"),
+                uninterrupted.island_digest(*id).expect("reference digest"),
+                "retry must match uninterrupted agent, brain, and RNG state"
+            );
         }
+        let census = archipelago.organism_census().expect("committed census");
+        assert!(
+            !census.is_empty(),
+            "the retry proof must exercise living agents"
+        );
+        assert_eq!(
+            census,
+            uninterrupted.organism_census().expect("reference census")
+        );
 
         let state = state.borrow();
         assert_eq!(
@@ -3234,6 +3987,21 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&first_batch, &state.attempts[1]));
         assert_eq!(state.attempts[1].id(), first_batch_id);
+        assert_eq!(
+            state
+                .attempts
+                .iter()
+                .map(|batch| {
+                    batch
+                        .scientific()
+                        .expect("scientific boundary")
+                        .summary()
+                        .tick
+                })
+                .collect::<Vec<_>>(),
+            vec![Tick(1), Tick(1), Tick(2), Tick(3), Tick(4), Tick(5)],
+            "the retained tick is retried exactly once; later ticks are not duplicated"
+        );
         assert!(
             state.attempts[2..]
                 .windows(2)
@@ -3294,9 +4062,19 @@ mod tests {
                 "island {id}'s exposed view must remain at the prior barrier \
                  after a mid-barrier fault"
             );
+            assert!(matches!(
+                archipelago.island_digest(IslandId(id)),
+                Err(ArchipelagoError::Latched { .. })
+            ));
+            let mut read_called = false;
+            let read = archipelago.with_island_world(IslandId(id), |_| {
+                read_called = true;
+            });
+            assert!(matches!(read, Err(ArchipelagoError::Latched { .. })));
+            assert!(!read_called, "a failed science closure must not execute");
         }
         assert!(matches!(
-            archipelago.island_digest(IslandId(0)),
+            archipelago.organism_census(),
             Err(ArchipelagoError::Latched { .. })
         ));
     }

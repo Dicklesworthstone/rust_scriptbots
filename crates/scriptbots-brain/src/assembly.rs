@@ -464,6 +464,10 @@ impl BrainFamilyCodec for AssemblyFamilyAdapter {
             .collect())
     }
 
+    fn genome_loci_upper_bound(&self) -> Option<usize> {
+        Some(BRAIN_SIZE)
+    }
+
     fn validate_evaluator_state(
         &self,
         state: &BrainEvaluatorStateEnvelope,
@@ -833,6 +837,15 @@ mod tests {
 
     #[test]
     fn heredity_capability_matches_assembly_mutation_gates() {
+        let family = AssemblyFamilyAdapter::new().unwrap();
+        let mut rng = SmallRngStream::seed_from_u64(791);
+        let genome = family
+            .random_genome(BrainProvenance::default(), &mut rng)
+            .unwrap();
+        assert_eq!(
+            family.genome_loci_upper_bound(),
+            Some(family.genome_loci(&genome).unwrap().len())
+        );
         let BrainHeredityCapabilityV1::LocusCapable {
             locus_schema,
             mutation_trials,

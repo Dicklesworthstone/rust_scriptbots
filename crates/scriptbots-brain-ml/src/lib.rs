@@ -24,8 +24,6 @@ pub enum MlBackendKind {
     Candle,
     /// Tract dependency selection; the unified adapter currently copies sensors.
     Tract,
-    /// Tch dependency selection; the unified adapter currently copies sensors.
-    Tch,
     /// No ML dependency selected; the unified adapter copies sensors.
     #[default]
     None,
@@ -62,8 +60,6 @@ impl MlBrain {
     pub const fn new() -> Self {
         let kind = if cfg!(feature = "tract") {
             MlBackendKind::Tract
-        } else if cfg!(feature = "tch") {
-            MlBackendKind::Tch
         } else {
             MlBackendKind::None
         };

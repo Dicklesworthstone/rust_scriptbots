@@ -27,7 +27,11 @@ fn synthetic_summary(tick: u64) -> TickSummary {
     let phase = u16::try_from(tick % 5).expect("bounded phase");
     let population = if tick < 100 { 10_u16 } else { 40_u16 } + phase;
     let energy_phase = i16::try_from(tick % 7).expect("bounded energy phase");
-    let average_energy = f32::from(energy_phase - 3).mul_add(0.5, 50.0);
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "fixture arithmetic; keep the exact f32 so certified energy values stay bit-stable"
+    )]
+    let average_energy = 50.0 + f32::from(energy_phase - 3) * 0.5;
     let spike_hits = if tick < 100 { 2 } else { 12 } + u32::from(phase);
     TickSummary {
         tick: Tick(tick),
@@ -61,9 +65,9 @@ fn event(tick: u64, kind: EventKind, metric: &str) -> EventRecord {
 
 /// A synthetic statistics fixture, not a claim of simulated lifecycle counts.
 ///
-/// Summaries and canonical inputs agree exactly. Batches use an explicitly
-/// configured sparse cadence; generic dashboard metrics deliberately carry
-/// no evidence of the planted shift.
+/// Summaries and canonical inputs agree exactly. Batches use an explicit sparse
+/// persistence cadence (the config default, `0`, disables persistence); generic
+/// dashboard metrics deliberately carry no evidence of the planted shift.
 fn create_fixture(dir: &tempfile::TempDir, events: &[EventRecord], include_inputs: bool) -> String {
     let path = dir.path().join("series.sqlite").display().to_string();
     let mut storage = Storage::create_unattributed_file(&path).expect("create fixture");
@@ -156,6 +160,27 @@ fn planted_shift_is_certified_from_complete_inputs_across_pages() {
         TERMINAL_TICK
     );
     assert_eq!(output.machine["truncated"], false);
+    assert_eq!(
+        output.machine["inference"]["confidence_interval"],
+        "circular_moving_block_bootstrap_percentile_v1"
+    );
+    assert_eq!(
+        output.machine["inference"]["p_value"],
+        "length_stratified_whole_block_permutation_v1"
+    );
+    assert_eq!(
+        output.machine["inference"]["interpretation"],
+        "exploratory_selected_events"
+    );
+    assert_eq!(output.machine["inference"]["block_len"], 5);
+    assert_eq!(output.machine["inference"]["resamples"], 200);
+    assert_eq!(output.machine["inference"]["permutations"], 200);
+    assert!(output.human_md.contains("Exploratory"));
+    assert!(
+        output
+            .human_md
+            .contains("do not correct for event selection")
+    );
 
     let rows = output.machine["events"].as_array().expect("events");
     assert_eq!(rows.len(), 1);
@@ -170,6 +195,48 @@ fn planted_shift_is_certified_from_complete_inputs_across_pages() {
     );
     assert!(output.human_md.contains("consecutive simulation ticks"));
     assert!(output.human_md.contains("yes"));
+}
+
+#[test]
+fn declared_block_length_changes_the_published_interval_from_persisted_inputs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = create_fixture(
+        &dir,
+        &[event(100, EventKind::PopulationBoom, METRIC_POPULATION)],
+        true,
+    );
+    let cx = ReaderCtx::open(&path).expect("open reader");
+    let registry = Registry::builtin();
+    let analyze = |block_len| {
+        let params = ReportParams::from_pairs([
+            "window=30".to_owned(),
+            "resamples=200".to_owned(),
+            "permutations=200".to_owned(),
+            format!("block_len={block_len}"),
+        ])
+        .expect("params");
+        registry
+            .run("narrative-validate", &cx, &params)
+            .expect("analyse complete persisted inputs")
+    };
+    let points = analyze(1);
+    let blocks = analyze(5);
+    let point_row = &points.machine["events"][0];
+    let block_row = &blocks.machine["events"][0];
+
+    // The fixture has an exact five-tick period on each side of the +30
+    // shift. Every circular block of length five has the same sum; point
+    // resampling instead destroys that temporal structure.
+    assert_eq!(point_row["shift"], block_row["shift"]);
+    assert_eq!(block_row["shift"], 30.0);
+    assert_eq!(block_row["ci_lower"], 30.0);
+    assert_eq!(block_row["ci_upper"], 30.0);
+    assert!(point_row["ci_lower"].as_f64().expect("point lower") < 30.0);
+    assert!(point_row["ci_upper"].as_f64().expect("point upper") > 30.0);
+    assert_eq!(points.machine["inference"]["block_len"], 1);
+    assert_eq!(blocks.machine["inference"]["block_len"], 5);
+    assert_eq!(points.machine["inputs_read"], TERMINAL_TICK);
+    assert_eq!(blocks.machine["inputs_read"], TERMINAL_TICK);
 }
 
 #[test]
@@ -435,7 +502,7 @@ fn empty_database_handles_gracefully() {
     assert!(
         output
             .human_md
-            .contains("No narrative events could be certified")
+            .contains("No narrative events had a supported, complete window")
     );
 }
 

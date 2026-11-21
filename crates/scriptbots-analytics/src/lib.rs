@@ -30,9 +30,10 @@ use scriptbots_core::narrative::{EventRecord, NarrativeInputRecordV1, NarrativeR
 use scriptbots_core::{AgentUid, Tick};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    FinishedRunView, NarrativeInputBindingV1, NarrativeInputStreamError, PersistedAgentObservation,
-    PersistedInteraction, PersistedInteractionCapture, PersistedMetric, PersistedRunEvent,
-    PersistenceBatchId, RunEventIdentity, RunManifestRecord, StorageError, StorageReader,
+    FinishedRunView, NarrativeInputBindingV1, NarrativeInputPolicyV1, NarrativeInputStreamError,
+    PersistedAgentObservation, PersistedInteraction, PersistedInteractionCapture, PersistedMetric,
+    PersistedRunEvent, PersistenceBatchId, RunEventIdentity, RunManifestRecord, StorageError,
+    StorageReader,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,13 +48,12 @@ pub use stats::StatsError;
 /// bd-2z0.11.3's adapter decision consumes. Never enters core or any tick path.
 pub mod stats;
 
-/// Statistical certification of narrative events (bd-2z0.11.6, item 1).
+/// Exploratory statistical analysis of narrative events (bd-2z0.11.6, item 1).
 ///
-/// Answers "is this detected event real, or the tail of noise?" for the events the detector
-/// fires, with Benjamini-Hochberg false-discovery-rate control across a whole run — the
-/// principled replacement for eyeballed per-event thresholds that bd-16g.2.3's false-positive
-/// budget needs. Pure functions over a metric series; the report that reads real `EventRecord`s
-/// from a database is a thin adapter on top.
+/// Temporal-block resampling measures shifts without treating every tick as an
+/// independent observation. Nominal Benjamini-Hochberg decisions do not correct
+/// for selecting events from the same series. Reports retain these assumptions
+/// and expose the exact method and controls alongside the observed effect.
 pub mod certify;
 
 /// Matched-seed treatment-effect analysis (bd-2z0.11.6 item 3; serves bd-16g.1.4).
@@ -115,6 +115,13 @@ pub const REPORT_SCHEMA_VERSION: u32 = 1;
 /// run, and explicitly scopes kind counts to the returned page. The original
 /// replay-record shape remains available as the `replay-timeline` report at v1.
 pub const NARRATIVE_TIMELINE_SCHEMA_VERSION: u32 = 2;
+
+/// Narrative reconstruction with authenticated tick-boundary policy transitions.
+///
+/// V2 adds the effective policy-change count and final policy. Reconstruction
+/// uses the current detector implementation; this is not a claim of historical
+/// equivalence across different source revisions.
+pub const NARRATIVE_RECONSTRUCT_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum metric rows sampled by `metric-summary` in one bounded SQL page.
 ///
@@ -598,14 +605,6 @@ pub enum AnalyticsError {
     /// The canonical narrative detector refused a recorded input or policy.
     #[error("narrative reconstruction error: {0}")]
     NarrativeInput(#[from] scriptbots_core::narrative::NarrativeInputError),
-    /// The current replay kernel cannot reproduce a mid-run detector policy change.
-    #[error(
-        "narrative detector policy changed at tick {tick}; reconstruction requires constant narrative_interval, history_capacity, and narrative_capacity"
-    )]
-    NarrativePolicyChanged {
-        /// First input whose detector policy differs from the initial recorded policy.
-        tick: u64,
-    },
 }
 
 /// Read-only context handed to every report.
@@ -1810,31 +1809,27 @@ fn metric_stats_error(error: &crate::stats::StatsError) -> AnalyticsError {
     })
 }
 
-/// `metric-changepoints`: find and CERTIFY the most prominent regime shift in each metric.
+/// `metric-changepoints`: locate prominent shifts and report exploratory block inference.
 ///
-/// This is the certification pipeline (bd-2z0.11.6) run over real persisted data. For every metric
-/// the run recorded, it locates the single largest mean shift ([`changepoint::largest_shift`]),
-/// certifies it — permutation test, bootstrap CI on the shift, effect sizes — and applies
-/// Benjamini-Hochberg across all metrics, so a run with a dozen metrics cannot report a chance
-/// "regime change" it never had. It answers "which metrics genuinely shifted in this run, and
-/// when?" with statistics rather than an eyeballed threshold.
-///
-/// Distinct from `scriptbots-core::detect`, which is the ONLINE detector: this is the offline
-/// certification of shifts, over the finished series.
+/// The largest shift is selected from the same series used for its interval and
+/// p-value. Temporal blocks preserve local dependence, but neither resampling nor
+/// Benjamini-Hochberg corrects for that selection. The report records the actual
+/// procedures and their assumptions instead of certifying a selected split as real.
 struct MetricChangepoints;
 
 #[derive(Debug, Serialize)]
 struct ChangepointsMachine {
-    /// Certification window (samples on each side of the shift).
+    /// Analysis window (recorded samples on each side of the selected shift).
     window: usize,
-    /// Target false-discovery rate for the across-metrics correction.
+    /// Nominal Benjamini-Hochberg threshold across the selected metrics.
     fdr: f64,
-    /// Metrics whose series was long enough to admit a certified change-point.
+    /// Actual inference procedures, controls and assumptions.
+    inference: certify::CertificationMethod,
+    /// Metrics whose series was long enough to admit a change-point.
     metrics_examined: usize,
-    /// How many of those hold up under FDR control — the honest count of real regime shifts.
+    /// Selected metrics crossing the nominal Benjamini-Hochberg threshold.
     significant: usize,
-    /// True when the bounded metric read hit its cap, so early history was not analysed and a
-    /// change-point in it would be invisible. A truncated analysis must not read as a complete one.
+    /// True when the bounded metric read hit its cap and excluded earlier history.
     truncated: bool,
     changepoints: Vec<ChangepointRow>,
 }
@@ -1842,7 +1837,7 @@ struct ChangepointsMachine {
 #[derive(Debug, Serialize)]
 struct ChangepointRow {
     metric: String,
-    /// The tick at which the new regime begins.
+    /// The tick at which the selected new regime begins.
     change_tick: u64,
     shift: f64,
     before_mean: f64,
@@ -1852,7 +1847,7 @@ struct ChangepointRow {
     ci_upper: f64,
     cohens_d: f64,
     cliffs_delta: f64,
-    /// Survives Benjamini-Hochberg across the run's metrics. The field to act on.
+    /// Nominal BH decision; does not correct for selecting the largest shift.
     significant_fdr: bool,
 }
 
@@ -1863,6 +1858,42 @@ struct ChangepointCandidate {
     before_mean: f64,
     after_mean: f64,
     certification: certify::EventCertification,
+}
+
+fn parse_changepoint_params(
+    params: &ReportParams,
+) -> Result<certify::CertificationParams, AnalyticsError> {
+    params.validate_keys(&["window", "fdr", "block_len", "resamples", "permutations"])?;
+    let window = params.get_usize("window")?.unwrap_or(30);
+    if window.checked_mul(2).is_none() {
+        return Err(AnalyticsError::BadParam {
+            name: "window".to_owned(),
+            reason: "two analysis windows exceed the addressable sample count".to_owned(),
+        });
+    }
+    let controls = certify::CertificationParams {
+        window,
+        fdr: params
+            .get("fdr")
+            .map(str::parse::<f64>)
+            .transpose()
+            .map_err(|error| AnalyticsError::BadParam {
+                name: "fdr".to_owned(),
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0.05),
+        block_len: params.get_usize("block_len")?.unwrap_or(5),
+        n_resamples: params.get_usize("resamples")?.unwrap_or(2000),
+        n_permutations: params.get_usize("permutations")?.unwrap_or(2000),
+        ..certify::CertificationParams::default()
+    };
+    controls
+        .validate()
+        .map_err(|error| AnalyticsError::BadParam {
+            name: "certification".to_owned(),
+            reason: error.to_string(),
+        })?;
+    Ok(controls)
 }
 
 fn certify_metric_changepoints(
@@ -1894,6 +1925,22 @@ fn certify_metric_changepoints(
 fn render_changepoints_markdown(machine: &ChangepointsMachine) -> String {
     let mut md = String::new();
     let _ = writeln!(md, "# Metric change-points\n");
+    let _ = writeln!(
+        md,
+        "> **Exploratory:** each split maximizes the observed shift in the same series being tested. Nominal Benjamini-Hochberg decisions do not correct for this selection or guarantee false-discovery control.\n"
+    );
+    let _ = writeln!(
+        md,
+        "Shift intervals: `{}` ({} resamples, confidence {}). P-values: `{}` ({} permutations). Both use blocks of {} consecutive recorded samples and resampling seed {}. Recorded samples need not be adjacent simulation ticks.\n\n{}\n",
+        machine.inference.confidence_interval,
+        machine.inference.resamples,
+        machine.inference.confidence,
+        machine.inference.p_value,
+        machine.inference.permutations,
+        machine.inference.block_len,
+        machine.inference.seed,
+        machine.inference.assumptions,
+    );
     if machine.truncated {
         let _ = writeln!(
             md,
@@ -1903,18 +1950,21 @@ fn render_changepoints_markdown(machine: &ChangepointsMachine) -> String {
     }
     let _ = writeln!(
         md,
-        "_window={}, FDR={}, {} of {} metrics show a certified regime shift._\n",
+        "_window={}, nominal FDR={}, {} of {} selected metrics cross the BH threshold._\n",
         machine.window, machine.fdr, machine.significant, machine.metrics_examined
     );
     if machine.changepoints.is_empty() {
         let _ = writeln!(
             md,
-            "_No metric series was long enough to certify a change-point._"
+            "_No metric series was long enough to analyse a change-point._"
         );
         return md;
     }
 
-    let _ = writeln!(md, "| metric | tick | shift | p | 95% CI | d | δ | real? |");
+    let _ = writeln!(
+        md,
+        "| metric | tick | shift | block p | 95% block CI | d | δ | BH threshold? |"
+    );
     let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
     for row in &machine.changepoints {
         let _ = writeln!(
@@ -1940,54 +1990,27 @@ impl Report for MetricChangepoints {
     }
 
     fn description(&self) -> &'static str {
-        "Find and statistically certify the largest regime shift in each metric (FDR-controlled)"
+        "Locate the largest metric shifts with exploratory temporal-block inference"
     }
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
-        let window = params.get_usize("window")?.unwrap_or(30);
-        if window == 0 {
-            return Err(AnalyticsError::BadParam {
-                name: "window".to_owned(),
-                reason: "must be at least 1".to_owned(),
-            });
-        }
-
+        // Validate even for an empty database, before any metric read or split selection.
+        let cert_params = parse_changepoint_params(params)?;
+        let window = cert_params.window;
         let read_started = Instant::now();
         let readings = cx.reader.recent_metrics(METRIC_SUMMARY_ROW_LIMIT)?;
-        // `recent_metrics` is a bounded most-recent-N read. If it came back full, earlier history
-        // was dropped and a change-point in it is invisible — say so rather than let a truncated
-        // analysis read as a complete one.
         let truncated = readings.len() >= METRIC_SUMMARY_ROW_LIMIT;
         log_report_stage("read", &read_started, readings.len());
 
         let render_started = Instant::now();
-        // Group into ordered (tick, value) series per metric. recent_metrics order is not
-        // contractually chronological here, so we sort by tick explicitly — a change-point over a
-        // mis-ordered series would be meaningless.
         let mut by_metric: BTreeMap<String, Vec<(u64, f64)>> = BTreeMap::new();
         for PersistedMetric { tick, name, value } in readings {
             by_metric.entry(name).or_default().push((tick, value));
         }
 
-        let cert_params = certify::CertificationParams {
-            window,
-            fdr: params
-                .get("fdr")
-                .map(str::parse::<f64>)
-                .transpose()
-                .map_err(|e| AnalyticsError::BadParam {
-                    name: "fdr".to_owned(),
-                    reason: e.to_string(),
-                })?
-                .unwrap_or(0.05),
-            ..certify::CertificationParams::default()
-        };
-
-        // The window doubles as `min_segment`, so every located shift leaves a full certification
-        // window on both sides and `certify_event` cannot see an out-of-range window.
+        // The split finder leaves a complete window on each side. Selection is
+        // still data-dependent; the method metadata and prose retain that fact.
         let candidates = certify_metric_changepoints(by_metric, window, &cert_params)?;
-
-        // Second pass: Benjamini-Hochberg across every metric's p-value at once.
         let p_values: Vec<f64> = candidates.iter().map(|c| c.certification.p_value).collect();
         let rejected = certify::benjamini_hochberg(&p_values, cert_params.fdr);
 
@@ -2015,21 +2038,22 @@ impl Report for MetricChangepoints {
         let machine = ChangepointsMachine {
             window,
             fdr: cert_params.fdr,
+            inference: cert_params.method(),
             metrics_examined: rows.len(),
             significant,
             truncated,
             changepoints: rows,
         };
-
         let md = render_changepoints_markdown(&machine);
-
-        let output = base_output(
+        let mut output = base_output(
             self.name(),
             cx,
             machine.changepoints.len(),
             serde_json::to_value(&machine)?,
             md,
         )?;
+        // V2 changes both inference procedures and adds explicit method metadata.
+        output.schema_version = 2;
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
     }
@@ -2037,8 +2061,8 @@ impl Report for MetricChangepoints {
 
 /// Input contract for a predeclared matched-seed endpoint comparison.
 pub const RUN_COMPARISON_COHORT_SCHEMA_V1: &str = "scriptbots.run-comparison-cohort.v1";
-/// Report-specific contract distinguishing independent seed pairs from trajectory samples.
-pub const RUN_COMPARISON_SCHEMA_V2: &str = "scriptbots.run-comparison.v2";
+/// Report contract identifying the actual seed-level p-value procedure and evaluation count.
+pub const RUN_COMPARISON_SCHEMA_V3: &str = "scriptbots.run-comparison.v3";
 
 /// Maximum encoded cohort JSON size; enforced again while reading a growing file.
 pub const MAX_COMPARISON_COHORT_BYTES: usize = 1_048_576;
@@ -2109,6 +2133,7 @@ struct RunComparisonMachine {
     confidence: f64,
     resampling_seed: u64,
     n_resamples: usize,
+    /// Requested Monte Carlo budget; each metric records its actual procedure and work.
     n_permutations: usize,
     metrics_compared: usize,
     significant: usize,
@@ -2159,6 +2184,9 @@ struct RunComparisonRow {
     ci_lower: Option<f64>,
     ci_upper: Option<f64>,
     p_value: Option<f64>,
+    /// Absent for descriptive rows, which evaluate no sign assignments.
+    p_value_procedure: Option<&'static str>,
+    sign_assignments_evaluated: usize,
     /// Also absent when a zero-spread difference has no finite standardized effect size.
     cohens_dz: Option<f64>,
     fraction_positive: f64,
@@ -2516,6 +2544,8 @@ fn compare_endpoint_metrics(
                     ci_lower: None,
                     ci_upper: None,
                     p_value: None,
+                    p_value_procedure: None,
+                    sign_assignments_evaluated: 0,
                     cohens_dz: None,
                     fraction_positive: if difference > 0.0 { 1.0 } else { 0.0 },
                     significant_fdr: false,
@@ -2559,6 +2589,8 @@ fn compare_endpoint_metrics(
                 ci_lower: Some(comparison.difference_ci.lower),
                 ci_upper: Some(comparison.difference_ci.upper),
                 p_value: Some(comparison.p_value),
+                p_value_procedure: Some(comparison.p_value_procedure.as_str()),
+                sign_assignments_evaluated: comparison.sign_assignments_evaluated,
                 cohens_dz: comparison
                     .cohens_dz
                     .is_finite()
@@ -2609,7 +2641,7 @@ fn comparison_machine(
         .cloned()
         .collect();
     Ok(RunComparisonMachine {
-        schema: RUN_COMPARISON_SCHEMA_V2,
+        schema: RUN_COMPARISON_SCHEMA_V3,
         mode: if infer {
             "matched_seed_cohort"
         } else {
@@ -2706,8 +2738,11 @@ fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
             md,
             "{} of {} predeclared metrics meet the Benjamini–Hochberg FDR threshold {}. \
              Confidence intervals resample seed pairs, and permutation tests flip paired \
-             endpoint differences. Each run contributes one observation per metric.\n",
-            machine.significant, machine.metrics_compared, machine.fdr
+             endpoint differences. Each run contributes one observation per metric. \
+             Cohorts of at most twelve pairs enumerate all sign assignments; larger cohorts \
+             use Monte Carlo sampling. Both require within-pair exchangeability under the null. \
+             The requested Monte Carlo budget is {}; actual evaluations appear per metric.\n",
+            machine.significant, machine.metrics_compared, machine.fdr, machine.n_permutations
         );
     } else {
         let _ = writeln!(
@@ -2730,10 +2765,11 @@ fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
     }
     let _ = writeln!(
         md,
-        "| metric | run pairs | Δ (treat−ctrl) | {:.0}% CI | p | d_z | +frac | FDR discovery |",
+        "| metric | run pairs | Δ (treat−ctrl) | {:.0}% CI | p | p procedure | \
+         sign assignments | d_z | +frac | FDR discovery |",
         machine.confidence * 100.0
     );
-    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|");
     for row in &machine.metrics {
         let interval = row.ci_lower.zip(row.ci_upper).map_or_else(
             || "—".to_owned(),
@@ -2742,17 +2778,24 @@ fn render_run_comparison_markdown(machine: &RunComparisonMachine) -> String {
         let p_value = row
             .p_value
             .map_or_else(|| "—".to_owned(), |value| format!("{value:.4}"));
+        let procedure = row.p_value_procedure.unwrap_or("—");
+        let assignments = row.p_value_procedure.map_or_else(
+            || "—".to_owned(),
+            |_| row.sign_assignments_evaluated.to_string(),
+        );
         let effect = row
             .cohens_dz
             .map_or_else(|| "—".to_owned(), |value| format!("{value:.3}"));
         let _ = writeln!(
             md,
-            "| {} | {} | {:+.4} | {} | {} | {} | {:.2} | {} |",
+            "| {} | {} | {:+.4} | {} | {} | {} | {} | {} | {:.2} | {} |",
             row.metric,
             row.n_pairs,
             row.mean_difference,
             interval,
             p_value,
+            procedure,
+            assignments,
             effect,
             row.fraction_positive,
             if machine.inference_status != "computed" {
@@ -3384,6 +3427,8 @@ struct NarrativeReconstruct;
 #[derive(Debug, Serialize)]
 struct NarrativeReconstructionMachine {
     input_binding: NarrativeInputBindingV1,
+    policy_changes: u64,
+    final_policy: NarrativeInputPolicyV1,
     inputs_replayed: u64,
     input_pages: u64,
     events_reconstructed: u64,
@@ -3416,7 +3461,7 @@ impl Report for NarrativeReconstruct {
         let _ = writeln!(md, "Run: `{}`\n", binding.run_id);
         let _ = writeln!(
             md,
-            "Replayed all {} detector inputs from tick {} through {} in {} bounded pages. The recorded policy uses an interval of {} ticks, {} history entries, and an event ring of {}.\n",
+            "Replayed all {} detector inputs from tick {} through {} in {} bounded pages. The initial recorded policy uses an interval of {} ticks, {} history entries, and an event ring of {}.\n",
             machine.inputs_replayed,
             binding.first_tick,
             binding.terminal_tick,
@@ -3427,7 +3472,15 @@ impl Report for NarrativeReconstruct {
         );
         let _ = writeln!(
             md,
-            "Reconstructed {} events independently of persisted narrative output rows. Event counts cover the complete run.\n",
+            "Applied {} authenticated policy changes at their completed tick boundaries, preserving detector cooldowns. The final policy uses an interval of {} ticks, {} history entries, and an event ring of {}.\n",
+            machine.policy_changes,
+            machine.final_policy.narrative_interval,
+            machine.final_policy.history_capacity,
+            machine.final_policy.event_capacity,
+        );
+        let _ = writeln!(
+            md,
+            "Reconstructed {} events with the current detector implementation, independently of persisted narrative output rows. Event counts cover the complete run; historical equivalence across different source revisions is not asserted.\n",
             machine.events_reconstructed,
         );
         if machine.events_reconstructed == 0 {
@@ -3461,13 +3514,14 @@ impl Report for NarrativeReconstruct {
                 "\n_Showing the newest {count} events in canonical tick/kind/metric order; the output limit does not limit detector input coverage._"
             );
         }
-        let output = base_output(
+        let mut output = base_output(
             self.name(),
             cx,
             machine.events.len(),
             serde_json::to_value(&machine)?,
             md,
         )?;
+        output.schema_version = NARRATIVE_RECONSTRUCT_SCHEMA_VERSION;
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
     }
@@ -3490,6 +3544,8 @@ fn reconstruct_narrative(
             },
         ))?;
     let mut replay = NarrativeReplay::new(first.replay_policy()?)?;
+    let mut final_policy = NarrativeInputPolicyV1::from(*first);
+    let mut policy_changes = 0_u64;
     let mut inputs_replayed = 0_u64;
     let mut input_pages = 0_u64;
     let mut events_reconstructed = 0_u64;
@@ -3498,7 +3554,12 @@ fn reconstruct_narrative(
     loop {
         input_pages = input_pages.saturating_add(1);
         for record in page.inputs {
+            let policy = NarrativeInputPolicyV1::from(record);
             replay_narrative_record(&mut replay, record)?;
+            if policy != final_policy {
+                policy_changes = policy_changes.saturating_add(1);
+                final_policy = policy;
+            }
             inputs_replayed = inputs_replayed.saturating_add(1);
             // Drain each tick so complete-run counting neither depends on the
             // production event-ring capacity nor accumulates an unbounded tail.
@@ -3518,6 +3579,8 @@ fn reconstruct_narrative(
     }
     Ok(NarrativeReconstructionMachine {
         input_binding: binding,
+        policy_changes,
+        final_policy,
         inputs_replayed,
         input_pages,
         events_reconstructed,
@@ -3538,14 +3601,11 @@ fn replay_narrative_record(
     replay: &mut NarrativeReplay,
     record: NarrativeInputRecordV1,
 ) -> Result<(), AnalyticsError> {
-    if record.replay_policy()? != replay.policy() {
-        // Resetting the detector here would silently lose its history and
-        // cooldown state. Unrelated authenticated config revisions are safe.
-        return Err(AnalyticsError::NarrativePolicyChanged {
-            tick: record.input.tick.0,
-        });
-    }
-    replay.push(record.input)?;
+    // StorageReader authenticates revision/policy transitions against the owner
+    // journal before returning a page. Reuse the live tick-boundary retention
+    // semantics without resetting history, event identities or cooldown state.
+    record.validate()?;
+    replay.push_with_policy(record.input, record.replay_policy()?)?;
     Ok(())
 }
 
@@ -3555,7 +3615,7 @@ mod narrative_reconstruction_tests {
     use scriptbots_core::narrative::NarrativeInputV1;
 
     #[test]
-    fn replay_refuses_policy_changes_without_losing_state() {
+    fn replay_applies_policy_changes_and_rejects_invalid_records_atomically() {
         let original = NarrativeInputRecordV1 {
             record_schema_version: 1,
             input: NarrativeInputV1::new(Tick(1), 12, 1.0, 0).expect("valid input"),
@@ -3574,28 +3634,56 @@ mod narrative_reconstruction_tests {
         };
         for changed in [
             NarrativeInputRecordV1 {
-                narrative_interval: 8,
+                record_schema_version: original.record_schema_version + 1,
                 ..next
             },
             NarrativeInputRecordV1 {
-                history_capacity: 64,
+                history_capacity: 0,
                 ..next
             },
             NarrativeInputRecordV1 {
-                event_capacity: 16,
+                input: original.input,
+                narrative_interval: 0,
+                history_capacity: 1,
+                event_capacity: 0,
                 ..next
             },
         ] {
             assert!(matches!(
                 replay_narrative_record(&mut replay, changed),
-                Err(AnalyticsError::NarrativePolicyChanged { tick: 2 })
+                Err(AnalyticsError::NarrativeInput(_))
             ));
+            assert_eq!(replay.policy(), original.replay_policy().unwrap());
             assert_eq!(replay.history().len(), 1);
             assert_eq!(replay.history().front(), Some(&original.input));
         }
         replay_narrative_record(&mut replay, next)
             .expect("an unrelated authenticated config revision preserves detector policy");
         assert_eq!(replay.history().len(), 2);
+        let smaller = NarrativeInputRecordV1 {
+            input: NarrativeInputV1::new(Tick(3), 12, 1.0, 0).unwrap(),
+            config_revision: 2,
+            narrative_interval: 0,
+            history_capacity: 1,
+            event_capacity: 0,
+            ..next
+        };
+        replay_narrative_record(&mut replay, smaller).expect("authenticated retention change");
+        assert_eq!(replay.policy(), smaller.replay_policy().unwrap());
+        assert_eq!(replay.history().len(), 1);
+        assert_eq!(replay.history().front(), Some(&smaller.input));
+        assert_eq!(replay.dropped_inputs(), 2);
+        let resumed = NarrativeInputRecordV1 {
+            input: NarrativeInputV1::new(Tick(4), 12, 1.0, 0).unwrap(),
+            config_revision: 3,
+            ..next
+        };
+        replay_narrative_record(&mut replay, resumed).expect("re-enable detector without reset");
+        assert_eq!(replay.policy(), original.replay_policy().unwrap());
+        assert_eq!(replay.history().len(), 2);
+        assert_eq!(replay.history().front(), Some(&smaller.input));
+        assert_eq!(replay.history().back(), Some(&resumed.input));
+        assert_eq!(replay.dropped_inputs(), 2);
     }
 }
 

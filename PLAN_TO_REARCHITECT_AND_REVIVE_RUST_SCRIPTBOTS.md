@@ -2,6 +2,1516 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Between-step lifecycle events and archipelago continuation (2026-11-20):**
+[Source implemented; focused runtime regressions passed — Codex; `bd-uxvp`]
+
+- Preserve actual arrival and map-removal ticks when the next completed step
+  publishes those records. Permit only the immediately preceding nonzero tick
+  for injected arrivals and map-incompatibility deaths.
+- Exercise real paused commands, event clients and encoded owner restoration;
+  retain explicit refusals for stale/future rows and mistimed natural events.
+- Re-run the observed archipelago continuation failure with random migrations.
+
+DSR on unchanged source passed all four real-MLP founder integration tests,
+29 runtime checkpoint tests (including the formerly failing archipelago case),
+the genesis-origin regression and targeted formatting. Both new event-client
+and encoded-owner regressions exercise real paused injections/map culls and
+refuse stale/future rows and mistimed natural events. UBS still reports its
+pre-existing constant-time-comparison false positive on public numeric session
+IDs; its aggregate is not green. This does not qualify the full workspace.
+
+**Saved-world continuity and experiment retries (2026-11-20):**
+[Source implemented; focused regressions passed — full workspace acceptance open
+under `bd-e32s` and `bd-5ygz`]
+
+- [x] Read the architecture plan and authoritative Beads; select reproducible
+  saved-world and experiment failures that block normal user workflows.
+- [x] Preserve tick-zero founder origins and genome declarations in full-owner
+  continuations without advancing science or discarding pending records.
+- [x] Retain completed demographic/combat counters while continuing to reject
+  unresolved persistence, replay anchors, commands and later arrivals.
+- [x] Reconstruct pending genome declarations when importing a scientific cut,
+  so a fresh imported world can immediately become a full-owner continuation.
+- [x] Reuse the restored schedule-history allocation when it matches the saved
+  snapshot, preserving idle-drive revisions and exact re-saved bytes while real
+  later schedule changes remain observable.
+- [x] Execute core, runtime and browser regressions through DSR, including both
+  ordinary and arbitrary-precision JSON feature configurations.
+- [ ] Complete the full workspace and native application checkpoint acceptance,
+  including retries after a lost receipt.
+- [x] Publish meaningful verified changes directly to `main`; keep the original
+  broader acceptance beads open until their named probes actually pass.
+
+Frozen DSR `scriptbots-browser-final/20261120T162650-qxlQRaJq` passed all
+29 runtime checkpoint tests and the complete native browser-library suite in
+both JSON modes: **80 passed, 0 failed, 1 intentionally ignored** in each run.
+The two originally named browser failures and fresh single/mixed-family import,
+save and continuation regressions pass. Targeted formatting also passed.
+
+Workspace qualification remains open. Focused Clippy stopped at 26 existing
+diagnostics in unchanged `scriptbots-runtime/src/lab_guide.rs`. The full workspace
+check stopped at a linker SIGBUS in `visibility`, and full Clippy then failed for
+disk exhaustion. Full formatting printed differences in unchanged native app
+files despite returning zero; only the targeted check was clean. The native
+application checkpoint attempt was killed in `asupersync` before tests ran.
+UBS retains the existing public-session-ID comparison false positive described
+above. Neither original workspace-acceptance bead is closed by these results.
+
+**Native/browser scientific checkpoint transfer (2026-11-20):**
+[Source implemented and independently reviewed — full native/WASM qualification remains open]
+
+- `24902d4` imports canonical `WorldCheckpointV1` files into fresh paused browser
+  owners and exports the same raw format without advancing science. Saved tick,
+  actual RNG root, complete supported registry/evaluator identities and restored
+  digest are checked, including mixed and extinct families. Raw interchange
+  refuses novelty/curiosity selection, communication scrambling and imported maps
+  because the format omits their auxiliary state. Full owner continuations remain
+  a separate supported format.
+- `4d0b12b` adds scientific file import/export and **Continue selected world locally
+  (paused)** in the native checkpoint catalog. Artifact size, identity and SHA-256
+  are verified before browser restoration. The retained local world and remote
+  view survive refusal; a successful handoff replaces only the local owner and
+  disconnects the viewer without sending a server mutation. Source changes cancel
+  pending transfers. Imported science carries no original host journal, schedule
+  or founder recipe, and does not certify cross-target future equivalence.
+- Regression coverage includes core/native consumer round trips, all supported
+  families and refusal boundaries, real DOM lifecycle cases with explicit WASM
+  doubles, and a packaged native-to-WASM-to-native branch-study journey. The real
+  journey uses MLP; arbitrary mixed or Unbound cuts need a compatible native
+  consumer and are not represented as supported named study presets.
+
+DSR on the final frozen browser source passed **239 JavaScript unit tests** and
+**five JavaScript syntax checks**. Pinned targeted Rust formatting also passed.
+Chromium refused Unix socket creation before any DOM assertion, so the DOM and
+packaged native/browser/native journeys remain unexecuted. Full workspace Rust
+dependency acquisition was blocked by the pinned Zed fetch through the environment
+proxy. These scoped results do not close the broader browser, checkpoint or
+cross-target acceptance beads.
+
+**Live native soundscape integration (2026-11-16):**
+[Source implemented and independently reviewed — executable qualification remains open
+under `bd-16g.14` and `bd-2z0.14.1.11`]
+
+- Connected the existing bounded synthesis engine to a real Kira callback, replacing
+  the empty device sink. Input generations discard old owners and muted queues;
+  device-sized rendering does not retrigger observed ticks. Active layer controls,
+  finite-input validation, a bounded drone phase and actual device-rate handling are
+  implemented. Muted event layers no longer starve audible cues.
+- Added a shared immutable-snapshot projector. Canonical population metrics, configured
+  diet classification and exact completed-tick counts stay observational. Duplicate
+  publications do not replay events; missed ticks are counted without inventing cues.
+- Added explicit opt-in sound and mixer controls to GPUI and Bevy. World/Lab share one
+  device; pause, history, background and lifecycle gates mute or rebase it. Device
+  initialization and observed runtime failures have visible terminal status.
+- Authored production-callback, transport, mixer, real-owner projection and frontend
+  policy regressions. Independent review corrected stale-queue ordering, muted-layer
+  budget starvation, active-tail volume and frontend lifetime/error handling.
+
+DSR dependency probes stopped before compilation at the existing uncached pinned
+`xcb` Git dependency. A scoped dependency fetch and intermediate formatter execution
+completed, but repeated execution-workspace outages prevented the new tests and final
+compiler/Clippy/format qualification. The published source is independently reviewed;
+these observations do not constitute executable acceptance. Native output is currently
+mono, and physical-device journeys, spatial output, the original 10k performance budget
+and live/offline soundtrack equivalence remain unqualified. Original Bead criteria and
+statuses remain unchanged.
+
+**Saved-world inspection and registry portability (2026-11-16):**
+[Source implemented and independently reviewed — Codex; executable qualification remains open]
+
+The saved-world product loop now has a native-to-browser review path:
+
+- `75e54a3` reconstructs the recorded compiled brain registry in its saved order,
+  including supported subsets and extinct families. Complete protocol and constructor
+  identities remain required. Canvas and montage replay no longer guess from today's
+  preset roster; managed study provenance still requires a true matching founder preset.
+- `fb1c648` adds `GET /api/v1/checkpoints/{checkpoint_id}/canvas?session_id=...`.
+  It verifies the retained descriptor, exact payload bytes and both checksums, restores
+  the saved scientific cut and checks its digest. The live owner is neither stepped nor
+  replaced. One reconstruction slot, a 30-second response deadline, 16 MiB source and
+  8 MiB binary-frame bounds, bounded populations, grids and history capacities provide
+  explicit admission limits; these are not a total resident-memory guarantee.
+- The browser exposes **Review saved world** and **Return to live**, keeps the live
+  stream and event timeline separate, and disables live mutations and UID inspection
+  while displaying saved science. It checks the source session, saved identity and
+  frame boundary, rejects stale results and invalidates presentation caches on view
+  changes. Saved PNGs identify the checkpoint, tick and digest. Original per-tick
+  activity and live tick rate are unavailable for a reconstructed scientific cut.
+
+Authored regressions cover registry portability and deterministic continuation,
+unchanged-owner canvas/reel replay, cold and cached sources, corrupt/oversized artifacts,
+admission boundaries, session and capacity refusals, browser cancellation and unchanged
+stream cursors. A real native/browser journey exercises review, both PNG renderers,
+incoming live frames and return to live. These new tests have **not run**.
+
+DSR refused native build admission for insufficient disk capacity, then the execution
+workspace disconnected. Independent source review found and corrected test/lifecycle
+issues, but establishes no compiler, formatter, Clippy, Rust, JavaScript or live-browser
+pass. Qualification must use DSR when execution is available. Original checkpoint,
+replay and browser Beads retain their acceptance criteria and statuses; none is closed
+by this source-only increment.
+**Mixed-family browser worlds and bounded journal writes (2026-11-16):**
+[Source committed and independently reviewed — Codex; scoped JavaScript checks
+passed; original acceptance remains open under `bd-ywtv` and `bd-50bg`]
+
+Three functional increments are published on main:
+
+- `eac2c9c` batches canonical domain-event projection inserts within the existing
+  1,024-binding budget (102 ten-field events per statement). Checked identities,
+  exact payload bytes, empty-boundary metadata, returned-row checks and transaction
+  rollback remain intact. No schema, database pin or foreign-key policy changed.
+- `4433f24` restores compatible volatile browser checkpoints with any supported
+  combination of MLP, DWRAON and Assembly families. Registry order, complete
+  adapter/genome/evaluator identity and empty or extinct families are retained.
+  Browser resource limits apply before executable restoration. Imported mixed
+  continuations require an explicit fresh-world choice before reset.
+- `9486777` creates opt-in mixed founder worlds in repeating MLP, DWRAON, Assembly
+  order, including zero-founder registries. A version 2 founder recipe preserves
+  this choice through sharing, forks and reset; existing version 1 bytes and
+  default seeding are preserved. Browser controls distinguish a fresh mixed
+  recipe from a saved continuation and refuse stale or incomplete packages before
+  replacing the active owner. Links retain their recorded seed; demo Reset
+  creates a new seed.
+
+Authored regressions cover real reproduction, checkpoint science and evaluator
+parity, recipe compatibility, browser replacement/refusal, canonical multi-chunk
+event readback, late conversion/SQL failures and original-archive retry.
+Independent source review corrected test diagnostics before publication.
+
+DSR on unchanged source `9486777` passed all **10 JavaScript recipe unit tests**.
+The formatter returned zero but printed eight diffs in the unchanged terminal
+`frankentui_shell.rs`; no web/storage diffs were emitted and no clean workspace
+format claim is made. Chromium was refused socket creation before any DOM
+assertion ran. The native `browser_mixed` probe hit its configured 300-second
+deadline after logging dependency acquisition; no Rust test pass was observed.
+Workspace checking, Clippy, storage Rust regressions, WASM execution and throughput
+qualification remain unpassed.
+
+[The validation record](docs/validation/2026-11-16-mixed-families/README.md)
+retains raw receipts, configurations and logs for the current checks and the two
+earlier failed attempts. Source inventories remained unchanged during the current
+checks. Progress comments were exported through `br`; original bead criteria,
+ownership and in-progress status remain unchanged. No browser durable-watermark,
+cross-target equivalence, measured speedup or broad bead closure is claimed.
+
+
+**Shared first-run Lab guide in terminal and GPUI (2026-11-15):**
+[Source implemented and independently reviewed — executable qualification remains open under `bd-2z0.10.4`]
+
+Added a shared, versioned eight-step walkthrough and opt-in terminal and GPUI
+surfaces: identify the live world, inspect a living stable UID, pause, advance
+one tick, change only food growth, save a fresh cut, run a two-arm study, and
+read its descriptive outcome. Both terminal event paths and the shared World/Lab
+guide observe actual command receipts and publications. Admission alone cannot
+advance the guide; volatile journal commitments are labelled explicitly. Old
+saves, foreign owners, stale callbacks, unchanged single-arm continuations, and
+mismatched reports cannot satisfy steps. Hiding the guide preserves progress
+and opening it does not mutate science.
+
+GPUI action buttons use the existing inspector, live controls, saved-checkpoint
+composer and verified report loader. The growth-edit adapter retains the normal
+application command identity and attaches all three owner revision guards.
+That closes the race between a client precheck and application of a whole
+configuration. A real-owner regression separately exercises stale control,
+scientific and configuration rejection while preserving the competing state.
+
+Model and real-owner adapter regressions are authored but unexecuted. The
+required DSR health preflight refused insufficient storage capacity before
+checks; the workspace subsequently became unavailable. No compiler, formatter,
+Clippy, terminal, or GUI pass is claimed for these changes. Automatic first-run
+presentation, the default meadow/provenance experience, and the complete actual
+native journey remain open acceptance work; the broad bead is not closed.
+
+**Terminal saved-study results and portable intervention inputs (2026-11-14):**
+[Source committed and independently reviewed — Codex; terminal executable qualification remains open]
+
+The terminal journey from a saved scientific cut to an interpretable study
+result now uses the existing shared Lab provider. Bounded checkpoint and
+retained-study catalogs, explicit study selection, and verified report readback
+preserve the existing pending/final presentation rail for
+save, historical review, branch creation and cancellation. Original real-PTY,
+runtime and broader scientific qualification under `bd-2z0.6.8` remains open.
+
+Repaired the independently reproduced `StudyIntervention` JSON field-order
+failure: with arbitrary-precision JSON enabled, a valid `params`-before-`type`
+input reaches Serde's intermediate buffering and rejects finite f32 parameters.
+Preserved the current wire representation, duplicate/unknown-field refusal and
+scientific meanings. Ordinary JSON and direct JSON Value round trips passed the
+causal probe; only the reordered arbitrary-precision input failed.
+
+- [x] Connect paged saved checkpoints and retained studies to the live Replay route.
+- [x] Expose verified control/treatment report observations and their single-seed scope.
+- [x] Preserve saved-cut review, mutation ordering, bounded workers and source invalidation.
+- [x] Repair order-independent scientific intervention decoding with regression coverage.
+- [x] Run source-bound DSR checks and record their exact scope before publication.
+- [ ] Execute the actual terminal/provider/PTY regressions when the locked app graph resolves.
+
+The codec is published as `08a94fd`; Replay is published as `049553e`.
+Genuine DSR executed the actual production codec and core wire types with all
+11 extracted registry versions/checksums matching `Cargo.lock`. The original
+codec passes all three regressions normally and fails all three with arbitrary
+precision; the replacement passes all three in both modes. Strict Clippy and
+pinned formatting also pass (DSR receipt `20261114T230225-EHnII3Cv`, 4/4).
+This closes scoped codec bead `bd-2z0.12.2.2`; full-plan/CLI/API/scientific runner
+qualification remains with the parent. The initial small probe and later full
+regression matrix differ in coverage, not in the underlying field-order defect.
+
+Replay's three changed Rust files pass pinned DSR formatting (receipt
+`20261114T230325-DV4J9xya`, 3/3). Authored tests cover actual saved-canvas and
+branch-service journeys, paging, hidden-source refusal, retained worker bounds,
+changed source/route invalidation and corrupted report refusal. Those tests
+have not executed: the pinned Zed revision below still blocks the application
+dependency graph. Source review and formatting do not establish runtime passage.
+
+**Narrative queries for retained simulation runs (2026-11-14):**
+[Source implemented and independently reviewed — Codex; executable acceptance open under `bd-urtp`]
+
+Connected the storage reader's existing explicit run selection to narrative
+search and chronological windows through the shared query DTO, direct/remote
+CLI, REST and MCP. Previously, the unqualified reader refused multi-run
+databases with no selection path on these surfaces. The new optional `run_id`
+preserves that refusal when no run is chosen, validates canonical run IDs and
+refuses live-memory fallback for an explicitly selected stored run, including
+zero-limit requests. MCP advertises zero limits/windows consistently with the
+existing shared handler semantics.
+
+The new real same-file two-run regression overlaps keyword, event kind and
+tick while retaining distinguishable text/severity, checks both query modes
+across all five surfaces, and refuses omitted/unknown/malformed selections.
+Direct reads receive a conflicting live-event decoy. Missing-storage and
+canonical-ID unit regressions are also authored. Pinned DSR formatting passes
+for all four Rust files, with final server-schema check bound to SHA256
+`8a2dc3692e98e5533586dd1589d0ccb0b72ada30aa55dc8d09592aaf7d8b740a`.
+The actual storage/transport tests remain unexecuted due to the same pinned
+application dependency blocker; `bd-urtp` remains in progress.
+
+**Terminal experiment workflow convergence (2026-11-15):**
+[Source committed and independently reviewed — Codex; executable qualification under `bd-2z0.6.8`]
+
+The terminal Experiments route now consumes the shared Lab model and application
+provider used by GPUI and Bevy. Its bounded catalog, per-arm progress and eight
+verified endpoint choices replace the former first-batch-only projection.
+The shared composer and cooperative stop/resume controls now use the terminal's
+successful-presentation boundary. Request gates retain occupied-worker bounds,
+owner identity checks and exact creation retry data. Final receipts remain
+retained until actually presented, including early failures evicted from the
+ordinary bounded history. The concurrent endpoint/provenance work below is
+preserved, including detail-view bracket shortcuts and legacy provider regressions.
+
+- [x] Read the recovery plan, authoritative Beads and actual frontend/provider paths.
+- [x] Make the existing application Lab provider available in terminal-only builds.
+- [x] Connect bounded catalog navigation and selected experiment progress across all arms.
+- [x] Expose the shared verified comparison workflow and all eight metric choices.
+- [x] Connect execution controls through the actual successful-presentation boundary.
+- [x] Connect shared experiment creation, numeric editing, scientific disclosure and exact retries.
+- [x] Author real-provider catalog/detail/comparison and bounded navigation regressions.
+- [x] Author focused mutation lifecycle tests for actual presentation callbacks,
+  numeric route interception, provider disconnection and frozen retries, distinct
+  stop acknowledgements, foreign owners/navigation/shutdown and receipt eviction.
+- [ ] Execute real-provider integration and refusal/lifecycle regression cases.
+- [x] Pass pinned DSR formatting and independent source review; publish coherent code increments.
+- [x] Reconcile original Beads notes and current progress through `br` after workspace recovery.
+
+The source-bound app check with the exact locked dependencies timed out after
+900 seconds before Rust compilation, while fetching Zed. Its offline follow-up
+identified the missing pinned GPUI/Zed revision
+`5f8a7413a31769e0882357f90dc424b3962ac72d`, which Cargo still resolves for the
+terminal-only application check. No application compile or test pass is claimed.
+
+The shared browser/comparison change is committed as `8bf8f79`; composer and
+stop/resume are committed as `7e73f77`. The workspace disconnected after final
+formatting and independent review, before the final review-wrapper invocation
+and Beads export could finish. The exact cached final sources were recovered
+and verified against their already-reviewed SHA256 hashes before GitHub
+publication; every blob and the complete resulting Git tree also matched:
+
+- `terminal/mod.rs`: `93fa3ea06bb0a7cc18f317ee5d934301567664cf8556eb347c60715defb9d35a`
+- `terminal/science_screens.rs`: `1570285107c0b10188a8137718458c3acc5847b8182cf45d30899676becd68b6`
+
+All three code increments are on `main` and its `master` mirror. The authoritative
+Beads export has not been hand-edited or marked complete; its broad original
+acceptance remains open. This plan records the final qualification boundary
+until the CLI-produced tracker updates can be exported.
+
+**Portable map generator decoding (2026-11-15):**
+[Source committed and scoped codec checks passed — Codex; full qualification under `bd-pih9`]
+
+Keep the existing `generator_type` JSON representation while replacing the
+internally tagged enum's intermediate numeric buffering with direct typed
+deserialization. The full workspace enables arbitrary-precision JSON numbers;
+that feature must not make an exported finite-f32 map draft unreadable.
+
+- [x] Trace the actual save/open/copy/paste path and the tagged generator codec.
+- [x] Reproduce the original failure with arbitrary precision enabled: an exact-locked
+  DSR codec probe accepts ordinary JSON numbers and fails with arbitrary precision.
+- [x] Implement direct typed decoding for both generator variants; author wire,
+  field-order, JSON Value and exact f32-bit regression coverage.
+- [x] Reject malformed, duplicate, unknown and mixed generator payloads; author
+  sixteen negative envelope cases without changing generator science or serialization.
+- [x] Run the actual scalar-bit and malformed-envelope tests plus both-variant
+  wire/tag-last/JSON Value checks in a source-bound DSR extraction: three passed
+  in ordinary JSON mode and three with arbitrary precision enabled. This uses
+  the exact locked serialization libraries, not the complete workspace graph.
+- [x] Pass strict Clippy on that frozen extraction with all targets and features,
+  warnings denied and all/pedantic/nursery lints enabled; pass pinned formatting.
+- [ ] Exercise real generation after round-trip and retain source-bound validation.
+
+The production repair is committed as `e4ba8de`. Full-core generated-map and
+renderer save/open/copy/paste qualification remain pending; scoped extraction
+does not count as those gates. This does not alter generator science, file
+schemas or the three separate viewport failures recorded in the original bead.
+
+**Portable archipelago continuation and terminal scientific comparisons (2026-11-15):**
+[Source implemented and independently reviewed — Codex; `bd-16g.5`, `bd-2z0.6`;
+executable qualification open]
+
+Capture and restore the complete multi-island owner state at a settled barrier,
+including migration policy, command identities and retained volatile journals.
+Expose exclusive checkpoint export and further-barrier continuation through the
+CLI without claiming continuation of the original science database. Connect the
+terminal experiment view to the shared eight-endpoint scientific metric catalog.
+Original determinism, lifecycle, source-binding and qualification requirements
+remain unchanged.
+
+The runtime checkpoint now carries the complete paired volatile owner cuts in a
+canonical, checksummed 256 MiB envelope, with at most 64 islands and 4 MiB of
+metadata. Restore validates configuration/session identity, topology, cadence,
+epoch and exclusive command cursors before reconstructing executable owners.
+The recorded CLI can export a complete final cut with `--archipelago-checkpoint`.
+`continue-archipelago` restores it, advances a bounded number of further barriers
+with the original executable brain registry, and saves a new exclusive output.
+It leaves the source checkpoint and database unchanged and explicitly reports
+that the original science database is not continued. Input size, regular-file
+identity, checksum, existing outputs, work horizon and thread count are bounded.
+
+Four runtime regressions cover continued science/migrations and invalid cuts.
+File tests cover corruption, size limits, aliases and preservation of existing
+evidence; a CLI integration regression compares actual MLP migration continuation
+against an uninterrupted run, then continues the resulting checkpoint again.
+
+The terminal Experiments route now selects every shared `LabMetric` with `[`/`]`
+and dispatches the actual chosen service endpoint with `c` or Shift+C. Results
+bind the experiment, plan digest, source generation, variants and metric. A
+selection change invalidates the old request even after cycling away and back;
+its occupied worker remains bounded until completion. Refresh keeps the selected
+metric and preserves evidence only for the same source observation. Labels and
+units come from the shared catalog. Authored terminal regressions cover all eight
+wire keys, real population-versus-food treatment differences, unavailable empty
+cohort means, source mismatches, stale responses and the live Shift+C event path.
+
+Pinned Rustfmt source formatting and whitespace review succeeded. DSR refused
+this host during storage admission. A fresh health check still finds root, home,
+Cargo home and temporary storage below the unchanged 20 GiB-per-role minimum;
+only the scratch build root qualifies. Compilation, test execution, Clippy and
+broader qualification remain unexecuted.
+
+**Checkpoint-create retries across service reopen (2026-11-14):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Keyed checkpoint creation now writes a bounded immutable admission before the
+payload, retaining the original request and captured metadata. An exact retry
+can recover a completed save from the existing artifact root even at full
+capacity. Recovery requires the original ready catalog, exact descriptor and
+verified checkpoint bytes; changed requests, corrupt or aliased records,
+conflicting roots and unfinished publication prefixes refuse before another
+capture. Historical receipts neither adopt the old owner session nor write to
+the new owner's database. The recorded session is capture context; scientific
+checkpoint bytes themselves do not encode owner identity.
+
+Retained admission count and bytes are exposed separately, including incomplete
+or unsynced files. Capacity uses the bounded union of actual payload paths and
+reserved checkpoint identities, so an admission plus its matching payload
+consumes one slot, while an unfinished admission and an unrelated anonymous
+save consume two. Unreadable or truncated admissions conservatively reserve
+their evidence path. A missing original payload stays explicitly unavailable;
+the implementation does not reconstruct missing science or overwrite uncertain
+evidence. Existing completed catalogs and anonymous saves retain their meaning.
+
+Six new regression cases cover a different live owner, concurrent cold retries,
+full retention capacity, a new SQL writer that refuses checkpoints, interrupted
+publication prefixes, mixed anonymous/incomplete reservations, corrupt/rehashed
+identity and payload, duplicate roots, and filesystem aliases. Independent source
+review caught and corrected separate-counter undercharging before publication;
+the mixed warm/cold case covers both intact and truncated admissions. The
+execution environment became unavailable during dependency preparation: these
+tests, Rust formatting, compilation, Clippy, UBS and process/platform qualification
+remain unexecuted. This contributes to `bd-2z0.16` without changing its original
+acceptance.
+
+**Lossless NeuroFlow genome inspection (2026-11-14):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+NeuroFlow now exposes canonical inherited loci from its existing validated f64
+genome. Bias-first rows retain every scalar bit, including signed zero,
+subnormals and one-ULP differences, and wide connection addresses represent
+configured slots above 255 without aliasing. The architecture-bound heredity
+capability counts one primary mutation trial per actual bias/weight; immutable
+structural source loci do not inflate that denominator. This enrolls NeuroFlow
+in the existing typed heredity and genome-browser paths.
+
+Core differences and traces, runtime pages, browser validation, and GPUI/Bevy
+inspection now carry f64 values without narrowing. Difference summaries refuse
+non-finite or overflowing aggregates with typed unavailability while valid
+genome values remain inspectable. Existing f32 loci and deltas keep their old
+variant encodings; the f64 and wide-address variants are appended. The public
+genome-inspection wire schema advances to `scriptbots.genome-inspection.v2`
+with matching bundled browser validation and API documentation. Existing source
+and page bounds still apply, including explicit refusal of oversized sources.
+
+The opaque NeuroFlow genome/state codecs, adapter identity, evaluator,
+mutation/crossover algorithms and RNG routines are unchanged. Its separate
+heredity-capability attestation changes intentionally to include the new locus
+schema. Regression source covers exact bias/source order, mutation-trial counts,
+300-wide connections, malformed values, signed-zero/one-ULP serialization,
+finite aggregate overflow, SVG/PNG trace precision, wire bounds and browser/
+native rendering. The existing real-world continuation case also checks that
+repeated inspection preserves the full checkpoint and world digest before each
+transition. Independent source review is complete; compilation, Rust formatting,
+Clippy and all new test execution remain unqualified because the workspace
+became unavailable. This advances the genome-browser/heredity work in
+`bd-2z0.3` without claiming its remaining acceptance or platform qualification.
+
+**Opt-in browser recovery checkpoints (2026-11-14):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+The local browser owner can now save automatic recovery checkpoints after
+explicit opt-in. The first eligible owner timer callback attempts a save;
+subsequent changed scientific, control or configuration revisions are eligible
+at most once every 30 seconds. This uses a separate, versioned IndexedDB slot
+and preserves the user's manual saved continuation. Capture observes an exact
+owner boundary, does not advance science, never runs from RAF, and admits only
+one pending capture/write. Hidden pages and manual save/load suspend new work.
+
+The panel acknowledges only transaction completion, exposes the exact saved
+tick and time, and latches storage failures until an explicit retry. Reset,
+restore, owner replacement and remote mode disable recovery and cancel pending
+work when still possible; late completion cannot acknowledge a replaced owner.
+Pagehide also disables recovery while retaining the owner attachment for a
+back/forward-cache return. Reload offers explicit validation and paused restore,
+without offline catch-up or silent replacement of the current world.
+
+Ten new unit cases cover separate slots, exact integer and byte bounds, commit
+acknowledgement, cancellation while opening or committing, bounded pending work,
+same-tick revisions, owner replacement, source changes and quota retry. The
+extended Playwright lifecycle journey uses real IndexedDB with the existing
+explicit WASM owner double; it covers UI admission, saved-source identity,
+manual-slot preservation, quota refusal/retry, reset opt-out and paused restore.
+It does not qualify the production WASM checkpoint codec. These new cases and
+the browser/compiler/format gates remain unexecuted after the workspace became
+unavailable. This contributes functional recovery to `bd-ywtv`; browser eviction
+and per-slot cross-tab last-completed-write behavior remain visible limitations.
+It does not establish SQLite-image or journal durability, and the original
+durability and cross-platform acceptance requirements remain open.
+
+**Publication-driven remote streams (2026-11-14):**
+[Source implemented and independently reviewed — Codex; runtime compiler check passed]
+
+Negotiated WebSocket delivery now waits for immutable owner publications instead
+of polling the latest snapshot on a recurring interval. A shared, bounded runtime
+notification API admits at most 128 asynchronous observers per owner, creates no
+worker threads or snapshot queues, releases slots on idle disconnect, and keeps
+publication independent of observer registration locks. Cancelled waits preserve
+their last observed revision. Existing scalar subscribers are unchanged.
+
+The transport coalesces both frames and notifications while a dispatch is pending.
+A one-shot cadence delay applies only when useful work has credit; new
+publications cannot postpone an eligible dispatch. Successful acknowledgements
+also request work, so narrative pages can drain from one paused publication.
+A separate earliest-credit deadline remains active when every channel is blocked
+or no new publication arrives. Replacement subscriptions reuse their observer;
+capacity refusal preserves the prior stream. Existing projection/write bounds,
+canonical controls, single-frame channel credits, revision/gap evidence, and the
+unnegotiated legacy wire format remain intact.
+
+Regression source covers register/publish/cancel races, reentrant executor wakers,
+idle slot reuse, malformed-publication silence, deadline overflow and regression,
+and no-idle/no-credit scheduling. Real-socket cases exercise capacity refusal and
+recovery, timeout without further publication, and an actual core-generated
+65-record narrative backlog consumed as 64 plus 1 records from the same scientific
+cut, with reconnect cursors and unchanged world digest. Independent source review
+is complete. The final exact candidate passed pinned DSR formatting checks for
+all four Rust files and offline, locked runtime all-target compiler checking,
+including its regression source. No new executable-test pass is claimed. Strict
+Clippy found two notifier issues, now corrected, and five existing Lab-model
+findings; the strict gate remains open. Native application/socket execution is
+unqualified after the unchanged Asupersync dependency was externally killed in
+the preceding application build. UBS is unavailable. This is a functional
+contribution to `bd-ac4l`; sub-16 ms latency, 60 TPS multi-client soak, full
+platform/browser and original acceptance remain open and unclaimed.
+
+**Native matched-seed ecological treatments (2026-11-14):**
+[Source implemented and independently reviewed — Codex; runtime compiler check passed]
+
+Both native experiment composers now offer a controlled ecological design beside
+the existing brain-family comparison. The ecological design holds the family
+and independent founding-seed cohort constant, leaves the baseline unchanged,
+and assigns one food-growth, basal-metabolism or movement-cost coefficient to
+the challenger at an exact completed-tick boundary. Choices use the runner's
+actual fresh-world defaults and core bounds. The preview discloses the baseline,
+f32-rounded assignment, coefficient units, percentage and first affected
+transition. A 100% unchanged-value control is valid and explicitly identified.
+
+The complete treatment remains frozen through uncertain admission and exact
+retry. Edits cannot introduce a second family factor, silently clamp a requested
+boundary, or substitute the live world's configuration. Admission checks the
+canonical runner plan digest as well as every returned seed, family and horizon,
+so matching run rows cannot hide a different coefficient or application time.
+Both frontends retain the known question with current-source admitted results
+and use the existing eight verified endpoint comparisons. Unknown historical
+designs do not receive an inferred treatment description.
+
+Regression source covers numeric/boundary/capability bounds, single-factor edits,
+immutable retries and source changes, both production UI interactions, and the
+Bevy row limit under the largest composer state. Two application cases cover all
+three actual coefficient mappings and a real managed food-growth experiment:
+lost receipt, exact retry, altered-plan refusal, independently verified run
+bundles, paired food divergence, a zero-effect unchanged-value control, unchanged
+live-owner science and joined workers. Independent source review and pinned DSR
+format emission/check passed for all four changed Rust files. The exact candidate
+passed `scriptbots-runtime --all-targets` compiler checking. The focused test
+build was externally killed during runtime code generation before executing any
+tests. The native GUI application check was separately killed in the unchanged
+Asupersync dependency before reaching the provider or renderer; neither attempt
+reported a Rust source diagnostic. UBS is unavailable in this environment.
+The new test executions, native application/frontend compilation, Clippy, full
+workspace and platform qualification remain open. This continues `bd-2z0.7.6.1`
+without changing its original acceptance requirements.
+
+The preceding committed source `3e57213` separately passed a pinned DSR runtime
+all-target compiler check and all 28 focused Lab tests this session. Those passes
+qualify the earlier shared Lab implementation, not the new treatment candidate
+or the native renderer/application tests.
+
+**Native saved-checkpoint studies (2026-11-14):**
+[Source implemented and reviewed — Codex; executable qualification open]
+
+Continue `bd-2z0.7.6.1` with complete saved-source study flows in the GPUI and
+Bevy Checkpoints panes. Select a retained scientific cut, configure an unchanged
+future or the existing whole-world drought, food-bloom or closed-world treatment,
+and review its exact source, horizon, target tick and total transitions before
+explicit admission. The original live owner continues independently.
+
+The shared model freezes the complete draft, source session and request identity
+after an uncertain admission. Exact retry uses the existing managed service and
+retained source even if the original checkpoint is no longer available. Idle
+abandonment is explicit. Navigation and source changes retain the single occupied
+worker until it drains, and late results cannot replace the current context.
+Retained study discovery and reopening are read-only; observed status and
+cancellation use the existing backend lifecycle.
+
+Completed outcome reads bind the saved source and completed receipt to the
+verified report artifact, checksums and schema. Both native panes show actual
+terminal population, food, energy and health, population extinction/recovery,
+first-divergence evidence, full-width seed and source/report provenance. Different
+terminal digests require a divergence trace; earlier divergence followed by
+terminal reconvergence remains valid. Empty-population means and empty-source
+recovery ratios are unavailable. These are descriptive outcomes from one saved
+seed, without independent-seed inference or substituted trajectory averages.
+
+Focused regression source covers the shared lifecycle, bounds and malformed
+receipts/reports; production GPUI and Bevy interactions; and a real managed study
+with a lost response, original-cut unavailability, exact retry, changed-payload
+refusal, verified food divergence, catalog reopening and corrupt-report rejection.
+The real-service case checks unchanged live scientific state and joins workers
+before temporary artifact cleanup. Independent source review is complete. Pinned
+DSR Rustfmt emission and the subsequent source-bound `--check` both passed for
+the four changed Rust modules. The bounded Cargo attempt stopped during dependency
+fetch before compilation, and low available memory currently prevents a safe
+follow-up. Compiler, executable tests, Clippy, UBS, native/platform qualification
+and the broader bead acceptance remain open.
+
+**Native Lab matched-seed experiment creation (2026-11-14):**
+[Source implemented and reviewed — Codex; executable qualification open]
+
+Continue `bd-2z0.7.6.1` by closing the native catalog-to-run gap in both
+GPUI and Bevy. The shared composer obtains the actually compiled brain-family
+catalog and runner limits from the application, exposes two distinct family arms,
+and previews the exact consecutive seed cohort, per-run horizon, total run count,
+fresh-world source and sequential execution before an explicit launch. This
+increment runs fresh experiment defaults. Saved-checkpoint studies are covered
+above; live-configuration inheritance and an arbitrary treatment editor remain
+separate work.
+
+Native admission uses the existing experiment service, with explicit stable
+request fields and one worker slot. An unconfirmed outcome freezes the complete
+draft and request identity for exact idempotent retry. Changing panels, owners
+or result context cannot turn an old response into a new launch or silently admit
+another run. Explicitly abandoning an unconfirmed receipt warns that its batch
+may already exist. A verified creation selects the existing progress, cancellation,
+resume and scientific comparison view.
+
+Checked validation preserves full-width seeds and exact horizons, rejects
+duplicate family arms and seed overflow, and respects the complete two-arm work
+allowance. Before dropping per-run details into the native projection, the
+application checks every returned arm, seed, family, target horizon and run ID
+against the frozen request. No runner, simulation, statistical or dependency
+semantics change.
+
+Regression source covers the shared draft and worker lifecycle, native interaction
+paths, and real application admission with a deliberately lost first response.
+The real-service case uses consecutive seeds ending at `u64::MAX`, observes one
+catalog identity after retry, rejects changed-payload reuse and altered returned
+matrices, and preserves the live owner's scientific state. It explicitly joins
+experiment workers before temporary artifact cleanup, including panic cleanup.
+
+Source review is complete; compilation, tests, Rustfmt, Clippy, UBS and completed
+DSR qualification remain unexecuted because the execution host is unavailable.
+Original native/platform requirements and the broader bead remain open.
+
+**Native Lab scientific endpoint comparisons (2026-11-14):**
+[Source implemented and reviewed — Codex; executable qualification open]
+
+Continue `bd-2z0.7.6.1` by exposing all eight existing final-state endpoints
+through the shared native Lab model, GPUI and Bevy controls. One typed catalog
+now supplies native choices and the runner/API vocabulary. Requests and accepted
+responses bind the exact metric as well as the experiment, arms, plan and status
+generation. Changing metrics clears old evidence and invalidates a pending result
+without freeing its occupied worker. Values and intervals name their actual
+units, including age counters rather than elapsed simulation ticks.
+
+Regression source covers wrong-metric responses, an in-flight A/B/A selection,
+real provider comparisons that distinguish equal populations from different food,
+unavailable means/maxima after extinction, and both native input paths. The
+touched GPUI checkpoint fixture now uses its actually observed saved-world digest
+instead of a placeholder that the existing receipt validator refuses. Scientific
+execution, statistical thresholds, inference rules and dependency pins are unchanged.
+
+A DSR diagnostic baseline attempted the pinned runtime check with one Cargo job,
+one Rust frontend thread and debug info disabled. The pinned FrankenSQLite fetch
+failed before compilation; the execution host then became unavailable. No
+compiler, tests, Rustfmt, Clippy, UBS or completed DSR pass is claimed. Original
+native/platform and broad bead acceptance remain open. Native experiment
+authoring is the next implementation increment.
+
+**Whole-cohort experiment work admission (2026-11-13):**
+[Source implemented — Codex; executable qualification open]
+
+Continue the resource contract in `bd-2z0.5.11` and `bd-2z0.12.2`.
+The existing 10,000,000-tick single-run ceiling now also bounds the sum of
+scientific transitions across the complete variant-by-seed cohort. Previously,
+4,096 individually valid runs could admit 40,960,000,000 transitions. Shared
+checked admission computes the complete product before API catalog recovery and
+before initialization or execution acquires status-file leases or creates owners.
+Resume refuses synchronously before capacity reservation or clearing cancellation.
+Read-only status, catalog and completed-evidence validation retain their original
+science/provenance rules without applying this new execution limit. Concurrency
+and completed-run filtering do not reset the full plan's execution allowance.
+Oversized plans refuse with their requested work and limit; horizons, seeds and
+existing artifact bytes are preserved. This is a logical-work cardinality policy,
+not a wall-clock, total-memory or retained-byte guarantee.
+
+Four new regressions cover seed/variant multiplication, exact-boundary admission,
+concurrency independence, retained single-run/zero-tick-library behavior, refusal
+before execution I/O and unchanged API catalog/idempotency/capacity. Historical
+pending definitions remain discoverable while resume refuses; no completed
+historical science is invented by those fixtures. A small real run follows
+refused admission. Negative controls stop unexpectedly admitted workers before
+asserting failure. Tests are authored and source reviewed;
+native execution, compiler, formatter, Clippy, UBS and DSR remain unavailable.
+Original acceptance stays open.
+
+**Bundle input liveness (2026-11-13):**
+[Source implemented — Codex; executable qualification open]
+
+Continue the bounded bundle-verification work in `bd-2z0.5.11.1`.
+Both public verifiers now open Unix inputs nonblocking before checking the
+opened handle is a regular file. A manifest or artifact FIFO can therefore
+reach its typed refusal without waiting for a writer; the ordinary verifier's
+database projection rereads use the same opener. Symlinks to regular files
+retain their existing behavior. Byte, hash, projection and database restrictions
+remain unchanged. This is not a general filesystem or database-call deadline.
+
+New regressions cover manifest/artifact FIFOs directly and through symlinks in
+reaped subprocesses, require actual typed-refusal observations, and retain
+positive symlinked-manifest/artifact verification. Existing multichunk integrity
+tests remain. Source review is complete; native tests, formatter, compiler,
+Clippy, UBS and DSR execution remain unavailable and unclaimed.
+
+**Exact experiment horizons (2026-11-13):**
+[Source implemented — Codex; executable qualification open]
+
+Continue `bd-2z0.5.11` and `bd-2z0.12.2` by refusing REST/MCP
+`ticks_per_run` outside the runner's shared positive range before catalog
+recovery or admission side effects. The API previously silently clamped these
+requests, which could execute a different scientific horizon. Omission retains
+the documented 1,000-tick default; the runner's intentional zero-tick library
+support remains available.
+
+Two new regressions cover zero, the first value above the bound, `u64::MAX`,
+unchanged undiscovered catalog evidence and capacity, exact short-run completion,
+the omitted default and upper-bound admission with cooperative cancellation.
+They are authored and independently source reviewed, not executed. The execution
+host became unavailable during pinned Rust/DSR setup; no compiler, Rustfmt,
+Clippy, UBS or DSR pass is claimed. Original bead acceptance remains open.
+
+**NeuroFlow admitted to matched-seed experiments (2026-11-13):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Connect the existing optional NeuroFlow family to the matched-seed runner,
+central compiled-family catalog, Lab admission and remote browser controls.
+With `neuro` enabled, `neuro`, `neuroflow` and `ml.neuroflow` resolve
+to canonical `ml.neuroflow`; without it, every alias refuses before admission
+side effects. Executable family construction is preflighted before owners,
+workers or artifacts exist. Dependencies and feature defaults are unchanged.
+
+Checkpoint resume and portable-bundle verification reconstruct the adapter from
+the immutable launch manifest's normalized configuration, not potentially changed
+live settings. Isolated experiments use their own default NeuroFlow architecture
+and activation; this increment does not introduce architecture-factor controls
+or claim inheritance from the live host. The browser offers the remote family
+and preserves canonical request/status binding.
+
+New and extended regressions exercise actual NeuroFlow owners through original
+constructor preservation after a raw configuration change, exact checkpoint
+continuation, concurrency one/two, scheduled-treatment resume, API completion and
+portable export/restore. Feature-disabled API tests check no retained catalog,
+idempotency, capacity or artifact mutation. Browser tests cover aliases and form
+serialization while retaining unknown-family refusal. C1's checkpoint promotion
+guard and regression are preserved exactly.
+
+Native and browser changes are source reviewed; no tests or formatting checks
+executed because the execution environment remains unavailable. No DSR, compiler,
+Clippy or UBS pass is claimed. Brain-family performance/determinism acceptance
+(`bd-2z0.3.12.5`) and original tracker status remain open.
+
+**Exact inference for small matched-seed cohorts (2026-11-13):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+The matched-seed analysis paths associated with `bd-2z0.11.6` and
+`bd-7453` now enumerate every paired sign assignment for cohorts of at most
+twelve independent seeds (at most 4,096 evaluations). This removes avoidable
+sampling variability where the complete null is inexpensive: five consistently
+positive pairs have an exact two-sided p-value of 2/32, not a sampled decision
+that can cross 0.05. Larger cohorts retain their existing seeded Monte Carlo
+draw order and add-one correction. Matching seeds alone does not establish the
+within-pair exchangeability assumption required by either procedure.
+
+Both statistics layers expose the actual procedure and assignment count. Lab
+notebooks bind those fields to reanalyzed evidence and distinguish them from
+the requested sampling budget. Offline comparison machine schema V3 and Lab
+reproduction input schema 3 carry the revised contract; descriptive singleton
+reports continue to omit inference. Normalized compensated enumeration includes
+floating-point ties conservatively, and non-finite derived paired values refuse.
+
+Ten new regressions cover exact manual oracles, zero multiplicity, directional
+tails, scaling/cancellation, seed and budget independence, the 12/13-pair boundary,
+invalid derived values, forged notebook metadata and the finished-database report.
+They are authored and source reviewed, not executed. No usable execution
+environment was available; no DSR, compiler, Rustfmt, Clippy or UBS pass is claimed.
+Original bead acceptance and tracker status remain unchanged.
+
+**Time-series inference uses its declared temporal blocks (2026-11-13):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+The statistical path associated with `bd-2z0.11.6` previously applied
+`block_len` only to an after-window context interval that both reports discarded.
+Published shift intervals and p-values resampled individual ticks. Both now use
+the declared temporal blocks: a circular moving-block percentile interval and
+a whole-block permutation test that preserves group sizes and partial tails.
+Controls require two complete blocks per window and are validated even when
+there are no candidate events. Overflowing event windows are safely skipped.
+
+Narrative report schema V3 and metric change-point schema V2 record the actual
+methods, draw counts, block length, confidence, threshold and seed. Both reports
+explicitly describe data-selected events as exploratory; their nominal BH flags
+do not establish unconditional false-discovery control. Metric reports now honor
+all declared resampling controls. New regressions cover correlated plateaus,
+temporal ordering, short tails, exact persisted tick inputs, invalid empty-input
+requests and truthful machine metadata. Original assertions remain in place.
+These regressions and the native code have not executed: no usable execution
+environment was available. No DSR, compiler, Rustfmt, Clippy or UBS pass is claimed;
+original acceptance and tracker status remain unchanged.
+
+**Experiment checkpoint promotion safety (2026-11-12):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Continue the crash-safe resume contract in `bd-2z0.5.11`. An interrupted
+temporary successor previously passed canonical framing, plan, capacity and
+parent/tick checks before replacing the committed checkpoint, while executable
+brain-registry and reconstructed scientific-state checks happened only afterward.
+Recovery now restores the candidate owner through the production adapter boundary
+before synchronizing or promoting its file. A refusal preserves the exact parent
+and temporary evidence. Ordinary reads without a temporary successor retain their
+existing restoration path.
+
+The added regression captures genuine MLP and DWRAON owners, wraps the foreign
+owner in matching metadata with authentic checksums, and checks repeated refusal,
+byte-identical retained files and continued parent restorability. Its positive
+control promotes a genuine MLP successor and compares the restored scientific
+digest. The test is authored but has not executed: this session has GitHub access
+and no usable execution environment. No DSR, compiler, Rustfmt, Clippy or UBS pass
+is claimed. Original acceptance and tracker status remain unchanged.
+
+**Checkpoint usability and experiment resource admission (2026-11-13):**
+[Source implemented and independently reviewed — Codex; browser DSR passed,
+native and full-workspace qualification open]
+
+Address `bd-e32s`, `bd-5ygz` and the per-owner resource slice of
+`bd-2z0.5.11`. Native Lab and browser checkpoint receipts, saved-study reports
+and completed experiment observations now distinguish the actual 16-character
+FNV-1a64 world digest from 64-character artifact and plan checksums. The existing
+identity, checksum and observation-order guards remain. MCP retained-state
+conflicts now return actionable tool execution failures; malformed arguments
+retain their protocol errors.
+
+A fresh browser owner can capture its genuine empty journal prefix before any
+tick or command. The volatile adapter is bound to the actual session, restores
+without an invented accepted batch, and rejects foreign sessions or completed
+owner work paired with erased history. New regressions cover clock initialization,
+exact continuation and MLP/DWRAON/Assembly worlds with zero and three founders.
+Browser fork provenance uses core's typed canonical serializer so stored f32
+values retain the same exact observations with or without arbitrary-precision
+JSON feature unification.
+
+Managed experiment runs reuse the branch-study 10,000-agent ceiling and bound
+history and narrative retention to 10,000 entries. Admission checks the initial
+configuration and every resolved intervention prefix before execution or output
+creation. Actual population is checked after a successful scientific step and
+before sealing or encoding the successor checkpoint. Crossing the ceiling fails
+the run while retaining the preceding cut. Decoded checkpoints are checked before
+executable restore and before temporary-file recovery can replace a valid parent.
+New regressions use real HostCore growth, exact resumed-versus-uninterrupted
+digests, retained failure, and repeated refusal preserving both parent and
+temporary bytes. The first crossing tick can allocate before its boundary check;
+this is a cardinality policy, not a total heap or disk guarantee.
+
+DSR ran all 210 browser tests successfully, with no skipped or cancelled tests,
+plus syntax checks for all three changed production JavaScript modules. The
+same revised tests against the original production code produced 53 failures.
+Both executions retained unchanged before/after source snapshots. The eight
+stable Rust files passed the pinned nightly's read-only Rustfmt check. The final
+runner formatting operation completed, but its later read-only check did not.
+
+Native baseline compilation reached unchanged `scriptbots-core`, then rustc was
+killed with SIGKILL before tests ran. The final combined candidate stalled during
+formatting and the execution environment became unavailable. Its native tests,
+workspace check and strict Clippy commands did not execute. UBS also refused
+because ast-grep was unavailable; no scanner pass is claimed. After the outage,
+the final runner was recovered with exact byte identity against its pre-loss
+Git blob `40f73a6323f31ab604365dd802d6fe669b3d2e31` and saved through GitHub.
+The original bead acceptance criteria, Known issues entries and broader resource,
+fault-injection, native and packaged-browser qualification remain open.
+
+**Browser matched-seed experiment workflow (2026-11-12):**
+[Source implemented and reviewed — Codex; executable and browser qualification open]
+
+Continue `bd-2z0.12.3` by connecting the browser to the existing experiment
+owner's fresh-world, matched-seed cohorts. The new panel creates two arms with
+explicit families, initial overrides and ordered numeric intervention schedules;
+it pages retained batches, observes saved checkpoint progress, cancels or resumes
+unfinished work and compares completed cohorts. These worlds use the runner's
+defaults plus their declared overrides; the current canvas and saved checkpoint
+studies remain separate scientific sources.
+
+Capture one immutable admission request and retry its exact bytes after an
+uncertain response. Full-width u64 seeds remain decimal strings in browser
+observations and exact integer tokens in request JSON. Bounded readers refuse
+duplicate fields, incomplete seed matrices, changed plans, regressing
+generations and contradictory terminal evidence. Session changes invalidate
+late observations. The experiment API now enforces the existing optional Lab
+session header before handlers can admit work, cancel, resume or compare;
+headerless clients retain their established behavior.
+
+Paired results bind the selected experiment, plan digest, status generation,
+endpoint, arms and every matched seed. One independent pair stays descriptive;
+unavailable effect sizes retain their explanation. Larger endpoints are not
+fitness verdicts, and separate metric requests are not one jointly corrected
+analysis. Observation export includes the original request only when this
+browser retains an observed admission for that exact selected experiment;
+historical status cannot reconstruct a missing plan or become a server bundle.
+
+Controls require an observed frame from the connected host. Hidden panels,
+local mode, disconnects and page exit stop reads and discard late responses.
+Catalog and run presentation are bounded; progress is a published or recovered
+checkpoint observation rather than a fabricated live tick. Source review also
+corrected catalog admission for configurable shared capacity, including zero
+slots and values above the default.
+
+Authored protocol, transport, controller and view regressions cover exact
+numeric provenance, uncertain retry, source replacement, lifecycle, pagination,
+comparison scope and export attribution. The existing real-HTTP session guard
+regression now covers experiment routes and valid admission with stale,
+malformed, matching and absent session headers. The execution environment
+became unavailable before DSR checks could run; no new Node, browser, native
+compile, Rustfmt or runtime test pass is claimed. These files were reconstructed
+from the reviewed changes and preserved through the GitHub connector. Parent
+acceptance and packaged-browser qualification remain open.
+
+**Retained study discovery and measured browser outcomes (2026-11-11):**
+[Implemented and source reviewed — Codex; DSR web checks passed, native/browser qualification open]
+
+Continue `bd-2z0.12.3` and the checkpoint-study surface by exposing the durable
+receipt catalog through REST, MCP and `checkpoint branch list`. The recovery
+service contributed in `2b1b8ed4` retains admitted definitions and final receipts,
+restores completed artifact discovery, and marks interrupted work stopped.
+`a9d0ecba` makes that catalog available through each control interface.
+
+The browser pages those receipts and explicitly reopens an existing study
+without submitting scientific work. It pins the observed branch, source tick,
+target tick and world digest; selection never invents the original treatment,
+retry key or saved population. Uncertain admissions keep their unchanged retry
+request. Historical running studies remain observable and cancellable; completed
+studies expose retained downloads. A source change invalidates stale results.
+
+The new report reader verifies the downloaded artifact and admits bounded
+schema-4 saved-source reports tied to the selected receipt. It preserves the
+full u64 seed without JavaScript rounding, shows actual terminal observations
+and treatment-minus-control endpoint differences, and separately labels the
+recorded whole-trajectory means and standard deviations. First divergence,
+extinction, population recovery ratio and exact source provenance remain
+descriptive observations from one saved seed. The view does not infer independent
+replication from repeated ticks. Report previews have a 1 MiB bound; ordinary
+downloads retain their separate 64 MiB bound.
+
+Correct the report generator's recovery threshold to the integer ceiling of
+four fifths of the baseline, with at least one living agent. Previously rounding
+could label two of three agents as 80% recovered, and a zero baseline could use
+a different threshold when locating the first recovery tick. One shared exact
+threshold now controls both decisions without changing ecological dynamics.
+
+New coverage exercises cold REST/MCP/CLI discovery, browser history and stale
+source handling, verified report decoding, exact numeric provenance and small
+population recovery boundaries. The frozen feature candidate passed all 160
+Node tests and four production JavaScript syntax checks through DSR, with the
+same source snapshot before and after execution. UBS also passed through DSR
+with zero critical findings; noncritical warnings remain. Pinned Rustfmt passed
+on the three Rust files changed in this continuation. The JavaScript fixtures describe
+the Rust schema contract and are not evidence of a real scientific run. Native
+compilation and Rust runtime tests remain unverified with the shared disk nearly
+full; parent acceptance and packaged-browser qualification remain open.
+
+**Native ecological particles (2026-11-11):**
+[Source wired and independently reviewed — Codex; native and GPU qualification open]
+
+Continue `bd-2z0.14.1.7` by consuming authoritative located birth, death, combat,
+eating, reproduction, spike and boost events through one live/offscreen Bevy
+plugin. The actual resolved world entropy root, recorded event tick and original
+accepted ordinal determine each recipe without consuming scientific randomness.
+One bounded pool, resident storage buffer, indexed billboard mesh and material
+replace the former absence of a production particle consumer.
+
+Quality-tier and adapter bounds constrain admission; critical effects take
+priority. Duplicate publications do not respawn events, ordinary 10,000-tick
+epoch changes preserve active effects, and prior-tick intervention stamps retain
+their actual age. Relative integer ages preserve precision at large ticks;
+pause and reduced-motion settings stop fractional motion. Explicit counters
+record skipped snapshot boundaries and producer or budget drops. A latest-value
+snapshot stream still cannot recover events it never observed.
+
+The shared shader uses pinned Bevy material/view bindings, aligned storage rows,
+additive premultiplied output and depth testing. Reversed-axis torus wrapping
+keeps edge events beside their agents. Eleven new regression tests cover event
+provenance, scientific neutrality, lifecycle, bounds, resident assets, shader
+layout and pool overflow/handle edges; none have executed. Independent source
+review checked Bevy 0.17.3 interfaces. The local executor repeatedly disconnected
+before the bounded DSR formatting attempt could start. Rust formatting,
+compilation, native/GPU execution and performance acceptance remain open.
+
+Serialized `RenderSnapshot` now requires the actual `visual_seed`; older host
+checkpoint JSON embedding a seedless render snapshot fails decoding. No fallback
+seed is invented. Scientific world-checkpoint and browser dynamic-frame schemas
+are unchanged. The parent bead retains its original qualification requirements.
+
+**Browser saved-world studies (2026-11-11):**
+[Source implemented and reviewed — Codex; executable and packaged-browser qualification open]
+
+Continue `bd-2z0.12.3` by connecting the browser to the existing checkpoint and
+managed-study services. The Saved-world experiments panel saves and pages real
+server checkpoints, launches an unchanged future or matched treatment/control
+study, observes job status, requests cancellation, and downloads the completed
+report, exact source, exported plan and retained bundle files. The live owner is
+not advanced or replaced by these studies. The shared backend now pages only
+artifacts actually published for the requested completed study.
+
+Each browser operation is bound to the observed server session. Immutable retry
+requests survive uncertain delivery; source changes invalidate late responses.
+The panel stops reads when hidden or disconnected and waits for a successfully
+painted remote frame before admitting work. Download paths, actual byte counts,
+metadata and SHA-256 are checked within explicit client bounds. Offered downloads
+do not establish an operating-system save, and one matched trajectory is not
+independent replication.
+
+Added backend session-guard and real-study artifact-isolation regressions, plus
+browser controller/transport coverage for retries, source changes, lifecycle,
+pagination and download integrity. The initial feature snapshot passed all 117
+Node tests, including 24 new checkpoint-study tests, and three JavaScript syntax
+checks through DSR. A later regression covers the concurrent backend's `stopped`
+outcome; the current 160-test DSR result is recorded above. The browser treats
+stopped work as terminal and never automatically reruns it. An earlier UBS
+finding on the public dropdown-cache comparison was source-reviewed as a false
+positive and clarified by naming. Chromium was refused at startup before DOM
+execution. Rust regressions have not executed: baseline checking and Clippy
+stopped during dependency resolution when the shared disk filled. Compilation,
+packaged-browser execution and full acceptance remain open. Existing parent bead
+status and ownership are preserved.
+
+**Managed checkpoint branch studies (2026-11-10):**
+[Source implemented and independently reviewed — Codex; runtime qualification open]
+
+`fb1d90f13a5c` connects verified saved scientific checkpoints to the existing
+branch-study runner through one bounded application service, REST/MCP and the
+control CLI. An unchanged future or a matched control/treatment pair runs without
+advancing or replacing the live owner. Saved tick-zero sources are supported;
+seeded warmup still requires a positive checkpoint tick. Exact retry identities,
+shared execution capacity, owned cancellable workers and joined shutdown prevent
+duplicate or detached work. Completed reports, exact source bytes and verified
+bundles become downloadable together after integrity checks.
+
+The canonical plan exported for a decoded saved source now names its retained
+checkpoint instead of implying seeded warmup. Reproduction regressions download
+the published plan and run the offline orchestrator from both tick-zero MLP and
+nonzero DWRAON sources, checking exact source bytes and final scientific outcomes.
+Relocating the files requires updating the source path in the plan.
+
+Replay now configures the horizon and treatment with N, starts with Enter, and
+shows observed status plus the completed report identity. Admission waits for a
+successfully presented pending receipt. Navigation retains the running study;
+X requests cancellation, and closing the terminal cancels even when admission's
+result is still queued. A shared admitted-identity handoff covers that shutdown
+race. Draft cancellation and worker cancellation remain distinct outcomes.
+
+Added real-source MLP/DWRAON oracle and divergence regressions, invalid/corrupt
+source and capacity cases, shutdown/drop cases, cross-transport and CLI report
+journeys, and terminal presentation/admission/shutdown journeys. Pinned formatting
+and independent source review passed; new runtime tests and full native terminal
+qualification have not yet been established in this environment.
+
+At the November 10 implementation boundary, managed status and retry identities
+lasted for the service process. The November 11 recovery service and discovery
+work above supersede that limitation with durable definitions and receipts;
+interrupted work is marked stopped and never automatically rerun. Existing
+output is never overwritten. A scientific fork does not continue the source
+host's session, journal, schedules or omitted auxiliary histories. One source
+trajectory is descriptive evidence, not independent replication. Existing
+raw-checkpoint refusals and full-owner acceptance requirements remain.
+
+**Evolutionary browser defaults, Ft tournament entry, and visible food (2026-11-09):**
+[Source implemented and independently reviewed — Codex; full native, browser and GPU qualification open]
+
+Continue `bd-2z0.12.3`, `bd-2z0.3.12.6` and `bd-2z0.7.4` with three functional
+increments. New browser worlds use versioned, heritable MLP genomes; DWRAON and
+experimental Assembly are selectable, and owner continuations restore the exact
+family/evaluator identity, including empty worlds. Explicit Wander and unbound
+choices retain their meaning; Wander's unsupported save controls are visibly
+disabled. Replacement owners are constructed before the current owner is changed.
+
+The tournament runner admits the real Ft adapter under `brain-ft`, refuses
+unavailable families before execution, and retains entered competitor identities
+through rows, cohort validation and ratings. Its founder topology count reads a
+validated genome without inventing tick-zero activity. The opt-in
+`tournament/ft_comparison.toml` compares Ft and MLP with equal founder cohorts,
+balanced orders and identical reruns. It explicitly permits different model
+capacities; the canonical 200-source-scalar gate remains unchanged.
+
+Bevy consumes published food through the shared live/offscreen `sync_world` path.
+Separate bounded meshes follow actual density, depletion and regrowth, including
+paused revisions. Unchanged chunks retain their mesh assets; food uses its own
+cell grid and palette without recoloring terrain. A full-footprint terrain support
+bound keeps each mote above interior ridges. Regression source covers inherited
+offspring, exact continuations, tournament identity/refusals, food cache lifetime,
+asset recovery, independent grids and interior terrain clearance.
+
+Frozen DSR checks passed for browser native and `wasm32-unknown-unknown`
+all-targets checking, Ft adapter all-targets checking, 75 Node component tests,
+JavaScript syntax, edited Rust formatting and zero-critical UBS scans. These are
+focused feature-snapshot results, not full final-main qualification. Native browser
+test code generation was killed in unchanged core code; later application and
+Bevy checks stopped in dependencies when the shared disk filled. Chromium was
+refused by the environment before DOM execution. Executable tournament, native
+food/GPU, full workspace, Clippy, performance and long-horizon scientific
+acceptance remain open. Concurrent main changes and existing bead ownership are
+preserved; the parent acceptance beads are not closed by these increments.
+
+**Live narrative policy transitions (2026-11-09):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Continue `bd-16g.2.9` with shared tick-boundary retention for the live detector
+and persisted-input replay. Authenticated cadence/history/event-capacity changes
+preserve detector cooldowns and pending persistence, remove the complete excess
+display/history prefix, and take effect at the next completed tick. Coalesced
+commands between ticks cannot erase unrecorded history. Reconstruction report
+schema v2 includes policy-change counts and the final effective policy; it uses
+the current kernel and does not assert historical equality across source revisions.
+
+Three new core regressions cover atomic refusals, disable/re-enable cadence,
+live/replay parity and scientific-digest neutrality. Analytics coverage includes
+the actual owner/storage-journal path across page boundaries. These tests are
+authored but unexecuted: genuine DSR refused native host admission because every
+available writable filesystem has less than its required 20 GiB free. Pinned
+rustfmt was used to format edited source; no DSR format, compiler, Clippy or test
+gate is claimed. Original whole-run, recovery and scenario-budget acceptance
+remains required.
+
+**Experiment checkpoint progress (2026-11-09):**
+[Source implemented and independently reviewed — Codex; executable qualification open]
+
+Continue `bd-2z0.5.11` and `bd-2z0.12.2` with plan-derived `target_ticks` and typed
+`checkpoint_progress` across REST, MCP, the control CLI and the terminal's
+Saved/Target display. Terminal `total_ticks` and completion evidence retain their
+existing meaning. Published observations follow successful checkpoint write,
+sync, rename and directory sync; recovered observations validate the complete
+committed world/owner/journal cut. Both identify the exact encoded bytes by
+BLAKE3. Unavailable and refused states never invent progress.
+
+The latest-value cache is bounded by admitted run IDs and bound to the source-aware
+plan and output root. Active polls read the cache. Stopped detail requests recover
+at most one cold cut, with one recovery in flight per runner; summary listings
+recover none. Observations describe historical cuts, not continuous file-integrity
+verification or a filesystem deadline. Explicit resume retries cached refusals
+through the existing checkpoint guards; status reads do not advance science or
+rewrite saved status.
+
+Authored regressions cover real-owner publication and write failure, bounded
+read-only recovery, corrupt and foreign cuts, conflicting/older observations,
+cancel/resume checksums, control DTOs and terminal projection. Independent source
+review resolved a missing test import and a conflict-then-older cache edge.
+Executable qualification remains unavailable: genuine DSR refuses native host
+admission because available writable filesystems have less than its required
+20 GiB free. No passing compiler, Clippy or test result is claimed. Original full
+recovery, resource, fault, process and native acceptance remains open.
+
+**Browser laboratory controls and replicated branch studies (2026-11-09):**
+[Source implemented — Codex; full application and packaged-browser qualification open]
+
+The browser functionality in `bd-2z0.12.3` now includes bounded canonical
+genome-locus and living-primary-parent difference pages, and source-bound
+local/remote scientific interventions with retry-stable command identities.
+Command application queues an intervention; the next scientific tick can apply
+its ecological effect. Application, journal durability and global observed-effect
+history remain separate outcomes. Reads preserve exact owner identities and
+refuse oversized source material before decoding. Paused-boundary admission
+rejects stale or future control revisions, including queued Resume races.
+
+Phase 4.5 now exposes `branch-study --seeds` and independently initialized matched
+checkpoint pairs. Aggregate population, food-total and total-energy inference
+uses one terminal observation per seed and branch. The runner preserves every
+underlying report and verified bundle, rejects duplicate seeds, enforces the
+existing transition ceiling across the complete cohort, and publishes no aggregate
+success for incomplete studies. README documents commands and statistical limits.
+
+Frozen DSR evidence includes 284 passing runtime tests (six ignored), a separate
+six-test intervention owner regression suite, focused real MLP genome and local
+intervention/reset tests, native browser-crate checking, and the actual
+`wasm32-unknown-unknown` target check. JavaScript controller/transport, formatting
+and UBS critical-issue gates pass. Actual packaged-browser/DOM execution remains
+unqualified. Application all-target and isolated library/binary checks, including
+a resource-only MIR-memory retry, were killed in `asupersync` 0.5.0 under the host's
+8 GiB limit before application validation. The new application HTTP and replicated
+study executable tests therefore remain unexecuted. Existing bead ownership and
+acceptance remain unchanged.
+
+**Shared native creature appearance (2026-11-09):** [Source implemented and
+independently reviewed — Codex; native/GPU execution and performance acceptance open]
+
+Continue the material and rendering portion of `bd-2z0.7.3`: live Bevy and
+`OffscreenCapture` install one appearance plugin, with four shared PBR classes
+and stable `MeshTag` rows for independently colored parts. Suspension joints
+reuse their body's row. Eligible identical mesh/material pairs can use Bevy's
+automatic batching; the existing root and part entities still own transforms,
+visibility, picking, terrain contact and interpolation.
+
+A resident storage buffer receives coalesced dirty-range writes. Ordinary color
+changes do not modify the storage-buffer asset, avoiding Bevy 0.17's repeated GPU
+allocation path. Growth rebinds the shared materials; actual buffer recreation
+forces a complete upload. Revisions retain changes across skipped extraction or
+late render-asset preparation. Population turnover releases old slots before
+allocating replacements, and generation checks prevent stale ownership. Capture
+reset reuses retained storage and invalidates former slots. Capacity admission
+uses both the actual device binding limit and an independent application ceiling.
+
+Forward/deferred PBR and a dedicated prepass preserve the admitted material
+classes' linear colors, emissive exposure semantics, vertex tint, lighting,
+fog, normals/motion output and Blend/Add shadow cutoff. Independent review checked
+these paths against pinned Bevy 0.17.3, plus resource scheduling, API signatures,
+all changed helper calls and system arity. Concurrent HUD/receipt and motion-test
+fixes through `aacdb4ebe1d85e3aa7a0055cfe78d2e98d7bb6a1` are preserved.
+
+DSR formatting passed. The actual Cargo all-targets check first lacked pkg-config;
+a verified distro-package extraction supplied genuine pkgconf, Wayland, ALSA,
+xkbcommon and udev prerequisites, whose version checks passed. The subsequent
+check was killed by the 8 GiB host memory limit inside unchanged `bevy_render`,
+before the project's native code compiled. Six new CPU tests cover slot lifetime,
+resident uploads, growth, five-palette reference parity, turnover/capacity refusal
+and capture reset; they remain unexecuted, as does GPU capture qualification.
+This increment does not close entity elimination, culling/LOD, draw-call,
+throughput or the full instancing acceptance work.
+
+**Browser brain activity and bounded explanations (2026-11-09):** [Implemented;
+focused executable checks and runtime type checks passed — Codex; full native,
+WASM and rendered-output acceptance open]
+
+Continue `bd-2z0.12.3` with an opt-in selected-brain panel shared by local WASM and
+remote REST. The panel displays named activation layers, signed heatmaps, exact
+selected values, actual retained weights and the shared core's output estimates.
+Observed owner/session/epoch/revisions stay distinct from the displayed frame.
+Reconstructed Ft activity is explicitly labelled; missing, unbound, unsupported,
+unrecorded and mismatched observations retain typed unavailable outcomes.
+
+The owner query reads one requested brain without advancing science or installing
+a persistent probe. Closing the panel or hiding the page stops reads. There is
+one current request, a four-Hz publication-driven refresh ceiling, a 250 ms native
+owner deadline and a separate 512 KiB streamed brain-response ceiling. View
+navigation is local, including 32-connection pages; accepted heatmaps allocate at
+most 512 by 512 pixels, including narrow and wide 4,096-value layers.
+
+Core attribution now refuses an affected output when finite arithmetic overflows.
+It also checks fixed ceilings before examining more than 262,144 path edges,
+retaining more than 1,024 pending states or collecting more than 4,096 unmerged
+contributions per output. Refusal discards partial estimates while retaining the
+network and other outputs; accepted calculations preserve their previous f32
+order. Dense cyclic graphs therefore have an explicit work bound independent
+of payload clipping and the request deadline.
+
+Executed DSR evidence: 36 Node tests and four JavaScript syntax checks passed;
+all changed Rust sources passed formatting. The exact core library and complete
+runtime test source passed a pinned type check using retained locked Cargo
+dependencies. The real final attribution module passed all 16 of its tests in an
+isolated harness after its shared activation types, constants and channel source
+were compared with the retained Cargo-built core. Fifteen are data/channel tests;
+one also exercises the retained core's unbound owner. This is module coverage,
+not current-core integration. Actual web and app Cargo checks were killed by the
+8 GiB host memory limit in core and asupersync; authored owner, HTTP, WASM and
+DOM/pixel acceptance remain open. Genome paging and intervention controls are
+separate remaining functionality; this increment does not close the full bead.
+
+**Ft genome loci and activity inspection (2026-11-09):** [Implemented and
+ type-checked — Codex; executable qualification open]
+
+FtBrain now exposes architecture-scoped canonical bias, weight and incoming-source
+loci through the shared heredity and genome-browser protocol. Discovery reports
+one mutation trial per existing flat parameter; structural source loci consume
+no mutation trials or random draws. The heredity discovery digest changes, while
+the adapter descriptor, genome/state codecs and checkpoint registry identity
+remain unchanged.
+
+A context-aware inspection hook reconstructs feed-forward activity from the
+owner's recorded sensors using the exact scalar kernels and verifies the recorded
+outputs bit-for-bit. The result explicitly labels reconstructed activity, names
+its layers and supplies global connection indices. Initial/indistinguishable
+zero observations and mismatched responses produce typed per-target refusals.
+Source work is checked before graph allocation or evaluation. Reapplying owner
+bounds preserves valid sampled weights while keeping clipping explicit and
+refusing attribution over incomplete topology. Inspection adds no evaluator
+history, checkpoint state or scientific mutation.
+
+DSR type-checked the exact core and brain libraries and the complete Ft test
+source with the pinned compiler and retained locked Cargo dependencies. Four new
+Ft regressions and one core regression cover loci/mutation mapping, reconstruction,
+batch rehydration, clipping, unavailable targets and checkpoint/continuation
+neutrality. Their executable results remain open: the 8 GiB host memory limit
+killed the unchanged Frankentorch dependency during Cargo code generation and
+then the core code-generation attempt using retained dependencies. Formatting
+is checked separately. This increment does not establish full Cargo/Clippy,
+GPU or performance acceptance for `bd-2z0.3.12.3`.
+
+**Browser creature inspector (2026-11-09):** [Source implemented and reviewed —
+Codex; recovered-byte compilation and browser/HTTP acceptance open]
+
+Continue the browser interaction slice of `bd-2z0.12.3` with click and keyboard
+selection, a shared Canvas/WebGPU highlight, and a bounded scientific inspector.
+Local WASM and remote REST use the same typed read-only owner projection.
+Stable creature IDs, session, epoch and source revisions remain exact decimal
+strings; the panel identifies observed versus displayed boundaries and rejects
+late replies after selection, reset, source, session or epoch changes. The owner
+stamps even an absent-creature reply with its epoch, so a request from an old
+epoch reports a source conflict instead of a misleading missing-creature result.
+
+The panel exposes health, age, generation, energy, net lifetime food balance,
+reproduction progress, lineage, sensory traits, and named recorded input/output
+channels. The basic owner query skips genome decoding and sensor attribution,
+so inspection does not require a brain's optional genome-locus schema. It does
+not submit selection commands, step science, retain history or serialize genomes.
+Automatic refresh is limited to 4 Hz and one current request; native queries
+carry a 250 ms deadline and browser requests a two-second timeout with a streamed
+16 KiB response cap. Existing Host and Origin checks protect the REST route.
+
+Before the workspace became unavailable, DSR compiled the current core library
+and complete runtime test crate using the pinned compiler and retained locked
+Cargo dependencies. Inspector, owner-query and remote/subscription filters
+passed 23 unique tests, and the four runtime files passed formatting. The first
+compile attempt exposed a missing proc-macro search path in the external
+verification helper; correcting that helper allowed the same source to pass.
+
+The 17 feature files were subsequently recovered from reviewed edits against
+the exact published base. Subsequent source review fixed two integration gaps:
+absent-creature replies now retain the owner epoch, and the WASM inspector uses
+JSON-compatible serialization so absent parents are null just as they are in
+REST responses. Those fixes and their regression cases are also unexecuted.
+The recovered bytes have not been compiled or formatted again. Browser Node/syntax/format and web Cargo checks were launched,
+but their outcomes were lost with the executor; they are not claimed as passes.
+Authored HTTP origin/source checks, Node state-machine cases and actual DOM
+picking/highlight journeys remain qualification work. No WASM, GPU, full
+workspace Cargo/Clippy or performance acceptance is asserted by this increment.
+
+**Persistent cohort execution and food-funded ecology (2026-11-09):**
+[Implemented increments — Codex; targeted native tests passed, broader
+performance, application and long-horizon qualification open]
+
+Continue `bd-2z0.3.12.3` by retaining successful batch evaluators across science
+ticks, with exact membership/genome/state validation and transactional failure
+invalidation. Continue the selectable ecology work behind `bd-lmk6` by admitting
+an explicit food-funded reproduction configuration and a separate meadow
+scenario. Existing timed defaults and baseline artifacts remain unchanged.
+These are functionality increments; the broader performance and long-horizon
+acceptance requirements remain open.
+
+Successful batch evaluators now survive across brain stages only when their
+actual adapter allocation and semantic identity, architecture, ordered stable
+UID/arena identities, genome material/provenance and exact scalar preimages
+match. Every successor still checkpoints and reconstructs before publication.
+Faults discard retained scratch; departed cohorts and changed layouts do not
+accumulate as history. The map is owned directly by `WorldState`, accessed through
+its exclusive borrow, and absent from checkpoints and scientific digests. Cold
+checkpoint restoration reconstructs it on demand. Peak rebuild memory may contain
+both previous and next active cohorts; no exact heap-byte bound is claimed.
+
+DSR compiled the complete core test crate in both the default and scalar-only
+feature lanes, with economy fault tests enabled and retained locked Cargo
+dependencies. The default lane passed six cache-specific regressions, the
+eight-stage scalar/cohort equivalence test, 11 brain-stage tests and 19
+reproduction tests (filters overlap). The scalar-only lane passed its brain-stage
+test and all 19 reproduction tests; source formatting passed. An initial new
+test incorrectly assumed `WorldState: Sync`, which the existing Send-only sense
+provider already prevents. The cache now uses an ordinary owned map and the test
+asserts the actual `Send` contract. A separate scalar compile was killed under
+host memory pressure; the subsequent identical feature lane compiled and passed.
+No throughput result or full workspace Cargo/Clippy qualification is asserted.
+
+The food-funded slice is now implemented: both diet rates may be zero together;
+mixed zero/positive pairs remain invalid and positive-rate timer reachability is
+still enforced. `scenarios/food_funded_meadow_v1.scenario.toml` is selectable
+through the existing scenario CLI, with seven food-earned progress units, closed
+population accounting, low regrowth and parent-paid child energy. Its three-seed,
+10,000-tick study is included in the real CLI cohort/replay matrix but has not
+been executed. No long-run stability or balance conclusion is asserted.
+
+DSR compiled the complete core test crate using the pinned compiler and retained
+locked Cargo dependencies, then passed all five new food-funded tests, all 19
+reproduction-filtered tests (including those five), the existing bounded-config
+negative test, and formatting for core and the scenario test file. The first run
+identified a fixture that omitted the parent's real brain-initialization ordinal;
+the corrected expectation passes without changing production behavior. Full
+workspace Cargo/Clippy and the application scenario test remain unqualified.
+
+**Novelty/curiosity birth admission (2026-11-09):** [Implemented and targeted
+tests passed — Codex; full workspace qualification open]
+
+The production reproduction gate now compares the deterministic admission draw
+with the effective probability after selection modulation, including when the
+configured attempt chance is one. Previously that setting bypassed novelty and
+curiosity entirely. Fitness keeps its existing certain-admission/no-draw path.
+Two regression tests exercise actual novelty recomputation and the keyed
+admission stream, including missing scores and zero/intermediate/unit scores.
+All 14 reproduction-filtered core tests pass, with the economy fault feature
+enabled, under DSR using the pinned compiler and dependencies retained from the
+previous locked Cargo build. Source formatting also passes. This focused run
+does not establish full Cargo, Clippy or workspace qualification, and opt-in
+novelty/curiosity trajectories can intentionally change at affected settings.
+
+**Bevy snapshot-pair presentation (2026-11-09):** [Source implemented and
+reviewed — Codex; native build, formatting, test and GPU qualification open]
+
+The presentation slice of `bd-2z0.14.1.9.1` now retains two compact producer-observed
+pose cuts rather than integrating an easing filter over rendered frames. Stable
+UIDs, one shared frame fraction and shortest toroidal displacement align creature
+roots, heading and spike extension; terrain grounding samples the displayed pose.
+Picking and camera follow use the same displayed position.
+
+Owner/session, epoch, configuration, scientific revision and tick continuity gate
+the pair. Pauses, reduced motion, rewinds, births, changed arena handles and
+ambiguous teleports snap to the current committed endpoint. Control-only
+publications preserve the measured interval, and a stalled consumer receives the
+producer's last pair without accumulating a queue or extrapolating.
+
+`OffscreenCapture::render_interpolated` accepts two immutable worlds and a bounded
+explicit fraction. Its provenance records both actual endpoint digests and leaves
+the synthetic frame's single `world_digest` absent. Terrain, population and other
+discrete cues use the current cut; independently supplied worlds are not certified
+as one replay. Ordinary endpoint capture validation and provenance are preserved.
+
+After the execution environment failed, both files were reconstructed against
+the pinned upstream source and independently reviewed in full. These bytes do
+not match the unavailable pre-loss files; the earlier formatter pass does not
+qualify this reconstruction. Regression tests cover timing, coalesced delivery,
+identity discontinuities, pause/resume, births/reordering, toroidal motion,
+terrain/spike clearance, displayed follow/picking, capture endpoints and source
+immutability, but they remain unexecuted. The concurrent embedded-font and
+wrapping change is preserved. Full native/GPU acceptance, wheel-phase/event
+treatment, hydrology interpolation and performance evidence remain open.
+
+
+**Ft cohorts and browser world layers (2026-11-09):** [Source implemented —
+Codex; full native, rendered-output and performance qualification remains open]
+
+This pass prioritizes missing executable functionality from the current plan and
+authoritative Beads: true FtBrain cohort evaluation (`bd-2z0.3.12.3`) and browser
+environment rendering (`bd-2z0.12.3`).
+
+- FtBrain now packs distinct per-agent weights and invokes one F32 batched matrix
+  contraction per layer. Scalar evaluation remains the bit-level oracle; output
+  publication is all-or-nothing. Canonical genome and evaluator-state codecs stay
+  unchanged; adapter semantic version 3 identifies the new executor. At that
+  increment core reconstructed cohorts at each tick; retention is implemented
+  above. Neither increment establishes a throughput result.
+- Local WASM and remote Canvas/WebGPU views now show terrain, food and observed
+  water depth from the agents' immutable publication, including empty worlds.
+  Overviews retain all small-grid cells or at most 128 × 128 labelled center
+  samples covering the full source world. Layer/owner caches, frozen JS objects
+  and owner-generation invalidation prevent stale or caller-poisoned reuse.
+  Binary `SBWS` frames advance to v2; JSON controls/subscriptions/acks remain v1.
+- Executed DSR checks: the final Ft source passed all 15 tests with Rayon thread
+  counts 1 and 4 after compiling against the dependencies from its successful
+  locked Cargo build; final browser consumer/continuation tests passed 25/25;
+  runtime remote/subscription tests passed 17/17. The exact production browser
+  Rust/JS and consumer-test blobs were recovered after executor loss by matching
+  their recorded Git hashes. UI wording, documentation and parts of the browser
+  DOM harness were reconstructed and source-reviewed; the DOM harness was not run.
+- Full Cargo/Clippy continuation and native web/Bevy qualification were blocked
+  when the shared filesystem filled, then the execution environment became
+  unavailable. The targeted Ft rerun used DSR with memory-backed compiler output
+  and the previously built locked dependencies; it does not stand in for full
+  workspace qualification. Actual Canvas/WebGPU pixel assertions are authored
+  but unexecuted. Upstream F32 parameter round-trip, full performance evidence
+  and the original Beads' broader acceptance criteria remain open.
+
+
+**Checkpoint discovery and experiment admission (2026-11-05):** [Source
+implemented — Codex; native qualification remains open]
+
+New API checkpoint captures now retain an immutable bounded descriptor and an
+empty completion marker, published after the original persistence receipt.
+Restarted catalogs discover, download and reconstruct those saved scientific
+cuts without adopting the old owner's request identities, session or journal.
+Unmarked binary/partial descriptor files remain preserved and consume existing
+binary retention quota; they are not promoted to completed captures. Discovery
+checks the descriptor, exact payload, codec, tick, population and science digest,
+refuses ambiguous IDs across roots, and bounds metadata, directory scanning and
+per-call verification. These descriptors do not establish a fresh host
+continuation or requalify old SQL receipts.
+
+Experiment preflight derives dense grid cardinality from the same normalized
+dimensions as WorldState. It admits at most 262,144 cells per run and 1,048,576
+cells across the largest possible concurrent run set, including resume packing.
+Control services reserve that same aggregate budget across separate batches and
+release it with worker ownership. The capacity DTO exposes both grid and run-slot
+reservations. This bounds grid cardinality, not population or total resident
+memory, and changes no scientific calculations or baseline artifacts.
+
+Nine Rust regressions are authored for these paths. Independent source review
+and formatting were performed; the native candidate was not compiled or tested.
+The exact pinned toolchain and dependencies were prepared, but the baseline
+compiler run was interrupted and candidate execution refused when shared free
+disk fell below the retained 6 GiB working margin. Native tests and Clippy remain
+unexecuted. Original Phase 4.1/4.3 and `bd-2z0.5.13`/`bd-2z0.5.11` acceptance
+criteria and status remain unchanged.
+
+Browser presentation recovery is committed at `1ec247a`: one RAF chain survives
+frame/Canvas failures, partial paints are retried, repeated failures are reported
+once per episode, and recovery cannot restart a stopped science clock. DSR passed
+both edited JavaScript syntax checks and all 21 existing continuation/remote
+adapter tests. The new real-DOM lifecycle regressions remain unexecuted because
+the managed environment refused Chrome's Unix socket creation before startup.
+
 **Responsive Bevy HUD (2026-11-05):** [Currently In Progress — GentleDuck;
 original `bd-2z0.14.1.18.1`; verify existing `bd-2z0.14.1.18.4`, scopes unchanged]
 
@@ -251,7 +1761,8 @@ Hardware, Metal, broader HUD/terrain, science and performance parents remain
 open. Later integration and publication remain pending below; this native binary
 is explicitly `4f0f3db8`, not the later merged revision.
 
-**Experiment consumers and browser recovery (2026-11-06):** [Currently In Progress — Codex]
+**Experiment consumers and browser recovery (2026-11-06):** [Source increments
+implemented — original native/browser qualification remains open]
 
 The verified experiment service now reaches MCP and the supported GPUI Lab, with
 paged checkpoint discovery/review in that Lab. Explicit browser-local saved
@@ -3882,6 +5393,44 @@ clean source-status and source-diff digests plus Cargo.lock digest
 
 ### 7.7 experiment runner
 
+**Checkpoint recovery and replay integration — Codex, 2026-11-15:**
+[Source implemented and independently reviewed; executable qualification open]
+
+Torn temporary status writes now recover only when the existing committed
+status and required executable continuation evidence validate (`295a416`).
+The exact torn bytes are retained in one exclusive incident directory before
+normal publication resumes. Missing cuts, invalid bundles, complete invalid
+successors, aliases and repeated incidents still refuse. Existing running work
+is never reset to tick zero. Original acceptance under `bd-2z0.5.11` stays open.
+
+Saved-canvas review, event reconstruction and managed branch studies now restore
+configured NeuroFlow through a shared compiled application-preset catalog
+(`1ddb8f4`). The `reel` command's checkpoint replay uses the same catalog for
+DWRAON, Assembly and feature-enabled Ft/Neuro registries as well as MLP, Mixed
+and no-brain worlds. Full saved registry identity remains mandatory, including
+NeuroFlow constructor settings; changed settings cannot authorize a substitute.
+
+Regression source covers nonzero owner continuation, completed-bundle recovery,
+refusal and evidence preservation, all compiled replay families, independent
+uninterrupted digests, configured NeuroFlow service paths and repeatable ASCII/GIF
+encoding. Pinned DSR formatting passed for the exact four changed Rust files
+(receipt `20261114T231028-UeSIpqE3`, 1/1). The locked application check with
+`--no-default-features --features neuro` was killed with exit 137 after dependency
+downloads, before Rust source diagnostics. No compile, test or Clippy pass is
+claimed, and the original checkpoint/host qualification remains open.
+
+**Source implementation extension — Codex, 2026-11-08:** Lab proposals expose
+ordered intervention schedules as a bounded treatment axis. Configuration factors,
+canonical families and schedules form the admitted arm product, with the first
+arm as the matched-seed baseline. Pure runner preflight checks each expanded
+treatment before execution. The exact schedule is carried through execution,
+verified bundle ingestion, version-4 scientific-row digests, notebook references
+and version-2 reproduction inputs. Reproduction refuses schedule substitution
+and oversized inputs before output writes; exported launch config now uses the
+canonical runner config. Regression source includes a real scheduled-cohort
+reproduction and schedule/provenance tampering. Native DSR qualification remains
+pending under the dependency-fetch and shared-storage limits recorded in Phase 4.5.
+
 **Source implementation extension — Codex, 2026-11-06 UTC:** Lab proposals now
 expose installed brain families as a bounded treatment axis. Typed expanded arms
 use the runner's canonical family resolver, include the family/configuration product
@@ -4148,6 +5697,18 @@ No test may declare the TUI rendered correctly without inspecting buffer cells o
 Normal/error cleanup uses RAII. Release builds use `panic = "abort"`, so unwinding is not a guarantee: install and test a minimal emergency panic hook and supported-signal restoration path, avoid allocations/locks where practical, and document best-effort limits. `SIGKILL`, power loss, and equivalent uncatchable termination cannot restore a terminal and are not falsely claimed.
 
 ### 8.7 control CLI convergence
+
+**Source implementation extension — Codex, 2026-11-08:** The control CLI exposes
+experiment create/list/status/cancel/resume/compare, checkpoint create/list/status/
+download, artifact list/status/download and schema discovery. Commands preserve
+server-owned state and verified comparison provenance, bound input and response
+bytes, validate URL identities and retain pagination cursors. Explicit-path
+downloads verify metadata, response headers, byte count and both checksums before
+creating a new destination; existing files and symlinks are never overwritten.
+Regression source covers real owner/REST experiment and checkpoint journeys,
+payload bounds, corruption and destination races. Pinned DSR formatting and
+whitespace checks pass. Native execution remains unqualified under the baseline
+dependency-fetch/storage limits; `bd-2z0.12.2`'s original acceptance stays open.
 
 The separate `control_cli watch` loop currently duplicates Ratatui/Crossterm behavior and defaults to a different server port. After the main frontend is stable, reuse the same model/widgets or replace watch with the shared TUI client. All control surfaces default to 8088 or one centrally defined value.
 
@@ -6071,6 +7632,23 @@ idempotent cancel/shutdown landed and were pushed at exact revision
 
 #### 3.9 Bevy terrain, camera, HUD, and capture
 
+**[Source implemented; executable qualification open — bd-2z0.7.6.1, Codex, 2026-11-10]**
+Share the native experiment/checkpoint protocol, bounded asynchronous consumer and
+stale-result guards between GPUI and Bevy. Bevy adds experiment catalog/detail,
+paired population comparisons, stop/resume and saved-checkpoint review with a
+separate latest-live presentation. Both native frontends can save the live world
+through the existing owner service, preserve idempotency across uncertain
+retries and directly review the verified saved cut outside the current catalog
+page. Its modal captures input, historical pixels cannot issue live organism
+commands, and returning live restores the newest owner publication. Ordinary
+simulation epoch progression preserves review; an actual host-session change
+invalidates stale observations. Existing application services remain the
+authorities of the shared protocol.
+
+Retain the original bead and its remaining replay seek, first-divergence, export
+and full native/GPU acceptance. Source review and authored regressions alone do
+not establish DSR, Clippy, native-window, performance or GPU qualification.
+
 **[Currently In Progress — bd-2z0.14.1.20, TurquoiseLake, 2026-09-08]**
 Connect same-tick look-development camera bookmarks and configured exposure to
 the existing GPU capture path. Art review and hardware evidence remain open.
@@ -6165,6 +7743,31 @@ resume, replay, and first-divergence verification remain separate open work in t
 
 #### 4.5 intervention studies
 
+**Source functionality extension — Codex, 2026-11-08:** `branch-study --example`
+and `branch-study --plan ... --out ...` expose paired checkpoint studies through
+the application CLI. Strict JSON and configuration/brain/workload preflight run
+before output reservation. New/empty destinations are exclusively claimed;
+completed and partial studies are never silently replaced. Restoration uses the
+configured brain registry. Regression source exercises the actual CLI, digest
+repeatability, retained artifact verification, output preservation and bounded
+input refusal. Tournament reporting separately retains descriptive ratings while
+withholding intervals and winner decisions for insufficient independent seeds or
+incomplete bootstrap fitting. Native DSR qualification is still pending; these
+increments do not close the original end-to-end acceptance requirements.
+
+**Source correctness extension — Codex, 2026-11-08:** Branch studies now apply
+interventions at their declared completed-tick boundaries, reject unobservable
+or overflowing schedules, and compare divergence against the control at the
+same tick. Initial energy/health and recovery baselines come from observed state.
+Report schema 2 declares a single-seed trajectory basis and omits inferential
+statistics that would incorrectly treat repeated ticks as independent trials.
+The independent-pair helper rejects mismatched/non-finite inputs. Timing, digest,
+report and real-study regression source is included; native DSR qualification
+remains pending because the pinned FrankenSQLite dependency's SQLite submodule
+was unavailable in the offline baseline and shared storage prevented completing
+the online dependency fetch. Bundle verification remains artifact integrity,
+not a complete application-owner restore or replay qualification.
+
 - [Completed — bd-tygg, TurquoiseLake, 2026-09-05, pinned DSR37 at 3c3ae1d] Preserve refused migration
   payloads and report interrupted transfers from observed ownership. Returning home is a new
   arrival, not atomic rollback; durable migration persistence and session recovery stay open.
@@ -6208,6 +7811,29 @@ parity fixtures and pinned tooling; no Vite integration or fresh browser pass is
 - schema/version discovery.
 
 #### 5.3 browser live renderer
+
+**[Implementation contributed — Codex, 2026-11-10; qualification open]**
+Browser sharing and local narrative consumers now have functional implementations
+under `bd-2z0.12.3`. Bounded `sbb1` launch recipes retain the effective config,
+actual resolved seed, founder population and brain family, including entropy
+starts. Initial-condition variants preserve those inputs and validate the
+complete resulting configuration; existing `sbw1` gallery references remain
+supported. Imported continuations explicitly refuse invented founder recipes.
+The UI identifies each recipe's restart semantics and reports captured build
+inputs without claiming cross-build replay equivalence. Local narrative pages
+reuse the canonical remote event projection; the shared timeline has exact
+cursors, bounded paging/display, explicit retention gaps and owner isolation.
+
+Focused DSR checks on 2026-11-10 passed 93 Node tests, JavaScript syntax checks,
+targeted web Rust formatting, and the production WASM library typecheck
+(`cargo check -p scriptbots-web --lib --target wasm32-unknown-unknown --locked`).
+UBS completed both language scanners with
+test-pattern and heuristic findings reviewed; it did not return a clean exit.
+Native test execution was blocked by a killed compiler before the new tests ran,
+and Chromium refused its startup socket before DOM execution. The added Rust
+roundtrip/scientific-neutrality tests and expanded browser fixtures are not
+represented as executed passes. The original native/browser, package,
+durability and performance acceptance remains open.
 
 - only after native runtime and snapshot contracts are stable;
 - real Canvas/WebGPU tests;

@@ -26,6 +26,37 @@ ScriptBots adopts a **dark-field microscopy** visual metaphor. In dark-field mic
 
 ---
 
+## 2.1 Creature Figure/Ground Under Daylight Terrain (baseline, pending creature redesign)
+
+The dark-field ordering -- every agent brighter than all resolved terrain -- holds against the canonical
+`BIOLUMINESCENT_DARK_FIELD_V1` reference (full shaded sweep), which the
+`weakest_agent_remains_brighter_than_the_brightest_resolved_terrain` test guards via `terrain_shaded_color_for`.
+It does **not** hold against the active daylight terrain (`NATURAL_FIELD_STYLE_V2`): commit `2de46a55`
+deliberately replaced the six terrain albedos and noted that "the dark-field constant remains, so a later
+creature or interface redesign can still inherit it ... creature and interface semantics stay inherited until
+their own redesigns." Creature figure/ground under daylight terrain is therefore **pending the creature
+redesign**, not a current guarantee.
+
+Measured baseline (body-fill sRGB luminance, WCAG contrast `(hi+0.05)/(lo+0.05)`, 15,625-agent grid over
+genome/health/age/diet x 192 resolved daylight tiles): **all 192 tiles fall below a 3:1 fill contrast against
+some agent in the range.** Worst (minimum) contrast per terrain kind:
+
+| terrain kind | worst fill contrast | at tile luminance |
+|---|---|---|
+| DeepWater | 1.674:1 | 0.107 |
+| ShallowWater | 1.000:1 | 0.270 |
+| Sand | 1.000:1 | 0.358 |
+| Grass | 1.000:1 | 0.272 |
+| Bloom | 1.000:1 | 0.253 |
+| Rock | 1.000:1 | 0.235 |
+
+A 1.000:1 means some agent in the grid matches that tile's luminance to three decimals. This persists for as
+long as any resolved tile's luminance falls inside the agents' luminance band. Until the creature redesign,
+figure/ground for dim agents on mid-luminance daylight terrain is **not guaranteed**: the renderer's agent
+glow is zero for an agent with no indicator, spike, or sharing intent, so it does not supply the missing contrast.
+
+---
+
 ## 3. Visual Vocabulary
 
 The visual system is partitioned into six distinct vocabulary domains:

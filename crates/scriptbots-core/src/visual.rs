@@ -1003,6 +1003,19 @@ pub const fn terrain_temperature_tint(temperature: f32) -> [f32; 3] {
 /// `moisture` and `temperature` likewise.
 #[must_use]
 pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
+    terrain_shaded_color_for(visual_style(), input)
+}
+
+/// Resolve a terrain tile's shaded color under an explicit style.
+///
+/// `terrain_shaded_color` is this with the active [`visual_style`]; the dark-field figure/ground
+/// test passes [`BIOLUMINESCENT_DARK_FIELD_V1`] to resolve the reference style's full shaded
+/// terrain sweep.
+#[must_use]
+pub const fn terrain_shaded_color_for(
+    style: &VisualStyleV1,
+    input: &TerrainShadeInput,
+) -> [f32; 3] {
     let moisture = clamp01(input.moisture);
     let elevation = clamp01(input.elevation);
     let slope = clamp01(input.slope);
@@ -1010,7 +1023,7 @@ pub const fn terrain_shaded_color(input: &TerrainShadeInput) -> [f32; 3] {
     let daylight = clamp01(input.daylight);
     let temperature = clamp01(input.temperature);
 
-    let base = terrain_kind_base_color(input.kind);
+    let base = style.terrain[terrain_kind_index(input.kind)].albedo_srgb;
     let brightness = match input.kind {
         TerrainKind::DeepWater => (0.42 + daylight * 0.25 + moisture * 0.2).clamp(0.25, 1.05),
         TerrainKind::ShallowWater => (0.55 + daylight * 0.35 + moisture * 0.3).clamp(0.4, 1.25),
@@ -2227,6 +2240,19 @@ pub enum AtlasVerificationError {
         /// `TerrainKind` layer index corresponding to the first mismatching byte.
         mismatch_layer: TerrainKind,
     },
+    /// The current atlas generator no longer produces the pinned reference.
+    /// Without the pinned bytes, a mismatch cannot be attributed to a layer.
+    #[error(
+        "atlas reference digest mismatch: expected {expected}, generated {reference}; input digest {actual} (byte and layer unavailable)"
+    )]
+    ReferenceDigestMismatch {
+        /// Expected BLAKE3 digest in lowercase hex.
+        expected: String,
+        /// Digest of the locally generated reference atlas.
+        reference: String,
+        /// Digest of the supplied atlas.
+        actual: String,
+    },
 }
 
 /// Bake the canonical 6-layer biome atlas.
@@ -2237,6 +2263,13 @@ pub fn bake_canonical_biome_atlas() -> Vec<u8> {
 
 /// Verify an atlas against the canonical fixture parameters and digest.
 pub fn verify_biome_atlas(atlas: &[u8]) -> Result<(), AtlasVerificationError> {
+    verify_biome_atlas_against(atlas, CANONICAL_BIOME_ATLAS_DIGEST)
+}
+
+fn verify_biome_atlas_against(
+    atlas: &[u8],
+    expected_digest: &str,
+) -> Result<(), AtlasVerificationError> {
     const KINDS: [TerrainKind; 6] = [
         TerrainKind::DeepWater,
         TerrainKind::ShallowWater,
@@ -2253,20 +2286,28 @@ pub fn verify_biome_atlas(atlas: &[u8]) -> Result<(), AtlasVerificationError> {
         });
     }
     let actual_digest = blake3::hash(atlas).to_hex().to_string();
-    if actual_digest != CANONICAL_BIOME_ATLAS_DIGEST {
+    if actual_digest != expected_digest {
         let reference = bake_canonical_biome_atlas();
-        let mut mismatch_offset = 0;
-        for (i, (&a, &b)) in atlas.iter().zip(reference.iter()).enumerate() {
-            if a != b {
-                mismatch_offset = i;
-                break;
-            }
+        let reference_digest = blake3::hash(&reference).to_hex().to_string();
+        if reference_digest != expected_digest {
+            return Err(AtlasVerificationError::ReferenceDigestMismatch {
+                expected: expected_digest.to_owned(),
+                reference: reference_digest,
+                actual: actual_digest,
+            });
         }
+        // The equal-length inputs have different hashes, so at least one byte
+        // must differ. Only a reference that matches the pin can locate it.
+        let mismatch_offset = atlas
+            .iter()
+            .zip(&reference)
+            .position(|(actual, expected)| actual != expected)
+            .expect("different deterministic hashes imply different bytes");
         let pixel_index = mismatch_offset / 4;
         let x_pixel = pixel_index % (CANONICAL_BIOME_ATLAS_WIDTH as usize);
         let layer_index = (x_pixel / (CANONICAL_BIOME_ATLAS_TILE_SIZE as usize)).min(5);
         return Err(AtlasVerificationError::DigestMismatch {
-            expected: CANONICAL_BIOME_ATLAS_DIGEST.to_string(),
+            expected: expected_digest.to_owned(),
             actual: actual_digest,
             first_mismatch_offset: mismatch_offset,
             mismatch_layer: KINDS[layer_index],
@@ -3050,6 +3091,14 @@ mod tests {
 
     #[test]
     fn weakest_agent_remains_brighter_than_the_brightest_resolved_terrain() {
+        // Guards the dark-field figure/ground ordering: even the weakest (darkest) agent must
+        // out-luminance the brightest RESOLVED terrain of the BIOLUMINESCENT_DARK_FIELD_V1 style
+        // -- the full shaded sweep, not raw albedos. 2de46a55 swapped the active terrain albedos
+        // for the daylight NATURAL_FIELD_STYLE_V2 and deliberately kept the dark-field constant so
+        // "creature and interface semantics stay inherited until their own redesigns", so this
+        // contract is asserted against the dark-field reference via terrain_shaded_color_for, not
+        // the active visual_style(). Creature figure/ground under the active daylight terrain is a
+        // documented baseline pending the creature redesign -- docs/visual_art_direction.md 2.1.
         let weak = agent_visual_params(&AgentVisualInput {
             genome_color: [0.0; 3],
             health: 0.0,
@@ -3072,17 +3121,19 @@ mod tests {
                     for slope in [0.0, 1.0] {
                         for accent in [0.0, 1.0] {
                             for daylight in [0.0, 1.0] {
-                                brightest_terrain = brightest_terrain.max(luminance(
-                                    terrain_shaded_color(&TerrainShadeInput {
-                                        kind,
-                                        moisture,
-                                        elevation,
-                                        slope,
-                                        accent,
-                                        daylight,
-                                        temperature: 0.5,
-                                    }),
-                                ));
+                                brightest_terrain =
+                                    brightest_terrain.max(luminance(terrain_shaded_color_for(
+                                        &BIOLUMINESCENT_DARK_FIELD_V1,
+                                        &TerrainShadeInput {
+                                            kind,
+                                            moisture,
+                                            elevation,
+                                            slope,
+                                            accent,
+                                            daylight,
+                                            temperature: 0.5,
+                                        },
+                                    )));
                             }
                         }
                     }
@@ -3091,8 +3142,10 @@ mod tests {
         }
         assert!(
             luminance(weak.body_color) > brightest_terrain,
-            "figure/ground invariant: {:?} vs {brightest_terrain}",
-            weak.body_color
+            "dark-field figure/ground: weakest agent {:?} (L={:.4}) must out-luminance brightest V1 resolved terrain (L={:.4})",
+            weak.body_color,
+            luminance(weak.body_color),
+            brightest_terrain
         );
     }
 
@@ -3644,9 +3697,35 @@ mod tests {
                 assert_eq!(first_mismatch_offset, target_byte);
                 assert_eq!(mismatch_layer, TerrainKind::Grass);
             }
-            other @ AtlasVerificationError::LengthMismatch { .. } => {
+            other => {
                 panic!("expected DigestMismatch, got {other:?}")
             }
+        }
+    }
+
+    #[test]
+    fn atlas_reference_drift_never_invents_a_byte_or_layer() {
+        let atlas = bake_canonical_biome_atlas();
+        let reference_digest = blake3::hash(&atlas).to_hex().to_string();
+        let other_digest = blake3::hash(b"a different pinned atlas")
+            .to_hex()
+            .to_string();
+        assert_ne!(reference_digest, other_digest);
+
+        for input in [atlas.clone(), {
+            let mut damaged = atlas;
+            damaged[800] ^= 0xFF;
+            damaged
+        }] {
+            let input_digest = blake3::hash(&input).to_hex().to_string();
+            assert_eq!(
+                verify_biome_atlas_against(&input, &other_digest),
+                Err(AtlasVerificationError::ReferenceDigestMismatch {
+                    expected: other_digest.clone(),
+                    reference: reference_digest.clone(),
+                    actual: input_digest,
+                }),
+            );
         }
     }
 

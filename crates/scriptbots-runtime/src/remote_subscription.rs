@@ -7,17 +7,19 @@
 use crate::RenderSnapshot;
 use crate::remote::{
     REMOTE_MAX_AGENTS, REMOTE_MAX_EVENT_LABEL_BYTES, REMOTE_MAX_EVENT_TEXT_BYTES,
-    REMOTE_MAX_EVENTS, REMOTE_PROTOCOL_VERSION, RemoteEventGap, RemoteEventPage, RemoteEventRecord,
+    REMOTE_MAX_EVENTS, RemoteEnvironmentCache, RemoteEventGap, RemoteEventPage, RemoteEventRecord,
     RemoteFrame, RemoteFrameIdentity, RemoteFramePayload, RemoteProtocolError,
     RemoteSequencedEvent,
 };
 use scriptbots_core::{Tick, TickSummary, TickSummaryDto};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{cell::RefCell, time::Duration};
 use thiserror::Error;
 
 /// Maximum inbound subscription or control message, independently of frame size.
 pub const REMOTE_MAX_REQUEST_BYTES: usize = 16 * 1024;
+/// JSON subscription and consumption-credit schema; independent of the binary frame codec.
+pub const REMOTE_SUBSCRIPTION_PROTOCOL_VERSION: u16 = 1;
 
 /// Independently negotiated presentation channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,7 +27,7 @@ pub const REMOTE_MAX_REQUEST_BYTES: usize = 16 * 1024;
 pub enum RemoteChannel {
     /// Canonical tick aggregates.
     Telemetry,
-    /// Dynamic-world snapshots for the existing browser renderers.
+    /// Dynamic-world snapshots and coherent bounded environment overviews.
     Canvas,
     /// Canonical narrative records with session-bound ordinals.
     Events,
@@ -116,7 +118,9 @@ impl RemoteFrameAck {
     }
 
     fn validated_identity(&self) -> Result<(u128, u64, Option<u64>), RemoteSubscriptionError> {
-        if self.protocol_version != REMOTE_PROTOCOL_VERSION || self.command != "stream_ack" {
+        if self.protocol_version != REMOTE_SUBSCRIPTION_PROTOCOL_VERSION
+            || self.command != "stream_ack"
+        {
             return Err(RemoteSubscriptionError::Request(
                 "expected protocol_version 1 and command stream_ack".into(),
             ));
@@ -164,7 +168,9 @@ impl RemoteSubscriptionRequest {
     }
 
     fn validate(&self) -> Result<(), RemoteSubscriptionError> {
-        if self.protocol_version != REMOTE_PROTOCOL_VERSION || self.command != "subscribe" {
+        if self.protocol_version != REMOTE_SUBSCRIPTION_PROTOCOL_VERSION
+            || self.command != "subscribe"
+        {
             return Err(RemoteSubscriptionError::Request(
                 "expected protocol_version 1 and command subscribe".into(),
             ));
@@ -397,12 +403,33 @@ impl RemoteDeliveryWindow {
     /// subtraction never wraps or treats a future send as a fresh delivery.
     #[must_use]
     pub fn expired(&self, now: Duration) -> bool {
-        !self.is_empty()
-            && (self.validate_time(now).is_err()
-                || self.pending.iter().flatten().any(|pending| {
-                    now.checked_sub(pending.sent_at)
-                        .is_none_or(|elapsed| elapsed >= self.timeout)
-                }))
+        self.acknowledgement_timeout_remaining(now) == Some(Duration::ZERO)
+    }
+
+    /// Time remaining before the earliest outstanding acknowledgement expires.
+    ///
+    /// `None` means no frame is awaiting credit. Expiration or clock regression
+    /// returns zero, so a transport can arm one deadline without periodic polling.
+    /// This read does not move a delivery's timestamp or the observed clock, and
+    /// subtraction avoids overflow when an absolute deadline cannot fit `Duration`.
+    #[must_use]
+    pub fn acknowledgement_timeout_remaining(&self, now: Duration) -> Option<Duration> {
+        if self.is_empty() {
+            return None;
+        }
+        if self.validate_time(now).is_err() {
+            return Some(Duration::ZERO);
+        }
+        self.pending
+            .iter()
+            .flatten()
+            .map(|pending| {
+                now.checked_sub(pending.sent_at)
+                    .map_or(Duration::ZERO, |elapsed| {
+                        self.timeout.saturating_sub(elapsed)
+                    })
+            })
+            .min()
     }
 
     fn validate_time(&self, now: Duration) -> Result<(), RemoteSubscriptionError> {
@@ -428,7 +455,7 @@ fn delivery_clock_regression() -> RemoteSubscriptionError {
     RemoteSubscriptionError::Request("remote delivery clock moved backwards".into())
 }
 
-/// Per-connection cursors; no snapshots or outbound messages are retained here.
+/// Per-connection cursors and one bounded environment cache; no outbound queue is retained.
 #[derive(Debug, Clone)]
 pub struct RemoteSubscription {
     session_id: u128,
@@ -438,6 +465,7 @@ pub struct RemoteSubscription {
     canvas_revision: Option<u64>,
     after_event: u64,
     initial_events: bool,
+    environment: RefCell<RemoteEnvironmentCache>,
 }
 
 impl RemoteSubscription {
@@ -487,6 +515,7 @@ impl RemoteSubscription {
             canvas_revision: after_revision,
             after_event,
             initial_events: true,
+            environment: RefCell::new(RemoteEnvironmentCache::default()),
         })
     }
 
@@ -601,6 +630,11 @@ impl RemoteSubscription {
             playback: snapshot.playback,
             coalesced_publications: previous_revision
                 .map_or(0, |previous| identity.publication_revision - previous - 1),
+            environment: if channel == RemoteChannel::Canvas {
+                Some(self.environment.borrow_mut().snapshot(snapshot)?)
+            } else {
+                None
+            },
             payload,
         };
         frame.validate()?;
@@ -787,7 +821,7 @@ mod tests {
             ),
         };
         RemoteFrameAck {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
+            protocol_version: REMOTE_SUBSCRIPTION_PROTOCOL_VERSION,
             command: "stream_ack".into(),
             session_id: frame.identity.session_id.to_string(),
             channel,
@@ -1052,6 +1086,82 @@ mod tests {
             window.expired(Duration::from_secs(17)),
             "the remaining channel keeps its original deadline"
         );
+    }
+
+    #[test]
+    fn remote_ack_timeout_tracks_the_earliest_credit_without_overflow_or_clock_mutation() {
+        let owner = owner();
+        let snapshot = owner.latest_snapshot();
+        let stream = RemoteSubscription::new(
+            &request(vec![RemoteChannel::Canvas, RemoteChannel::Telemetry]),
+            &snapshot,
+        )
+        .unwrap();
+        let canvas = stream
+            .next_frame(RemoteChannel::Canvas, &snapshot)
+            .unwrap()
+            .unwrap();
+        let telemetry = stream
+            .next_frame(RemoteChannel::Telemetry, &snapshot)
+            .unwrap()
+            .unwrap();
+        let mut window =
+            RemoteDeliveryWindow::new(canvas.identity.session_id, Duration::from_secs(5));
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::MAX),
+            None
+        );
+        window.mark_sent(&canvas, Duration::from_secs(10)).unwrap();
+        window
+            .mark_sent(&telemetry, Duration::from_secs(12))
+            .unwrap();
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(12)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(11)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(15)),
+            Some(Duration::ZERO)
+        );
+        window
+            .acknowledge(&frame_ack(&canvas), Duration::from_secs(14))
+            .unwrap();
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(14)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::from_secs(16)),
+            Some(Duration::from_secs(1))
+        );
+        window
+            .acknowledge(&frame_ack(&telemetry), Duration::from_secs(15))
+            .unwrap();
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::ZERO),
+            None
+        );
+
+        let near_limit = Duration::MAX
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second is within the maximum duration");
+        window.mark_sent(&canvas, near_limit).unwrap();
+        assert_eq!(
+            window.acknowledgement_timeout_remaining(Duration::MAX),
+            Some(Duration::from_secs(4))
+        );
+        assert!(!window.expired(Duration::MAX));
+        let mut immediate = RemoteDeliveryWindow::new(canvas.identity.session_id, Duration::ZERO);
+        immediate.mark_sent(&canvas, Duration::ZERO).unwrap();
+        assert_eq!(
+            immediate.acknowledgement_timeout_remaining(Duration::ZERO),
+            Some(Duration::ZERO)
+        );
+        assert!(immediate.expired(Duration::ZERO));
     }
 
     #[test]

@@ -29,11 +29,11 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrowserConnectionView {
     /// Slot index of connection within node.
-    pub conn_slot: u8,
+    pub conn_slot: u32,
     /// Target node index.
     pub target_node: u32,
-    /// Connection weight.
-    pub weight: f32,
+    /// Exact connection weight. Existing f32 genes widen without loss.
+    pub weight: f64,
     /// Optional function kind tag (e.g. for DWRAON).
     pub kind: Option<String>,
 }
@@ -44,11 +44,11 @@ pub struct BrowserNodeView {
     /// Node index in the network.
     pub node_index: u32,
     /// Bias scalar, if present.
-    pub bias: Option<f32>,
+    pub bias: Option<f64>,
     /// Damping factor, if present.
-    pub damping: Option<f32>,
+    pub damping: Option<f64>,
     /// Gain scalar, if present.
-    pub gain: Option<f32>,
+    pub gain: Option<f64>,
     /// Connections associated with this node.
     pub connections: Vec<BrowserConnectionView>,
 }
@@ -168,33 +168,42 @@ pub struct GenomeBrowserViewModel {
 
 #[derive(Default)]
 struct NodeAccumulator {
-    bias: Option<f32>,
-    damping: Option<f32>,
-    gain: Option<f32>,
-    connections: BTreeMap<u8, ConnAccumulator>,
+    bias: Option<f64>,
+    damping: Option<f64>,
+    gain: Option<f64>,
+    connections: BTreeMap<u32, ConnAccumulator>,
 }
 
 #[derive(Default)]
 struct ConnAccumulator {
     target_node: u32,
-    weight: f32,
+    weight: f64,
     kind: Option<String>,
 }
 
 fn accumulate_nodes(loci: &[(Locus, LocusValue)]) -> BTreeMap<u32, NodeAccumulator> {
     let mut nodes: BTreeMap<u32, NodeAccumulator> = BTreeMap::new();
     for (locus, val) in loci {
-        match (*locus, *val) {
-            (Locus::NodeBias(node), LocusValue::Scalar(s)) => {
+        match (*locus, *val, val.scalar()) {
+            (Locus::NodeBias(node), _, Some(s)) => {
                 nodes.entry(node).or_default().bias = Some(s);
             }
-            (Locus::NodeDamping(node), LocusValue::Scalar(s)) => {
+            (Locus::NodeDamping(node), _, Some(s)) => {
                 nodes.entry(node).or_default().damping = Some(s);
             }
-            (Locus::NodeGain(node), LocusValue::Scalar(s)) => {
+            (Locus::NodeGain(node), _, Some(s)) => {
                 nodes.entry(node).or_default().gain = Some(s);
             }
-            (Locus::NodeWeight { node, conn }, LocusValue::Scalar(s)) => {
+            (Locus::NodeWeight { node, conn }, _, Some(s)) => {
+                nodes
+                    .entry(node)
+                    .or_default()
+                    .connections
+                    .entry(u32::from(conn))
+                    .or_default()
+                    .weight = s;
+            }
+            (Locus::NodeWeightWide { node, conn }, _, Some(s)) => {
                 nodes
                     .entry(node)
                     .or_default()
@@ -203,7 +212,16 @@ fn accumulate_nodes(loci: &[(Locus, LocusValue)]) -> BTreeMap<u32, NodeAccumulat
                     .or_default()
                     .weight = s;
             }
-            (Locus::NodeTarget { node, conn }, LocusValue::Target(t)) => {
+            (Locus::NodeTarget { node, conn }, LocusValue::Target(t), _) => {
+                nodes
+                    .entry(node)
+                    .or_default()
+                    .connections
+                    .entry(u32::from(conn))
+                    .or_default()
+                    .target_node = t;
+            }
+            (Locus::NodeTargetWide { node, conn }, LocusValue::Target(t), _) => {
                 nodes
                     .entry(node)
                     .or_default()
@@ -212,19 +230,19 @@ fn accumulate_nodes(loci: &[(Locus, LocusValue)]) -> BTreeMap<u32, NodeAccumulat
                     .or_default()
                     .target_node = t;
             }
-            (Locus::NodeKind { node, conn }, LocusValue::Kind(k)) => {
+            (Locus::NodeKind { node, conn }, LocusValue::Kind(k), _) => {
                 nodes
                     .entry(node)
                     .or_default()
                     .connections
-                    .entry(conn)
+                    .entry(u32::from(conn))
                     .or_default()
                     .kind = Some(format!("kind_{k}"));
             }
-            (Locus::Cell(cell_idx), LocusValue::Scalar(s)) => {
+            (Locus::Cell(cell_idx), _, Some(s)) => {
                 nodes.entry(cell_idx).or_default().bias = Some(s);
             }
-            (Locus::Hyper(id), LocusValue::Scalar(s)) => {
+            (Locus::Hyper(id), _, Some(s)) => {
                 nodes.entry(100_000 + u32::from(id)).or_default().bias = Some(s);
             }
             _ => {}
@@ -239,9 +257,52 @@ fn mutation_diff(
     parent_envelope: Option<&BrainGenomeEnvelope>,
     parent_uids: &[AgentUid],
 ) -> (MutationDiffStatus, Vec<GenomeDelta>) {
-    parent_envelope.map_or_else(
-        || (MutationDiffStatus::FounderNoParent, Vec::new()),
-        |parent| match diff_genomes(codec, parent, envelope) {
+    let supplied = parent_uids.first().copied();
+    if !envelope
+        .provenance()
+        .parents
+        .iter()
+        .flatten()
+        .copied()
+        .eq(parent_uids.iter().copied())
+    {
+        let reason = if supplied.is_none() {
+            "primary parent identity is unavailable"
+        } else {
+            "primary parent identity does not match genome provenance"
+        };
+        return (
+            MutationDiffStatus::Unavailable {
+                reason: reason.to_owned(),
+            },
+            Vec::new(),
+        );
+    }
+    match (parent_envelope, parent_uids.first().copied()) {
+        (None, None) => (MutationDiffStatus::FounderNoParent, Vec::new()),
+        (None, Some(_)) => (
+            MutationDiffStatus::Unavailable {
+                reason: "primary parent genome is unavailable".to_owned(),
+            },
+            Vec::new(),
+        ),
+        (Some(_), None) => (
+            MutationDiffStatus::Unavailable {
+                reason: "primary parent identity is unavailable".to_owned(),
+            },
+            Vec::new(),
+        ),
+        (Some(parent), Some(_))
+            if envelope.provenance().parent_genome_hashes[0] != Some(parent.material_hash()) =>
+        {
+            (
+                MutationDiffStatus::Unavailable {
+                    reason: "primary parent genome does not match recorded material".to_owned(),
+                },
+                Vec::new(),
+            )
+        }
+        (Some(parent), Some(parent_uid)) => match diff_genomes(codec, parent, envelope) {
             Ok(diff) => {
                 let status = if parent_uids.len() > 1 {
                     MutationDiffStatus::SexualPrimary {
@@ -250,7 +311,6 @@ fn mutation_diff(
                         summary: diff.summary,
                     }
                 } else {
-                    let parent_uid = parent_uids.first().copied().unwrap_or(AgentUid(0));
                     MutationDiffStatus::Computed {
                         parent_uid,
                         total_deltas: diff.deltas.len(),
@@ -266,7 +326,7 @@ fn mutation_diff(
                 Vec::new(),
             ),
         },
-    )
+    }
 }
 
 impl GenomeBrowserViewModel {
@@ -432,6 +492,7 @@ impl GenomeBrowserViewModel {
     pub fn delta_for_locus(&self, locus: &Locus) -> Option<&GenomeDelta> {
         self.deltas.iter().find(|d| match d {
             GenomeDelta::Scalar { locus: l, .. }
+            | GenomeDelta::Scalar64 { locus: l, .. }
             | GenomeDelta::Retarget { locus: l, .. }
             | GenomeDelta::KindFlip { locus: l, .. } => l == locus,
         })
@@ -447,6 +508,38 @@ mod tests {
         BrainGenomeMaterial, BrainHeredityCapabilityV1, BrainHeredityExclusionV1, MutationRates,
         OffspringStatePolicy, RandomStream,
     };
+
+    #[test]
+    fn topology_retains_f64_bits_wide_slots_and_exact_legacy_scalars() {
+        let precise = f64::from_bits(1.0_f64.to_bits() + 1);
+        let loci = [
+            (Locus::NodeBias(325), LocusValue::Scalar64(precise)),
+            (
+                Locus::NodeWeightWide {
+                    node: 325,
+                    conn: 299,
+                },
+                LocusValue::Scalar64(-0.0),
+            ),
+            (
+                Locus::NodeTargetWide {
+                    node: 325,
+                    conn: 299,
+                },
+                LocusValue::Target(324),
+            ),
+            (Locus::NodeBias(1), LocusValue::Scalar(0.1)),
+        ];
+        let nodes = accumulate_nodes(&loci);
+        assert_eq!(nodes[&325].bias.unwrap().to_bits(), precise.to_bits());
+        let connection = &nodes[&325].connections[&299];
+        assert_eq!(connection.weight.to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(connection.target_node, 324);
+        assert_eq!(
+            nodes[&1].bias.unwrap().to_bits(),
+            f64::from(0.1_f32).to_bits()
+        );
+    }
 
     struct MockCodec {
         family: BrainFamilyId,
@@ -654,9 +747,19 @@ mod tests {
         let parent_env =
             BrainGenomeEnvelope::new(family.clone(), 1, 1, vec![1, 2, 3], founder_provenance())
                 .expect("envelope");
-        let child_env =
-            BrainGenomeEnvelope::new(family.clone(), 1, 1, vec![1, 2, 4], founder_provenance())
-                .expect("envelope");
+        let child_env = BrainGenomeEnvelope::new(
+            family.clone(),
+            1,
+            1,
+            vec![1, 2, 4],
+            BrainProvenance {
+                parents: [Some(AgentUid(10)), None],
+                parent_genome_hashes: [Some(parent_env.material_hash()), None],
+                created_at: Tick(200),
+                derivation: BrainGenomeDerivation::MutationOnly,
+            },
+        )
+        .expect("envelope");
         let codec = DynamicMockCodec {
             family,
             parent_loci,
@@ -737,6 +840,63 @@ mod tests {
             }
             other => panic!("unexpected diff status: {other:?}"),
         }
+    }
+
+    #[test]
+    fn missing_parent_data_never_claims_founder_or_invents_an_identity() {
+        let (codec, parent, child) = delta_kind_fixture();
+        let build = |parent_envelope, parent_uids| {
+            GenomeBrowserViewModel::build(
+                &codec,
+                AgentUid(42),
+                2,
+                Tick(200),
+                &child,
+                parent_envelope,
+                parent_uids,
+                None,
+                None,
+                0,
+                20,
+            )
+            .unwrap()
+        };
+        let missing_genome = build(None, vec![AgentUid(10)]);
+        assert!(matches!(
+            &missing_genome.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent genome is unavailable"
+        ));
+        assert_eq!(missing_genome.deltas, []);
+        let missing_identity = build(Some(&parent), vec![]);
+        assert!(matches!(
+            &missing_identity.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent identity is unavailable"
+        ));
+        assert_eq!(missing_identity.deltas, []);
+        let omitted_identity = build(None, vec![]);
+        assert!(matches!(
+            &omitted_identity.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent identity is unavailable"
+        ));
+        let wrong_identity = build(Some(&parent), vec![AgentUid(11)]);
+        assert!(matches!(
+            &wrong_identity.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent identity does not match genome provenance"
+        ));
+        let different_parent = BrainGenomeEnvelope::new(
+            parent.family_id().clone(),
+            parent.schema_version(),
+            parent.codec_version(),
+            vec![9, 9, 9],
+            founder_provenance(),
+        )
+        .unwrap();
+        let changed_material = build(Some(&different_parent), vec![AgentUid(10)]);
+        assert!(matches!(
+            &changed_material.mutation_diff,
+            MutationDiffStatus::Unavailable { reason } if reason == "primary parent genome does not match recorded material"
+        ));
+        assert_eq!(changed_material.deltas, []);
     }
 
     #[test]
@@ -837,15 +997,28 @@ mod tests {
             family: family.clone(),
             loci,
         };
-        let env = BrainGenomeEnvelope::new(family, 1, 1, vec![1, 2], founder_provenance())
+        let env = BrainGenomeEnvelope::new(family.clone(), 1, 1, vec![1, 2], founder_provenance())
             .expect("envelope");
+        let child = BrainGenomeEnvelope::new(
+            family,
+            1,
+            1,
+            vec![1, 2],
+            BrainProvenance {
+                parents: [Some(AgentUid(1)), None],
+                parent_genome_hashes: [Some(env.material_hash()), None],
+                created_at: Tick(10),
+                derivation: BrainGenomeDerivation::Clone,
+            },
+        )
+        .expect("child envelope");
 
         let vm = GenomeBrowserViewModel::build(
             &codec,
             AgentUid(2),
             1,
             Tick(10),
-            &env,
+            &child,
             Some(&env), // Same parent envelope
             vec![AgentUid(1)],
             None,

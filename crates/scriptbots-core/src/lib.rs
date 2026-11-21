@@ -62,6 +62,7 @@ pub use interventions::{
     canonical_param_bytes, intervention_from_param_bytes, replay_journal_against_world,
     sort_interventions_deterministically, verify_journal_completeness,
 };
+pub use permalink::to_canonical_value;
 pub use replay::{
     ReplayScrubError, ReplayScrubFrame, ReplayScrubOutcome, replay_scrub_from_checkpoint,
 };
@@ -791,9 +792,26 @@ pub struct BrainInspectionBuildStats {
     pub truncated: bool,
 }
 
+/// How the displayed activity was obtained, independently of its topology and bounds.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainActivitySource {
+    /// Values retained in the evaluator's current state.
+    #[default]
+    EvaluatorState,
+    /// A read-only feed-forward reconstruction from the owner's recorded signal arrays.
+    ///
+    /// The final response matches the recorded outputs bit-for-bit. Intermediate activations
+    /// were recomputed; this does not claim they were retained from a historical evaluation.
+    ReconstructedFeedForward,
+}
+
 /// A family-produced activation payload after all request-time bounds are applied.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainInspectionSnapshot {
+    /// Whether activity is retained evaluator state or a labelled reconstruction.
+    #[serde(default)]
+    pub activity_source: BrainActivitySource,
     /// Bounded activation payload.
     pub activations: BrainActivations,
     /// Structural cost evidence for the build.
@@ -803,6 +821,12 @@ pub struct BrainInspectionSnapshot {
 /// Typed refusal at the read-only brain-inspection boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Error)]
 pub enum BrainInspectionError {
+    /// This target has no trustworthy activity sample; other targets remain inspectable.
+    #[error("brain activity is unavailable: {reason:?}")]
+    ActivityUnavailable {
+        /// Why no activity sample can be supplied.
+        reason: BrainInspectionUnavailable,
+    },
     /// Request exceeded the hard target-count bound.
     #[error("brain inspection requested {requested} targets, exceeding hard limit {limit}")]
     TargetLimitExceeded {
@@ -950,7 +974,10 @@ pub fn bound_brain_inspection(
         .filter_map(|layer| layer.width.checked_mul(layer.height))
         .max()
         .unwrap_or_default();
-    if !truncated {
+    // An already clipped edge list remains useful to inspectors. Reapplying the owner-side
+    // bounds must not erase it merely because the producer honestly marked it truncated.
+    // If a layer was dropped here, its index space is incomplete and edges are discarded.
+    if layers.len() == source_layers {
         connections = Vec::with_capacity(source_edges.min(limits.max_edges));
         for edge in activations.connections {
             if connections.len() == limits.max_edges
@@ -1005,6 +1032,7 @@ pub fn bound_brain_inspection(
     }
     let retained_payload_bytes = activation_payload_bytes(&activations);
     Ok(BrainInspectionSnapshot {
+        activity_source: BrainActivitySource::EvaluatorState,
         build: BrainInspectionBuildStats {
             source_scalars,
             source_layers,
@@ -2507,6 +2535,20 @@ impl BrainBinding {
         }
     }
 
+    /// Inspect with the owner's recorded signals, without changing evaluator state.
+    pub fn inspect_with_context(
+        &self,
+        request: BrainInspection,
+        context: BrainInspectionContext<'_>,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        match self {
+            Self::Protocol { evaluator, .. } => evaluator.as_ref().map_or(Ok(None), |evaluator| {
+                evaluator.inspect_with_context(request, context)
+            }),
+            Self::Unbound | Self::Legacy { .. } => self.inspect(request),
+        }
+    }
+
     fn take_execution(&mut self) -> BrainExecution {
         match self {
             Self::Unbound => BrainExecution::None,
@@ -2719,7 +2761,7 @@ struct BrainEntry {
     adapter_identity: Option<BrainAdapterIdentityV1>,
     heredity_capability: Option<BrainHeredityCapabilityV1>,
     spawner: Option<BrainSpawner>,
-    protocol_adapter: Option<Box<dyn BrainFamilyAdapter>>,
+    protocol_adapter: Option<Arc<dyn BrainFamilyAdapter>>,
 }
 
 /// Registry owning brain runners keyed by opaque handles.
@@ -2983,7 +3025,7 @@ impl BrainRegistry {
                 adapter_identity: Some(adapter_identity),
                 heredity_capability: Some(heredity_capability),
                 spawner: None,
-                protocol_adapter: Some(adapter),
+                protocol_adapter: Some(Arc::from(adapter)),
             },
         );
         Ok(key)
@@ -3397,6 +3439,10 @@ pub enum BrainInspectionUnavailable {
     UnboundBrain,
     /// The bound brain family cannot inspect.
     Unsupported,
+    /// No recorded signal pair can be distinguished from the unevaluated initial state.
+    NoRecordedEvaluation,
+    /// Reconstructing from recorded inputs did not reproduce the recorded response exactly.
+    RecordedResponseMismatch,
 }
 
 /// Current selected-agent detail captured without mutating the evaluator or world.
@@ -5019,8 +5065,11 @@ pub const KNOB_RANGES: &[KnobRange] = &[
     KnobRange::live("food_intake_rate", 0.0, 1.0),
     KnobRange::live("food_waste_rate", 0.0, 1.0),
     KnobRange::live("food_transfer_rate", 0.0, 1.0),
+    KnobRange::live("food_respawn_interval", 0.0, 1_000_000.0),
     // Metabolism and locomotion.
     KnobRange::live("metabolism_drain", 0.0, 1.0),
+    KnobRange::live("metabolism_ramp_rate", 0.0, 1.0),
+    KnobRange::live("metabolism_boost_penalty", 0.0, 1.0),
     KnobRange::live("movement_drain", 0.0, 1.0),
     KnobRange::live("bot_speed", 0.0, 100.0),
     KnobRange::live("boost_multiplier", 1.0, 50.0),
@@ -5045,6 +5094,7 @@ pub const KNOB_RANGES: &[KnobRange] = &[
     // reappear unnoticed.
     KnobRange::live("reproduction_energy_threshold", 0.0, 2.0),
     KnobRange::live("reproduction_energy_cost", 0.0, 2.0),
+    KnobRange::live("reproduction_attempt_chance", 0.0, 1.0),
     // Population.
     KnobRange::live("population_minimum", 0.0, 100_000.0),
     KnobRange::live("population_spawn_interval", 0.0, 1_000_000.0),
@@ -5134,7 +5184,7 @@ pub fn knob_range(path: &str) -> Option<&'static KnobRange> {
 /// wrong agents near the seam — an agent at x=5 and one at x=995 in a 1000-wide
 /// world are 10 apart, not 990 — and the bug is invisible until someone drops a
 /// meteor near an edge and watches the wrong things die.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(tag = "shape", rename_all = "snake_case")]
 pub enum Region {
     /// The entire world.
@@ -5160,6 +5210,46 @@ pub enum Region {
         /// Height along the wrapped y axis.
         h: f32,
     },
+}
+
+impl<'de> Deserialize<'de> for Region {
+    // AP-invariant deserialize (bd R1 / fastmcp FND-01 hazard): a plain struct's derived Deserialize
+    // calls `deserialize_f32` directly and never Content-buffers, so serde_json's `arbitrary_precision`
+    // feature (which turns buffered numbers into maps) cannot break it. The wire stays byte-identical
+    // to the `#[serde(tag = "shape")]` Serialize above.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct Flat {
+            shape: String,
+            x: Option<f32>,
+            y: Option<f32>,
+            radius: Option<f32>,
+            w: Option<f32>,
+            h: Option<f32>,
+        }
+        let flat = Flat::deserialize(deserializer)?;
+        match flat.shape.as_str() {
+            "all" => Ok(Self::All),
+            "disc" => Ok(Self::Disc {
+                x: flat.x.ok_or_else(|| serde::de::Error::missing_field("x"))?,
+                y: flat.y.ok_or_else(|| serde::de::Error::missing_field("y"))?,
+                radius: flat
+                    .radius
+                    .ok_or_else(|| serde::de::Error::missing_field("radius"))?,
+            }),
+            "rect" => Ok(Self::Rect {
+                x: flat.x.ok_or_else(|| serde::de::Error::missing_field("x"))?,
+                y: flat.y.ok_or_else(|| serde::de::Error::missing_field("y"))?,
+                w: flat.w.ok_or_else(|| serde::de::Error::missing_field("w"))?,
+                h: flat.h.ok_or_else(|| serde::de::Error::missing_field("h"))?,
+            }),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["all", "disc", "rect"],
+            )),
+        }
+    }
 }
 
 impl Eq for Region {}
@@ -5323,7 +5413,7 @@ pub enum CohortSource {
 }
 
 /// How cohort positions are sampled without consuming world RNG.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "placement", rename_all = "snake_case")]
 pub enum Placement {
     /// Uniform sampling inside the region, driven by the carried seed. The seed IS the
@@ -5334,6 +5424,37 @@ pub enum Placement {
         /// Seed driving the sampling; carried so replay reproduces the cohort exactly.
         seed: u64,
     },
+}
+
+impl<'de> Deserialize<'de> for Placement {
+    // AP-invariant deserialize (bd R1 / fastmcp FND-01 hazard): the derived internally-tagged
+    // Deserialize Content-buffers the whole map, so under serde_json's `arbitrary_precision` the
+    // nested `Region`'s f32 fields arrive as maps ("invalid type: map, expected f32") even though
+    // `Region` now has a direct Deserialize. A plain `Flat` struct's derived Deserialize reads each
+    // field straight from the deserializer (no buffer), so `region` reaches `Region::deserialize`
+    // directly and stays AP-safe. The wire is byte-identical to the `#[serde(tag = "placement")]`
+    // Serialize above.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct Flat {
+            placement: String,
+            region: Option<Region>,
+            seed: Option<u64>,
+        }
+        let flat = Flat::deserialize(deserializer)?;
+        match flat.placement.as_str() {
+            "seeded" => Ok(Self::Seeded {
+                region: flat
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                seed: flat
+                    .seed
+                    .ok_or_else(|| serde::de::Error::missing_field("seed"))?,
+            }),
+            other => Err(serde::de::Error::unknown_variant(other, &["seeded"])),
+        }
+    }
 }
 
 impl Placement {
@@ -5422,7 +5543,7 @@ const fn neutral_cohort_diet() -> f32 {
 }
 
 /// An operator intervention applied at a simulation tick boundary.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Intervention {
     /// Suppress food regrowth in a region for a while.
@@ -5503,6 +5624,132 @@ pub enum Intervention {
         #[serde(default)]
         herbivore_tendency: Option<f32>,
     },
+}
+
+impl<'de> Deserialize<'de> for Intervention {
+    // AP-invariant deserialize (bd R1 / fastmcp FND-01 hazard): the derived internally-tagged
+    // Deserialize Content-buffers the whole map, so under serde_json's `arbitrary_precision` every
+    // f32 (and every nested Region/Placement f32) arrives as a map ("invalid type: map, expected
+    // f32"). A plain `Flat` struct's derived Deserialize reads each field straight from the
+    // deserializer (no buffer): the direct f32 fields use `deserialize_f32`, and `region`/`placement`
+    // reach their own direct Deserialize. Wire byte-identical to the `#[serde(tag = "kind")]`
+    // Serialize above; the Option fields below reproduce the original `#[serde(default...)]`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the AP-invariant Flat deserialize matches all 8 Intervention variants in one place; splitting it would scatter the single-source wire contract across helper fns"
+    )]
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct Flat {
+            kind: String,
+            region: Option<Region>,
+            ticks: Option<u32>,
+            growth_scale: Option<f32>,
+            amount: Option<f32>,
+            lethality: Option<f32>,
+            scorch: Option<f32>,
+            terrain: Option<TerrainKind>,
+            fertility_bias: Option<f32>,
+            count: Option<u16>,
+            genome: Option<CohortSource>,
+            placement: Option<Placement>,
+            herbivore_tendency: Option<f32>,
+            closed: Option<bool>,
+            selector: Option<CellSelector>,
+            headroom: Option<u32>,
+        }
+        let f = Flat::deserialize(deserializer)?;
+        match f.kind.as_str() {
+            "drought" => Ok(Self::Drought {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                ticks: f
+                    .ticks
+                    .ok_or_else(|| serde::de::Error::missing_field("ticks"))?,
+                growth_scale: f
+                    .growth_scale
+                    .ok_or_else(|| serde::de::Error::missing_field("growth_scale"))?,
+            }),
+            "embargo" => Ok(Self::Embargo {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                ticks: f
+                    .ticks
+                    .ok_or_else(|| serde::de::Error::missing_field("ticks"))?,
+            }),
+            "bloom" => Ok(Self::Bloom {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                amount: f
+                    .amount
+                    .ok_or_else(|| serde::de::Error::missing_field("amount"))?,
+            }),
+            "meteor" => Ok(Self::Meteor {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                lethality: f
+                    .lethality
+                    .ok_or_else(|| serde::de::Error::missing_field("lethality"))?,
+                scorch: f
+                    .scorch
+                    .ok_or_else(|| serde::de::Error::missing_field("scorch"))?,
+            }),
+            "paint_terrain" => Ok(Self::PaintTerrain {
+                region: f
+                    .region
+                    .ok_or_else(|| serde::de::Error::missing_field("region"))?,
+                terrain: f
+                    .terrain
+                    .ok_or_else(|| serde::de::Error::missing_field("terrain"))?,
+                fertility_bias: f.fertility_bias,
+            }),
+            "inject_cohort" => Ok(Self::InjectCohort {
+                count: f
+                    .count
+                    .ok_or_else(|| serde::de::Error::missing_field("count"))?,
+                genome: f
+                    .genome
+                    .ok_or_else(|| serde::de::Error::missing_field("genome"))?,
+                placement: f
+                    .placement
+                    .ok_or_else(|| serde::de::Error::missing_field("placement"))?,
+                herbivore_tendency: f.herbivore_tendency.unwrap_or_else(neutral_cohort_diet),
+            }),
+            "set_closed_world" => Ok(Self::SetClosedWorld {
+                closed: f
+                    .closed
+                    .ok_or_else(|| serde::de::Error::missing_field("closed"))?,
+            }),
+            "spawn_from_archive" => Ok(Self::SpawnFromArchive {
+                selector: f
+                    .selector
+                    .ok_or_else(|| serde::de::Error::missing_field("selector"))?,
+                placement: f
+                    .placement
+                    .ok_or_else(|| serde::de::Error::missing_field("placement"))?,
+                headroom: f.headroom,
+                herbivore_tendency: f.herbivore_tendency,
+            }),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &[
+                    "drought",
+                    "embargo",
+                    "bloom",
+                    "meteor",
+                    "paint_terrain",
+                    "inject_cohort",
+                    "set_closed_world",
+                    "spawn_from_archive",
+                ],
+            )),
+        }
+    }
 }
 
 impl Intervention {
@@ -9669,7 +9916,7 @@ fn validate_claimed_genome_loci(
                 format!("decoded duplicate locus {locus:?} at canonical index {index}"),
             ));
         }
-        if matches!(value, crate::genome_diff::LocusValue::Scalar(value) if !value.is_finite()) {
+        if !value.is_finite() {
             return Err(invalid_heredity_capability(
                 identity,
                 format!("decoded non-finite scalar at locus {locus:?}"),
@@ -10566,6 +10813,20 @@ pub enum BrainInspection {
     Activations(BrainInspectionLimits),
 }
 
+/// Borrowed owner-side signals available to a read-only inspection.
+///
+/// These arrays are scientific state already recorded by the owner. The context adds no
+/// evaluator history or checkpoint fields and cannot advance a simulation or random stream.
+#[derive(Debug, Clone, Copy)]
+pub struct BrainInspectionContext<'a> {
+    /// Completed owner tick at which the arrays are being inspected.
+    pub source_tick: Tick,
+    /// Latest sensor vector recorded by the owner.
+    pub sensors: &'a [f32; INPUT_SIZE],
+    /// Latest unmodified evaluator response recorded by the owner.
+    pub outputs: &'a [f32; OUTPUT_SIZE],
+}
+
 /// Object-safe scalar evaluator reconstructed from exact genome and state envelopes.
 pub trait BrainEvaluator: Send + Sync {
     /// Owning protocol family.
@@ -10588,6 +10849,16 @@ pub trait BrainEvaluator: Send + Sync {
         request: BrainInspection,
     ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError>;
 
+    /// Inspect using recorded owner signals when the family has no retained activation state.
+    /// Existing families keep their ordinary state-based inspection by default.
+    fn inspect_with_context(
+        &self,
+        request: BrainInspection,
+        _context: BrainInspectionContext<'_>,
+    ) -> Result<Option<BrainInspectionSnapshot>, BrainInspectionError> {
+        self.inspect(request)
+    }
+
     /// Capture every future-affecting dynamic value in a bounded state envelope.
     fn checkpoint_state(&self) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError>;
 }
@@ -10598,9 +10869,12 @@ pub trait BrainEvaluator: Send + Sync {
 /// arrays or device-native state instead of allocating one `Box<dyn BrainEvaluator>` per agent.
 /// Lane order is caller order. A successful call must be bit-identical to scalar evaluation with
 /// the same per-lane reduction order and independent of cohort partitioning or thread count. Core
-/// evaluates through a disposable batch object and commits outputs/state only after every lane
-/// checkpoints and reconstructs successfully, so a rejected or partially mutated batch is never
-/// allowed to replace the parked scalar preimages.
+/// commits outputs/state only after every lane checkpoints and reconstructs successfully, so a
+/// rejected or partially mutated batch is never allowed to replace the parked scalar preimages.
+/// A successful batch may be retained for the next stage only while its factory, ordered lane
+/// identities, genomes and exact checkpoint states still match those scalar preimages. Every
+/// future-affecting lane value must therefore be represented by `checkpoint_states`; retained
+/// scratch and packed immutable weights must not change the scientific transition.
 pub trait BrainBatchEvaluator: Send {
     /// Owning protocol family.
     fn family_id(&self) -> &BrainFamilyId;
@@ -10614,6 +10888,38 @@ pub trait BrainBatchEvaluator: Send {
 
     /// Capture one future-affecting state envelope per evaluator lane.
     fn checkpoint_states(&self) -> Result<Vec<BrainEvaluatorStateEnvelope>, BrainProtocolError>;
+}
+
+#[cfg(feature = "batch-brains")]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BrainCohortKey {
+    registry_key: u64,
+    family_id: BrainFamilyId,
+    architecture: BrainBatchArchitectureKey,
+}
+
+#[cfg(feature = "batch-brains")]
+#[derive(PartialEq, Eq)]
+struct BrainCohortLane {
+    agent_id: AgentId,
+    uid: AgentUid,
+    material_hash: BrainGenomeHash,
+    // Material hashes deliberately exclude provenance, but an adapter receives the entire
+    // envelope and may use that metadata when constructing its evaluator.
+    provenance: BrainProvenance,
+}
+
+/// Execution-only reuse of the immediately preceding stage's successful cohorts. This is not
+/// scientific state and is deliberately absent from checkpoints, world digests and registry
+/// descriptors. Keeping the actual adapter alive makes pointer identity safe against allocator
+/// reuse, including replacement by an identically attested factory at the same registry key.
+#[cfg(feature = "batch-brains")]
+struct RetainedBrainCohort {
+    adapter: Arc<dyn BrainFamilyAdapter>,
+    adapter_identity: BrainAdapterIdentityV1,
+    lanes: Vec<BrainCohortLane>,
+    states: Vec<BrainEvaluatorStateEnvelope>,
+    evaluator: Box<dyn BrainBatchEvaluator>,
 }
 
 /// Object-safe family-owned protocol hooks implemented by each concrete brain family.
@@ -10664,6 +10970,17 @@ pub trait BrainFamilyCodec: Send + Sync {
         Err(BrainProtocolError::GenomeLociUnavailable {
             family_id: self.family_id().clone(),
         })
+    }
+
+    /// Upper bound on canonical loci for every genome accepted by this exact adapter.
+    ///
+    /// Inspection uses this allocation-free declaration before decoding an opaque genome.
+    /// A family with no declared producer bound remains available to offline diffing, but
+    /// cannot enter bounded interactive inspection. The declaration changes neither genome
+    /// semantics nor heredity eligibility. Implementations must derive it from their admitted
+    /// architecture, and inspection verifies the returned locus count against the declaration.
+    fn genome_loci_upper_bound(&self) -> Option<usize> {
+        None
     }
 
     /// Validate generic versions and family-owned future-affecting state bytes.
@@ -13120,15 +13437,21 @@ pub struct ScriptBotsConfig {
     pub reproduction_energy_threshold: f32,
     /// Energy deducted from a parent upon reproduction.
     pub reproduction_energy_cost: f32,
-    /// Cooldown in ticks between reproductions.
+    /// Reproduction progress required before another birth (at least one unit).
+    /// Food intake and carcass rewards earn progress; positive reproduction rates
+    /// also add progress each tick. This is a tick cooldown only at unit rates
+    /// when food contributes no progress.
     pub reproduction_cooldown: u32,
     /// Interval (in ticks) controlling when reproduction attempts are evaluated. `0` allows attempts every tick.
     pub reproduction_attempt_interval: u32,
     /// Probability that a ready agent reproduces when the attempt cadence fires.
     pub reproduction_attempt_chance: f32,
-    /// Herbivore reproduction rate multiplier applied per tick.
+    /// Per-tick reproduction progress for a pure herbivore.
+    /// Set both diet rates to zero for food-funded reproduction, or both positive
+    /// for the existing diet-interpolated timer plus food bonuses.
     pub reproduction_rate_herbivore: f32,
-    /// Carnivore reproduction rate multiplier applied per tick.
+    /// Per-tick reproduction progress for a pure carnivore; see
+    /// [`Self::reproduction_rate_herbivore`] for the paired-rate policy.
     pub reproduction_rate_carnivore: f32,
     /// Bonus applied to the reproduction counter per unit ground intake.
     pub reproduction_food_bonus: f32,
@@ -14023,20 +14346,30 @@ impl ScriptBotsConfig {
             "reproduction_attempt_chance must be within [0, 1]"
         );
         reject_unless!(
-            self.reproduction_rate_herbivore > 0.0,
-            "reproduction_rate_herbivore must be positive"
+            self.reproduction_rate_herbivore >= 0.0,
+            "reproduction_rate_herbivore must be non-negative"
         );
         reject_unless!(
-            self.reproduction_rate_carnivore > 0.0,
-            "reproduction_rate_carnivore must be positive"
+            self.reproduction_rate_carnivore >= 0.0,
+            "reproduction_rate_carnivore must be non-negative"
         );
+        // Both zero is an explicit food-funded regime. A mixed zero/positive pair
+        // would interpolate arbitrarily small timer rates for some diets, outside
+        // the established reachability guarantee for positive-rate worlds.
+        let food_funded_reproduction =
+            self.reproduction_rate_herbivore == 0.0 && self.reproduction_rate_carnivore == 0.0;
         let minimum_reproduction_rate = self
             .reproduction_rate_herbivore
             .min(self.reproduction_rate_carnivore);
+        reject_unless!(
+            food_funded_reproduction || minimum_reproduction_rate > 0.0,
+            "reproduction_rate_herbivore and reproduction_rate_carnivore must both be zero or both be positive"
+        );
         let maximum_reachable_cooldown =
             f64::from(minimum_reproduction_rate) * f64::from(MAX_EXACT_F32_INTEGER);
         reject_unless!(
-            f64::from(self.reproduction_cooldown.max(1)) <= maximum_reachable_cooldown,
+            food_funded_reproduction
+                || f64::from(self.reproduction_cooldown.max(1)) <= maximum_reachable_cooldown,
             "reproduction_cooldown must be reachable at the minimum configured reproduction rate"
         );
         reject_unless!(
@@ -15708,9 +16041,10 @@ pub mod narrative {
     ///
     /// This is deliberately a runtime policy, not a persisted wire type:
     /// storage must bind a run to fixed-width, versioned configuration
-    /// metadata before constructing it. One replay covers one stable policy
-    /// revision; a mid-run policy transition must be segmented or refused by
-    /// the persisted feeder rather than silently applied.
+    /// metadata before constructing it. Policy transitions take effect at the
+    /// next completed scientific tick; they retain detector cooldowns and the
+    /// newest history that fits the new bounds. A persisted feeder must verify
+    /// the configuration revision before supplying a changed policy.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct NarrativeReplayPolicyV1 {
         /// Completed ticks between detector passes; zero disables detection.
@@ -15806,17 +16140,45 @@ pub mod narrative {
         /// Refuses unsupported schemas, non-finite values, repeated or
         /// decreasing ticks, and gaps in the supposedly complete input stream.
         pub fn push(&mut self, input: NarrativeInputV1) -> Result<(), NarrativeInputError> {
+            self.push_with_policy(input, self.policy)
+        }
+
+        /// Feed one complete input under its authenticated effective policy.
+        ///
+        /// Changes apply at this completed tick, as in the live world. Shrinking
+        /// retention evicts the oldest display events and inputs; growing it
+        /// never reconstructs previously evicted history. Detection cadence is
+        /// evaluated against the absolute tick, including after re-enabling it.
+        /// Cooldowns and events awaiting persistence survive every policy change.
+        /// The caller owns authentication of the recorded configuration revision.
+        ///
+        /// # Errors
+        ///
+        /// Invalid policies, inputs, and continuity leave the entire replay,
+        /// including its previous policy and retained evidence, unchanged.
+        pub fn push_with_policy(
+            &mut self,
+            input: NarrativeInputV1,
+            policy: NarrativeReplayPolicyV1,
+        ) -> Result<(), NarrativeInputError> {
+            let policy = NarrativeReplayPolicyV1::new(
+                policy.interval,
+                policy.history_capacity,
+                policy.event_capacity,
+            )?;
             input.validate()?;
             if let Some(previous) = self.last_tick {
                 validate_tick_pair(previous, input.tick.0)?;
             }
 
-            if self.history.len() >= self.policy.history_capacity {
-                self.history.pop_front();
-                self.dropped_inputs = self.dropped_inputs.saturating_add(1);
-            }
+            self.policy = policy;
+            self.dropped_inputs = self.dropped_inputs.saturating_add(retain_latest(
+                &mut self.history,
+                self.policy.history_capacity - 1,
+            ));
             self.history.push_back(input);
             self.last_tick = Some(input.tick.0);
+            self.narrative.retain_capacity(self.policy.event_capacity);
 
             if self.policy.interval != 0
                 && input.tick.0.is_multiple_of(u64::from(self.policy.interval))
@@ -15937,6 +16299,15 @@ pub mod narrative {
     }
 
     impl RunNarrative {
+        /// Apply a display-ring bound without dropping undrained evidence or
+        /// resetting deduplication. Called once per completed tick even when
+        /// event detection is disabled or not due.
+        pub(super) fn retain_capacity(&mut self, capacity: usize) {
+            self.dropped = self
+                .dropped
+                .saturating_add(retain_latest(&mut self.events, capacity));
+        }
+
         pub(crate) fn validate_checkpoint(&self, tick: Tick, capacity: usize) -> bool {
             let policy = self.policy;
             self.events.len() <= capacity
@@ -16055,6 +16426,7 @@ pub mod narrative {
         {
             let inputs: Vec<NarrativeInputV1> = history.into_iter().collect();
             validate_input_sequence(&inputs)?;
+            self.retain_capacity(capacity);
             if inputs.len() < 8 || capacity == 0 {
                 return Ok(());
             }
@@ -16249,6 +16621,16 @@ pub mod narrative {
             self.pending_persistence.push(record.clone());
             self.events.push_back(record);
         }
+    }
+
+    /// Preserve the newest observations without allocating or inventing history.
+    /// Both the live and persisted feeders apply this at the tick boundary.
+    pub(super) fn retain_latest<T>(values: &mut VecDeque<T>, capacity: usize) -> u64 {
+        let removed = values.len().saturating_sub(capacity);
+        for _ in 0..removed {
+            values.pop_front();
+        }
+        u64::try_from(removed).unwrap_or(u64::MAX)
     }
 
     fn validate_input_sequence(inputs: &[NarrativeInputV1]) -> Result<(), NarrativeInputError> {
@@ -18937,7 +19319,7 @@ mod map_sandbox {
     }
 
     /// Generator configuration for an editor draft: either rule-based (tileset) or sample-based.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize)]
     #[serde(tag = "generator_type")]
     pub enum DraftGeneratorConfig {
         /// Rule-based wave-function-collapse using explicit tileset and adjacency rules.
@@ -18950,6 +19332,66 @@ mod map_sandbox {
             /// Exemplar pattern sample specification.
             sample: SamplePatternSpec,
         },
+    }
+
+    impl<'de> Deserialize<'de> for DraftGeneratorConfig {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            // Read the typed payload directly, even when it precedes the tag. An
+            // internally tagged derived Deserialize buffers through Serde Content;
+            // with serde_json/arbitrary_precision its nested f32 values become
+            // number maps instead of reaching deserialize_f32. Keep the existing
+            // Serialize representation and reject ambiguous or unrelated payloads.
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Fields {
+                generator_type: MapGeneratorKind,
+                #[serde(default, deserialize_with = "present_payload")]
+                tileset: Option<TilesetSpec>,
+                #[serde(default, deserialize_with = "present_payload")]
+                sample: Option<SamplePatternSpec>,
+            }
+
+            // Absence is optional while reading the fields; a present payload
+            // must have its actual type, never null. This also lets the derived
+            // struct reject duplicate fields before a second payload is read.
+            fn present_payload<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+                T: Deserialize<'de>,
+            {
+                T::deserialize(deserializer).map(Some)
+            }
+
+            let fields = Fields::deserialize(deserializer)?;
+            match fields.generator_type {
+                MapGeneratorKind::RuleBased => {
+                    if fields.sample.is_some() {
+                        return Err(serde::de::Error::unknown_field(
+                            "sample",
+                            &["generator_type", "tileset"],
+                        ));
+                    }
+                    Ok(Self::RuleBased {
+                        tileset: fields
+                            .tileset
+                            .ok_or_else(|| serde::de::Error::missing_field("tileset"))?,
+                    })
+                }
+                MapGeneratorKind::SampleBased => {
+                    if fields.tileset.is_some() {
+                        return Err(serde::de::Error::unknown_field(
+                            "tileset",
+                            &["generator_type", "sample"],
+                        ));
+                    }
+                    Ok(Self::SampleBased {
+                        sample: fields
+                            .sample
+                            .ok_or_else(|| serde::de::Error::missing_field("sample"))?,
+                    })
+                }
+            }
+        }
     }
 
     /// The editable parameters and constraints of an editor draft.
@@ -20377,6 +20819,149 @@ mod map_sandbox {
         }
 
         #[test]
+        fn draft_generator_json_round_trip_preserves_wire_and_generated_map() {
+            for config in [
+                DraftGeneratorConfig::RuleBased {
+                    tileset: default_tileset_spec(),
+                },
+                DraftGeneratorConfig::SampleBased {
+                    sample: SamplePatternSpec {
+                        sample_id: "portable_sample".to_owned(),
+                        sample_width: 2,
+                        sample_height: 2,
+                        pattern_size: 2,
+                        sample_tiles: vec![
+                            TerrainKind::Grass,
+                            TerrainKind::Sand,
+                            TerrainKind::DeepWater,
+                            TerrainKind::Rock,
+                        ],
+                        all_orientations: false,
+                        periodic: true,
+                    },
+                },
+            ] {
+                let (kind, field, payload) = match &config {
+                    DraftGeneratorConfig::RuleBased { tileset } => (
+                        "RuleBased",
+                        "tileset",
+                        serde_json::to_string(tileset).unwrap(),
+                    ),
+                    DraftGeneratorConfig::SampleBased { sample } => (
+                        "SampleBased",
+                        "sample",
+                        serde_json::to_string(sample).unwrap(),
+                    ),
+                };
+                let encoded = serde_json::to_string(&config).unwrap();
+                assert_eq!(
+                    encoded,
+                    format!(r#"{{"generator_type":"{kind}","{field}":{payload}}}"#),
+                    "the existing tagged wire representation must not change"
+                );
+                let tag_last = format!(r#"{{"{field}":{payload},"generator_type":"{kind}"}}"#);
+                let expected_map = MapEditorDraft::new("original", 4, 4, 16, 42, config.clone())
+                    .generate_artifact()
+                    .unwrap();
+                for restored in [
+                    serde_json::from_str::<DraftGeneratorConfig>(&encoded).unwrap(),
+                    serde_json::from_str::<DraftGeneratorConfig>(&tag_last).unwrap(),
+                    serde_json::from_value::<DraftGeneratorConfig>(
+                        serde_json::from_str(&encoded).unwrap(),
+                    )
+                    .unwrap(),
+                ] {
+                    assert_eq!(restored, config);
+                    let actual_map = MapEditorDraft::new("restored", 4, 4, 16, 42, restored)
+                        .generate_artifact()
+                        .unwrap();
+                    assert_eq!(
+                        actual_map.scientific_content_hash(),
+                        expected_map.scientific_content_hash(),
+                        "imported inputs must regenerate identical scientific layers"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn draft_generator_json_preserves_every_optional_float_bit() {
+            let fields: &[fn(&mut TileSpec) -> &mut Option<f32>] = &[
+                |tile| &mut tile.fertility_bias,
+                |tile| &mut tile.temperature_bias,
+                |tile| &mut tile.elevation,
+                |tile| &mut tile.moisture,
+                |tile| &mut tile.accent,
+                |tile| &mut tile.permeability,
+                |tile| &mut tile.runoff_bias,
+                |tile| &mut tile.basin_rank,
+                |tile| &mut tile.channel_priority,
+                |tile| &mut tile.swim_cost,
+            ];
+            for field in fields {
+                for value in [
+                    None,
+                    Some(0.0),
+                    Some(-0.0),
+                    Some(f32::from_bits(1)),
+                    Some(f32::from_bits(0x3f00_0001)),
+                    Some(f32::MAX),
+                ] {
+                    let mut expected = fixture_spec();
+                    *field(&mut expected.tiles[0]) = value;
+                    let encoded = serde_json::to_vec(&DraftGeneratorConfig::RuleBased {
+                        tileset: expected.clone(),
+                    })
+                    .unwrap();
+                    let restored: DraftGeneratorConfig = serde_json::from_slice(&encoded).unwrap();
+                    assert_eq!(serde_json::to_vec(&restored).unwrap(), encoded);
+                    let DraftGeneratorConfig::RuleBased {
+                        tileset: mut actual,
+                    } = restored
+                    else {
+                        panic!("rule payload must retain its variant");
+                    };
+                    assert_eq!(
+                        field(&mut actual.tiles[0]).map(f32::to_bits),
+                        value.map(f32::to_bits)
+                    );
+                    assert_eq!(
+                        compute_tileset_hash(&actual),
+                        compute_tileset_hash(&expected)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn draft_generator_json_refuses_ambiguous_or_malformed_envelopes() {
+            let rules =
+                r#"{"id":"rules","tiles":[{"id":"grass","terrain_kind":"Grass","elevation":0.1}]}"#;
+            let sample = r#"{"sample_id":"sample","sample_width":1,"sample_height":1,"pattern_size":1,"sample_tiles":["Sand"]}"#;
+            for (json, reason) in [
+                (format!(r#"{{"tileset":{rules}}}"#), "missing field `generator_type`"),
+                (format!(r#"{{"generator_type":"Future","tileset":{rules}}}"#), "unknown variant"),
+                (r#"{"generator_type":"RuleBased"}"#.to_owned(), "missing field `tileset`"),
+                (r#"{"generator_type":"SampleBased"}"#.to_owned(), "missing field `sample`"),
+                (r#"{"generator_type":"RuleBased","tileset":null}"#.to_owned(), "invalid type: null"),
+                (r#"{"generator_type":"SampleBased","sample":null}"#.to_owned(), "invalid type: null"),
+                (format!(r#"{{"generator_type":"RuleBased","tileset":{rules},"revision":1}}"#), "unknown field `revision`"),
+                (format!(r#"{{"generator_type":"RuleBased","generator_type":"RuleBased","tileset":{rules}}}"#), "duplicate field `generator_type`"),
+                (format!(r#"{{"generator_type":"RuleBased","tileset":{rules},"tileset":{rules}}}"#), "duplicate field `tileset`"),
+                (format!(r#"{{"generator_type":"SampleBased","sample":{sample},"sample":{sample}}}"#), "duplicate field `sample`"),
+                (format!(r#"{{"generator_type":"RuleBased","tileset":{rules},"sample":{sample}}}"#), "unknown field `sample`"),
+                (format!(r#"{{"generator_type":"SampleBased","sample":{sample},"tileset":{rules}}}"#), "unknown field `tileset`"),
+                (format!(r#"{{"generator_type":"RuleBased","tileset":{rules},"sample":null}}"#), "invalid type: null"),
+                (r#"{"generator_type":"RuleBased","tileset":{"id":"first","id":"second"}}"#.to_owned(), "duplicate field `id`"),
+                (r#"{"generator_type":"RuleBased","tileset":{"id":"rules","tiles":[{"id":"grass","terrain_kind":"Grass","elevation":null,"elevation":0.1}]}}"#.to_owned(), "duplicate field `elevation`"),
+                (r#"{"generator_type":"RuleBased","tileset":{"id":"rules","tiles":[{"id":"grass","terrain_kind":"Grass","elevation":"0.1"}]}}"#.to_owned(), "invalid type: string"),
+            ] {
+                let error = serde_json::from_str::<DraftGeneratorConfig>(&json).unwrap_err();
+                assert!(error.to_string().contains(reason), "{json}: {error}");
+            }
+        }
+
+        #[test]
         fn map_editor_draft_bounded_undo_redo() {
             let spec = default_tileset_spec();
             let mut draft = MapEditorDraft::new(
@@ -21695,6 +22280,12 @@ pub struct WorldState {
     runtime: AgentMap<AgentRuntime>,
     index: UniformGridIndex,
     brain_registry: BrainRegistry,
+    // Only cohorts used in the immediately preceding stage survive. Membership changes and
+    // failures evict them; no history of prior populations or architectures accumulates. Like
+    // the existing Send-only SenseProvider, batch evaluators preserve WorldState's Send
+    // contract. The stage accesses this map only through its exclusive world borrow.
+    #[cfg(feature = "batch-brains")]
+    brain_cohorts: BTreeMap<BrainCohortKey, RetainedBrainCohort>,
     cadence: TickCadence,
     food_scratch: Vec<f32>,
     // Reusable per-tick working buffers to avoid allocations
@@ -22700,6 +23291,8 @@ impl WorldState {
             runtime: AgentMap::new(),
             index,
             brain_registry: BrainRegistry::new(),
+            #[cfg(feature = "batch-brains")]
+            brain_cohorts: BTreeMap::new(),
             cadence,
             food_profiles,
             food_scratch: vec![0.0; (food_w as usize) * (food_h as usize)],
@@ -24073,14 +24666,6 @@ impl WorldState {
         &mut self,
         execution_faults: &mut BTreeMap<AgentId, BrainExecutionFault>,
     ) -> Result<(), BrainSpawnError> {
-        #[cfg(feature = "batch-brains")]
-        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-        struct BrainCohortKey {
-            registry_key: u64,
-            family_id: BrainFamilyId,
-            architecture: BrainBatchArchitectureKey,
-        }
-
         struct BrainJob {
             agent_id: AgentId,
             kind: String,
@@ -24124,9 +24709,12 @@ impl WorldState {
 
         #[cfg(feature = "batch-brains")]
         {
+            let mut retained_cohorts = std::mem::take(&mut self.brain_cohorts);
+            let mut next_cohorts = BTreeMap::new();
             let mut candidates = Vec::<(BrainCohortKey, usize)>::new();
             let mut opted_in_families = BTreeSet::new();
             let mut rejected_cohorts = 0_usize;
+            let mut reused_cohorts = 0_usize;
 
             // Classification is canonical and fail-closed. Missing execution variants never
             // reach this loop because only a parked live protocol evaluator can become a batch
@@ -24200,7 +24788,7 @@ impl WorldState {
                 let end = cursor + cohort_len;
                 let cohort = &candidates[cursor..end];
 
-                // A single lane gains nothing from transient cohort construction and retains the
+                // A single lane gains nothing from cohort construction and retains the
                 // exact scalar steady-state path.
                 if cohort.len() < 2 {
                     cursor = end;
@@ -24208,7 +24796,13 @@ impl WorldState {
                 }
                 eligible_sizes.push(cohort.len());
 
-                let Some(adapter) = self.brain_registry.family(cohort_key.registry_key) else {
+                let Some(adapter) = self
+                    .brain_registry
+                    .entries
+                    .get(&cohort_key.registry_key)
+                    .and_then(|entry| entry.protocol_adapter.as_ref())
+                    .cloned()
+                else {
                     cursor = end;
                     continue;
                 };
@@ -24246,18 +24840,49 @@ impl WorldState {
                     continue;
                 }
 
-                let state_refs = states.iter().collect::<Vec<_>>();
-                let mut batch = match adapter.batch_evaluator(&genomes, &state_refs) {
-                    Ok(Some(batch)) => batch,
-                    Ok(None) => {
-                        cursor = end;
-                        continue;
-                    }
-                    Err(error) => {
-                        rejected_cohorts += 1;
-                        reject_cohort(&mut jobs, cohort, error);
-                        cursor = end;
-                        continue;
+                let adapter_identity = adapter.adapter_identity();
+                let lanes = cohort
+                    .iter()
+                    .zip(&genomes)
+                    .map(|((_, job_index), genome)| {
+                        let agent_id = jobs[*job_index].agent_id;
+                        self.identities
+                            .get(agent_id)
+                            .map(|identity| BrainCohortLane {
+                                agent_id,
+                                uid: identity.uid,
+                                material_hash: genome.material_hash(),
+                                provenance: genome.provenance().clone(),
+                            })
+                    })
+                    .collect::<Option<Vec<_>>>();
+                // The parked live scalar evaluators remain authoritative. Reuse is permitted
+                // only after every current preimage has passed the same validation as a fresh
+                // cohort; a rebind, mutation, state edit, arena reuse or factory replacement
+                // therefore cannot execute stale packed parameters or lane state.
+                let retained = retained_cohorts.remove(cohort_key).filter(|retained| {
+                    Arc::ptr_eq(&retained.adapter, &adapter)
+                        && retained.adapter_identity == adapter_identity
+                        && lanes.as_ref() == Some(&retained.lanes)
+                        && retained.states == states
+                });
+                let mut batch = if let Some(retained) = retained {
+                    reused_cohorts += 1;
+                    retained.evaluator
+                } else {
+                    let state_refs = states.iter().collect::<Vec<_>>();
+                    match adapter.batch_evaluator(&genomes, &state_refs) {
+                        Ok(Some(batch)) => batch,
+                        Ok(None) => {
+                            cursor = end;
+                            continue;
+                        }
+                        Err(error) => {
+                            rejected_cohorts += 1;
+                            reject_cohort(&mut jobs, cohort, error);
+                            cursor = end;
+                            continue;
+                        }
                     }
                 };
 
@@ -24277,17 +24902,18 @@ impl WorldState {
                             outputs: outputs.len(),
                         });
                     }
-                    genomes
+                    let replacements = genomes
                         .iter()
                         .zip(&next_states)
                         .map(|(genome, state)| {
-                            Self::reconstruct_protocol_evaluator(adapter, genome, state)
+                            Self::reconstruct_protocol_evaluator(adapter.as_ref(), genome, state)
                         })
-                        .collect::<Result<Vec<_>, _>>()
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((replacements, next_states))
                 })();
 
                 match replacements {
-                    Ok(replacements) => {
+                    Ok((replacements, next_states)) => {
                         for (((_, job_index), output), evaluator) in
                             cohort.iter().zip(outputs).zip(replacements)
                         {
@@ -24297,6 +24923,18 @@ impl WorldState {
                             job.batch_handled = true;
                         }
                         batch_sizes.push(cohort.len());
+                        if let Some(lanes) = lanes {
+                            next_cohorts.insert(
+                                cohort_key.clone(),
+                                RetainedBrainCohort {
+                                    adapter,
+                                    adapter_identity,
+                                    lanes,
+                                    states: next_states,
+                                    evaluator: batch,
+                                },
+                            );
+                        }
                     }
                     Err(error) => {
                         rejected_cohorts += 1;
@@ -24305,6 +24943,10 @@ impl WorldState {
                 }
                 cursor = end;
             }
+
+            // Unmatched old cohorts, singleton fallbacks and declined layouts are all dropped.
+            // Retention is bounded by this stage's active cohorts, not by simulation lifetime.
+            self.brain_cohorts = next_cohorts;
 
             let scalar_protocol_agents = jobs
                 .iter()
@@ -24323,6 +24965,7 @@ impl WorldState {
                 batch_agents = batch_sizes.iter().sum::<usize>(),
                 scalar_protocol_agents,
                 rejected_cohorts,
+                reused_cohorts,
                 eligible_sizes = ?eligible_sizes,
                 batch_sizes = ?batch_sizes,
                 "classified and evaluated protocol brain cohorts"
@@ -24334,6 +24977,7 @@ impl WorldState {
                 batch_sizes,
                 scalar_protocol_agents,
                 rejected_cohorts,
+                reused_cohorts,
             );
         }
 
@@ -24470,6 +25114,13 @@ impl WorldState {
                 explain_calls = self.probe_stats.explain_calls,
                 "probe activation stats"
             );
+        }
+
+        #[cfg(feature = "batch-brains")]
+        if first_error.is_some() || !execution_faults.is_empty() {
+            // No partially evaluated or otherwise fault-adjacent scratch crosses a containment
+            // boundary. Scalar preimages and the existing fault/zero-output policy are intact.
+            self.brain_cohorts.clear();
         }
 
         first_error.map_or(Ok(()), Err)
@@ -25826,9 +26477,10 @@ impl WorldState {
             spike_hits: self.combat_spike_hits,
         };
         self.record_narrative_input(&summary);
-        if self.history.len() >= self.config.history_capacity {
-            self.history.pop_front();
-        }
+        narrative::retain_latest(
+            &mut self.history,
+            self.config.history_capacity.saturating_sub(1),
+        );
         self.history.push_back(summary.clone());
         self.last_spike_hits = self.combat_spike_hits;
         self.last_max_age = max_age;
@@ -26455,6 +27107,8 @@ impl WorldState {
     /// observes or mutates simulation state, so enabling it cannot perturb a
     /// run (proved by `narrative_layer_does_not_perturb_the_simulation`).
     fn stage_narrative(&mut self, next_tick: Tick) {
+        self.narrative
+            .retain_capacity(self.config.narrative_capacity);
         let interval = self.config.narrative_interval;
         if interval == 0 || !next_tick.0.is_multiple_of(u64::from(interval)) {
             return;
@@ -28684,7 +29338,9 @@ impl WorldState {
                     .unwrap_or(0.0),
             };
             let p = (reproduction_chance * modulator).clamp(0.0, 1.0);
-            if reproduction_chance < 1.0 {
+            // A certain attempt still passes through novelty/curiosity selection.
+            // Fitness at probability one keeps its established no-draw path.
+            if p < 1.0 {
                 let draw: f32 = admission_rng.random_range(0.0..1.0);
                 if draw >= p {
                     continue;
@@ -31564,6 +32220,9 @@ impl WorldState {
             }
         }
 
+        // Narrative retention follows the final effective policy at the next
+        // completed tick. Trimming here would make a shrink/grow command pair
+        // between ticks lose history that persisted per-tick inputs cannot see.
         self.config = new_config;
         if self.config.communication_mi_interval > 0 {
             self.realized_hearing_capture_enabled = true;
@@ -31675,10 +32334,23 @@ impl WorldState {
 
             runner_inspections = runner_inspections.saturating_add(1);
             let family = runtime.brain.kind().unwrap_or("unknown");
-            let Some(produced) = runtime
-                .brain
-                .inspect(BrainInspection::Activations(request.limits))?
-            else {
+            let produced = match runtime.brain.inspect_with_context(
+                BrainInspection::Activations(request.limits),
+                BrainInspectionContext {
+                    source_tick: self.tick,
+                    sensors: &runtime.sensors,
+                    outputs: &runtime.outputs,
+                },
+            ) {
+                Ok(produced) => produced,
+                Err(BrainInspectionError::ActivityUnavailable { reason }) => {
+                    telemetry
+                        .push(SelectedBrainTelemetryOutcome::Unavailable { agent_uid, reason });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(produced) = produced else {
                 telemetry.push(SelectedBrainTelemetryOutcome::Unavailable {
                     agent_uid,
                     reason: BrainInspectionUnavailable::Unsupported,
@@ -31686,12 +32358,14 @@ impl WorldState {
                 continue;
             };
             let producer_build = produced.build;
+            let activity_source = produced.activity_source;
             let mut snapshot = bound_brain_inspection(
                 family,
                 produced.activations,
                 producer_build.source_scalars,
                 request.limits,
             )?;
+            snapshot.activity_source = activity_source;
             snapshot.build.source_layers = snapshot
                 .build
                 .source_layers
@@ -36109,10 +36783,10 @@ mod tests {
             ("reproduction_attempt_chance", -0.1, |config, value| {
                 config.reproduction_attempt_chance = value;
             }),
-            ("reproduction_rate_herbivore", 0.0, |config, value| {
+            ("reproduction_rate_herbivore", -1.0, |config, value| {
                 config.reproduction_rate_herbivore = value;
             }),
-            ("reproduction_rate_carnivore", 0.0, |config, value| {
+            ("reproduction_rate_carnivore", -1.0, |config, value| {
                 config.reproduction_rate_carnivore = value;
             }),
             ("reproduction_food_bonus", -1.0, |config, value| {
@@ -37443,6 +38117,146 @@ mod tests {
     }
 
     #[test]
+    fn narrative_policy_changes_bound_history_and_refuse_invalid_inputs_atomically() {
+        use narrative::{NarrativeInputV1, NarrativeReplay, NarrativeReplayPolicyV1};
+
+        let input = |tick| NarrativeInputV1::new(Tick(tick), 10, 1.0, 0).unwrap();
+        let original = NarrativeReplayPolicyV1::new(0, 8, 8).unwrap();
+        let mut replay = NarrativeReplay::from_inputs(original, (1..=8).map(input)).unwrap();
+        let small = NarrativeReplayPolicyV1::new(0, 3, 0).unwrap();
+        replay.push_with_policy(input(9), small).unwrap();
+        assert_eq!(
+            replay
+                .history()
+                .iter()
+                .map(|row| row.tick.0)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9],
+            "one tick must enforce a smaller bound, not evict only one old row"
+        );
+        assert_eq!(replay.dropped_inputs(), 6);
+
+        let grown = NarrativeReplayPolicyV1::new(0, 6, 8).unwrap();
+        replay.push_with_policy(input(10), grown).unwrap();
+        replay.push(input(11)).unwrap();
+        assert_eq!(
+            replay
+                .history()
+                .iter()
+                .map(|row| row.tick.0)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9, 10, 11],
+            "increasing retention must not fabricate the evicted prefix"
+        );
+        assert_eq!(replay.dropped_inputs(), 6);
+
+        let invalid_policy = NarrativeReplayPolicyV1 {
+            history_capacity: 0,
+            ..small
+        };
+        for (candidate, policy) in [
+            (input(12), invalid_policy),
+            (input(11), small),
+            (input(13), small),
+            (
+                NarrativeInputV1 {
+                    average_energy: f32::NAN,
+                    ..input(12)
+                },
+                small,
+            ),
+        ] {
+            let previous = replay.clone();
+            assert!(replay.push_with_policy(candidate, policy).is_err());
+            assert_eq!(replay.policy(), previous.policy());
+            assert_eq!(replay.history(), previous.history());
+            assert_eq!(replay.events(), previous.events());
+            assert_eq!(replay.dropped_inputs(), previous.dropped_inputs());
+            assert_eq!(replay.dropped_events(), previous.dropped_events());
+            assert_eq!(replay.emission_watermarks(), previous.emission_watermarks());
+            assert_eq!(replay.pending_persistence(), previous.pending_persistence());
+        }
+        replay
+            .push(input(12))
+            .expect("failed transitions leave the next tick retryable");
+        assert_eq!(replay.history().len(), 6);
+    }
+
+    #[test]
+    fn narrative_policy_disable_and_reenable_preserve_evidence_cooldowns_and_cadence() {
+        use narrative::{EventKind, NarrativeInputV1, NarrativeReplay, NarrativeReplayPolicyV1};
+
+        let original = NarrativeReplayPolicyV1::new(1, 128, 8).unwrap();
+        let input = |tick, count| NarrativeInputV1::new(Tick(tick), count, 1.0, 0).unwrap();
+        let mut replay = NarrativeReplay::new(original).unwrap();
+        for tick in 1..=128 {
+            replay
+                .push(input(tick, if tick <= 64 { 1000 } else { 200 }))
+                .unwrap();
+        }
+        assert!(
+            replay
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::PopulationCrash)
+        );
+        let pending = replay.pending_persistence().to_vec();
+        let watermarks = replay.emission_watermarks().to_vec();
+        let retained = replay.events().len();
+        let dropped = replay.dropped_events();
+
+        let disabled = NarrativeReplayPolicyV1::new(0, 128, 0).unwrap();
+        replay.push_with_policy(input(129, 1000), disabled).unwrap();
+        assert!(
+            replay.events().is_empty(),
+            "zero capacity clears the display ring even when detection is disabled"
+        );
+        assert_eq!(
+            replay.dropped_events(),
+            dropped + u64::try_from(retained).unwrap()
+        );
+        assert_eq!(replay.pending_persistence(), pending);
+        assert_eq!(replay.emission_watermarks(), watermarks);
+
+        let reenabled = NarrativeReplayPolicyV1::new(16, 128, 8).unwrap();
+        for tick in 130..144 {
+            replay
+                .push_with_policy(input(tick, 1000), reenabled)
+                .unwrap();
+            assert!(
+                replay.events().is_empty(),
+                "detection must wait for the absolute cadence at tick 144"
+            );
+            assert_eq!(replay.pending_persistence(), pending);
+        }
+        replay.push(input(144, 1000)).unwrap();
+        assert!(
+            replay
+                .events()
+                .iter()
+                .any(|event| event.kind == EventKind::PopulationBoom)
+        );
+        assert!(
+            replay
+                .events()
+                .iter()
+                .all(|event| event.kind != EventKind::PopulationCrash),
+            "re-enabling a retained history must not re-emit the earlier crash"
+        );
+        assert!(replay.pending_persistence().starts_with(&pending));
+        let before = replay.clone();
+        let invalid = NarrativeInputV1 {
+            average_energy: f32::INFINITY,
+            ..input(145, 200)
+        };
+        assert!(replay.push_with_policy(invalid, disabled).is_err());
+        assert_eq!(replay.events(), before.events());
+        assert_eq!(replay.pending_persistence(), before.pending_persistence());
+        assert_eq!(replay.emission_watermarks(), before.emission_watermarks());
+        assert_eq!(replay.policy(), before.policy());
+    }
+
+    #[test]
     fn narrative_detects_a_crash_and_names_it_in_deterministic_prose() {
         let mut values = vec![1000usize; 120];
         values.extend(std::iter::repeat_n(300usize, 120));
@@ -37893,6 +38707,167 @@ mod tests {
             replay.dropped_events(),
             "live and replay output rings must truncate identically"
         );
+    }
+
+    #[test]
+    fn production_narrative_policy_changes_match_replay_without_changing_science() {
+        let config = ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            closed: true,
+            population_spawn_interval: 0,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            spike_damage: 0.0,
+            spike_energy_cost: 0.0,
+            reproduction_energy_threshold: f32::MAX,
+            history_capacity: 128,
+            narrative_interval: 8,
+            narrative_capacity: 8,
+            rng_seed: Some(0x16_020_902),
+            ..ScriptBotsConfig::default()
+        };
+        let original_policy = narrative::NarrativeReplayPolicyV1::from_config(&config).unwrap();
+        let mut world = WorldState::new(config.clone()).unwrap();
+        let mut control = WorldState::new(config).unwrap();
+        let mut replay = narrative::NarrativeReplay::new(original_policy).unwrap();
+        for seed in 0..12 {
+            let mut agent = sample_agent(seed);
+            agent.health = 2.0;
+            world.spawn_agent(agent);
+            control.spawn_agent(agent);
+        }
+        for tick in 1..=160 {
+            if tick == 97 {
+                for target in [&mut world, &mut control] {
+                    target
+                        .enqueue_intervention(Intervention::Meteor {
+                            region: Region::All,
+                            lethality: 10.0,
+                            scorch: 0.0,
+                        })
+                        .unwrap();
+                }
+            }
+            if tick == 105 {
+                let history = world.history.clone();
+                let events = world.narrative_events().clone();
+                let previous = world.config().clone();
+                let mut small = previous.clone();
+                small.history_capacity = 3;
+                small.narrative_capacity = 0;
+                small.narrative_interval = 0;
+                world.apply_config_update(small).unwrap();
+                assert_eq!(world.history, history);
+                assert_eq!(world.narrative_events(), &events);
+                world.apply_config_update(previous).unwrap();
+                assert_eq!(
+                    world.history, history,
+                    "coalesced policy changes must not erase history between recorded ticks"
+                );
+
+                let previous_revision = world.config_revision();
+                let previous_config = world.config().clone();
+                let mut invalid = previous_config.clone();
+                invalid.history_capacity = 0;
+                assert!(world.apply_config_update(invalid).is_err());
+                assert_eq!(world.config_revision(), previous_revision);
+                assert_eq!(world.config(), &previous_config);
+                assert_eq!(world.history, history);
+                assert_eq!(world.narrative_events(), &events);
+            }
+            if let Some((history_capacity, narrative_capacity, narrative_interval)) = match tick {
+                113 => Some((3, 0, 0)),
+                114 | 145 => Some((32, 8, 8)),
+                137 => Some((8, 1, 0)),
+                _ => None,
+            } {
+                let mut next = world.config().clone();
+                next.history_capacity = history_capacity;
+                next.narrative_capacity = narrative_capacity;
+                next.narrative_interval = narrative_interval;
+                world.apply_config_update(next).unwrap();
+            }
+            if tick == 129 {
+                for seed in 100..112 {
+                    let mut agent = sample_agent(seed);
+                    agent.health = 2.0;
+                    world.try_inject_agent(agent).unwrap();
+                    control.try_inject_agent(agent).unwrap();
+                }
+            }
+            let completion = world.step_outcome().expect("live policy transition");
+            let control_completion = control
+                .step_outcome()
+                .expect("unchanged-policy scientific control");
+            assert!(
+                completion.fault.is_none(),
+                "live fault at tick {tick}: {:?}",
+                completion.fault
+            );
+            assert!(
+                control_completion.fault.is_none(),
+                "control fault at tick {tick}: {:?}",
+                control_completion.fault
+            );
+            replay
+                .push_with_policy(
+                    narrative::NarrativeInputV1::try_from(&completion.outcome.summary).unwrap(),
+                    narrative::NarrativeReplayPolicyV1::from_config(world.config()).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(world.narrative_events(), replay.events(), "tick {tick}");
+            assert_eq!(
+                world.narrative_dropped_events(),
+                replay.dropped_events(),
+                "tick {tick}"
+            );
+            assert_eq!(
+                world.narrative.emission_watermarks(),
+                replay.emission_watermarks(),
+                "tick {tick}"
+            );
+            let live_inputs = world
+                .history
+                .iter()
+                .map(narrative::NarrativeInputV1::try_from)
+                .collect::<Result<VecDeque<_>, _>>()
+                .unwrap();
+            assert_eq!(&live_inputs, replay.history(), "tick {tick}");
+            assert!(world.history.len() <= world.config().history_capacity);
+            assert!(world.narrative_events().len() <= world.config().narrative_capacity);
+            assert_eq!(
+                world.world_digest_v1().unwrap(),
+                control.world_digest_v1().unwrap(),
+                "narrative policy must leave the scientific transition unchanged at tick {tick}"
+            );
+            // The disabled storage lane drains pending events at every live tick.
+            replay.drain_pending_persistence();
+
+            match tick {
+                104 => assert!(
+                    world
+                        .narrative_events()
+                        .iter()
+                        .any(|event| event.kind == narrative::EventKind::Extinction)
+                ),
+                113 => {
+                    assert_eq!(world.history.len(), 3);
+                    assert!(world.narrative_events().is_empty());
+                }
+                114 => assert_eq!(world.history.len(), 4),
+                136 => assert!(
+                    world
+                        .narrative_events()
+                        .iter()
+                        .any(|event| event.kind == narrative::EventKind::PopulationBoom)
+                ),
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -41994,6 +42969,66 @@ mod tests {
     }
 
     #[test]
+    fn activation_edge_clipping_survives_repeated_bounds_without_claiming_complete_topology() {
+        let limits = BrainInspectionLimits::tightened(2, 32, 8, 2, 1024, 32);
+        let first = bound_brain_inspection(
+            "clipped-weights",
+            BrainActivations {
+                layers: vec![ActivationLayer {
+                    name: "flat".to_owned(),
+                    width: 4,
+                    height: 1,
+                    values: vec![0.1, 0.2, 0.3, 0.4],
+                }],
+                connections: (0..3)
+                    .map(|from| ActivationEdge {
+                        from,
+                        to: 3,
+                        weight: 0.5,
+                    })
+                    .collect(),
+                output_slots: vec![3],
+                truncated: false,
+            },
+            7,
+            limits,
+        )
+        .expect("first bounds pass");
+        assert_eq!(first.activations.connections.len(), 2);
+        assert!(first.activations.truncated);
+        let second = bound_brain_inspection(
+            "clipped-weights",
+            first.activations.clone(),
+            first.build.source_scalars,
+            limits,
+        )
+        .expect("owner bounds pass");
+        assert_eq!(first.activations, second.activations);
+        assert!(matches!(
+            crate::attribution::attribute_output(&second.activations, 0, 3)
+                .unwrap()
+                .method,
+            crate::attribution::AttributionMethod::Unavailable(
+                crate::attribution::AttributionUnavailable::TruncatedTopology
+            )
+        ));
+
+        let dropped_layer = bound_brain_inspection(
+            "clipped-weights",
+            second.activations,
+            7,
+            BrainInspectionLimits::tightened(1, 32, 3, 2, 1024, 32),
+        )
+        .expect("tighter layer bound");
+        assert_eq!(dropped_layer.activations.layers, [] as [ActivationLayer; 0]);
+        assert_eq!(
+            dropped_layer.activations.connections,
+            [] as [ActivationEdge; 0]
+        );
+        assert!(dropped_layer.activations.truncated);
+    }
+
+    #[test]
     fn brain_inspection_is_explicit_deduplicated_revisioned_and_digest_neutral() {
         #[derive(Debug)]
         struct CountingBrain {
@@ -43205,9 +44240,11 @@ mod tests {
         batch_opt_in: bool,
         batch_returns_none: bool,
         batch_fail_at_lane: Option<usize>,
+        batch_failure_accumulator: Option<i16>,
         batch_truncates_checkpoint: bool,
         reconstruction_failure: Option<(i8, i16)>,
         batch_probe: Option<Arc<Mutex<Vec<Vec<i8>>>>>,
+        batch_layout: Option<Arc<AtomicUsize>>,
         locus_mode: FixtureLocusMode,
         heredity_capability: BrainHeredityCapabilityV1,
     }
@@ -43224,9 +44261,11 @@ mod tests {
                 batch_opt_in: true,
                 batch_returns_none: false,
                 batch_fail_at_lane: None,
+                batch_failure_accumulator: None,
                 batch_truncates_checkpoint: false,
                 reconstruction_failure: None,
                 batch_probe: None,
+                batch_layout: None,
                 locus_mode: FixtureLocusMode::Unavailable,
                 heredity_capability: BrainHeredityCapabilityV1::excluded(
                     BrainHeredityExclusionV1::NoCanonicalLocusSchema,
@@ -43464,6 +44503,7 @@ mod tests {
         id: BrainFamilyId,
         evaluators: Vec<FixtureBrainEvaluator>,
         fail_at_lane: Option<usize>,
+        failure_accumulator: Option<i16>,
         truncates_checkpoint: bool,
     }
 
@@ -43491,7 +44531,11 @@ mod tests {
                 .zip(outputs.iter_mut())
                 .enumerate()
             {
-                if self.fail_at_lane == Some(lane) {
+                if self.fail_at_lane == Some(lane)
+                    && self
+                        .failure_accumulator
+                        .is_none_or(|accumulator| evaluator.accumulator == accumulator)
+                {
                     return Err(BrainProtocolError::InvalidPayload {
                         kind: BrainEnvelopeKind::EvaluatorState,
                         family_id: self.id.clone(),
@@ -43538,6 +44582,10 @@ mod tests {
             if let Some(lane) = self.batch_fail_at_lane {
                 semantic_material.push(1);
                 semantic_material.extend_from_slice(lane.to_string().as_bytes());
+            }
+            if let Some(accumulator) = self.batch_failure_accumulator {
+                semantic_material.push(4);
+                semantic_material.extend_from_slice(&accumulator.to_le_bytes());
             }
             if self.batch_truncates_checkpoint {
                 semantic_material.push(2);
@@ -43731,7 +44779,12 @@ mod tests {
             if !self.batch_opt_in {
                 return Ok(None);
             }
-            BrainBatchArchitectureKey::new(b"fixture-dense-scalar-v1".to_vec()).map(Some)
+            let mut architecture = b"fixture-dense-scalar-v1".to_vec();
+            if let Some(layout) = &self.batch_layout {
+                architecture
+                    .extend_from_slice(&layout.load(AtomicUsizeOrdering::Relaxed).to_le_bytes());
+            }
+            BrainBatchArchitectureKey::new(architecture).map(Some)
         }
 
         fn batch_evaluator(
@@ -43773,6 +44826,7 @@ mod tests {
                 id: self.id.clone(),
                 evaluators,
                 fail_at_lane: self.batch_fail_at_lane,
+                failure_accumulator: self.batch_failure_accumulator,
                 truncates_checkpoint: self.batch_truncates_checkpoint,
             })))
         }
@@ -46377,12 +47431,49 @@ mod tests {
             agents: batch_agents,
             probe: batch_probe,
         } = build_world(true);
-        scalar
-            .stage_brains(&mut BTreeMap::new())
-            .expect("matched scalar stage");
-        batch
-            .stage_brains(&mut BTreeMap::new())
-            .expect("matched batch stage");
+        for stage in 0..8 {
+            for (lane, (scalar_agent, batch_agent)) in
+                scalar_agents.into_iter().zip(batch_agents).enumerate()
+            {
+                let sensor = (stage + lane) as f32 * 0.25;
+                scalar.agent_runtime_mut(scalar_agent).unwrap().sensors[0] = sensor;
+                batch.agent_runtime_mut(batch_agent).unwrap().sensors[0] = sensor;
+            }
+            scalar
+                .stage_brains(&mut BTreeMap::new())
+                .expect("matched scalar stage");
+            batch
+                .stage_brains(&mut BTreeMap::new())
+                .expect("matched retained batch stage");
+            for (scalar_agent, batch_agent) in scalar_agents.into_iter().zip(batch_agents) {
+                assert_eq!(
+                    output_bits(
+                        scalar
+                            .agent_runtime(scalar_agent)
+                            .expect("matched scalar result")
+                            .outputs,
+                    ),
+                    output_bits(
+                        batch
+                            .agent_runtime(batch_agent)
+                            .expect("matched batch result")
+                            .outputs,
+                    )
+                );
+                assert_eq!(
+                    scalar
+                        .agent_brain_evaluator_state(scalar_agent)
+                        .expect("matched scalar checkpoint"),
+                    batch
+                        .agent_brain_evaluator_state(batch_agent)
+                        .expect("matched batch checkpoint")
+                );
+            }
+            assert_eq!(
+                scalar.world_digest_v1().expect("matched scalar digest"),
+                batch.world_digest_v1().expect("matched batch digest")
+            );
+        }
         assert!(
             scalar_probe
                 .lock()
@@ -46391,36 +47482,275 @@ mod tests {
         );
         assert_eq!(
             *batch_probe.lock().expect("matched batch probe"),
-            vec![vec![2, 3, -1, 2]]
+            vec![vec![2, 3, -1, 2]],
+            "eight evolving stages must construct the packed cohort only once"
         );
-        for (scalar_agent, batch_agent) in scalar_agents.into_iter().zip(batch_agents) {
+    }
+
+    #[cfg(feature = "batch-brains")]
+    fn retained_cohort_fixture(family: FixtureBrainFamily) -> (WorldState, u64, [AgentId; 2]) {
+        let family_id = family.id.to_string();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            population_minimum: 0,
+            rng_seed: Some(0xCA_C4_E0),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("retained cohort world");
+        let key = world
+            .register_brain_family(family_id.clone(), Box::new(family))
+            .expect("retained cohort family");
+        let agents = [
+            fixture_protocol_lane(1, 2, 0, 0, 4.0),
+            fixture_protocol_lane(2, 3, 0, 0, 2.0),
+        ]
+        .map(|lane| spawn_fixture_protocol_agent(&mut world, key, &family_id, lane));
+        (world, key, agents)
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_invalidates_material_provenance_and_scalar_state() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let family = FixtureBrainFamily::with_batch_probe("retained-edits", Arc::clone(&probe));
+        let (mut world, key, agents) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(probe.lock().unwrap().len(), 1);
+
+        // Each edit changes just one relevant continuation input: material, provenance with
+        // identical material/state, then scalar checkpoint state with an identical genome.
+        let family = FixtureBrainFamily::new("retained-edits");
+        for (gain, created_at, accumulator, constructions) in
+            [(5, 0, 1, 2), (5, 1, 2, 3), (5, 1, -7, 4)]
+        {
+            let genome = family.genome(
+                gain,
+                0,
+                BrainProvenance {
+                    created_at: Tick(created_at),
+                    ..BrainProvenance::default()
+                },
+            );
+            let state = family.state(accumulator);
+            let evaluator = family.evaluator(&genome, &state).unwrap();
+            world.agent_runtime_mut(agents[0]).unwrap().brain =
+                BrainBinding::protocol(key, "retained-edits".to_owned(), genome, evaluator);
+            world.stage_brains(&mut BTreeMap::new()).unwrap();
+            assert_eq!(probe.lock().unwrap().len(), constructions);
             assert_eq!(
-                output_bits(
-                    scalar
-                        .agent_runtime(scalar_agent)
-                        .expect("matched scalar result")
-                        .outputs,
-                ),
-                output_bits(
-                    batch
-                        .agent_runtime(batch_agent)
-                        .expect("matched batch result")
-                        .outputs,
-                )
+                world.agent_runtime(agents[0]).unwrap().outputs[0].to_bits(),
+                (f32::from(gain) * 4.0 + f32::from(accumulator)).to_bits()
             );
             assert_eq!(
-                scalar
-                    .agent_brain_evaluator_state(scalar_agent)
-                    .expect("matched scalar checkpoint"),
-                batch
-                    .agent_brain_evaluator_state(batch_agent)
-                    .expect("matched batch checkpoint")
+                world.agent_brain_evaluator_state(agents[0]).unwrap(),
+                Some(family.state(accumulator + 1))
             );
         }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_tracks_membership_and_evicts_inactive_groups() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let family = FixtureBrainFamily::with_batch_probe("retained-members", Arc::clone(&probe));
+        let (mut world, key, [first, second]) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        let retired_uid = world.agent_uid(second).unwrap();
+        world.remove_agent(second).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert!(world.brain_cohorts.is_empty());
         assert_eq!(
-            scalar.world_digest_v1().expect("matched scalar digest"),
-            batch.world_digest_v1().expect("matched batch digest")
+            probe.lock().unwrap().len(),
+            1,
+            "singletons use scalar execution"
         );
+
+        let replacement = spawn_fixture_protocol_agent(
+            &mut world,
+            key,
+            "retained-members",
+            fixture_protocol_lane(2, 3, 0, 1, 2.0),
+        );
+        assert_ne!(
+            replacement, second,
+            "recycled arena slots carry new generations"
+        );
+        assert_ne!(world.agent_uid(replacement).unwrap(), retired_uid);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(probe.lock().unwrap().len(), 2);
+
+        // Replace a member between stages without changing the population or lane material.
+        // Its matching checkpoint must not hide a new stable identity or arena generation.
+        let accumulator = FixtureBrainFamily::new("retained-members")
+            .decode_state(
+                &world
+                    .agent_brain_evaluator_state(replacement)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        world.remove_agent(replacement).unwrap();
+        let replacement = spawn_fixture_protocol_agent(
+            &mut world,
+            key,
+            "retained-members",
+            fixture_protocol_lane(2, 3, 0, accumulator, 2.0),
+        );
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(probe.lock().unwrap().len(), 3);
+        world.remove_agent(first).unwrap();
+        world.remove_agent(replacement).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert!(world.brain_cohorts.is_empty());
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_rebuilds_for_layout_and_same_descriptor_factory() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let layout = Arc::new(AtomicUsize::new(0));
+        let mut family =
+            FixtureBrainFamily::with_batch_probe("retained-factory", Arc::clone(&probe));
+        family.batch_layout = Some(Arc::clone(&layout));
+        let (mut world, key, _) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        for revision in [1, 0] {
+            layout.store(revision, AtomicUsizeOrdering::Relaxed);
+            world.stage_brains(&mut BTreeMap::new()).unwrap();
+        }
+        assert_eq!(
+            probe.lock().unwrap().len(),
+            3,
+            "old layouts are not retained as history"
+        );
+
+        let identity = world
+            .brain_registry()
+            .family(key)
+            .unwrap()
+            .adapter_identity();
+        let mut family =
+            FixtureBrainFamily::with_batch_probe("retained-factory", Arc::clone(&probe));
+        family.batch_layout = Some(layout);
+        assert_eq!(family.adapter_identity(), identity);
+        let mut replacement = BrainRegistry::new();
+        assert_eq!(
+            replacement
+                .register_family("retained-factory", Box::new(family))
+                .unwrap(),
+            key
+        );
+        *world.brain_registry_mut().unwrap() = replacement;
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(
+            probe.lock().unwrap().len(),
+            4,
+            "a new factory object at the same key must rebuild once despite identical attestations"
+        );
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_failure_discards_mutated_scratch() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let mut family =
+            FixtureBrainFamily::failing_batch_after("retained-failure", 1, Arc::clone(&probe));
+        family.batch_failure_accumulator = Some(2);
+        let (mut world, _, agents) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(probe.lock().unwrap().len(), 1);
+        let before = agents.map(|agent| world.agent_brain_evaluator_state(agent).unwrap());
+
+        for constructions in [1, 2] {
+            let error = world.stage_brains(&mut BTreeMap::new()).unwrap_err();
+            assert!(error.to_string().contains("fixture batch failed at lane 1"));
+            assert_eq!(probe.lock().unwrap().len(), constructions);
+            assert!(world.brain_cohorts.is_empty());
+            for (lane, agent) in agents.into_iter().enumerate() {
+                assert_eq!(
+                    world.agent_runtime(agent).unwrap().outputs,
+                    [0.0; OUTPUT_SIZE]
+                );
+                assert_eq!(
+                    world.agent_brain_evaluator_state(agent).unwrap(),
+                    before[lane]
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn stage_brains_retained_cohort_never_rescues_a_missing_scalar_evaluator() {
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let family = FixtureBrainFamily::with_batch_probe("retained-missing", Arc::clone(&probe));
+        let (mut world, _, agents) = retained_cohort_fixture(family);
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        let BrainBinding::Protocol { evaluator, .. } =
+            &mut world.agent_runtime_mut(agents[0]).unwrap().brain
+        else {
+            panic!("fixture protocol binding");
+        };
+        *evaluator = None;
+        let error = world.stage_brains(&mut BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("no live evaluator"));
+        assert_eq!(
+            world.agent_runtime(agents[0]).unwrap().outputs,
+            [0.0; OUTPUT_SIZE]
+        );
+        assert_eq!(probe.lock().unwrap().len(), 1);
+        assert!(world.brain_cohorts.is_empty());
+    }
+
+    #[cfg(feature = "batch-brains")]
+    #[test]
+    fn retained_cohorts_do_not_change_checkpoint_bytes_or_world_send_contract() {
+        fn require_send<T: Send>() {}
+        require_send::<WorldState>();
+
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let family =
+            FixtureBrainFamily::with_batch_probe("retained-checkpoint", Arc::clone(&probe));
+        let (mut world, _, agents) = retained_cohort_fixture(family);
+        for agent in agents {
+            let genome = world.agent_brain_genome(agent).unwrap().clone();
+            world.bind_agent_brain_genome(agent, &genome).unwrap();
+        }
+        world.stage_brains(&mut BTreeMap::new()).unwrap();
+        assert_eq!(world.brain_cohorts.len(), 1);
+        let checkpoint = world.checkpoint_v1().unwrap();
+        let bytes = checkpoint.encode().unwrap();
+        let digest = world.world_digest_v1().unwrap();
+        let retained = std::mem::take(&mut world.brain_cohorts);
+        assert_eq!(world.checkpoint_v1().unwrap().encode().unwrap(), bytes);
+        assert_eq!(world.world_digest_v1().unwrap(), digest);
+        world.brain_cohorts = retained;
+
+        let restored_probe = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = BrainRegistry::new();
+        registry
+            .register_family(
+                "retained-checkpoint",
+                Box::new(FixtureBrainFamily::with_batch_probe(
+                    "retained-checkpoint",
+                    Arc::clone(&restored_probe),
+                )),
+            )
+            .unwrap();
+        let mut restored = WorldState::restore_checkpoint_v1(&checkpoint, registry).unwrap();
+        assert!(restored.brain_cohorts.is_empty());
+        for _ in 0..3 {
+            world.stage_brains(&mut BTreeMap::new()).unwrap();
+            restored.stage_brains(&mut BTreeMap::new()).unwrap();
+            assert_eq!(
+                world.world_digest_v1().unwrap(),
+                restored.world_digest_v1().unwrap()
+            );
+        }
+        assert_eq!(probe.lock().unwrap().len(), 1);
+        assert_eq!(restored_probe.lock().unwrap().len(), 1);
     }
 
     #[cfg(feature = "batch-brains")]
@@ -46502,7 +47832,7 @@ mod tests {
                 Box::new(FixtureBrainFamily::failing_reconstruction_after_batch(
                     "batch-reconstruction",
                     3,
-                    2,
+                    3,
                     Arc::clone(&probe),
                 )),
             )
@@ -46521,6 +47851,10 @@ mod tests {
                 fixture_protocol_lane(2, 3, -2, 1, 2.0),
             ),
         ];
+        world
+            .stage_brains(&mut BTreeMap::new())
+            .expect("warm cohort before reconstruction failure");
+        assert_eq!(world.brain_cohorts.len(), 1);
         let before = agents.map(|agent| {
             world
                 .agent_brain_evaluator_state(agent)
@@ -46534,12 +47868,13 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("fixture rejected reconstruction for gain 3 at accumulator 2")
+                .contains("fixture rejected reconstruction for gain 3 at accumulator 3")
         );
         assert_eq!(
             *probe.lock().expect("reconstruction probe"),
             vec![vec![2, 3]]
         );
+        assert!(world.brain_cohorts.is_empty());
         for (lane, agent) in agents.into_iter().enumerate() {
             let runtime = world
                 .agent_runtime(agent)
@@ -49611,6 +50946,309 @@ mod tests {
     }
 
     #[test]
+    fn food_funded_reproduction_requires_an_explicit_zero_rate_pair() {
+        let food_funded = ScriptBotsConfig {
+            reproduction_rate_herbivore: 0.0,
+            reproduction_rate_carnivore: 0.0,
+            reproduction_cooldown: 7,
+            ..ScriptBotsConfig::default()
+        };
+        food_funded.validate().expect("food-funded regime");
+        let encoded = serde_json::to_vec(&food_funded).expect("serialize food-funded config");
+        let decoded: ScriptBotsConfig =
+            serde_json::from_slice(&encoded).expect("restore food-funded config");
+        decoded.validate().expect("restored food-funded regime");
+        assert_eq!(decoded.reproduction_rate_herbivore.to_bits(), 0);
+        assert_eq!(decoded.reproduction_rate_carnivore.to_bits(), 0);
+
+        for (herbivore, carnivore) in [(0.0, 1.0), (1.0, 0.0)] {
+            let config = ScriptBotsConfig {
+                reproduction_rate_herbivore: herbivore,
+                reproduction_rate_carnivore: carnivore,
+                ..food_funded.clone()
+            };
+            let error = config.validate().expect_err("mixed timer policy refused");
+            assert_eq!(
+                invalid_config_message(&error),
+                "reproduction_rate_herbivore and reproduction_rate_carnivore must both be zero or both be positive"
+            );
+        }
+
+        let unreachable_timer = ScriptBotsConfig {
+            reproduction_rate_herbivore: f32::MIN_POSITIVE,
+            reproduction_rate_carnivore: f32::MIN_POSITIVE,
+            ..food_funded
+        };
+        assert_eq!(
+            invalid_config_message(
+                &unreachable_timer
+                    .validate()
+                    .expect_err("timed reachability retained")
+            ),
+            "reproduction_cooldown must be reachable at the minimum configured reproduction rate"
+        );
+        ScriptBotsConfig::default()
+            .validate()
+            .expect("unchanged timed defaults");
+    }
+
+    fn food_funded_reproduction_config() -> ScriptBotsConfig {
+        ScriptBotsConfig {
+            food_growth_rate: 0.0,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_intake_rate: 0.25,
+            food_waste_rate: 0.25,
+            food_capacity_base: 1.0,
+            food_capacity_fertility: 0.0,
+            food_transfer_rate: 0.0,
+            reproduction_rate_herbivore: 0.0,
+            reproduction_rate_carnivore: 0.0,
+            reproduction_food_bonus: 2.0,
+            reproduction_fertility_bonus: 0.0,
+            reproduction_energy_cost: 0.25,
+            reproduction_child_energy: 0.25,
+            reproduction_mutation_scale: 0.0,
+            closed: true,
+            history_capacity: 16,
+            ..protocol_reproduction_config(0.0)
+        }
+    }
+
+    fn food_funded_reproduction_world(
+        config: ScriptBotsConfig,
+        herbivore: f32,
+    ) -> (WorldState, AgentId) {
+        let mut world = WorldState::new(config).expect("reproduction world");
+        let key = world
+            .brain_registry_mut()
+            .expect("idle heritable brain registry")
+            .register("food-funded-idle", |_rng| {
+                Ok(Box::new(HeritableBrain::new(0.0)))
+            });
+        let parent = world.spawn_agent(AgentData {
+            position: Position::new(25.0, 25.0),
+            ..AgentData::default()
+        });
+        assert!(
+            world
+                .bind_agent_brain(parent, key)
+                .expect("bind idle parent")
+        );
+        let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+        runtime.herbivore_tendency = herbivore;
+        runtime.energy = 1.0;
+        runtime.reproduction_counter = 0.0;
+        (world, parent)
+    }
+
+    #[test]
+    fn food_funded_reproduction_needs_real_grazing_and_resets_the_newborn() {
+        let config = food_funded_reproduction_config();
+        let (mut dry, dry_parent) = food_funded_reproduction_world(config.clone(), 1.0);
+        let (mut fed, fed_parent) = food_funded_reproduction_world(config, 1.0);
+        fed.food.fill(0.5).expect("two ground meals per cell");
+
+        for tick in 1..=2 {
+            let completion = fed.step_outcome().expect("grazing tick");
+            assert!(completion.fault.is_none(), "{:?}", completion.fault);
+            assert_eq!(completion.outcome.summary.births, usize::from(tick == 2));
+            if tick == 1 {
+                assert_eq!(
+                    fed.agent_runtime(fed_parent)
+                        .expect("fed parent")
+                        .reproduction_counter
+                        .to_bits(),
+                    0.5_f32.to_bits(),
+                    "one actual 0.25 meal earns half the required progress"
+                );
+            } else {
+                let births: Vec<_> = completion
+                    .outcome
+                    .births
+                    .iter()
+                    .filter(|record| record.origin == BirthOrigin::Born)
+                    .collect();
+                assert_eq!(births.len(), 1);
+                assert_eq!(births[0].parent_a, fed.agent_uid(fed_parent));
+            }
+        }
+        assert_eq!(
+            fed.food.get(1, 1),
+            Some(0.0),
+            "the parent's cell was consumed"
+        );
+        let child = fed
+            .agents()
+            .iter_handles()
+            .find(|id| *id != fed_parent)
+            .expect("food-earned child");
+        assert_eq!(
+            fed.agent_runtime(child)
+                .expect("newborn")
+                .reproduction_counter
+                .to_bits(),
+            0
+        );
+        assert_eq!(
+            fed.agent_runtime(fed_parent)
+                .expect("parent reset")
+                .reproduction_counter
+                .to_bits(),
+            0
+        );
+
+        fed.food.fill(0.0).expect("remove remaining food");
+        for _ in 0..128 {
+            for world in [&mut dry, &mut fed] {
+                let completion = world.step_outcome().expect("food-free tick");
+                assert!(completion.fault.is_none(), "{:?}", completion.fault);
+                assert_eq!(completion.outcome.summary.births, 0);
+                assert!(
+                    completion
+                        .outcome
+                        .births
+                        .iter()
+                        .all(|birth| birth.origin != BirthOrigin::Injected)
+                );
+            }
+        }
+        assert_eq!(dry.agent_count(), 1);
+        assert_eq!(fed.agent_count(), 2);
+        assert_eq!(
+            dry.agent_runtime(dry_parent)
+                .expect("dry parent")
+                .reproduction_counter
+                .to_bits(),
+            0
+        );
+        assert_eq!(
+            fed.agent_runtime(child)
+                .expect("unfed child")
+                .reproduction_counter
+                .to_bits(),
+            0
+        );
+    }
+
+    #[test]
+    fn food_funded_reproduction_uses_an_actual_spiked_carcass() {
+        for spiked in [false, true] {
+            let config = ScriptBotsConfig {
+                carcass_reproduction_reward: 1.0,
+                carcass_maturity_age: 1,
+                ..food_funded_reproduction_config()
+            };
+            let (mut world, parent) = food_funded_reproduction_world(config, 0.0);
+            let corpse = world.spawn_agent(AgentData {
+                position: Position::new(26.0, 25.0),
+                health: 0.0,
+                age: 2,
+                ..AgentData::default()
+            });
+            world
+                .agent_runtime_mut(corpse)
+                .expect("corpse runtime")
+                .spiked = spiked;
+            let completion = world.step_outcome().expect("carcass-feeding tick");
+            assert!(completion.fault.is_none(), "{:?}", completion.fault);
+            assert_eq!(completion.outcome.summary.deaths, 1);
+            assert_eq!(completion.outcome.summary.births, usize::from(spiked));
+            assert!(!world.agents().contains(corpse));
+            assert_eq!(world.agent_count(), 1 + usize::from(spiked));
+            assert_eq!(
+                world
+                    .agent_runtime(parent)
+                    .expect("surviving carnivore")
+                    .reproduction_counter
+                    .to_bits(),
+                0
+            );
+            if spiked {
+                let child = world
+                    .agents()
+                    .iter_handles()
+                    .find(|id| *id != parent)
+                    .expect("carcass-earned child");
+                assert_eq!(
+                    world
+                        .agent_runtime(child)
+                        .expect("newborn")
+                        .reproduction_counter
+                        .to_bits(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn food_funded_reproduction_keeps_population_injection_separate() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            closed: false,
+            population_minimum: 2,
+            ..food_funded_reproduction_config()
+        })
+        .expect("open food-funded world");
+        let completion = world.step_outcome().expect("population-floor tick");
+        assert!(completion.fault.is_none(), "{:?}", completion.fault);
+        assert_eq!(world.agent_count(), 2);
+        assert_eq!(completion.outcome.summary.births, 0);
+        assert_eq!(completion.outcome.births.len(), 2);
+        assert!(
+            completion
+                .outcome
+                .births
+                .iter()
+                .all(|birth| birth.origin == BirthOrigin::Injected)
+        );
+    }
+
+    #[test]
+    fn food_funded_reproduction_admission_preserves_positive_rate_arithmetic() {
+        let config = ScriptBotsConfig {
+            reproduction_rate_carnivore: 0.5,
+            reproduction_rate_herbivore: 1.5,
+            reproduction_cooldown: 3,
+            ..food_funded_reproduction_config()
+        };
+        let (mut world, parent) = food_funded_reproduction_world(config, 0.25);
+        // This existing timed regime earns exactly 3/4 per tick with no food.
+        // It produces three births, paying 1/4 energy each, at ticks 4, 8, and 12.
+        let counter_bits = [0x3f40_0000, 0x3fc0_0000, 0x4010_0000, 0];
+        let mut birth_ticks = Vec::new();
+        for tick in 1_u64..=12 {
+            let completion = world.step_outcome().expect("unchanged timed tick");
+            assert!(completion.fault.is_none(), "{:?}", completion.fault);
+            if completion.outcome.summary.births != 0 {
+                birth_ticks.push(tick);
+            }
+            assert_eq!(
+                world
+                    .agent_runtime(parent)
+                    .expect("timed parent")
+                    .reproduction_counter
+                    .to_bits(),
+                counter_bits[((tick - 1) % 4) as usize]
+            );
+        }
+        assert_eq!(birth_ticks, vec![4, 8, 12]);
+        assert_eq!(world.agent_count(), 4);
+        assert_eq!(
+            world
+                .agent_runtime(parent)
+                .expect("timed parent")
+                .energy
+                .to_bits(),
+            0.25_f32.to_bits()
+        );
+        assert_eq!(
+            world.agent_rng_counters(parent),
+            Some(AgentRngCountersV1::from_ordinals(3, 3, 1))
+        );
+    }
+
+    #[test]
     // bd-tqpj: the spy-log mutex guard must stay held across this test's batch assertions; drop order is semantic.
     #[allow(clippy::significant_drop_tightening)]
     fn reproduction_spawns_child() {
@@ -49792,6 +51430,118 @@ mod tests {
         let ticks_b = reproduction_tick_sequence(base, 24);
         assert_eq!(ticks_a, ticks_b);
         assert_ne!(ticks_a, [] as [u64; 0]);
+    }
+
+    #[test]
+    fn reproduction_selection_modulates_certain_attempts_from_real_novelty_scores() {
+        for mode in [
+            EvolutionSelectionMode::Novelty,
+            EvolutionSelectionMode::Curiosity { w: 1.0 },
+            EvolutionSelectionMode::Fitness,
+        ] {
+            let mut config = protocol_reproduction_config(0.0);
+            config.selection_mode = mode;
+            config.novelty_k = 2;
+            config.archive_space = BehaviorSpaceV0::new(
+                0,
+                vec![
+                    Axis::new("diet", PhenotypeFeature::DietTendency, (0.0, 1.0), 4)
+                        .expect("diet behavior axis"),
+                ],
+            );
+            let mut world = WorldState::new(config).expect("selection world");
+            let mut parents = Vec::new();
+            for (seed, diet) in [(0, 0.0), (1, 0.0), (2, 1.0)] {
+                let parent = world.spawn_agent(sample_agent(seed));
+                let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+                runtime.energy = 1.0;
+                runtime.reproduction_counter = 1.0;
+                runtime.herbivore_tendency = diet;
+                parents.push(parent);
+            }
+
+            world.stage_reproduction().expect("selected reproduction");
+            let admitted: Vec<_> = world
+                .pending_spawns
+                .iter()
+                .map(|order| order.parent_id)
+                .collect();
+            if mode == EvolutionSelectionMode::Fitness {
+                assert_eq!(admitted, parents, "fitness keeps certain admission");
+                assert!(world.novelty_state.is_none());
+            } else {
+                let state = world.novelty_state.as_ref().expect("computed scores");
+                let scores: Vec<_> = parents
+                    .iter()
+                    .map(|id| state.normalized_scores[&world.agent_uid(*id).unwrap()])
+                    .collect();
+                assert_eq!(scores, vec![0.0, 0.0, 1.0]);
+                assert_eq!(
+                    admitted,
+                    vec![parents[2]],
+                    "only the novel parent reproduces"
+                );
+            }
+            for parent in &parents {
+                let born = u64::from(admitted.contains(parent));
+                assert_eq!(
+                    world.agent_rng_counters(*parent).expect("parent counters"),
+                    AgentRngCountersV1::from_ordinals(1, born, 0),
+                    "selection claims one attempt but only admitted births claim a birth ordinal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reproduction_selection_uses_the_effective_probability_and_preserves_fitness() {
+        for mode in [
+            EvolutionSelectionMode::Novelty,
+            EvolutionSelectionMode::Curiosity { w: 0.5 },
+            EvolutionSelectionMode::Fitness,
+        ] {
+            for base_chance in [0.65_f32, 1.0] {
+                for score in [None, Some(0.0), Some(0.4), Some(1.0)] {
+                    let mut config = protocol_reproduction_config(0.0);
+                    config.selection_mode = mode;
+                    config.reproduction_attempt_chance = base_chance;
+                    let root_seed = config.rng_seed.expect("pinned seed");
+                    let mut world = WorldState::new(config).expect("selection threshold world");
+                    let parent = world.spawn_agent(sample_agent(0));
+                    let uid = world.agent_uid(parent).expect("parent uid");
+                    let runtime = world.agent_runtime_mut(parent).expect("parent runtime");
+                    runtime.energy = 1.0;
+                    runtime.reproduction_counter = 1.0;
+                    let scores: Vec<_> = score.into_iter().map(|value| (uid, value)).collect();
+                    world.novelty_state =
+                        Some(NoveltyState::new(Tick::zero(), &scores, &scores, 0));
+                    let effective = if mode == EvolutionSelectionMode::Fitness {
+                        base_chance
+                    } else {
+                        base_chance * score.unwrap_or(0.0)
+                    };
+                    let mut oracle = agent_substream(
+                        root_seed,
+                        uid,
+                        AgentRngOperationV1::ReproductionAdmission,
+                        0,
+                    );
+                    let expected = oracle.random_range(0.0..1.0) < effective;
+                    world
+                        .stage_reproduction()
+                        .expect("effective probability gate");
+                    assert_eq!(
+                        world.pending_spawns.len(),
+                        usize::from(expected),
+                        "mode={mode:?}, base={base_chance}, score={score:?}"
+                    );
+                    assert_eq!(
+                        world.agent_rng_counters(parent).expect("parent counters"),
+                        AgentRngCountersV1::from_ordinals(1, u64::from(expected), 0)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

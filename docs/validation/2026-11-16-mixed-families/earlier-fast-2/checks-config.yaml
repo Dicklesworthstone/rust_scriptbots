@@ -1,0 +1,26 @@
+tools:
+  rust_scriptbots:
+    repo: Dicklesworthstone/rust_scriptbots
+    local_path: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_first
+    required_checks:
+      - cargo fmt --check
+      - node --test crates/scriptbots-web/web/tests/recipes.test.mjs crates/scriptbots-web/web/tests/permalink_fork_dom.test.js
+      - cargo test --locked -p scriptbots-web --lib browser_mixed_checkpoint
+      - cargo test --locked -p scriptbots-web --lib browser_checkpoint
+      - cargo test --locked -p scriptbots-web --lib browser_fork
+      - cargo test --locked -p scriptbots-storage --lib chunked_domain_events
+      - cargo test --locked -p scriptbots-storage --lib chunked_insert_rejects_a_short_returning_row_count
+      - cargo test --locked -p scriptbots-storage --lib chunked_replay_inserts_preserve_rows_and_roll_back_late_sql_failures
+      - cargo check --locked --workspace --all-targets
+      - cargo clippy --locked --workspace --all-targets -- -D warnings
+  rust_scriptbots_fast:
+    repo: Dicklesworthstone/rust_scriptbots
+    local_path: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_first
+    required_checks:
+      - cargo fmt --check
+      - node --test crates/scriptbots-web/web/tests/recipes.test.mjs crates/scriptbots-web/web/tests/permalink_fork_dom.test.js
+  rust_scriptbots_first_compile:
+    repo: Dicklesworthstone/rust_scriptbots
+    local_path: /workspace/scratch/59c449fc313c/rust_scriptbots_dsr_first
+    required_checks:
+      - cargo test --locked -p scriptbots-web --lib browser_mixed_checkpoint

@@ -110,6 +110,7 @@ fn bevy_host_client_e2e_drives_real_commands_and_snapshots() {
             _ => None,
         }),
         control_health: None,
+        lab_submit: None,
         logging: scriptbots_bevy::LoggingOwnership::Renderer,
     };
     let submitter = CommandSubmitter::new(Arc::clone(&renderer_ctx.command_submit));

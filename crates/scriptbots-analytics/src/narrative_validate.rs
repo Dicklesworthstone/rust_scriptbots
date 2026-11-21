@@ -22,11 +22,13 @@ use crate::{
     metric_stats_error, timeline_markdown_cell,
 };
 
-/// V2 certifies exact canonical tick windows and reports their complete source binding.
+/// V3 uses temporal blocks for both shift intervals and significance tests, and
+/// records their method, controls and exploratory interpretation.
 ///
-/// V1 sampled a capped dashboard-metric tail and used sample counts as ticks.
-/// The `truncated` field now describes event selection, not detector-input coverage.
-pub const NARRATIVE_VALIDATE_SCHEMA_VERSION: u32 = 2;
+/// V2 introduced exact canonical tick windows and complete source binding. V1
+/// sampled a capped dashboard-metric tail and used sample counts as ticks.
+/// The `truncated` field describes event selection, not detector-input coverage.
+pub const NARRATIVE_VALIDATE_SCHEMA_VERSION: u32 = 3;
 
 /// Rows fetched at a time; the complete run is traversed without retaining it.
 const INPUT_READ_PAGE_SIZE: usize = 256;
@@ -49,13 +51,15 @@ pub struct NarrativeValidate;
 pub struct NarrativeValidateMachine {
     /// Ticks per exact window: before `[tick-window, tick)`, after `[tick, tick+window)`.
     pub window: usize,
-    /// Target False Discovery Rate for Benjamini-Hochberg multiple-testing control.
+    /// Nominal Benjamini-Hochberg threshold across the selected events.
     pub fdr: f64,
-    /// Moving-block length used in block bootstrap resampling.
+    /// Temporal block length used in both bootstrap and permutation resampling.
     pub block_len: usize,
+    /// Actual inference procedures, controls and assumptions for these observations.
+    pub inference: certify::CertificationMethod,
     /// Total events examined and statistically tested.
     pub events_examined: usize,
-    /// Number of events certified significant under FDR control.
+    /// Number of selected events crossing the nominal Benjamini-Hochberg threshold.
     pub significant: usize,
     /// Selected events with unsupported island/metric evidence or incomplete tick windows.
     pub skipped: usize,
@@ -90,7 +94,7 @@ pub struct NarrativeValidateRow {
     pub ci_lower: f64,
     /// Upper bound of the bootstrap confidence interval on the shift.
     pub ci_upper: f64,
-    /// Two-sided permutation test p-value against the stationary null.
+    /// Two-sided whole-block permutation p-value under block exchangeability.
     pub p_value: f64,
     /// Parametric standardized effect size (Cohen's d).
     pub cohens_d: f64,
@@ -98,9 +102,10 @@ pub struct NarrativeValidateRow {
     pub cliffs_delta: f64,
     /// Which effect size estimator was used.
     pub effect_estimator: String,
-    /// True if p-value < alpha prior to multiple testing correction.
+    /// True if the p-value is at or below the nominal threshold before correction.
     pub significant_uncorrected: bool,
-    /// True if the event survives Benjamini-Hochberg FDR control across tested events.
+    /// Nominal Benjamini-Hochberg decision across tested events, without correcting
+    /// for their selection by the online detector from the same observations.
     pub significant_fdr: bool,
 }
 
@@ -130,11 +135,27 @@ struct ValidationEvidence {
 
 fn render_narrative_validate_markdown(machine: &NarrativeValidateMachine) -> String {
     let mut md = String::new();
-    let _ = writeln!(md, "# Narrative event statistical certification\n");
+    let _ = writeln!(md, "# Narrative event statistical analysis\n");
+    let _ = writeln!(
+        md,
+        "> **Exploratory:** the detector selected these events from the same observations. The nominal Benjamini-Hochberg decisions do not correct for event selection or guarantee false-discovery control.\n"
+    );
+    let _ = writeln!(
+        md,
+        "Shift intervals: `{}` ({} resamples, confidence {}). P-values: `{}` ({} permutations). Both use blocks of {} consecutive ticks and resampling seed {}.\n\n{}\n",
+        machine.inference.confidence_interval,
+        machine.inference.resamples,
+        machine.inference.confidence,
+        machine.inference.p_value,
+        machine.inference.permutations,
+        machine.inference.block_len,
+        machine.inference.seed,
+        machine.inference.assumptions,
+    );
     if machine.truncated {
         let _ = writeln!(
             md,
-            "> **Note:** the requested event limit excludes older events. FDR control covers the selected, tested events.\n"
+            "> **Note:** the requested event limit excludes older events. The nominal Benjamini-Hochberg family contains only the selected, tested events.\n"
         );
     }
     if let Some(binding) = &machine.input_binding {
@@ -150,7 +171,7 @@ fn render_narrative_validate_markdown(machine: &NarrativeValidateMachine) -> Str
     }
     let _ = writeln!(
         md,
-        "_window={}, FDR={}, {} of {} events certified significant ({} skipped)._\n",
+        "_window={}, nominal FDR={}, {} of {} events cross the BH threshold ({} skipped)._\n",
         machine.window, machine.fdr, machine.significant, machine.events_examined, machine.skipped
     );
     if machine.skipped > 0 {
@@ -161,13 +182,16 @@ fn render_narrative_validate_markdown(machine: &NarrativeValidateMachine) -> Str
     }
 
     if machine.events.is_empty() {
-        let _ = writeln!(md, "_No narrative events could be certified in this run._");
+        let _ = writeln!(
+            md,
+            "_No narrative events had a supported, complete window for analysis in this run._"
+        );
         return md;
     }
 
     let _ = writeln!(
         md,
-        "| tick | kind | metric | shift | 95% CI | p | d | δ | certified? | narrative |"
+        "| tick | kind | metric | shift | 95% block CI | block p | d | δ | BH threshold? | narrative |"
     );
     let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|");
 
@@ -203,10 +227,10 @@ fn parse_params(params: &ReportParams) -> Result<(CertificationParams, usize), A
     ])?;
 
     let window = params.get_usize("window")?.unwrap_or(30);
-    if window == 0 || window > MAX_WINDOW_TICKS {
+    if !(2..=MAX_WINDOW_TICKS).contains(&window) {
         return Err(AnalyticsError::BadParam {
             name: "window".to_owned(),
-            reason: format!("must be between 1 and {MAX_WINDOW_TICKS} ticks"),
+            reason: format!("must be between 2 and {MAX_WINDOW_TICKS} ticks"),
         });
     }
 
@@ -241,10 +265,10 @@ fn parse_params(params: &ReportParams) -> Result<(CertificationParams, usize), A
         });
     }
     let block_len = params.get_usize("block_len")?.unwrap_or(5);
-    if block_len == 0 {
+    if block_len == 0 || block_len > window / 2 {
         return Err(AnalyticsError::BadParam {
             name: "block_len".to_owned(),
-            reason: "must be at least 1".to_owned(),
+            reason: "must be positive and leave at least two complete blocks per window".to_owned(),
         });
     }
     let limit = params.get_usize("limit")?.unwrap_or(DEFAULT_EVENT_LIMIT);
@@ -414,7 +438,7 @@ impl Report for NarrativeValidate {
     }
 
     fn description(&self) -> &'static str {
-        "Statistical certification of persisted narrative events from exact per-tick detector evidence"
+        "Exploratory block-resampled analysis of narrative events from exact per-tick evidence"
     }
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
@@ -461,6 +485,7 @@ impl Report for NarrativeValidate {
             window: cert_params.window,
             fdr: cert_params.fdr,
             block_len: cert_params.block_len,
+            inference: cert_params.method(),
             events_examined: rows.len(),
             significant,
             skipped: evidence.skipped,
@@ -568,6 +593,7 @@ mod tests {
         });
         let params = CertificationParams {
             window: 2,
+            block_len: 1,
             n_resamples: 20,
             n_permutations: 20,
             ..CertificationParams::default()
@@ -592,6 +618,7 @@ mod tests {
     fn certification_params_fail_closed_on_invalid_statistical_controls() {
         for raw in [
             "window=0",
+            "window=1",
             "window=4097",
             "fdr=0",
             "fdr=1.1",
@@ -599,6 +626,8 @@ mod tests {
             "resamples=0",
             "permutations=0",
             "block_len=0",
+            "block_len=16",
+            "block_len=30",
             "limit=4096",
             "windwo=30",
         ] {

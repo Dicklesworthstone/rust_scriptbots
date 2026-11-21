@@ -1,12 +1,15 @@
 //! Retained-evidence verification and same-build canonical cohort re-execution.
 use super::notebook::{NotebookContext, RunRef};
-use super::spec::Arm;
-use super::stats::{AnalysisParams, MatchedSeedAnalysis, RunSummary, analyze_matched_seed_runs};
+use super::spec::{Arm, InteractionContrast};
+use super::stats::{
+    AnalysisParams, LAB_RUN_SUMMARY_VERSION, MatchedSeedAnalysis, RunSummary,
+    analyze_matched_seed_runs_with_interactions,
+};
 use crate::experiment_runner::{
     ExperimentBatchStatus, MatchedSeedCohort, MatchedSeedExperimentRunner, RunRecord, RunState,
     ScenarioVariant,
 };
-use crate::{BuildProvenanceV0, RunManifestV3};
+use crate::{BuildProvenanceV0, RunManifestV3, ScenarioInterventionV1};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,7 +17,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-const SCHEMA: u32 = 1;
+// v4 binds the complete predeclared interaction design and the joint correction
+// family, as well as timed treatments, v4 scientific rows and actual inference work.
+const SCHEMA: u32 = 4;
 const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, clap::Args)]
@@ -64,6 +69,8 @@ struct ReproductionInput {
     ticks: u64,
     context: NotebookContext,
     runs: Vec<SerializedRun>,
+    // Required even when empty: the declaration is distinct from the result table.
+    interaction_contrasts: Vec<InteractionContrast>,
     analysis: Option<MatchedSeedAnalysis>,
     configs: Vec<String>,
 }
@@ -208,29 +215,59 @@ fn same_build_identity(recorded: &BuildProvenanceV0) -> bool {
     recorded == &expected
 }
 
-fn validate_lab_variants(variants: &[ScenarioVariant]) -> Result<()> {
-    ensure!(
-        variants
-            .iter()
-            .all(|variant| variant.interventions.is_empty()),
-        "Lab reproduction cannot execute scheduled interventions absent from its arm provenance"
-    );
+fn validate_lab_plan(input: &ReproductionInput) -> Result<()> {
+    let planned = runner(input, Path::new("")).plan_batch()?;
+    // During emission the rows are populated only after retained bundles have
+    // been verified. Loaded reproduction inputs must bind every row to the plan,
+    // including workers invoked directly rather than through the parent process.
+    if !input.runs.is_empty() {
+        ensure!(
+            planned.len() == input.runs.len(),
+            "reproduction plan/run count mismatch"
+        );
+        for row in &input.runs {
+            let reference = &row.reference;
+            ensure!(
+                reference.provenance_version == LAB_RUN_SUMMARY_VERSION,
+                "Lab run-summary provenance schema mismatch run={}",
+                reference.run_id
+            );
+            let variant = input
+                .variants
+                .get(usize::from(reference.arm_id))
+                .context("retained arm outside reproduction plan")?;
+            ensure!(
+                variant.variant_id == reference.variant_id,
+                "reproduction arm differs from retained run={}",
+                reference.run_id
+            );
+            ensure!(
+                variant.interventions == reference.interventions,
+                "reproduction intervention schedule differs from retained run={}",
+                reference.run_id
+            );
+        }
+    }
     Ok(())
 }
 
-fn read_lab_manifest(bundle: &Path, run_id: &str) -> Result<RunManifestV3> {
+fn read_lab_manifest(
+    bundle: &Path,
+    run_id: &str,
+    interventions: &[ScenarioInterventionV1],
+) -> Result<RunManifestV3> {
     let wire: scriptbots_storage::RunBundleV1 =
         serde_json::from_slice(&checked_file(&bundle.join("bundle_manifest.json"))?)?;
     let manifest: RunManifestV3 = serde_json::from_str(&wire.manifest.manifest_json)?;
     ensure!(
-        manifest.scenario.interventions.is_empty(),
-        "retained run={run_id} contains scheduled interventions absent from Lab arm provenance"
+        manifest.scenario.interventions == interventions,
+        "retained run={run_id} intervention schedule differs from Lab arm provenance"
     );
     Ok(manifest)
 }
 
 fn verify_rows(input: &ReproductionInput, run_records: Vec<RunRecord>) -> Result<Vec<RunSummary>> {
-    validate_lab_variants(&input.variants)?;
+    validate_lab_plan(input)?;
     let arms = input
         .variants
         .iter()
@@ -242,12 +279,21 @@ fn verify_rows(input: &ReproductionInput, run_records: Vec<RunRecord>) -> Result
             Ok(Arm {
                 brain_family: family.to_owned(),
                 config_overrides: variant.config_overrides.clone(),
+                interventions: variant.interventions.clone(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
     for record in &run_records {
+        let arm_index = record
+            .variant_id
+            .strip_prefix("arm-")
+            .and_then(|rest| rest.parse::<usize>().ok())
+            .ok_or_else(|| anyhow::anyhow!("noncanonical variant_id {}", record.variant_id))?;
+        let arm = arms.get(arm_index).ok_or_else(|| {
+            anyhow::anyhow!("variant {} outside the cited plan", record.variant_id)
+        })?;
         let bundle = Path::new(record.bundle_path.as_deref().context("missing bundle")?);
-        let manifest = read_lab_manifest(bundle, &record.run_id)?;
+        let manifest = read_lab_manifest(bundle, &record.run_id, &arm.interventions)?;
         ensure!(
             same_build_identity(&manifest.build),
             "build provenance mismatch run={} arm={} seed={}",
@@ -262,16 +308,8 @@ fn verify_rows(input: &ReproductionInput, run_records: Vec<RunRecord>) -> Result
         // The manifest's normalized config must equal what THIS build derives from
         // the arm's cited overrides at the row's seed: a tampered override or a
         // bundle detached from its plan fails here, not only at digest compare.
-        let arm_index = record
-            .variant_id
-            .strip_prefix("arm-")
-            .and_then(|rest| rest.parse::<usize>().ok())
-            .ok_or_else(|| anyhow::anyhow!("noncanonical variant_id {}", record.variant_id))?;
-        let arm_overrides = arms.get(arm_index).ok_or_else(|| {
-            anyhow::anyhow!("variant {} outside the cited plan", record.variant_id)
-        })?;
         let expected_config =
-            crate::experiment_runner::config_for_run(&arm_overrides.config_overrides, record.seed)
+            crate::experiment_runner::config_for_run(&arm.config_overrides, record.seed)
                 .map_err(anyhow::Error::msg)?;
         let expected_value = serde_json::to_value(&expected_config)?;
         ensure!(
@@ -321,10 +359,17 @@ pub(crate) fn emit(
     session_id: &str,
     runs: &[RunRef],
     context: &NotebookContext,
-    analysis_choices: Option<(Vec<String>, AnalysisParams)>,
+    analysis_choices: Option<(Vec<String>, AnalysisParams, Vec<InteractionContrast>)>,
     configs: Vec<String>,
     out: &Path,
 ) -> Result<String> {
+    let (metrics, params, interaction_contrasts) = analysis_choices.unwrap_or_else(|| {
+        (
+            vec!["alive_agents".to_owned()],
+            AnalysisParams::default(),
+            Vec::new(),
+        )
+    });
     let mut input = ReproductionInput {
         schema: SCHEMA,
         session_id: session_id.to_owned(),
@@ -337,6 +382,7 @@ pub(crate) fn emit(
         ticks: 0,
         context: context.clone(),
         runs: Vec::new(),
+        interaction_contrasts,
         analysis: None,
         configs,
     };
@@ -384,10 +430,10 @@ pub(crate) fn emit(
                 variant_id: run.variant_id.clone(),
                 brain_family: run.brain_family.clone(),
                 config_overrides: run.config_overrides.clone(),
-                interventions: Vec::new(),
+                interventions: run.interventions.clone(),
             };
             if let Some(old) = variants.insert(run.arm_id, variant.clone()) {
-                ensure!(old == variant, "arm config differs between seeds");
+                ensure!(old == variant, "arm treatment differs between seeds");
             }
             seeds.insert(run.seed);
         }
@@ -423,19 +469,26 @@ pub(crate) fn emit(
                 reference.run_id
             );
         }
-        let (metrics, params) = analysis_choices
-            .unwrap_or_else(|| (vec!["alive_agents".to_owned()], AnalysisParams::default()));
         if input.variants.len() >= 2 {
-            input.analysis = Some(analyze_matched_seed_runs(&summaries, &metrics, params)?);
+            input.analysis = Some(analyze_matched_seed_runs_with_interactions(
+                &summaries,
+                &metrics,
+                params,
+                &input.interaction_contrasts,
+            )?);
         }
         input.runs = summaries.iter().map(SerializedRun::from_summary).collect();
     }
+    let bytes = serde_json::to_vec_pretty(&input)?;
+    ensure!(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_INPUT_BYTES,
+        "reproduction input exceeds the {MAX_INPUT_BYTES}-byte read bound"
+    );
+    let digest = blake3::hash(&bytes).to_hex().to_string();
     let root = confined_directory(out)?;
     for (index, config) in input.configs.iter().enumerate() {
         retain_file(&root, &format!("config-{index:04}.toml"), config.as_bytes())?;
     }
-    let bytes = serde_json::to_vec_pretty(&input)?;
-    let digest = blake3::hash(&bytes).to_hex().to_string();
     retain_file(&root, "reproduction.json", &bytes)?;
     retain_file(
         &root,
@@ -478,7 +531,16 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
     );
     let input: ReproductionInput = serde_json::from_slice(&bytes)?;
     ensure!(input.schema == SCHEMA, "reproduction schema mismatch");
-    validate_lab_variants(&input.variants)?;
+    match &input.analysis {
+        Some(analysis) => ensure!(
+            analysis.interaction_contrasts == input.interaction_contrasts,
+            "retained analysis differs from the declared interaction family"
+        ),
+        None => ensure!(
+            input.interaction_contrasts.is_empty(),
+            "declared interactions require a retained analysis"
+        ),
+    }
     ensure!(
         same_build_identity(&input.context.build),
         "expected source/build provenance mismatch"
@@ -488,6 +550,7 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
         !input.runs.is_empty(),
         "partial notebook has no completed cohort to reproduce"
     );
+    validate_lab_plan(&input)?;
     ensure!(
         input.configs.len() == input.runs.len(),
         "config/run count mismatch"
@@ -528,7 +591,7 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
                 .as_deref()
                 .context("missing bundle")?,
         );
-        read_lab_manifest(bundle, &expected.reference.run_id)?;
+        read_lab_manifest(bundle, &expected.reference.run_id, &variant.interventions)?;
         let output = confined_directory(output)?;
         ensure!(
             output.starts_with(&root) && output != root,
@@ -552,7 +615,12 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
     compare_rows(&input.runs, &retained)?;
     if let Some(analysis) = &input.analysis {
         ensure!(
-            analyze_matched_seed_runs(&retained, &analysis.metrics, analysis.params)? == *analysis,
+            analyze_matched_seed_runs_with_interactions(
+                &retained,
+                &analysis.metrics,
+                analysis.params,
+                &input.interaction_contrasts,
+            )? == *analysis,
             "retained canonical analysis differs"
         );
     }
@@ -606,7 +674,14 @@ pub fn run(args: &ReproduceArgs) -> Result<()> {
     let analysis = input
         .analysis
         .as_ref()
-        .map(|expected| analyze_matched_seed_runs(&regenerated, &expected.metrics, expected.params))
+        .map(|expected| {
+            analyze_matched_seed_runs_with_interactions(
+                &regenerated,
+                &expected.metrics,
+                expected.params,
+                &input.interaction_contrasts,
+            )
+        })
         .transpose()?;
     ensure!(
         analysis == input.analysis,
@@ -648,4 +723,45 @@ fn allocate_output(root: &Path) -> Result<PathBuf> {
         }
     }
     bail!("reproduction output namespace exhausted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_reproduction_input_is_refused_before_any_output_is_created() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("not-created");
+        let context = NotebookContext {
+            model_id: "offline".to_owned(),
+            build: BuildProvenanceV0::current(),
+            max_runs: 0,
+            runs_charged: 0,
+            max_ticks: 0,
+            ticks_charged: 0,
+            max_tokens: 0,
+            tokens_charged: 0,
+            max_iterations: 0,
+            iterations: 0,
+            failure_reason: None,
+        };
+        let error = emit(
+            "oversized-input",
+            &[],
+            &context,
+            None,
+            vec!["x".repeat(usize::try_from(MAX_INPUT_BYTES).unwrap())],
+            &output,
+        )
+        .expect_err("an input larger than the verifier can read must not be retained");
+        assert!(
+            error.to_string().contains("reproduction input exceeds"),
+            "{error}"
+        );
+        assert!(
+            !output.exists(),
+            "refusal must precede even output-directory creation"
+        );
+    }
 }

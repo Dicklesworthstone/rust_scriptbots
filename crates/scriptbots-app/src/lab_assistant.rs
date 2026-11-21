@@ -11,13 +11,19 @@ use crate::lab::llm::{
     LlmClient, LlmError, LlmMessage, LlmRequest, PROPOSE_EXPERIMENT_TOOL_NAME, StopReason,
     propose_experiment_tool,
 };
-use crate::lab::notebook::{NotebookRenderError, NotebookRenderer, claims_from_analysis, run_refs};
+#[cfg(test)]
+use crate::lab::notebook::claims_from_analysis;
+use crate::lab::notebook::{
+    NotebookRenderError, NotebookRenderer, claims_from_analysis_with_interactions, run_refs,
+};
 use crate::lab::spec::{
     Arm, ExperimentSpec, SpecBudget, SpecError, ValidatedSpec, render_errors, validate_spec,
 };
+#[cfg(test)]
+use crate::lab::stats::analyze_matched_seed_runs;
 use crate::lab::stats::{
     AnalysisParams, MatchedSeedAnalysis, RunSummary, RunSummaryParts, StatsError,
-    analyze_matched_seed_runs,
+    analyze_matched_seed_runs_with_interactions,
 };
 use scriptbots_storage::RunBundleV1;
 use serde::{Deserialize, Serialize};
@@ -233,7 +239,7 @@ impl ExperimentExecutor for MatchedSeedExecutor {
                 variant_id: format!("arm-{index:03}"),
                 brain_family: arm.brain_family.clone(),
                 config_overrides: arm.config_overrides.clone(),
-                interventions: Vec::new(),
+                interventions: arm.interventions.clone(),
             })
             .collect();
         let output_dir = self.output_root.join(&spec.spec_id);
@@ -363,9 +369,9 @@ pub(crate) fn completed_run_summaries(
                 bundle_manifest_path.display()
             )
         })?;
-        if !manifest.scenario.interventions.is_empty() {
+        if manifest.scenario.interventions != arm.interventions {
             return Err(format!(
-                "bundle {} contains scheduled interventions absent from planned Lab arm {arm_id}",
+                "bundle {} intervention schedule differs from planned Lab arm {arm_id}",
                 bundle_dir.display()
             ));
         }
@@ -492,6 +498,7 @@ pub(crate) fn completed_run_summaries(
             summary_path: Some(summary_path.to_string_lossy().into_owned()),
             variant_id: record.variant_id.clone(),
             config_overrides: arm.config_overrides.clone(),
+            interventions: arm.interventions.clone(),
             brain_family: row.brain_family,
         }));
     }
@@ -719,7 +726,14 @@ impl LabStateMachine {
         };
         let request = LlmRequest {
             system: "You propose bounded, falsifiable ScriptBots experiments. Call the offered \
-                     tool exactly once; prose is not an experiment."
+                     tool exactly once; prose is not an experiment. Config factors, brain families \
+                     and intervention_schedules form a full treatment product over matched seeds. \
+                     The first expanded arm is the baseline; put an empty schedule first to compare \
+                     an untreated control with timed numeric config patches. Same-tick patch order matters. \
+                     Set include_pairwise_interactions=true only when the hypothesis calls for interactions \
+                     between at least two varying axes. This predeclares every two-axis contrast against \
+                     the first levels, with other axes held at their first levels; it does not estimate \
+                     interactions averaged over the full grid."
                 .to_owned(),
             messages: vec![LlmMessage {
                 role: "user".to_owned(),
@@ -1000,10 +1014,11 @@ impl LabStateMachine {
             .as_ref()
             .ok_or_else(|| LabError::State("Analyze phase has no validated spec".to_owned()))?;
         let started = std::time::Instant::now();
-        let analysis = match analyze_matched_seed_runs(
+        let analysis = match analyze_matched_seed_runs_with_interactions(
             &self.run_summaries,
             &validated.spec.metrics,
             AnalysisParams::default(),
+            &validated.interaction_contrasts,
         ) {
             Ok(analysis) => analysis,
             Err(error) => {
@@ -1030,6 +1045,7 @@ impl LabStateMachine {
             stage = "analyze",
             inputs = self.run_summaries.len(),
             effects = analysis.effects.len(),
+            interactions = analysis.interactions.len(),
             correction = analysis.params.correction.as_str(),
             alternative = analysis.params.alternative.as_str(),
             bootstrap_iterations = analysis.params.bootstrap_iterations,
@@ -1136,9 +1152,10 @@ impl LabStateMachine {
                 validated.spec.hypothesis, validated.spec_id
             )
         };
-        let claims = match claims_from_analysis(
+        let claims = match claims_from_analysis_with_interactions(
             analysis,
             &self.run_summaries,
+            &validated.interaction_contrasts,
             &validated.spec.hypothesis,
             &validated.spec.falsifier,
         ) {
@@ -1188,6 +1205,7 @@ impl LabStateMachine {
             rationale = "notebook rendered and verified",
             stage = "report",
             effects = analysis.effects.len(),
+            interactions = analysis.interactions.len(),
             notebook_bytes = rendered.len(),
             "provenance-checked lab notebook rendered"
         );
@@ -1337,6 +1355,7 @@ mod tests {
                         summary_path: None,
                         variant_id: format!("arm-{arm_id:03}"),
                         config_overrides: arm.config_overrides.clone(),
+                        interventions: arm.interventions.clone(),
                         brain_family: arm.brain_family.clone(),
                     }));
                 }
@@ -1665,6 +1684,7 @@ mod tests {
             summary_path: None,
             variant_id: treatment.variant_id.clone(),
             config_overrides: treatment.config_overrides.clone(),
+            interventions: treatment.interventions.clone(),
             brain_family: treatment.brain_family.clone(),
         });
         assert_ne!(
@@ -1726,8 +1746,8 @@ mod tests {
             );
         }
         let notebook = lab.rendered_notebook.as_ref().expect("report retained");
-        assert!(notebook.contains(r"average\_energy"));
-        assert!(notebook.contains(r"total\_food"));
+        assert!(notebook.contains(r"**Metric**: average\_energy"));
+        assert!(notebook.contains(r"**Metric**: total\_food"));
         assert!(notebook.contains("Matched Pairs**: 2"));
     }
 
@@ -1811,7 +1831,7 @@ mod tests {
         let analysis = lab.analysis.as_ref().expect("matched family analysis");
         assert_eq!(analysis.effects.len(), 2);
         let notebook = lab.rendered_notebook.as_ref().expect("family report");
-        for family in [r"mlp\.baseline", r"dwraon\.baseline"] {
+        for family in [r"brain: mlp\.baseline", r"brain: dwraon\.baseline"] {
             assert!(notebook.contains(family));
         }
         let notebook_dir = lab.notebook_path.as_ref().unwrap().parent().unwrap();
@@ -1849,12 +1869,27 @@ mod tests {
     }
 
     #[test]
-    fn real_scheduled_bundle_cannot_be_attributed_to_an_unscheduled_lab_arm() {
+    fn real_scheduled_bundle_requires_exact_ordered_lab_arm_provenance() {
         let temp = tempfile::tempdir().expect("temporary scheduled experiment root");
         let arm = Arm {
             brain_family: crate::experiment_runner::DEFAULT_EXPERIMENT_BRAIN_FAMILY.to_owned(),
             config_overrides: BTreeMap::new(),
+            interventions: Vec::new(),
         };
+        let interventions = vec![
+            crate::ScenarioInterventionV1 {
+                tick: 0,
+                set: serde_json::json!({"food_growth_rate": 0.01}),
+            },
+            crate::ScenarioInterventionV1 {
+                tick: 0,
+                set: serde_json::json!({"food_growth_rate": 0.02}),
+            },
+            crate::ScenarioInterventionV1 {
+                tick: 1,
+                set: serde_json::json!({"food_growth_rate": 0.03}),
+            },
+        ];
         let runner = MatchedSeedExperimentRunner::new(
             "scheduled-outside-lab",
             MatchedSeedCohort {
@@ -1865,10 +1900,7 @@ mod tests {
                 variant_id: "arm-000".to_owned(),
                 brain_family: arm.brain_family.clone(),
                 config_overrides: arm.config_overrides.clone(),
-                interventions: vec![crate::ScenarioInterventionV1 {
-                    tick: 0,
-                    set: serde_json::json!({"food_growth_rate": 0.01}),
-                }],
+                interventions: interventions.clone(),
             }],
             2,
             1,
@@ -1887,12 +1919,30 @@ mod tests {
             verified.final_state.unwrap().scientific_digest,
             record.final_digest.as_ref().unwrap().as_str()
         );
-        let error = completed_run_summaries(&[arm], &status)
+        let error = completed_run_summaries(std::slice::from_ref(&arm), &status)
             .expect_err("Lab provenance cannot discard a real scheduled treatment");
         assert!(
-            error.contains("scheduled interventions absent from planned Lab arm 0"),
+            error.contains("intervention schedule differs from planned Lab arm 0"),
             "{error}"
         );
+        let mut declared = arm;
+        declared.interventions = interventions.clone();
+        let summaries = completed_run_summaries(std::slice::from_ref(&declared), &status)
+            .expect("the exact planned schedule admits verified scientific evidence");
+        assert_eq!(summaries[0].interventions, interventions);
+        assert!(summaries[0].verify_analysis_input().is_valid());
+        let mut reordered = declared.clone();
+        reordered.interventions.swap(0, 1);
+        let mut retimed = declared;
+        retimed.interventions[1].tick = 1;
+        for different in [reordered, retimed] {
+            let error = completed_run_summaries(&[different], &status)
+                .expect_err("matching final configuration cannot hide changed timing or ordering");
+            assert!(
+                error.contains("intervention schedule differs from planned Lab arm 0"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1918,6 +1968,7 @@ mod tests {
                     brain_family: crate::experiment_runner::DEFAULT_EXPERIMENT_BRAIN_FAMILY
                         .to_owned(),
                     config_overrides,
+                    interventions: Vec::new(),
                 }
             })
             .collect::<Vec<_>>();

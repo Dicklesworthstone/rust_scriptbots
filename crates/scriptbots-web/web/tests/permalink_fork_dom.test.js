@@ -1,10 +1,12 @@
 // crates/scriptbots-web/web/tests/permalink_fork_dom.test.js
 // Real-browser Playwright test for permalink loading, fork-this-world UX,
-// parent-diff display, honest build mismatch banner, and local owner replacement.
+// parent-diff display, honest build mismatch banner, local owner replacement,
+// and presentation recovery through the production page and Canvas renderer.
 // The WASM double exercises browser lifecycle behavior, not checkpoint codec proof.
 
 import fs from "node:fs";
 import http from "node:http";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -19,8 +21,9 @@ const mockWasmModule = `
   export function default_init_options() { return { world_width: 1280, world_height: 720 }; }
   
   const currentWorldLink = "sbw1.root_world_link";
-  const owners = window.__ownerTest = { records: [], nextFailure: null, failDriveId: null };
+  const owners = window.__ownerTest = { records: [], nextFailure: null, failDriveId: null, frameFailure: null, forkCalls: 0 };
   const timers = window.__ownerTimers = { pending: new Set(), maximum: 0 };
+  const frames = window.__ownerFrames = { pending: new Set(), maximum: 0, callbacks: 0 };
   const schedule = window.setTimeout.bind(window);
   const cancel = window.clearTimeout.bind(window);
   window.setTimeout = (callback, delay, ...args) => {
@@ -31,6 +34,20 @@ const mockWasmModule = `
     return id;
   };
   window.clearTimeout = (id) => { timers.pending.delete(id); cancel(id); };
+  const scheduleFrame = window.requestAnimationFrame.bind(window);
+  const cancelFrame = window.cancelAnimationFrame.bind(window);
+  window.requestAnimationFrame = (callback) => {
+    if (callback?.name !== "presentSimulation") return scheduleFrame(callback);
+    const id = scheduleFrame((now) => {
+      frames.pending.delete(id);
+      frames.callbacks += 1;
+      callback(now);
+    });
+    frames.pending.add(id);
+    frames.maximum = Math.max(frames.maximum, frames.pending.size);
+    return id;
+  };
+  window.cancelAnimationFrame = (id) => { frames.pending.delete(id); cancelFrame(id); };
 
   export function build_identity() {
     return {
@@ -41,6 +58,19 @@ const mockWasmModule = `
   }
 
   export function check_build_match(link) {
+    if (link.startsWith("sbb1.")) {
+      const status = link.includes("unavailable") ? "unavailable" : link.includes("mismatch") ? "mismatch" : "recorded_match";
+      return {
+        status, identity_scope: "recorded_browser_build_inputs",
+        evidence: "<em>Recorded recipe fixture; source input fingerprints only.</em>",
+        link_toolchain_digest: status === "unavailable" ? "unavailable" : "0x1111111111111111",
+        link_lockfile_digest: "0x2222222222222222",
+        link_core_digest: status === "mismatch" ? "0xcccccccccccccccc" : "0x3333333333333333",
+        local_toolchain_digest: "0x1111111111111111",
+        local_lockfile_digest: "0x2222222222222222",
+        local_core_digest: "0x3333333333333333"
+      };
+    }
     if (link.includes("mismatch")) {
       return {
         status: "mismatch",
@@ -65,6 +95,8 @@ const mockWasmModule = `
     }
     return {
       status: "exact",
+      identity_scope: "legacy_gallery_reference",
+      evidence: "Gallery fixture identifiers are not measured compiler or source identity.",
       link_toolchain_digest: "0x1111111111111111",
       link_lockfile_digest: "0x2222222222222222",
       link_core_digest: "0x3333333333333333",
@@ -89,34 +121,72 @@ const mockWasmModule = `
   }
 
   export function fork(handle, patch) {
-    return "sbw1.child_fork_link_with_diff";
+    owners.forkCalls += 1;
+    return handle.launchInfo().kind === "browser_launch" ? "sbb1.child_recipe_with_diff" : "sbw1.child_fork_link_with_diff";
+  }
+
+  export function permalink_info(link) {
+    if (link === "sbb1.mixed_fixture") return {
+      kind: "browser_launch", semantics: "initial_conditions_restart", shareable: true,
+      seed: owners.mixedRecipe.seed, initial_population: owners.mixedRecipe.population,
+      brain_preset: "mixed", recipe_version: 2, reason: null
+    };
+    return link.startsWith("sbb1.") ? {
+      kind: "browser_launch", semantics: "initial_conditions_restart", shareable: true,
+      seed: "18446744073709551615", initial_population: 151, brain_preset: "dwraon", recipe_version: 1, reason: null
+    } : {
+      kind: "gallery_reference", semantics: "gallery_configuration_restart", shareable: true,
+      seed: "1", initial_population: null, brain_preset: null, recipe_version: null,
+      reason: "No browser founder recipe is encoded in this gallery reference."
+    };
   }
 
   export function init_from_permalink(link) {
     if (link.startsWith("invalid") || link.includes("corrupt")) {
       throw new Error("permalink magic mismatch (first bytes: " + link.slice(0, 8) + ")");
     }
-    return createHandle("permalink", link);
+    if (link === "sbb1.mixed_fixture") {
+      const recipe = permalink_info(link);
+      return createHandle("permalink", link, 0, "mixed", recipe.seed, recipe.initial_population);
+    }
+    return createHandle("permalink", link, 0, link.startsWith("sbb1.") ? "dwraon" : "none");
   }
 
   export function init_sim(opts) {
-    return createHandle("reset", currentWorldLink);
+    const preset = opts.mixed_brains && !owners.ignoreMixedChoice ? "mixed"
+      : opts.default_brain || (opts.seed_strategy === "wander" ? "wander" : "none");
+    if (preset === "mixed") owners.mixedRecipe = { seed: String(opts.seed), population: opts.population };
+    return createHandle("reset", preset === "mixed" ? "sbb1.mixed_fixture" : currentWorldLink, 0, preset, opts.seed, opts.population);
   }
 
   export function checkpoint_byte_limit() { return 1024; }
   export function restore_checkpoint(bytes) {
     if (![1, 9].includes(bytes.length) || bytes[0] !== 42) throw new Error("intentional checkpoint refusal");
     const tick = bytes.length === 1 ? 37 : Number(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(1, true));
-    return createHandle("checkpoint", "sbw1.continuation", tick);
+    return createHandle("checkpoint", "sbw1.continuation", tick, owners.checkpointPreset || "mlp");
   }
-  export function decode_remote_frame_binary() { throw new Error("No remote frame in this lifecycle fixture"); }
+  export function world_checkpoint_byte_limit() { return 1024; }
+  export function import_world_checkpoint(bytes) {
+    if (bytes.length !== 1 || bytes[0] !== 77) throw new Error("intentional scientific checkpoint refusal");
+    return createHandle("scientific", "", 73, owners.checkpointPreset || "mlp", "18446744073709551615");
+  }
+  export function decode_remote_frame_binary(bytes) {
+    if (!window.__remoteTransferTest?.frame || bytes.length !== 1 || bytes[0] !== 91) {
+      throw new Error("No remote frame in this lifecycle fixture");
+    }
+    return structuredClone(window.__remoteTransferTest.frame);
+  }
 
-  function createHandle(kind, link, initialTick = 0) {
+  function createHandle(kind, link, initialTick = 0, preset = "mlp", seed = 1, population = 200) {
     const failure = owners.nextFailure;
     owners.nextFailure = null;
     if (failure === "create") throw new Error("intentional create failure");
-    const record = { id: owners.records.length + 1, kind, tick: initialTick,
-      freeCalls: 0, driveCalls: 0, elapsed: 0, speed: 1 };
+    const families = preset === "mixed"
+      ? [...(["checkpoint", "scientific"].includes(kind) ? owners.checkpointFamilies || ["assembly", "mlp", "dwraon"]
+        : owners.mixedFounderFamilies || ["mlp", "dwraon", "assembly"])]
+      : ["mlp", "dwraon", "assembly"].includes(preset) ? [preset] : [];
+    const record = { id: owners.records.length + 1, kind, preset, seed: String(seed), population, tick: initialTick,
+      freeCalls: 0, driveCalls: 0, frameCalls: 0, narrativeReads: 0, permalinkCalls: 0, elapsed: 0, speed: 1 };
     owners.records.push(record);
     let credit = 0;
     function check(stage) {
@@ -128,14 +198,54 @@ const mockWasmModule = `
         record.freeCalls += 1;
         if (record.freeCalls !== 1) throw new Error("owner freed twice: " + record.id);
       },
-      permalinkOf() { check("permalink"); return link; },
-      brainPreset() { check("preset"); return kind === "checkpoint" ? "mlp" : "wander"; },
+      permalinkOf() { check("permalink"); record.permalinkCalls += 1; return link; },
+      brainPreset() { check("preset"); return preset; },
+      brainFamilies() { check("families"); return [...families]; },
+      launchInfo: failure === "launch_missing" ? undefined : function () {
+        check("launch");
+        if (failure === "launch_schema") return { kind: "browser_launch", semantics: "saved_owner_continuation", shareable: true };
+        if (failure === "launch_seed") return { ...permalink_info("sbb1.fixture"), seed: "18446744073709551616" };
+        if (kind === "checkpoint") return {
+          kind: "checkpoint_continuation", semantics: "saved_owner_continuation", shareable: false,
+          seed: null, initial_population: null, brain_preset: null, recipe_version: null,
+          reason: "Use a saved-owner continuation; the original launch recipe is unavailable."
+        };
+        if (kind === "scientific") return {
+          kind: "scientific_checkpoint", semantics: "scientific_cut_new_owner", shareable: false,
+          seed: record.seed, initial_population: null, brain_preset: null, recipe_version: null,
+          reason: "New owner at a saved scientific cut, without the original host journal."
+        };
+        if (kind === "permalink") return permalink_info(link);
+        return { kind: "browser_launch", semantics: "initial_conditions_restart", shareable: failure !== "launch_unshareable",
+          seed: String(seed), initial_population: population, brain_preset: preset, recipe_version: preset === "mixed" ? 2 : 1,
+          reason: failure === "launch_unshareable" ? "This owner recipe exceeds the link size limit." : null };
+      },
+      narrativePage(afterEvent, expectedSessionId) {
+        check("narrative");
+        record.narrativeReads += 1;
+        if (expectedSessionId !== String(2000 + record.id) || !["0", "1"].includes(afterEvent)) {
+          throw new Error("narrative fixture refused a foreign session or cursor");
+        }
+        return { schema: "scriptbots.remote-frame.v2", kind: "events", identity: {
+          sessionId: expectedSessionId, publicationRevision: String(record.tick + 400),
+          scientificRevision: String(record.tick + 100), controlRevision: "20", configRevision: "10", tick: String(record.tick)
+        }, playback: { paused: record.speed === 0, speedMultiplier: record.speed }, coalescedPublications: "0", environment: null,
+          payload: { afterEvent, earliestRetained: "1", latestEvent: "1", gap: null,
+            events: afterEvent === "1" ? [] : [{ sequence: "1", record: { schemaVersion: 1, tick: "0",
+              kind: "extinction", humanText: "<em>owner " + record.id + " narrative fixture</em>", metric: "population",
+              severity: 1, magnitude: -1, window: ["0", "0"], before: 1, after: 0, score: 1, subject: null } }] } };
+      },
       checkpoint() {
         check("checkpoint");
         const bytes = new Uint8Array(9);
         bytes[0] = 42;
         new DataView(bytes.buffer).setBigUint64(1, BigInt(record.tick), true);
         return bytes;
+      },
+      worldCheckpoint() {
+        check("world_checkpoint");
+        record.worldExports = (record.worldExports || 0) + 1;
+        return new Uint8Array([77]);
       },
       setSpeed(value) { check("speed"); record.speed = value; },
       drive(now) {
@@ -151,7 +261,12 @@ const mockWasmModule = `
         return { scientific_steps: steps, automatic_steps_skipped: 0 };
       },
       frame() {
+        record.frameCalls += 1;
         check("frame");
+        if (owners.frameFailure?.ownerId === record.id && owners.frameFailure.remaining !== 0) {
+          if (owners.frameFailure.remaining > 0) owners.frameFailure.remaining -= 1;
+          throw new Error("intentional presentation frame failure " + record.frameCalls);
+        }
         const snapshot = this.snapshot();
         return { schema: "scriptbots.browser-frame.v1", snapshot, identity: {
           sessionId: String(2000 + record.id), publicationRevision: String(snapshot.tick + 400),
@@ -169,6 +284,7 @@ const mockWasmModule = `
         const fromPermalink = kind === "permalink";
         return {
           tick: record.tick,
+          epoch: "0",
           world: { width: 1280, height: 720, closed: true },
           summary: {
             agentCount: fromPermalink ? 150 : 200,
@@ -187,7 +303,7 @@ const mockWasmModule = `
 `;
 
 async function runOwnerLifecycleCases(page, context) {
-  const observations = { refusals: [], recoveries: [], replacements: [] };
+  const observations = { refusals: [], recoveries: [], replacements: [], presentationRecoveries: [] };
   await page.evaluate(() => {
     const read = File.prototype.arrayBuffer;
     File.prototype.arrayBuffer = function () {
@@ -200,13 +316,20 @@ async function runOwnerLifecycleCases(page, context) {
     session: document.getElementById("renderer-status").dataset.sessionId,
     pendingTimers: window.__ownerTimers.pending.size,
     maximumTimers: window.__ownerTimers.maximum,
+    pendingFrames: window.__ownerFrames.pending.size,
+    maximumFrames: window.__ownerFrames.maximum,
+    frameCallbacks: window.__ownerFrames.callbacks,
+    presentedTick: document.getElementById("renderer-status").dataset.snapshotTick,
+    presentationState: document.getElementById("renderer-status").dataset.presentationState,
+    rendererStatus: document.getElementById("renderer-status").textContent,
     speed: document.getElementById("steps-per-frame").value,
     preset: document.getElementById("brain-preset").value,
   }));
   const activeOwner = (value) => {
     const live = value.records.filter((owner) => owner.freeCalls === 0);
     if (live.length !== 1 || value.records.some((owner) => owner.freeCalls > 1)
-        || value.session !== String(2000 + live[0].id)) {
+        || value.session !== String(2000 + live[0].id)
+        || value.pendingFrames !== 1 || value.maximumFrames !== 1) {
       throw new Error(`Expected one live, presented owner: ${JSON.stringify(value)}`);
     }
     return live[0];
@@ -217,15 +340,17 @@ async function runOwnerLifecycleCases(page, context) {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   }, speed);
   const checkpointFile = { name: "lifecycle.sbcheckpoint", mimeType: "application/octet-stream", buffer: Buffer.from([42]) };
+  const scientificFile = { name: "native-world.sbworld", mimeType: "application/octet-stream", buffer: Buffer.from([77]) };
   const replace = async (operation) => {
-    if (operation === "checkpoint") {
+    if (operation === "checkpoint" || operation === "scientific") {
+      const selector = operation === "scientific" ? "#world-checkpoint-import" : "#checkpoint-load";
       await page.evaluate(() => { window.__ownerFileRead = null; });
-      await page.setInputFiles("#checkpoint-load", checkpointFile);
-      await page.evaluate(async () => {
+      await page.setInputFiles(selector, operation === "scientific" ? scientificFile : checkpointFile);
+      await page.evaluate(async (input) => {
         if (!window.__ownerFileRead) throw new Error("Checkpoint import did not read its file");
         await window.__ownerFileRead;
-        if (document.getElementById("checkpoint-load").disabled) throw new Error("Checkpoint import did not finish");
-      });
+        if (document.querySelector(input).disabled) throw new Error("Checkpoint import did not finish");
+      }, selector);
     } else {
       await page.evaluate((kind) => {
         if (kind === "permalink") {
@@ -239,12 +364,309 @@ async function runOwnerLifecycleCases(page, context) {
     await context.clock.runFor(32);
   };
 
+  observations.brainFamilies = [];
+  const defaultFamily = activeOwner(await state()).preset;
+  if (defaultFamily !== "mlp") throw new Error("Browser did not pass its default real MLP family to the owner");
+  for (const preset of ["dwraon", "assembly", "wander", "none", "mlp"]) {
+    await page.selectOption("#brain-preset", preset);
+    await replace("reset");
+    const current = activeOwner(await state());
+    const disabled = await page.evaluate(() => ["checkpoint-save", "checkpoint-browser-save"].map((id) => document.getElementById(id).disabled));
+    if (current.preset !== preset || disabled.some((value) => value !== (preset === "wander"))) {
+      throw new Error(`Family selection or continuation capability is incorrect: ${JSON.stringify({ preset, current, disabled })}`);
+    }
+    observations.brainFamilies.push({ preset, owner: current.id, saveDisabled: disabled });
+  }
+
+  // A stale package that ignores mixed_brains, or an incomplete producer that
+  // labels only two families as mixed, must not replace the active owner.
+  const beforeMixedRequest = activeOwner(await state());
+  for (const mismatch of ["ignored", "missing_family"]) {
+    await page.evaluate((kind) => {
+      window.__ownerTest.ignoreMixedChoice = kind === "ignored";
+      window.__ownerTest.mixedFounderFamilies = kind === "missing_family" ? ["mlp", "dwraon"] : null;
+    }, mismatch);
+    await page.selectOption("#brain-preset", "mixed");
+    await replace("reset");
+    const refused = await state();
+    if (activeOwner(refused).id !== beforeMixedRequest.id || refused.records.at(-1).freeCalls !== 1) {
+      throw new Error("An unsupported mixed founder request replaced the active owner or leaked its candidate");
+    }
+  }
+  await page.evaluate(() => {
+    window.__ownerTest.ignoreMixedChoice = false;
+    window.__ownerTest.mixedFounderFamilies = null;
+  });
+  await replace("reset");
+  const freshMixed = activeOwner(await state());
+  const freshMixedControls = await page.evaluate(() => ({
+    resetDisabled: document.getElementById("reset-btn").disabled,
+    saveDisabled: document.getElementById("checkpoint-save").disabled,
+    recipeKind: document.getElementById("launch-info").dataset.kind,
+    recipeText: document.getElementById("launch-info").textContent,
+  }));
+  if (freshMixed.preset !== "mixed" || freshMixedControls.resetDisabled || freshMixedControls.saveDisabled
+      || freshMixedControls.recipeKind !== "browser_launch" || !freshMixedControls.recipeText.includes("Recipe v2")
+      || !freshMixedControls.recipeText.includes("MLP + DWRAON + Assembly")) {
+    throw new Error("The explicit mixed founder choice did not create a usable version two recipe");
+  }
+
+  // A continuation can carry several actual evaluator families without inventing
+  // a founder distribution. Its saved state remains runnable and saveable; only
+  // an explicit new-world choice permits reset.
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointPreset = "mixed";
+    window.__ownerTest.checkpointFamilies = ["assembly", "mlp", "dwraon"];
+  });
+  await replace("checkpoint");
+  const mixedState = await state();
+  const mixedOwner = activeOwner(mixedState);
+  const mixedControls = await page.evaluate(() => ({
+    resetDisabled: document.getElementById("reset-btn").disabled,
+    saveDisabled: document.getElementById("checkpoint-save").disabled,
+    browserSaveDisabled: document.getElementById("checkpoint-browser-save").disabled,
+    capability: document.getElementById("checkpoint-capability").textContent,
+    recipeKind: document.getElementById("launch-info").dataset.kind,
+  }));
+  if (mixedOwner.preset !== "mixed" || mixedState.preset !== "mixed_continuation" || mixedState.speed !== "0"
+      || !mixedControls.resetDisabled || mixedControls.saveDisabled || mixedControls.browserSaveDisabled
+      || !mixedControls.capability.includes("assembly + mlp + dwraon")
+      || mixedControls.recipeKind !== "checkpoint_continuation") {
+    throw new Error(`Mixed continuation was collapsed or could not continue: ${JSON.stringify({ mixedState, mixedControls })}`);
+  }
+  await page.evaluate(() => document.getElementById("reset-btn").dispatchEvent(new Event("click")));
+  await context.clock.runFor(32);
+  if (activeOwner(await state()).id !== mixedOwner.id) {
+    throw new Error("A reset without a new family discarded the mixed continuation");
+  }
+  await setSpeed(1);
+  await context.clock.runFor(96);
+  if (activeOwner(await state()).tick <= mixedOwner.tick) throw new Error("Mixed continuation did not resume");
+  await page.selectOption("#brain-preset", "assembly");
+  if (await page.isDisabled("#reset-btn")
+      || await page.getAttribute("#launch-info", "data-kind") !== "checkpoint_continuation") {
+    throw new Error("A family choice changed the live recipe or left reset unavailable");
+  }
+  await replace("reset");
+  const chosenOwner = activeOwner(await state());
+  if (chosenOwner.id === mixedOwner.id || chosenOwner.preset !== "assembly") {
+    throw new Error("An explicit family choice did not create the requested new world");
+  }
+  await page.evaluate(() => { window.__ownerTest.checkpointFamilies = ["mlp", "neuroflow"]; });
+  await replace("checkpoint");
+  if (activeOwner(await state()).id !== chosenOwner.id
+      || !await page.textContent("#checkpoint-status").then((text) => text.includes("brain-family roster"))) {
+    throw new Error("Unsupported mixed families replaced the active world");
+  }
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointFamilies = ["assembly", "mlp"];
+  });
+  await replace("checkpoint");
+  if ((await state()).preset !== "mixed_continuation" || !await page.isDisabled("#reset-btn")) {
+    throw new Error("A saved mixture lost its explicit-reset guard");
+  }
+  await page.evaluate(() => {
+    document.getElementById("permalink-input").value = "sbb1.mixed_fixture";
+    document.getElementById("load-permalink-btn").click();
+  });
+  await context.clock.runFor(32);
+  const mixedRestart = activeOwner(await state());
+  if (mixedRestart.preset !== "mixed" || (await state()).preset !== "mixed"
+      || await page.isDisabled("#reset-btn")
+      || await page.getAttribute("#launch-info", "data-kind") !== "browser_launch") {
+    throw new Error("Loading a mixed founder recipe retained the saved-continuation reset guard");
+  }
+  observations.mixedFounders = { owner: freshMixed.id, restartedOwner: mixedRestart.id,
+    stalePackageRefused: true, missingFamilyRefused: true, recipeVersion: 2 };
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointPreset = null;
+    window.__ownerTest.checkpointFamilies = null;
+  });
+  await page.selectOption("#brain-preset", "mlp");
+  await replace("reset");
+  observations.mixedContinuation = { owner: mixedOwner.id, families: ["assembly", "mlp", "dwraon"],
+    resetRefused: true, explicitResetOwner: chosenOwner.id, unsupportedPreservedOwner: chosenOwner.id };
+
+  // The raw scientific file is deliberately a different format and ownership
+  // contract from a full browser continuation. Exercise the production controls
+  // with this explicit owner double; Rust tests prove the actual codec/science.
+  await setSpeed(0);
+  const beforeScientific = activeOwner(await state());
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointPreset = "mixed";
+    window.__ownerTest.checkpointFamilies = ["assembly", "mlp"];
+  });
+  await replace("scientific");
+  const scientificState = await state();
+  const scientificOwner = activeOwner(scientificState);
+  const scientificUi = await page.evaluate(() => ({
+    kind: document.getElementById("launch-info").dataset.kind,
+    text: document.getElementById("launch-info").textContent,
+    sharingDisabled: ["copy-permalink-btn", "fork-btn"].every((id) => document.getElementById(id).disabled),
+    continuationEnabled: !document.getElementById("checkpoint-save").disabled,
+    exportEnabled: !document.getElementById("world-checkpoint-export").disabled,
+    resetDisabled: document.getElementById("reset-btn").disabled,
+    recoveryEnabled: document.getElementById("checkpoint-recovery-enabled").checked,
+    link: document.getElementById("permalink-input").value,
+  }));
+  if (scientificOwner.id === beforeScientific.id || scientificOwner.tick !== 73 || scientificState.speed !== "0"
+      || scientificState.records[beforeScientific.id - 1].freeCalls !== 1 || scientificState.pendingTimers !== 1
+      || scientificOwner.preset !== "mixed" || scientificState.preset !== "mixed_continuation"
+      || scientificUi.kind !== "scientific_checkpoint" || !scientificUi.text.includes("18446744073709551615")
+      || !scientificUi.text.includes("new paused browser session") || !scientificUi.sharingDisabled
+      || !scientificUi.continuationEnabled || !scientificUi.exportEnabled || !scientificUi.resetDisabled
+      || scientificUi.recoveryEnabled || scientificUi.link !== "") {
+    throw new Error(`Scientific import changed its saved cut, family, or ownership contract: ${JSON.stringify({ scientificState, scientificUi })}`);
+  }
+  const downloadPromise = page.waitForEvent("download");
+  await page.evaluate(() => document.getElementById("world-checkpoint-export").click());
+  const scientificDownload = await downloadPromise;
+  const downloaded = [];
+  for await (const chunk of await scientificDownload.createReadStream()) downloaded.push(chunk);
+  const exported = activeOwner(await state());
+  if (scientificDownload.suggestedFilename() !== "scriptbots-scientific-tick-73.sbworld"
+      || !Buffer.concat(downloaded).equals(Buffer.from([77]))
+      || exported.id !== scientificOwner.id || exported.tick !== scientificOwner.tick
+      || exported.driveCalls !== scientificOwner.driveCalls || exported.worldExports !== 1) {
+    throw new Error("Scientific export changed the owner or did not download its actual bytes");
+  }
+  const scientificRefusals = [];
+  for (const [name, buffer, readExpected] of [["empty", Buffer.alloc(0), false],
+    ["oversized", Buffer.alloc(1025), false], ["corrupt", Buffer.from([0]), true],
+    ["full-owner-is-not-science", Buffer.from([42]), true]]) {
+    await page.evaluate(() => { window.__ownerFileRead = null; });
+    await page.setInputFiles("#world-checkpoint-import", { name: `${name}.sbworld`, mimeType: "application/octet-stream", buffer });
+    await page.evaluate(async () => { if (window.__ownerFileRead) await window.__ownerFileRead; });
+    await context.clock.runFor(32);
+    const refused = await state();
+    const message = await page.textContent("#world-checkpoint-status");
+    const readObserved = await page.evaluate(() => window.__ownerFileRead !== null);
+    if (activeOwner(refused).id !== scientificOwner.id || activeOwner(refused).tick !== 73
+        || refused.records.length !== scientificState.records.length || readObserved !== readExpected
+        || !message.startsWith("Scientific import failed:")) {
+      throw new Error(`Scientific ${name} refusal replaced the world or read oversized bytes`);
+    }
+    scientificRefusals.push({ name, readObserved, message });
+  }
+  await page.evaluate(() => {
+    window.__ownerTest.checkpointPreset = null;
+    window.__ownerTest.checkpointFamilies = null;
+  });
+  observations.scientificTransfer = { sourceOwner: beforeScientific.id, importedOwner: scientificOwner.id,
+    savedTick: scientificOwner.tick, ui: scientificUi, exportName: scientificDownload.suggestedFilename(),
+    refusals: scientificRefusals, evidence: "real DOM/download and explicit WASM lifecycle double" };
+  await page.selectOption("#brain-preset", "mlp");
+  await replace("reset");
+
+  // Keep reading the active owner after presentation faults, without flooding
+  // the UI/log or creating a second scientific timer or RAF chain.
+  await setSpeed(1);
+  await context.clock.runFor(32);
+  const beforeFrameFailure = await state();
+  const frameOwner = activeOwner(beforeFrameFailure);
+  await page.evaluate((ownerId) => {
+    window.__presentationReports = 0;
+    const status = document.getElementById("renderer-status");
+    window.__presentationObserver = new MutationObserver(() => {
+      if (status.textContent.startsWith("Presentation interrupted:")) window.__presentationReports += 1;
+    });
+    window.__presentationObserver.observe(status, { childList: true, characterData: true, subtree: true });
+    window.__ownerTest.frameFailure = { ownerId, remaining: -1 };
+  }, frameOwner.id);
+  await context.clock.runFor(160);
+  const failingFrames = await state();
+  const reporting = await page.evaluate(() => ({
+    updates: window.__presentationReports,
+    logs: document.getElementById("log").textContent.split("Presentation interrupted:").length - 1,
+  }));
+  if (activeOwner(failingFrames).id !== frameOwner.id
+      || activeOwner(failingFrames).frameCalls <= frameOwner.frameCalls + 1
+      || activeOwner(failingFrames).tick <= frameOwner.tick || failingFrames.pendingTimers !== 1
+      || failingFrames.presentationState !== "error" || reporting.updates !== 1 || reporting.logs !== 1) {
+    throw new Error(`Presentation failure stopped scheduling or flooded reporting: ${JSON.stringify({ failingFrames, reporting })}`);
+  }
+  await page.evaluate(() => { window.__ownerTest.frameFailure = null; });
+  await context.clock.runFor(64);
+  const frameRecovered = await state();
+  if (activeOwner(frameRecovered).id !== frameOwner.id || frameRecovered.presentationState
+      || Number(frameRecovered.presentedTick) <= frameOwner.tick
+      || frameRecovered.pendingTimers !== 1 || frameRecovered.maximumTimers !== 1
+      || !await page.evaluate(() => document.getElementById("log").textContent.includes("Presentation resumed"))) {
+    throw new Error("The existing owner failed to resume presentation after frame reads recovered");
+  }
+  await page.evaluate(() => window.__presentationObserver.disconnect());
+  observations.presentationRecoveries.push({ fault: "repeated frame read", owner: frameOwner.id,
+    attemptedFrames: activeOwner(failingFrames).frameCalls - frameOwner.frameCalls, reports: reporting,
+    presentedTick: frameRecovered.presentedTick });
+
+  // Fail after actually modifying the Canvas during capture of a paused world.
+  // Recovery must repaint the same publication even though capture was refused;
+  // merely continuing callbacks or trusting the old paint identity leaves red.
+  await setSpeed(0);
+  await context.clock.runFor(32);
+  const pausedBeforePaint = await state();
+  const pausedOwner = activeOwner(pausedBeforePaint);
+  await page.evaluate(() => {
+    const fill = CanvasRenderingContext2D.prototype.fillRect;
+    window.__canvasFaults = 0;
+    CanvasRenderingContext2D.prototype.fillRect = function (...args) {
+      if (this.canvas.id !== "sim-canvas") return fill.apply(this, args);
+      CanvasRenderingContext2D.prototype.fillRect = fill;
+      this.fillStyle = "#ff0000";
+      fill.apply(this, args);
+      window.__canvasFaults += 1;
+      throw new Error("intentional Canvas draw failure");
+    };
+    document.getElementById("capture-btn").click();
+  });
+  await context.clock.runFor(16);
+  const interruptedPaint = await page.evaluate(() => ({
+    faults: window.__canvasFaults,
+    capture: document.getElementById("capture-status").dataset.state,
+    pixel: Array.from(document.getElementById("sim-canvas").getContext("2d").getImageData(0, 0, 1, 1).data),
+  }));
+  if (interruptedPaint.faults !== 1 || interruptedPaint.capture !== "error"
+      || interruptedPaint.pixel.join(",") !== "255,0,0,255") {
+    throw new Error(`Canvas failure did not reach a partial paint and refuse capture: ${JSON.stringify(interruptedPaint)}`);
+  }
+  await context.clock.runFor(64);
+  const repainted = await state();
+  const pixel = await page.evaluate(() => Array.from(document.getElementById("sim-canvas")
+    .getContext("2d").getImageData(0, 0, 1, 1).data));
+  if (activeOwner(repainted).id !== pausedOwner.id || activeOwner(repainted).tick !== pausedOwner.tick
+      || repainted.presentedTick !== pausedBeforePaint.presentedTick || repainted.presentationState
+      || pixel.join(",") !== "11,17,32,255" || repainted.pendingTimers !== 1 || repainted.maximumTimers !== 1) {
+    throw new Error(`Canvas failed to repaint the paused publication: ${JSON.stringify({ repainted, pixel })}`);
+  }
+  observations.presentationRecoveries.push({ fault: "partial Canvas draw", owner: pausedOwner.id,
+    unchangedTick: repainted.presentedTick, interruptedPixel: interruptedPaint.pixel, recoveredPixel: pixel });
+
+  for (const operation of ["reset", "permalink", "checkpoint"]) {
+    const previous = activeOwner(await state());
+    await page.evaluate((ownerId) => {
+      window.__ownerTest.frameFailure = { ownerId, remaining: -1 };
+    }, previous.id);
+    await context.clock.runFor(32);
+    if ((await state()).presentationState !== "error") throw new Error("Replacement case did not observe a presentation fault");
+    await replace(operation);
+    const recovered = await state();
+    const next = activeOwner(recovered);
+    if (next.id === previous.id || recovered.records[previous.id - 1].freeCalls !== 1
+        || recovered.presentationState || recovered.pendingTimers !== 1 || recovered.maximumTimers !== 1) {
+      throw new Error(`${operation} did not recover a failed presentation: ${JSON.stringify(recovered)}`);
+    }
+    observations.presentationRecoveries.push({ fault: "persistent owner frame read", operation,
+      previousOwner: previous.id, presentedOwner: next.id, presentedTick: recovered.presentedTick });
+  }
+  await page.evaluate(() => { window.__ownerTest.frameFailure = null; });
+
   // Refusals after allocation are different from a decoder rejecting input:
   // each failed candidate must be freed without moving the paused old world.
   await setSpeed(0);
-  for (const operation of ["reset", "permalink", "checkpoint"]) {
-    for (const failure of ["create", "speed", "frame", "snapshot", "identity",
-      operation === "checkpoint" ? "preset" : "permalink"]) {
+  for (const operation of ["reset", "permalink", "checkpoint", "scientific"]) {
+    for (const failure of ["create", "speed", "frame", "snapshot", "identity", "launch", "launch_schema", "launch_seed",
+      ["checkpoint", "scientific"].includes(operation) ? "preset" : "permalink",
+      ...(operation === "scientific" ? ["launch_missing", "families"] : [])]) {
       const before = await state();
       const previous = activeOwner(before);
       await page.evaluate((stage) => { window.__ownerTest.nextFailure = stage; }, failure);
@@ -264,6 +686,27 @@ async function runOwnerLifecycleCases(page, context) {
     }
   }
 
+  // A large but valid owner remains usable when the bounded URL codec cannot
+  // admit its original recipe. Neither copy nor variant may invent a link.
+  await page.evaluate(() => { window.__ownerTest.nextFailure = "launch_unshareable"; });
+  await replace("reset");
+  const unshareable = activeOwner(await state());
+  const unshareableUi = await page.evaluate(() => ({
+    text: document.getElementById("launch-info").textContent,
+    controls: ["copy-permalink-btn", "fork-btn"].map((id) => document.getElementById(id).disabled),
+    link: document.getElementById("permalink-input").value,
+  }));
+  if (unshareable.permalinkCalls !== 0 || !unshareableUi.controls.every(Boolean)
+      || unshareableUi.link !== "" || !unshareableUi.text.includes("exceeds the link size limit")
+      || !unshareableUi.text.includes(`Initial seed ${unshareable.seed}`)) {
+    throw new Error(`A valid unshareable recipe lost its owner or offered an invented link: ${JSON.stringify(unshareableUi)}`);
+  }
+  await replace("reset");
+  if (await page.locator("#copy-permalink-btn").isDisabled() || await page.locator("#fork-btn").isDisabled()) {
+    throw new Error("A fresh bounded recipe did not restore sharing after an unshareable owner");
+  }
+  observations.unshareableRecipe = { owner: unshareable.id, ui: unshareableUi };
+
   // A stopped pump must stay stopped until a replacement succeeds. Check drive
   // calls as well as ticks: duplicate timers can drive the same elapsed boundary
   // without producing additional science, so tick progress alone is insufficient.
@@ -271,18 +714,26 @@ async function runOwnerLifecycleCases(page, context) {
     await setSpeed(1);
     await context.clock.runFor(64);
     const previous = activeOwner(await state());
-    await page.evaluate((id) => { window.__ownerTest.failDriveId = id; }, previous.id);
+    await page.evaluate((id) => {
+      window.__ownerTest.failDriveId = id;
+      window.__ownerTest.frameFailure = { ownerId: id, remaining: 1 };
+    }, previous.id);
     await context.clock.runFor(32);
     const stopped = await state();
     if (stopped.pendingTimers !== 0) throw new Error("Clock fault left a pump scheduled");
     await context.clock.runFor(80);
-    if (activeOwner(await state()).driveCalls !== activeOwner(stopped).driveCalls) {
-      throw new Error("Stopped clock continued to drive the old world");
+    const stillStopped = await state();
+    if (activeOwner(stillStopped).driveCalls !== activeOwner(stopped).driveCalls
+        || activeOwner(stillStopped).frameCalls <= activeOwner(stopped).frameCalls
+        || stillStopped.pendingTimers !== 0 || stillStopped.presentationState
+        || !await page.evaluate(() => document.getElementById("log").textContent.includes("Simulation clock stopped"))) {
+      throw new Error("Presentation recovery restarted or concealed a stopped scientific clock");
     }
     await page.evaluate(() => {
       // The clock fault was transient. Refusing a candidate must still preserve
       // the old owner's stopped state rather than implicitly trying it again.
       window.__ownerTest.failDriveId = null;
+      window.__ownerTest.frameFailure = null;
       window.__ownerTest.nextFailure = "speed";
     });
     await replace(operation);
@@ -325,7 +776,7 @@ async function runOwnerLifecycleCases(page, context) {
     observations.replacements.push({ operation, previousOwner: previous.id, newOwner: next.id });
   }
 
-  const beginDelayedImport = async () => {
+  const beginDelayedImport = async (scientific = false) => {
     await page.evaluate(() => {
       const read = File.prototype.arrayBuffer;
       window.__releaseOwnerRead = null;
@@ -338,14 +789,15 @@ async function runOwnerLifecycleCases(page, context) {
         });
       };
     });
-    await page.setInputFiles("#checkpoint-load", checkpointFile);
+    await page.setInputFiles(scientific ? "#world-checkpoint-import" : "#checkpoint-load", scientific ? scientificFile : checkpointFile);
     if (!await page.evaluate(() => typeof window.__releaseOwnerRead === "function")) {
       throw new Error("Delayed import did not reach its asynchronous read boundary");
     }
   };
-  const releaseCancelledImport = async () => {
+  const releaseCancelledImport = async (scientific = false) => {
     await page.evaluate(() => window.__releaseOwnerRead());
-    if (!await page.evaluate(() => document.getElementById("checkpoint-status").textContent.startsWith("Load cancelled"))) {
+    if (!await page.evaluate((isScientific) => document.getElementById(isScientific ? "world-checkpoint-status" : "checkpoint-status")
+      .textContent.startsWith(isScientific ? "Scientific import cancelled" : "Load cancelled"), scientific)) {
       throw new Error("Stale continuation read was not cancelled");
     }
   };
@@ -399,6 +851,36 @@ async function runOwnerLifecycleCases(page, context) {
     throw new Error("Return to local failed to resume its retained world with one timer");
   }
   observations.staleRemotePreservedOwner = activeOwner(returned).id;
+
+  await setSpeed(0);
+  await beginDelayedImport(true);
+  await replace("reset");
+  const scientificReset = await state();
+  await releaseCancelledImport(true);
+  await context.clock.runFor(32);
+  if (activeOwner(await state()).id !== activeOwner(scientificReset).id
+      || (await state()).records.length !== scientificReset.records.length) {
+    throw new Error("A delayed scientific import replaced a newer local world");
+  }
+  await beginDelayedImport(true);
+  await page.evaluate(() => document.getElementById("remote-connect").click());
+  const scientificRemote = await state();
+  await releaseCancelledImport(true);
+  if (!await page.isDisabled("#world-checkpoint-import") || !await page.isDisabled("#world-checkpoint-export")) {
+    throw new Error("Scientific transfer controls stayed enabled while viewing a remote owner");
+  }
+  await page.evaluate(() => document.getElementById("world-checkpoint-export").dispatchEvent(new Event("click")));
+  await context.clock.runFor(32);
+  if ((await state()).records.length !== scientificRemote.records.length
+      || activeOwner(await state()).id !== activeOwner(scientificRemote).id
+      || activeOwner(await state()).worldExports !== activeOwner(scientificRemote).worldExports
+      || (await state()).pendingTimers !== 0) {
+    throw new Error("Scientific transfer changed the retained local owner during a remote session");
+  }
+  await page.evaluate(() => document.getElementById("remote-local").click());
+  await context.clock.runFor(32);
+  observations.scientificTransfer.staleResetOwner = activeOwner(scientificReset).id;
+  observations.scientificTransfer.staleRemoteOwner = activeOwner(scientificRemote).id;
 
   // Real IndexedDB and DOM, with the same explicit WASM owner double. These
   // cases observe storage refusal and ownership races; stats_dom.test.js also
@@ -534,10 +1016,308 @@ async function runOwnerLifecycleCases(page, context) {
     staleStoredReads.push({ change, retainedOwner: activeOwner(after).id });
   }
   observations.browserStorage = { storedRefusals, quotaMessage, staleStoredReads };
+
+  // Production recovery controls with real IndexedDB and the explicit owner
+  // double. These observations cover persistence/lifecycle, not codec validity.
+  const waitRecovery = async (expected) => {
+    let timeout;
+    try {
+      return await Promise.race([
+        page.evaluate((expected) => new Promise((resolve) => {
+          const status = document.getElementById("checkpoint-recovery-status");
+          const check = () => {
+            if ((expected.state === undefined || status.dataset.state === expected.state)
+                && (expected.tick === undefined || status.dataset.savedTick === expected.tick)
+                && (expected.text === undefined || status.textContent.includes(expected.text))) {
+              observer.disconnect();
+              resolve(status.textContent);
+            }
+          };
+          const observer = new MutationObserver(check);
+          observer.observe(status, { attributes: true, childList: true, characterData: true, subtree: true });
+          check();
+        }), expected),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`Recovery did not reach ${JSON.stringify(expected)}`)), 10_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  const enableRecovery = (enabled) => page.evaluate((enabled) => {
+    const input = document.getElementById("checkpoint-recovery-enabled");
+    if (input.disabled) throw new Error("Recovery unexpectedly disabled for the active local world");
+    input.checked = enabled;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }, enabled);
+  await setSpeed(0);
+  await context.clock.runFor(32);
+  const recoveryOwner = activeOwner(await state());
+  if (await page.isChecked("#checkpoint-recovery-enabled")) throw new Error("Recovery opted in without user input");
+  await enableRecovery(true);
+  await context.clock.runFor(32);
+  await waitRecovery({ state: "enabled", tick: String(recoveryOwner.tick) });
+  const firstRecovery = await page.evaluate(async () => {
+    const { BrowserContinuationStore } = await import("/continuation-store.js");
+    const store = new BrowserContinuationStore(1024);
+    const record = await store.readRecovery();
+    const manual = await store.read();
+    const bytes = new Uint8Array(await record.blob.arrayBuffer());
+    return { tick: record.tick, source: record.source, manualTick: manual.tick,
+      byteTick: String(new DataView(bytes.buffer).getBigUint64(1, true)), byteTag: bytes[0] };
+  });
+  if (firstRecovery.tick !== String(recoveryOwner.tick) || firstRecovery.byteTick !== firstRecovery.tick
+      || firstRecovery.byteTag !== 42 || firstRecovery.source.sessionId !== String(2000 + recoveryOwner.id)
+      || firstRecovery.manualTick !== "37" || activeOwner(await state()).tick !== recoveryOwner.tick) {
+    throw new Error("Recovery saved a different owner cut, changed the manual slot, or advanced paused science");
+  }
+
+  await enableRecovery(false);
+  await setSpeed(1);
+  await context.clock.runFor(64);
+  await setSpeed(0);
+  const changedRecoveryTick = String(activeOwner(await state()).tick);
+  if (changedRecoveryTick === firstRecovery.tick) throw new Error("Recovery fixture did not create a newer scientific state");
+  await page.evaluate(() => {
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (record, key) {
+      if (key === "recovery") {
+        IDBObjectStore.prototype.put = put;
+        throw new DOMException("Controlled recovery quota refusal", "QuotaExceededError");
+      }
+      return put.call(this, record, key);
+    };
+  });
+  await enableRecovery(true);
+  await context.clock.runFor(32);
+  const recoveryQuota = await waitRecovery({ state: "error", tick: firstRecovery.tick, text: "quota" });
+  if (await page.isDisabled("#checkpoint-recovery-retry")) throw new Error("Recovery failure did not offer explicit retry");
+  const retainedRecoveryTick = await page.evaluate(async () => {
+    const { BrowserContinuationStore } = await import("/continuation-store.js");
+    return (await new BrowserContinuationStore(1024).readRecovery()).tick;
+  });
+  if (retainedRecoveryTick !== firstRecovery.tick) throw new Error("Quota refusal replaced the committed recovery slot");
+  await page.evaluate(() => document.getElementById("checkpoint-recovery-retry").click());
+  await context.clock.runFor(32);
+  await waitRecovery({ state: "enabled", tick: changedRecoveryTick });
+
+  await replace("reset");
+  if (await page.isChecked("#checkpoint-recovery-enabled")) throw new Error("Reset inherited the previous owner's recovery opt-in");
+  await page.evaluate(() => document.getElementById("checkpoint-recovery-restore").click());
+  await waitRecovery({ state: "off", tick: changedRecoveryTick, text: "Restored recovery at tick" });
+  await context.clock.runFor(32);
+  const restoredRecovery = await state();
+  if (String(activeOwner(restoredRecovery).tick) !== changedRecoveryTick || restoredRecovery.speed !== "0"
+      || await page.isChecked("#checkpoint-recovery-enabled") || restoredRecovery.pendingTimers !== 1) {
+    throw new Error("Recovery restore did not install exactly one paused owner with fresh opt-in");
+  }
+  observations.browserRecovery = { firstRecovery, recoveryQuota, restoredTick: changedRecoveryTick,
+    restoredOwner: activeOwner(restoredRecovery).id };
+
+  // Production DOM/controller integration with the explicit WASM double above.
+  // This proves presentation and owner lifetime, not real detector generation.
+  await setSpeed(0);
+  await context.clock.runFor(300);
+  const narrativeBefore = activeOwner(await state());
+  const narrativeText = await page.locator("#remote-events li").allTextContents();
+  if (narrativeText.length !== 1 || narrativeText[0] !== `#1 · tick 0: <em>owner ${narrativeBefore.id} narrative fixture</em>`
+      || await page.locator("#remote-events em").count() !== 0
+      || await page.getAttribute("#narrative-timeline", "data-session-id") !== String(2000 + narrativeBefore.id)) {
+    throw new Error("Local timeline did not consume exact canonical fixture prose as text for the active owner");
+  }
+  await context.clock.runFor(1_000);
+  const narrativeQuiet = activeOwner(await state());
+  if (narrativeQuiet.tick !== narrativeBefore.tick || narrativeQuiet.narrativeReads !== narrativeBefore.narrativeReads) {
+    throw new Error("Paused timeline presentation advanced ticks or reread an unchanged publication");
+  }
+  await page.evaluate(() => document.getElementById("narrative-refresh").click());
+  await context.clock.runFor(1);
+  const narrativeRefreshed = activeOwner(await state());
+  if (narrativeRefreshed.tick !== narrativeBefore.tick || narrativeRefreshed.narrativeReads !== narrativeBefore.narrativeReads + 1
+      || await page.locator("#remote-events li").count() !== 1) {
+    throw new Error("Explicit local history refresh changed science, duplicated events, or failed to read");
+  }
+  await replace("checkpoint");
+  const narrativeReplaced = activeOwner(await state());
+  const replacementText = await page.locator("#remote-events li").allTextContents();
+  if (replacementText.length !== 1 || replacementText[0] !== `#1 · tick 0: <em>owner ${narrativeReplaced.id} narrative fixture</em>`
+      || await page.getAttribute("#narrative-timeline", "data-session-id") !== String(2000 + narrativeReplaced.id)) {
+    throw new Error("Timeline retained old-owner prose when a replacement reused event ordinal one");
+  }
+  observations.narrative = { evidence: "production DOM and JavaScript with explicit WASM double",
+    before: narrativeBefore, refreshed: narrativeRefreshed, replacement: narrativeReplaced,
+    narrativeText, replacementText };
+  const continuationRecipe = await page.evaluate(() => {
+    const before = window.__ownerTest.forkCalls;
+    for (const id of ["copy-permalink-btn", "fork-btn"]) document.getElementById(id).dispatchEvent(new Event("click"));
+    return { disabled: ["copy-permalink-btn", "fork-btn", "fork-patch-input"].every((id) => document.getElementById(id).disabled),
+      kind: document.getElementById("launch-info").dataset.kind, text: document.getElementById("launch-info").textContent,
+      forkCalls: window.__ownerTest.forkCalls - before,
+      exports: window.__ownerTest.records.find((owner) => owner.freeCalls === 0).permalinkCalls };
+  });
+  if (!continuationRecipe.disabled || continuationRecipe.kind !== "checkpoint_continuation"
+      || !continuationRecipe.text.includes("original launch recipe is unavailable")
+      || continuationRecipe.forkCalls !== 0 || continuationRecipe.exports !== 0) {
+    throw new Error(`Continuation offered an unrecorded initial-condition recipe: ${JSON.stringify(continuationRecipe)}`);
+  }
+  observations.continuationRecipe = continuationRecipe;
+  await page.evaluate(() => { window.__ownerTest.nextFailure = "launch_missing"; });
+  await replace("checkpoint");
+  if (!(await page.locator("#copy-permalink-btn").isDisabled()) || !(await page.locator("#fork-btn").isDisabled())
+      || await page.getAttribute("#launch-info", "data-kind") !== "checkpoint_continuation"
+      || activeOwner(await state()).permalinkCalls !== 0) {
+    throw new Error("An older package without launchInfo offered a recipe for a saved continuation");
+  }
   const finalState = await state();
   observations.releasedOwners = finalState.records.filter((owner) => owner.freeCalls === 1).length;
   observations.maximumPendingTimers = finalState.maximumTimers;
+  observations.maximumPendingFrames = finalState.maximumFrames;
   return observations;
+}
+
+async function runRemoteScientificTransferCase(page, context, baseUrl) {
+  // Real page, remote client, bounded HTTP reads and SHA-256 verification. The
+  // socket and WASM codec are explicit doubles, as in the local lifecycle cases.
+  const sessionId = "18446744073709551610";
+  const bytes = Buffer.from([77]);
+  const checkpoint = { checkpoint_id: "saved-native-world", tick: 73, agent_count: 0, byte_size: bytes.length,
+    world_digest_v1: "a".repeat(16), checksum_blake3: "b".repeat(64),
+    checksum_sha256: createHash("sha256").update(bytes).digest("hex"),
+    schema: "scriptbots.world-checkpoint.v1.3", created_at_utc: "1794000000" };
+  const artifact = { artifact_id: checkpoint.checkpoint_id, filename: "native-world.sbworld",
+    content_type: "application/octet-stream", byte_size: bytes.length,
+    checksum_blake3: checkpoint.checksum_blake3, checksum_sha256: checkpoint.checksum_sha256,
+    created_at_utc: checkpoint.created_at_utc, relative_path: "checkpoints/native-world.sbworld" };
+  const requests = [];
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request(), pathname = new URL(request.url()).pathname;
+    requests.push({ path: pathname, method: request.method(), session: request.headers()["x-scriptbots-session"] });
+    if (request.method() !== "GET") return route.fulfill({ status: 405, body: "Unexpected mutation" });
+    if (pathname === `/api/v1/artifacts/${checkpoint.checkpoint_id}/download`) {
+      return route.fulfill({ status: 200, contentType: artifact.content_type,
+        headers: { "Content-Length": String(bytes.length) }, body: bytes });
+    }
+    const body = pathname === "/api/v1/checkpoints"
+      ? { items: [checkpoint], total: 1, limit: 12, offset: 0, has_more: false,
+        retention: { max_count: 128, max_bytes: 65536, file_count: 1, file_bytes: bytes.length } }
+      : pathname === "/api/v1/checkpoints/branches"
+        ? { items: [], total: 0, limit: 12, offset: 0, has_more: false }
+        : pathname === `/api/v1/artifacts/${checkpoint.checkpoint_id}` ? artifact : null;
+    return route.fulfill({ status: body ? 200 : 404, contentType: "application/json", body: JSON.stringify(body) });
+  });
+  await page.goto(baseUrl);
+  await context.clock.runFor(32);
+  await page.evaluate((sourceSessionId) => {
+    const speed = document.getElementById("steps-per-frame");
+    speed.value = "0";
+    speed.dispatchEvent(new Event("input", { bubbles: true }));
+    const fixture = window.__remoteTransferTest = { sent: [], closes: 0, frame: {
+      schema: "scriptbots.remote-frame.v2", kind: "canvas", coalescedPublications: "0", environment: null,
+      identity: { sessionId: sourceSessionId, publicationRevision: "100", scientificRevision: "91",
+        controlRevision: "2", configRevision: "1", tick: "91" },
+      playback: { paused: false, speedMultiplier: 1 },
+      payload: { tick: 91, epoch: "0", world: { width: 1280, height: 720, closed: true }, agents: [],
+        summary: { agentCount: 0, births: 4, deaths: 4, totalEnergy: 0, averageEnergy: 0, averageHealth: 0 } },
+    } };
+    window.WebSocket = class extends EventTarget {
+      constructor() {
+        super();
+        this.readyState = 1;
+        this.bufferedAmount = 0;
+        queueMicrotask(() => this.dispatchEvent(new Event("open")));
+      }
+      send(text) {
+        const request = JSON.parse(text);
+        fixture.sent.push(request);
+        if (request.command === "subscribe") queueMicrotask(() => {
+          this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
+            protocol_version: 1, type: "subscribed", request_id: request.request_id,
+            stream_protocol_version: 2, session_id: sourceSessionId,
+            channels: request.channels, max_fps: request.max_fps,
+          }) }));
+          this.dispatchEvent(new MessageEvent("message", { data: new Uint8Array([91]).buffer }));
+        });
+      }
+      close() { fixture.closes += 1; this.readyState = 3; }
+    };
+    document.getElementById("checkpoint-lab").open = true;
+    document.getElementById("remote-url").value = location.origin.replace("http", "ws") + "/api/ws/stream";
+    document.getElementById("remote-connect").click();
+  }, sessionId);
+  await context.clock.runFor(32);
+  await page.selectOption("#lab-checkpoint-select", checkpoint.checkpoint_id);
+  const state = () => page.evaluate(() => ({
+    records: window.__ownerTest.records, closes: window.__remoteTransferTest.closes,
+    sent: window.__remoteTransferTest.sent, remote: document.getElementById("remote-status").dataset.state,
+    session: document.getElementById("renderer-status").dataset.sessionId,
+    speed: document.getElementById("steps-per-frame").value,
+    timers: window.__ownerTimers.pending.size, maximumTimers: window.__ownerTimers.maximum,
+    selected: document.getElementById("lab-checkpoint-select").value,
+    transferDisabled: document.getElementById("lab-checkpoint-local").disabled,
+    remoteStepDisabled: document.getElementById("remote-step").disabled,
+    launchKind: document.getElementById("launch-info").dataset.kind,
+  }));
+  const connected = await state();
+  const retained = connected.records.find((owner) => owner.freeCalls === 0);
+  if (!retained || connected.remote !== "connected" || connected.session !== sessionId
+      || connected.timers !== 0 || connected.transferDisabled || connected.remoteStepDisabled) {
+    throw new Error(`Remote transfer did not start from a usable observed host: ${JSON.stringify(connected)}`);
+  }
+  const transfer = async (failure) => {
+    let timeout;
+    try {
+      await Promise.race([
+        page.evaluate((stage) => new Promise((resolve) => {
+          window.__ownerTest.nextFailure = stage;
+          const status = document.getElementById(stage ? "lab-notice" : "world-checkpoint-status");
+          const prefix = stage ? "Local checkpoint transfer unavailable:" : "Imported server checkpoint";
+          const observer = new MutationObserver(() => {
+            if (status.textContent.startsWith(prefix)) { observer.disconnect(); resolve(); }
+          });
+          observer.observe(status, { childList: true, characterData: true, subtree: true });
+          document.getElementById("lab-checkpoint-local").click();
+        }), failure),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`Remote transfer did not finish (${failure ?? "success"})`)), 10000);
+        }),
+      ]);
+    } finally { clearTimeout(timeout); }
+    await context.clock.runFor(64);
+    return state();
+  };
+  const refusals = [];
+  for (const failure of ["create", "identity"]) {
+    const before = await state();
+    const refused = await transfer(failure);
+    const live = refused.records.filter((owner) => owner.freeCalls === 0);
+    const candidates = refused.records.slice(before.records.length);
+    if (live.length !== 1 || live[0].id !== retained.id || live[0].tick !== retained.tick
+        || live[0].driveCalls !== retained.driveCalls || refused.closes !== 0 || refused.remote !== "connected"
+        || refused.session !== sessionId || refused.timers !== 0 || refused.transferDisabled || refused.remoteStepDisabled
+        || refused.selected !== checkpoint.checkpoint_id || candidates.length !== (failure === "create" ? 0 : 1)
+        || candidates.some((owner) => owner.freeCalls !== 1)) {
+      throw new Error(`Failed remote import changed either owner or leaked its candidate: ${JSON.stringify({ failure, refused })}`);
+    }
+    refusals.push({ failure, retainedOwner: retained.id, rejectedOwner: candidates[0]?.id ?? null });
+  }
+  const imported = await transfer(null);
+  const live = imported.records.filter((owner) => owner.freeCalls === 0);
+  if (live.length !== 1 || live[0].id === retained.id || live[0].kind !== "scientific"
+      || live[0].tick !== checkpoint.tick || live[0].speed !== 0 || imported.speed !== "0"
+      || imported.records[retained.id - 1].freeCalls !== 1
+      || imported.records[retained.id - 1].driveCalls !== retained.driveCalls
+      || imported.closes !== 1 || imported.remote !== "local" || imported.session !== String(2000 + live[0].id)
+      || imported.launchKind !== "scientific_checkpoint" || imported.timers !== 1 || imported.maximumTimers !== 1
+      || imported.sent.some((request) => !["subscribe", "stream_ack"].includes(request.command))
+      || requests.some((request) => request.method !== "GET" || request.session !== sessionId)
+      || requests.filter((request) => request.path.endsWith("/download")).length !== 3) {
+    throw new Error(`Remote transfer did not create one paused local owner without server mutation: ${JSON.stringify({ imported, requests })}`);
+  }
+  return { evidence: "production DOM/remote client/HTTP integrity checks with explicit socket and WASM doubles",
+    sourceSession: sessionId, sourceTick: 91, savedTick: checkpoint.tick, retainedOwner: retained.id,
+    importedOwner: live[0].id, refusals, requests, remoteCommands: imported.sent.map((request) => request.command),
+    socketCloses: imported.closes, paused: live[0].speed === 0 };
 }
 
 function createServer() {
@@ -549,7 +1329,7 @@ function createServer() {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/continuation-store.js", "/renderers/canvas.js", "/renderers/webgpu.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/experiments.js", "/experiment-protocol.js", "/experiment-view.js", "/checkpoint-lab.js", "/study-report.js", "/continuation-store.js", "/inspector.js", "/genome.js", "/interventions.js", "/narrative.js", "/recipes.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else {
@@ -571,7 +1351,7 @@ async function runTests() {
   });
 
   try {
-    let ownerLifecycle;
+    let ownerLifecycle, remoteScientificTransfer;
     // =========================================================================
     // Test 1: Honest Build Mismatch Warning Banner & Simulation Execution
     // =========================================================================
@@ -631,6 +1411,33 @@ async function runTests() {
             || await page.evaluate(() => !!window.__bannerExecuted)) {
           throw new Error(`${kind} banner interpreted build details as HTML`);
         }
+      }
+
+      for (const [status, heading] of [["recorded_match", "Recorded Build Inputs Match"],
+        ["unavailable", "Build Identity Unavailable"], ["mismatch", "Build Mismatch Warning"]]) {
+        await page.fill("#permalink-input", `sbb1.${status}_recipe`);
+        await page.click("#load-permalink-btn");
+        const banner = await page.textContent("#mismatch-banner");
+        const info = await page.textContent("#launch-info");
+        if (!banner.includes(heading) || !banner.includes("<em>Recorded recipe fixture; source input fingerprints only.</em>")
+            || await page.locator("#mismatch-banner em").count() !== 0
+            || !info.includes("18446744073709551615") || !info.includes("151 founders") || !info.includes("dwraon brains")
+            || !info.includes("tick zero") || await page.locator("#copy-permalink-btn").isDisabled()) {
+          throw new Error(`Browser recipe metadata or scoped build status was misrepresented: ${JSON.stringify({ status, banner, info })}`);
+        }
+        if (status === "unavailable" && (!banner.includes("equality is unknown") || banner.includes("Build Mismatch Warning"))) {
+          throw new Error("Unavailable recorded identity was treated as failed reproduction");
+        }
+        const tickBefore = BigInt(await page.textContent("#metric-tick"));
+        await context.clock.runFor(64);
+        if (BigInt(await page.textContent("#metric-tick")) <= tickBefore) throw new Error(`${status} prevented a recipe from running`);
+      }
+
+      await page.fill("#permalink-input", "sbw1.gallery_reference");
+      await page.click("#load-permalink-btn");
+      if (!(await page.textContent("#mismatch-banner")).includes("Gallery Build Reference")
+          || !(await page.textContent("#launch-info")).includes("does not encode a browser founder population")) {
+        throw new Error("Legacy gallery metadata was promoted to a measured browser recipe");
       }
 
       await context.close();
@@ -718,6 +1525,26 @@ async function runTests() {
         );
       }
 
+      await page.fill("#permalink-input", "sbb1.root_recipe");
+      await page.click("#load-permalink-btn");
+      const parentOwner = await page.evaluate(() => window.__ownerTest.records.find((owner) => owner.freeCalls === 0).id);
+      await page.fill("#fork-patch-input", '{"food_growth_rate": 0.05}');
+      await page.click("#fork-btn");
+      const childRecipe = await page.textContent("#fork-recipe-info");
+      if ((await page.textContent("#fork-child-link")) !== "sbb1.child_recipe_with_diff"
+          || !childRecipe.includes("18446744073709551615") || !childRecipe.includes("151 founders")
+          || !childRecipe.includes("dwraon brains") || !childRecipe.includes("tick zero")
+          || await page.inputValue("#permalink-input") !== "sbb1.root_recipe"
+          || await page.evaluate(() => window.__ownerTest.records.find((owner) => owner.freeCalls === 0).id) !== parentOwner) {
+        throw new Error("Variant recipe changed its running parent or lost founder recipe metadata");
+      }
+      await page.click("#load-forked-btn");
+      if (await page.inputValue("#permalink-input") !== "sbb1.child_recipe_with_diff"
+          || await page.evaluate(() => window.__ownerTest.records.find((owner) => owner.freeCalls === 0).id) === parentOwner
+          || await page.$eval("#fork-output", (element) => window.getComputedStyle(element).display) !== "none") {
+        throw new Error("Starting a variant did not replace its owner or clear the old child preview");
+      }
+
       await context.close();
     }
 
@@ -789,13 +1616,30 @@ async function runTests() {
       await context.close();
     }
 
+    // Real remote-view handoff, including failures before and after allocation.
+    {
+      const context = await browser.newContext();
+      const epoch = Date.UTC(2026, 0, 1);
+      await context.clock.install({ time: epoch });
+      await context.clock.pauseAt(epoch + 1000);
+      const page = await context.newPage();
+      const pageErrors = [];
+      page.on("pageerror", (error) => pageErrors.push(error.message));
+      await page.route("**/pkg/scriptbots_web.js", (route) => route.fulfill({
+        status: 200, contentType: "application/javascript; charset=utf-8", body: mockWasmModule,
+      }));
+      remoteScientificTransfer = await runRemoteScientificTransferCase(page, context, baseUrl);
+      if (pageErrors.length) throw new Error(`Unhandled remote handoff errors: ${pageErrors.join("; ")}`);
+      await context.close();
+    }
+
     const result = {
       schema: "scriptbots.browser-permalink-fork-dom.v1",
       timestamp: new Date().toISOString(),
       status: "pass",
-      cases_passed: 4,
+      cases_passed: 5,
       cases_failed: 0,
-      observations: { ownerLifecycle },
+      observations: { ownerLifecycle, remoteScientificTransfer },
     };
 
     console.log(JSON.stringify(result));

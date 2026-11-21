@@ -73,7 +73,14 @@ history/credit handling; nonempty narrative delivery requires observed records.
   replaying the hidden interval. A late timer retains the host's bounded catch-up
   policy and logs actual skipped tick opportunities. This main-thread adapter
   cannot guarantee deadlines when the browser suspends or blocks JavaScript.
-- **Population**: select the spawn count used the next time you reset. The wander brain offers immediate motion for visual feedback.
+- **Population**: select the spawn count used the next time you reset.
+- **Brain for new worlds**: the default MLP starts creatures with canonical
+  inherited genomes and evaluator state. DWRAON offers a recurrent network;
+  Assembly is an experimental evolving program. These three families use the
+  same versioned adapters as native worlds, including inherited offspring and
+  saved continuations. Unbound creates passive agents. The legacy Wander
+  movement demo has no supported continuation export. Selections take effect
+  when you reset.
 - **Renderer**: Automatic prefers WebGPU and falls back to Canvas 2D. You can
   also select either backend explicitly. Canvas presents immediately while
   WebGPU initializes, so a delayed device cannot block simulation startup.
@@ -84,21 +91,250 @@ history/credit handling; nonempty narrative delivery requires observed records.
   with boost rings. The canvas keeps its intrinsic aspect ratio when displayed
   beside the controls. The demo consumes one latest JSON snapshot per paint;
   binary bindings are separate from these controls.
+- **World layers**: choose the combined view, terrain, food, water, or agents
+  only. Canvas and WebGPU use the same overview captured with the agents'
+  committed publication, both locally and when connected to a server. Source
+  grids up to 128 cells per side retain every cell; larger grids use at most
+  128 × 128 center-cell samples covering the whole world. These samples are not
+  scientific averages. Food uses the configured food maximum and water uses
+  observed depth. The layer status identifies sampling and disabled hydrology.
+  Changing the view never submits a simulation command or advances a tick.
+- **Creature inspector**: click a creature on the canvas, or enter its stable
+  decimal UID in the inspector. Both renderers mark the selected creature with
+  a gold ring. The panel reads actual owner health, age, generation, energy,
+  accumulated net food/energy balance, reproduction progress, inherited traits,
+  parent UIDs, brain description, 25 named sensor values and nine named outputs.
+  These are recorded scientific values; inspection does not run the brain or
+  recompute its senses. Inputs and outputs follow the core's canonical channel
+  names. The lightweight read does not decode genomes or request topology, so
+  families without a genome-browser implementation can still be inspected.
+  Detail refreshes at most four times per second when publications advance,
+  with at most one request in flight. A paused publication is read once; use
+  **Refresh detail** for an explicit reread. The source line distinguishes the
+  inspected tick from a newer displayed frame immediately, including while a
+  remote request is pending. Clear the selection with the button, Escape, or an
+  empty part of the canvas. Selection survives a renderer switch and ordinary
+  creature motion; world/session/epoch changes clear it. A creature's death or
+  disappearance removes its old detail, and a reused arena handle cannot take
+  over its stable UID. Selection, highlights and inspection never advance science
+  or alter the simulation's selection state.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
-- **Saved continuations**: choose MLP or Unbound for a new world, then Reset.
+- **Initial-world recipes**: the launch panel displays the actual decimal seed,
+  founder count and brain family. Copying a recipe records these inputs and the
+  full effective configuration, including randomly initialized worlds. Opening
+  it restarts those founders at tick zero. Creating a variant changes the chosen
+  registered knobs while retaining the remaining launch inputs; it does not
+  branch the currently evolved state. Loaded continuations explicitly disable
+  recipe sharing and variants because their original founders are unknown.
+  Share those worlds with a continuation file instead. Browser recipes use
+  `sbb1`; existing `sbw1` gallery links remain supported. Build banners compare
+  recorded build inputs and identify missing metadata without claiming a proven
+  cross-build replay match.
+- **Scientific timeline**: both local worlds and remote sessions display the
+  canonical detector's event text, event tick and exact sequence. The source line
+  distinguishes the last history observation from a newer world publication.
+  Local reads occur at most four times per second, one bounded page at a time;
+  a paused unchanged publication is read once unless retained pages remain.
+  Hidden pages stop local reads. The view retains 48 rows and reports both
+  display omissions and exact gaps in the owner's retained history. Reset,
+  continuation replacement and local/remote switches cannot mix owners' events.
+  **Refresh history** explicitly retries an unavailable read. These observations
+  come from retained memory or a saved continuation, and do not establish a
+  durable event journal. Reading the timeline never ticks the simulation.
+- **Saved continuations**: MLP, DWRAON, Assembly and Unbound worlds can be saved.
+  Both save controls are visibly disabled for the legacy Wander demo.
   **Save Continuation File** downloads a portable full-owner checkpoint; **Load
-  Continuation File** validates and restores it paused. **Save in This Browser**
+  Continuation File** validates and restores it paused with its original family,
+  inherited genomes and evaluator state. Unsupported or mismatched family
+  identities are refused. **Save in This Browser**
   replaces one IndexedDB slot for this site and browser profile. The save is
   acknowledged only when the transaction completes. A reload displays the saved
   tick and time; **Restore Saved World** is always explicit and starts paused,
-  without adding ticks for offline time. There is no autosave. Browser storage
-  clearing or eviction can remove the slot, so download a file for a portable
+  without adding ticks for offline time. Automatic recovery is off until you
+  enable it separately. Browser storage clearing or eviction can remove either
+  slot, so download a file for a portable
   copy. Quota/abort errors keep the previous save, and invalid or stale restores
   preserve the active world. Both local restore paths work after an invalid
   startup permalink; all local continuation controls are disabled in remote mode.
-- Runtime brain presets can be toggled programmatically via `registerBrain("wander" | "mlp" | "none")` on the `SimHandle`.
+- **Automatic recovery (local)**: opt in for the current world to attempt an
+  immediate save on the next owner timer callback, then save changed owner
+  state at most once every 30 seconds. Recovery uses its own IndexedDB
+  slot and never replaces **Save in This Browser**. An independent owner timer
+  observes completed science, control and configuration revisions; rendering
+  never triggers a save or a simulation tick. Hidden pages suspend new captures.
+  One capture/write can be pending, with newer changes coalesced into the next
+  eligible save. The panel shows the last transaction-confirmed tick and time.
+  A storage failure pauses recovery until **Retry Recovery** is selected.
+  Reset, restore and local/remote owner changes disable recovery and cancel an
+  outstanding write when the browser still permits it. Enabling it for a new
+  owner is explicit. After reload, **Restore Recovery World (paused)** validates the saved
+  continuation and restores it paused; nothing restores or catches up silently.
+- **Saved-world experiments (remote)**: connect to a server and open the
+  **Saved-world experiments** panel. Save a server checkpoint or select an
+  existing one, then run an unchanged future or a paired treatment/control
+  study. Drought, food shock, temperature stress and population injection
+  policy are available as explicit treatments. The source is the selected
+  saved scientific state, rather than a new tick-zero recipe. The live owner
+  is not replaced or advanced by the study. The panel shows observed job
+  status, supports cooperative cancellation, and exposes the completed report
+  and the actual retained source, plan and verified bundle files.
+- Runtime brain presets can be rebuilt programmatically via
+  `registerBrain("mlp" | "dwraon" | "assembly" | "wander" | "none")` on the
+  `SimHandle`. Invalid choices preserve the current world.
+
+### Remote matched-seed experiments
+
+Connect to the existing remote host, wait for its canvas frame, then open
+**Matched-seed experiments**. The panel creates fresh worlds through the host's
+experiment runner. Each arm starts from the runner's defaults plus its own
+initial overrides; it does not start from the current canvas or a checkpoint.
+
+1. Enter distinct baseline and challenger arm IDs and choose their brain
+   families. Keep the initial overrides identical when comparing only families.
+2. Enter exact decimal seeds, separated by commas or whitespace. Every arm uses
+   the same seed set. The form accepts 1–32 distinct unsigned 64-bit seeds;
+   values above JavaScript's safe integer range remain exact.
+3. Choose the horizon and concurrency. The initial form uses seeds 11, 42 and
+   137, 200 ticks, one simultaneous run, and a population minimum of 20 in
+   each arm. These are editable experiment inputs, not changes to world defaults.
+4. Expand either arm to edit its initial JSON overrides or ordered numeric
+   intervention schedule. For example,
+   `[{"tick":100,"set":{"food_growth_rate":0.001}}]` changes that arm's growth
+   rate at tick 100. Schedule ticks must be inside the horizon; same-tick
+   statements retain their declared order. The host validates supported settings.
+5. Select **Create matched-seed experiment**. Follow the observed batch and run
+   states, or use **Cancel unfinished runs** and **Resume unfinished runs** for
+   an eligible stopped batch. Closing the panel stops browser reads and leaves
+   the host's experiment lifecycle under its existing owner.
+
+If admission is uncertain, **Retry exact request** retains the original seed
+tokens, configuration, schedule and idempotency key. Editing the form does not
+alter that retry. Network actions require the same observed host session;
+the server refuses an old `X-ScriptBots-Session` before admitting or changing
+work. An endpoint or session change clears its observations rather than
+resubmitting the request to another host. After a reload or reconnect, page
+through **Retained experiments** and choose a batch to read its current status.
+Historical selection never launches or resumes scientific work.
+
+The panel shows at most 16 run records at once. A running world's displayed
+progress comes from its last observed published or recovered checkpoint and
+may lag execution. Terminal ticks are shown only for completed runs. Capacity
+rows report the host's configured reservations, including zero-slot admission
+shutdown. A server bundle path identifies a retained host file; it is not a
+browser download link.
+
+When both chosen cohorts have completed every declared seed, select baseline,
+challenger and a terminal metric, then choose **Compare completed arms**.
+Results report challenger minus baseline across the independent matched seeds,
+with the host's interval, effect size, significance and uncertainty fields.
+One seed pair is descriptive only. Repeated ticks are not independent
+replicates, a larger endpoint is not a fitness verdict, and separate metric
+requests do not form one jointly corrected analysis. The comparison must match
+the observed plan digest, status generation, endpoint and complete seed set.
+
+**Export browser observation JSON** retains the observed status, comparison
+and exact decimal seed identities. It includes canonical request JSON only if
+this browser still holds an observed admission for the selected experiment.
+Historical selection cannot recover a missing original request. The export
+identifies its browser-observation scope and is separate from server run bundles.
+
+Requests and responses have explicit browser bounds (64 KiB creation and
+1 MiB response). The backend remains responsible for scientific execution,
+configuration validation, durable records and paired inference. Source-level
+regressions were added for this workflow, but the execution environment was
+unavailable before DSR could run them; browser and native qualification remain
+open under the existing acceptance work.
+
+### Remote checkpoint studies
+
+The browser uses the server's existing bounded checkpoint and managed-study
+services. Each save and launch retains an immutable request with a unique retry
+key. If delivery is uncertain, use **Retry same save** or **Retry same study
+request**; editing the form does not change that retained request. The explicit
+`X-ScriptBots-Session` header binds Lab operations to the owner negotiated by
+the stream. A replaced server session refuses old requests before acting.
+Returning to the local browser world or disconnecting stops reads and discards
+late responses, while the same endpoint/session can retain an uncertain retry.
+Closing the panel does not cancel a running server study; use **Cancel study**
+and observe its final status.
+
+Select a checkpoint and choose **Review saved world** to draw its saved agents
+and environment on the main canvas. A persistent banner identifies its checkpoint,
+tick and world digest, with **Return to live** available even after closing the Lab
+panel. The native server continues independently, and its stream and event timeline
+stay connected. Return to live presents the latest received live frame without
+pausing, stepping, replacing or restoring the live owner. A refused reconstruction
+leaves the current view intact; there is no automatic reconstruction retry.
+
+The saved view is read-only: live playback, creature and brain/genome inspection,
+interventions, new experiment/study requests and checkpoint saves are unavailable.
+The checkpoint contains a scientific state, not its original presentation history.
+Restored publication and environment revisions are newly reconstructed, and saved
+births/deaths and tick rate are shown as unavailable. **Save Frame as PNG** works
+with either renderer and names the checkpoint, saved tick and world digest. Changing
+views invalidates renderer caches and pending exports, so a later callback cannot
+label live pixels as a saved-world image.
+
+The preview GET is bound to the negotiated host session in both its query and
+`X-ScriptBots-Session` header. The browser verifies returned checkpoint metadata,
+checksums, session, exact tick, population and complete environment before admitting
+the reconstructed frame. Its 12 MiB response and 8 MiB binary-frame bounds are
+separate from checkpoint-file downloads; its 35-second fetch deadline accommodates
+the server's 30-second reconstruction deadline. Returning to live, changing source,
+disconnecting or hiding the panel aborts an in-flight preview and rejects late
+results. An already displayed saved view may remain visible offline, clearly marked
+as disconnected; connecting to another host clears it.
+
+Checkpoint and artifact lists are paginated. Only files published for the
+selected completed study are offered in its file list; a partial directory
+does not establish completion. Downloads are bounded and verified against the
+retained metadata. The browser offers each file for saving and does not claim
+the operating system has persisted it. To reproduce a downloaded plan offline,
+preserve its relative files and update the saved source path when relocating
+them, as described by the native `branch-study` command.
+
+Use **Reopen a retained study** to page through the host's saved study receipts
+after a browser refresh, reconnect or server restart. Selecting a study fetches
+its current status; running work can be observed or cancelled, and completed
+work exposes its retained artifacts. Selection does not submit a new study.
+An uncertain launch must first be resolved with its unchanged retry request.
+Interrupted studies are marked **stopped** and require an explicit new launch
+from a retained checkpoint if another future is wanted.
+
+For a completed study, **Read study results** opens its verified report in the
+panel. The table shows actual terminal population, ground food, total energy,
+average health, and final-tick births, deaths and spike hits. Paired studies
+show treatment-minus-control terminal differences separately from the report's
+whole-trajectory mean differences and standard deviations. The view includes
+first divergence, population minimum, final population as a percentage of its
+baseline, exact starting seed, saved source digest and downloaded report hash.
+The preview requires the selected study's schema-4 saved-source report and
+enforces a 1 MiB limit before downloading it; ordinary file downloads retain
+their separate 64 MiB bound.
+
+A saved scientific fork retains its genomes, evaluator state and scientific
+source, but does not continue the original host session, journal, schedules or
+omitted auxiliary histories. One saved trajectory and its matched control are
+descriptive evidence, not independent replication. Historical receipts identify
+the saved source and horizon; their original treatment is read from retained
+artifacts rather than reconstructed as a new request. Existing resource limits
+and backend refusals remain visible.
 
 Snapshots returned to JS follow the selected `snapshot_format` (defaults to JSON). To switch to binary snapshots (Postcard-encoded `Uint8Array`), pass `snapshot_format: "binary"` to `init_sim`.
+
+`SimHandle.inspectAgent(uid)` accepts an exact decimal UID string and returns a
+bounded `scriptbots.agent-inspection.v1` observation, or an absent value when the
+creature is no longer alive in that owner. `frame()` and the remote Canvas decoder
+expose agent `uid`, arena `id`, optional `brainKey`, and `epoch` as decimal strings
+so identities above JavaScript's safe integer range remain distinct. This
+presentation projection does not change the core JSON/Postcard snapshot codecs.
+Remote inspection uses the stream host's protected
+`GET /api/agents/inspect?uid=...&session_id=...&epoch=...` endpoint, preserving any
+reverse-proxy prefix before `/api/ws/stream`. It shares the existing authority and
+Origin policy, a 250 ms owner-read deadline and a 16 KiB browser response cap.
+Browser fetches time out after two seconds; errors are shown with an explicit
+refresh action. Responses from a replaced owner, old epoch or previous selection
+cannot populate the current inspector.
 
 The log pane (bottom of the sidebar) captures bootstrap and performance events so that ad-hoc benchmarking runs can be recorded while iterating on the renderer.
 
@@ -171,20 +407,32 @@ opaque empty-frame negatives and a one-pixel positive control. A separate
 canvas-copy count is diagnostic; it does not qualify GPU image export.
 The ordinary stats mode retains its separate four-case contract.
 
-The ordinary real-package checkpoint journey also saves a nonempty MLP owner in
-actual IndexedDB, aborts a replacement after request success, reloads the page,
-and explicitly restores the original snapshot and uninterrupted next tick. It
-checks stored-byte corruption and recovery from an ownerless startup. The
-permalink lifecycle harness separately checks stored tick mismatches, bounds,
-quota refusal, and delayed restore races with reset/remote mode using its explicit
-WASM double. `tests/continuation_store.test.mjs` can run under Node through DSR;
+The ordinary real-package checkpoint journey checks the default MLP owner's
+continuation capability, saves a nonempty MLP owner in actual IndexedDB, aborts a
+replacement after request success, reloads the page, and explicitly restores the
+original snapshot and uninterrupted next tick. It exercises downloaded DWRAON
+and Assembly continuations, preserving each selected family and its exact next
+tick, and verifies that the explicit Wander demo refuses save without changing
+science. It also checks stored-byte corruption and recovery from an ownerless
+startup. The permalink lifecycle harness separately checks each preset selection,
+stored tick mismatches, bounds, quota refusal, and delayed restore races with
+reset/remote mode using its explicit WASM double.
+`tests/continuation_store.test.mjs` can run under Node through DSR;
 its controlled IndexedDB events test adapter ordering, error handling and bounds,
 not real browser persistence or the Rust codec.
 
-The saved slot contains an opaque full-owner checkpoint Blob, not a database
-image or a batch journal. It leaves internal `CommittedVolatile` receipts intact
-and does not qualify the full SQLite-image/journal `Durable` path in `bd-ywtv`.
-Multiple tabs share the slot; the last completed manual save wins.
+Each saved slot contains an opaque full-owner checkpoint Blob, not a database
+image or a batch journal. The manual and recovery slots are separate and each
+holds one bounded checkpoint. They leave internal `CommittedVolatile` receipts
+intact and do not qualify the full SQLite-image/journal `Durable` path in
+`bd-ywtv`. Multiple tabs share both slots; the last completed transaction for a
+slot wins. An aborted replacement retains its prior save. A tab's cancelled
+pending IndexedDB open cannot accumulate opens or start a late write.
+
+Recovery-specific storage/controller regressions and the lifecycle harness cover
+these new paths. Their source was reviewed, but execution was blocked when the
+working environment became unavailable; no new browser durability or platform
+qualification is claimed.
 
 For determinism validation, run the accompanying WASM parity test:
 

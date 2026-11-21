@@ -91,6 +91,275 @@ fn archipelago_cli_capture_preserves_an_existing_report() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn recorded_archipelago_checkpoint_continues_real_migrations_without_reopening_source_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = retained_directory("archipelago-checkpoint-continuation-")?;
+    let mut runs = Vec::new();
+    for (name, ticks) in [("prefix", "2"), ("uninterrupted", "4")] {
+        let database = directory.join(format!("{name}.sqlite"));
+        let checkpoint = directory.join(format!("{name}.checkpoint"));
+        let mut command = recorded_cli();
+        command
+            .args(["--run-archipelago", "2", "--archipelago-ticks", ticks])
+            .arg("--archipelago-db")
+            .arg(&database)
+            .arg("--archipelago-checkpoint")
+            .arg(&checkpoint)
+            .args([
+                "--threads",
+                "1",
+                "--brain",
+                "mlp",
+                "--migration-interval",
+                "2",
+                "--migration-selection",
+                "random",
+                "--set",
+                "rng_seed=42",
+                "--set",
+                "persistence_interval=1",
+                "--set",
+                "world_width=600",
+                "--set",
+                "world_height=600",
+                "--set",
+                "closed=true",
+            ]);
+        let output = retain_cli(&directory, name, &mut command)?;
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(result["checkpoint"]["tick"], ticks.parse::<u64>()?);
+        assert_eq!(result["checkpoint"]["file_synced"], true);
+        let bytes = std::fs::read(&checkpoint)?;
+        assert_eq!(
+            result["checkpoint"]["blake3"],
+            blake3::hash(&bytes).to_hex().as_str()
+        );
+        let cut = scriptbots_runtime::archipelago::ArchipelagoCheckpointV1::decode(&bytes)?;
+        assert_eq!(cut.island_metadata().len(), 2);
+        runs.push((database, checkpoint, result, bytes));
+    }
+    let source_database = std::fs::read(&runs[0].0)?;
+    let continued_path = directory.join("continued.checkpoint");
+    let output = retain_cli(
+        &directory,
+        "continued",
+        recorded_cli()
+            .arg("continue-archipelago")
+            .arg(&runs[0].1)
+            .args(["--barriers", "2", "--brain", "mlp", "--threads", "2"])
+            .arg("--output")
+            .arg(&continued_path),
+    )?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let continued: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(continued["source_tick"], 2);
+    assert_eq!(continued["source_epoch"], 2);
+    assert_eq!(continued["tick"], 4);
+    assert_eq!(continued["epoch"], 4);
+    assert_eq!(continued["island_transitions"], 4);
+    assert_eq!(continued["rayon_threads"], 2);
+    assert_eq!(continued["science_database_continued"], false);
+    assert_eq!(continued["host_journal"], "committed_volatile");
+    assert_eq!(std::fs::read(&runs[0].0)?, source_database);
+    assert_eq!(std::fs::read(&runs[0].1)?, runs[0].3);
+    let prefix_moves = runs[0].2["migration_count"].as_u64().unwrap();
+    let total_moves = runs[1].2["migration_count"].as_u64().unwrap();
+    assert!(prefix_moves > 0 && total_moves > prefix_moves);
+    assert_eq!(continued["migration_count"], total_moves - prefix_moves);
+    let continued_islands = continued["islands"].as_array().unwrap();
+    let uninterrupted_islands = runs[1].2["islands"].as_array().unwrap();
+    assert_eq!(continued_islands.len(), 2);
+    assert_eq!(uninterrupted_islands.len(), 2);
+    for (actual, oracle) in continued_islands.iter().zip(uninterrupted_islands) {
+        assert_eq!(actual["island_id"], oracle["island_id"]);
+        assert_eq!(
+            actual["digest"], oracle["digest"],
+            "all scientific digest components must continue exactly"
+        );
+        assert_eq!(actual["population"], oracle["population"]);
+        assert!(actual["population"].as_u64().unwrap() > 0);
+    }
+    // An exclusive output and a mismatched executable registry must refuse without changing
+    // the saved source. The original checkpoint remains a usable retry point after both.
+    let saved_bytes = std::fs::read(&continued_path)?;
+    let refused = retain_cli(
+        &directory,
+        "existing-output",
+        recorded_cli()
+            .arg("continue-archipelago")
+            .arg(&runs[0].1)
+            .args(["--barriers", "1", "--brain", "mlp"])
+            .arg("--output")
+            .arg(&continued_path),
+    )?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already exists"));
+    assert_eq!(std::fs::read(&continued_path)?, saved_bytes);
+    let mismatched_path = directory.join("wrong-registry.checkpoint");
+    let refused = retain_cli(
+        &directory,
+        "wrong-registry",
+        recorded_cli()
+            .arg("continue-archipelago")
+            .arg(&runs[0].1)
+            .args(["--barriers", "1", "--brain", "assembly"])
+            .arg("--output")
+            .arg(&mismatched_path),
+    )?;
+    assert!(!refused.status.success());
+    assert!(!mismatched_path.exists());
+    assert_eq!(std::fs::read(&runs[0].1)?, runs[0].3);
+    let next_path = directory.join("continued-again.checkpoint");
+    let output = retain_cli(
+        &directory,
+        "continued-again",
+        recorded_cli()
+            .arg("continue-archipelago")
+            .arg(&continued_path)
+            .args(["--barriers", "1", "--brain", "mlp"])
+            .arg("--output")
+            .arg(&next_path),
+    )?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let next: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(next["source_tick"], 4);
+    assert_eq!(next["tick"], 5);
+    assert_eq!(next["epoch"], 5);
+    Ok(())
+}
+
+#[test]
+fn recorded_archipelago_cli_executes_the_declared_spread_or_grid_founders()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = retained_directory("recorded-archipelago-founders-")?;
+    let scenario = directory.join("fixed-grid.toml");
+    std::fs::write(
+        &scenario,
+        "schema = \"scriptbots.scenario.v1\"\nschema_version = 1\nid = \"grid-founders\"\n",
+    )?;
+    let grid_positions: Vec<_> = [60.0_f64, 180.0, 300.0, 420.0]
+        .into_iter()
+        .flat_map(|y| {
+            [60.0_f64, 180.0, 300.0, 420.0]
+                .into_iter()
+                .map(move |x| (x.to_bits(), y.to_bits()))
+        })
+        .collect();
+    let mut spread_observation = None;
+    for (name, recipe) in [
+        ("spread", scriptbots_app::FounderRecipe::Spread),
+        ("spread-repeat", scriptbots_app::FounderRecipe::Spread),
+        ("scenario-grid", scriptbots_app::FounderRecipe::CornerGrid),
+    ] {
+        let database = directory.join(format!("{name}.sqlite"));
+        let mut command = recorded_cli();
+        command
+            .args(["--run-archipelago", "2", "--archipelago-ticks", "1"])
+            .arg("--archipelago-db")
+            .arg(&database)
+            .args([
+                "--threads",
+                "1",
+                "--brain",
+                "mlp",
+                "--set",
+                "rng_seed=42",
+                "--set",
+                "persistence_interval=1",
+                "--set",
+                "world_width=600",
+                "--set",
+                "world_height=600",
+                "--set",
+                "closed=true",
+            ]);
+        if recipe == scriptbots_app::FounderRecipe::CornerGrid {
+            command.arg("--scenario").arg(&scenario);
+        }
+        let output = retain_cli(&directory, name, &mut command)?;
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(result["status"], "complete");
+        let reader = StorageReader::open(database.to_str().unwrap())?;
+        let manifest: serde_json::Value =
+            serde_json::from_str(&reader.run_manifest()?.manifest_json)?;
+        assert_eq!(
+            manifest["scenario"]["population_recipe"],
+            format!("{};brain=mlp", recipe.id())
+        );
+        assert!(reader.archipelago_report()?.conservation_audit.passed);
+        reader.close()?;
+
+        // Birth positions are the original tick-zero observations, before motion
+        // or migration. Reading them avoids inferring founders from a final count.
+        let connection = Connection::open(database.to_str().unwrap())?;
+        let births = connection.query(
+            "SELECT island_id, agent_uid, position_x, position_y FROM births
+             WHERE tick = 0 AND origin = 'seeded' ORDER BY island_id, agent_uid",
+        )?;
+        let mut positions = BTreeMap::<i64, Vec<(u64, u64)>>::new();
+        for row in births {
+            let island: i64 = row.get_typed(0)?;
+            let uid: i64 = row.get_typed(1)?;
+            let x: f64 = row.get_typed(2)?;
+            let y: f64 = row.get_typed(3)?;
+            assert!((0.0..600.0).contains(&x) && (0.0..600.0).contains(&y));
+            let island_positions = positions.entry(island).or_default();
+            assert_eq!(uid, i64::try_from(island_positions.len())? + 1);
+            island_positions.push((x.to_bits(), y.to_bits()));
+        }
+        connection.close()?;
+        assert_eq!(positions.keys().copied().collect::<Vec<_>>(), vec![0, 1]);
+        match recipe {
+            scriptbots_app::FounderRecipe::Spread => {
+                for observed in positions.values() {
+                    assert_eq!(observed.len(), scriptbots_app::SPREAD_FOUNDER_COUNT);
+                    assert_eq!(
+                        observed
+                            .iter()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len(),
+                        observed.len()
+                    );
+                }
+                assert_ne!(positions[&0], positions[&1]);
+                let observed = (positions, result["islands"].clone());
+                if let Some(reference) = &spread_observation {
+                    assert_eq!(reference, &observed, "seeded founder science must repeat");
+                } else {
+                    spread_observation = Some(observed);
+                }
+            }
+            scriptbots_app::FounderRecipe::CornerGrid => {
+                for observed in positions.values() {
+                    assert_eq!(observed, &grid_positions);
+                }
+            }
+        }
+        assert_eq!(result["founder_recipe"], recipe.id());
+        assert_eq!(manifest["archipelago"]["founder_recipe"], recipe.id());
+    }
+    Ok(())
+}
+
+#[test]
 fn recorded_archipelago_cli_persists_every_island_and_tick()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = retained_directory("recorded-archipelago-")?;
