@@ -2,6 +2,34 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser world exploration (2026-11-20):**
+[Implemented; DSR JavaScript regressions passed — Codex;
+scoped input/presentation contribution to `bd-2z0.12.3`]
+
+- Add shared Canvas/WebGPU camera geometry with 1–32× pointer-anchored zoom,
+  drag and keyboard pan, Fit world, and exact-UID Follow selected. Agents,
+  selection rings and environment tiles wrap across both world seams.
+- Anchor picking and gestures to the last admitted frame and its immutable
+  camera. A refused replacement frame cannot let old pixels authorize Follow
+  against a new owner, epoch or world extent. Follow stops when its creature
+  disappears; source replacement resets the view and cancels active gestures.
+- Repaint paused worlds when camera or selection changes without submitting
+  simulation commands, advancing ticks or modifying snapshots. Keep GPU
+  admission bounded to one outstanding frame and reuse environment textures.
+- Add 12 Node camera/renderer regressions and a production DOM/Canvas interaction
+  case covering wheel, drag, keyboard, fit/follow, paused-state command counts,
+  source replacement, refused-frame lifetime and resize cancellation. The DOM
+  case explicitly uses WASM-owner and renderer-admission doubles.
+
+DSR `scriptbots_browser_continue/20261121T000709-kFMgrZOk` passed all 251
+`*.test.mjs` tests with no failures or skips, plus syntax checks for every changed
+JavaScript module and both DOM harnesses. The frozen source signatures matched
+before and after execution. The Node renderer cases exercise host adapters with
+explicit graphics doubles; they do not establish browser pixels or GPU-driver
+behavior. Chromium is unavailable here, so the authored DOM interaction case,
+packaged-WASM journey and real GPU/capability matrix remain unexecuted.
+The original browser acceptance bead remains open.
+
 **Persistence and durable command recovery (2026-11-20):**
 [Source implemented; executable qualification blocked — Codex;
 scoped contributions to `bd-50bg` and `bd-2z0.12.2`]

@@ -118,6 +118,19 @@ history/credit handling; nonempty narrative delivery requires observed records.
   disappearance removes its old detail, and a reused arena handle cannot take
   over its stable UID. Selection, highlights and inspection never advance science
   or alter the simulation's selection state.
+- **World exploration**: drag the canvas to pan, scroll to zoom around the pointed
+  location, or use the visible zoom and **Fit world** controls. Zoom is bounded
+  from 1× through 32×. With the canvas focused, arrow keys pan, `+`/`-` zoom,
+  `Home` or `0` fits, and `F` toggles **Follow selected**. Follow tracks the
+  selected stable creature UID through toroidal seams and stops if it disappears;
+  a manual pan also stops following. Terrain, creatures, selection and hit-testing
+  share the same wrapped projection in Canvas and WebGPU. Picking uses the last
+  accepted paint even if a new camera view is waiting for the next frame. Camera
+  changes repaint paused worlds, survive renderer switches, and reset on a new
+  owner, epoch, world extent or saved-world review. Touch dragging pans; the
+  buttons provide touch zoom. These controls never advance science or submit an
+  owner command. Zooming does not invent detail beyond the bounded environment
+  overview described above.
 - **Reset Simulation**: reseeds with a fresh RNG seed and reuses the slider settings. A rolling 5-second performance log is appended to the console pane (`FPS`, `TPS`, population).
 - **Initial-world recipes**: the launch panel displays the actual decimal seed,
   founder count and brain family. Copying a recipe records these inputs and the
@@ -378,10 +391,12 @@ and permits retry. At most one generated object URL is retained, released on
 replacement or page exit. Capture never submits a science command or changes
 playback speed.
 Unchanged publications reuse their painted frame rather than repeatedly drawing
-a paused world. Renderer replacement, a new simulation or canvas resize
-invalidates that reuse; a waiting capture always requests a fresh paint. The
-cache retains only revision/session/size/generation metadata, not agent snapshots
-or a previous simulation handle.
+a paused world. Renderer replacement, a new world source, canvas resize, world-layer
+changes, camera movement or a changed selection invalidate that reuse; a waiting
+capture always requests a fresh paint. The bounded cache retains one last admitted
+frame observation and its immutable camera, source identity, revisions, dimensions
+and generations so picking and capture refer to the accepted pixels. It retains
+no simulation handle and cannot advance or mutate the source world.
 
 Inside a pinned DSR profile, the existing stats test can separately exercise
 real WebGPU/Canvas geometry, resizing, explicit capability failures and actual

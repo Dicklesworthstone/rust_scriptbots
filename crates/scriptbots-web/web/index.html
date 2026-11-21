@@ -58,7 +58,16 @@
             height: auto;
             display: block;
             cursor: crosshair;
+            touch-action: none;
         }
+
+        #sim-canvas[data-dragging="true"] { cursor: grabbing; }
+        #world-navigation { border: 1px solid #334155; border-radius: 0.5rem; padding: 0.65rem; }
+        #world-navigation h2 { font-size: 0.95rem; margin-bottom: 0.55rem; }
+        .world-navigation-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+        .world-navigation-actions button { flex: 1 1 45%; padding: 0.45rem 0.4rem; font-size: 0.82rem; }
+        #world-view-status, #world-navigation-help { font-size: 0.78rem; line-height: 1.45; overflow-wrap: anywhere; }
+        #world-navigation-help { color: #94a3b8; margin-bottom: 0; }
 
         #checkpoint-view {
             position: absolute;
@@ -388,7 +397,7 @@
     <div id="mismatch-banner" role="alert" aria-live="polite"></div>
     <main>
         <section id="sim-container">
-            <canvas id="sim-canvas" width="1280" height="720" tabindex="0" aria-label="Simulation canvas. Click a creature to inspect it; Escape clears selection."></canvas>
+            <canvas id="sim-canvas" width="1280" height="720" tabindex="0" aria-label="Simulation canvas. Click a creature to inspect; drag to pan; scroll or plus/minus to zoom; arrows pan; Home fits; F follows; Escape clears selection."></canvas>
             <div id="remote-overlay" role="status" hidden>Waiting for a remote canvas frame…</div>
             <section id="checkpoint-view" aria-label="Saved-world review" hidden>
                 <p id="checkpoint-view-status" role="status" aria-live="polite"></p>
@@ -433,6 +442,17 @@
                     <option value="agents">Agents only</option>
                 </select>
                 <div id="environment-status" role="status" aria-live="polite">Waiting for environment layers…</div>
+                <section id="world-navigation" aria-labelledby="world-navigation-heading">
+                    <h2 id="world-navigation-heading">Explore the world</h2>
+                    <div class="world-navigation-actions">
+                        <button id="world-zoom-out" type="button" disabled>− Zoom out</button>
+                        <button id="world-zoom-in" type="button" disabled>+ Zoom in</button>
+                        <button id="world-fit" type="button" disabled>Fit world</button>
+                        <button id="world-follow" type="button" aria-pressed="false" disabled>Follow selected</button>
+                    </div>
+                    <p id="world-view-status" role="status">Waiting for a world view.</p>
+                    <p id="world-navigation-help">Drag to pan; scroll to zoom. With the canvas focused: arrows pan, +/− zoom, Home fits, F follows selection. Panning stops following.</p>
+                </section>
                 <section id="agent-inspector" aria-labelledby="inspector-heading" data-state="empty">
                     <h2 id="inspector-heading">Creature inspector</h2>
                     <p id="inspector-status" role="status">Click a creature in the world, or enter its stable UID.</p>
