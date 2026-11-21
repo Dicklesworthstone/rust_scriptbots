@@ -19431,21 +19431,13 @@ impl Storage {
             return Ok(CommandAuthorityLookup::Collision);
         }
 
+        // Resolve each exact identity separately, as in journal admission below. The pinned
+        // engine scans the growing archive for the equivalent LEFT JOIN even when the
+        // command is keyed. This connection is confined to the storage owner and the run's
+        // writer lease, so no other writer can change these bindings between the reads.
         let terminal_rows = self.connection()?.query_with_params(
-            "SELECT command.journal_sequence, archive.payload_version,
-                    archive.payload_digest, length(CAST(archive.payload_json AS BLOB)),
-                    ledger.state
-             FROM host_command_records AS command
-             LEFT JOIN host_journal_archive AS archive
-               ON archive.run_id = command.run_id
-              AND archive.host_session_id = command.host_session_id
-              AND archive.journal_sequence = command.journal_sequence
-             LEFT JOIN host_journal_batch_ledger AS ledger
-               ON ledger.run_id = command.run_id
-              AND ledger.host_session_id = command.host_session_id
-              AND ledger.journal_sequence = command.journal_sequence
-             WHERE command.run_id = ?1 AND command.host_session_id = ?2
-               AND command.command_id = ?3
+            "SELECT journal_sequence FROM host_command_records
+             WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3
              LIMIT 2",
             &[
                 sqlite_run_id(self.run_id),
@@ -19473,13 +19465,57 @@ impl Storage {
         let journal: String = decode(terminal, 0, "host_command_records.journal_sequence")?;
         let journal_sequence =
             decode_journal_u64("host_command_records.journal_sequence", &journal)?;
+        let journal_identity = [
+            sqlite_run_id(self.run_id),
+            encoded_session.as_str().into(),
+            journal.as_str().into(),
+        ];
+        let archive_rows = self.connection()?.query_with_params(
+            "SELECT payload_version, payload_digest, length(CAST(payload_json AS BLOB))
+             FROM host_journal_archive
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+             LIMIT 2",
+            &journal_identity,
+        )?;
+        let archive = match archive_rows.as_slice() {
+            [] => {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_claims.archive_binding",
+                    reason: format!("command {command_id} has no canonical archive"),
+                });
+            }
+            [archive] => archive,
+            rows => {
+                return Ok(CommandAuthorityLookup::Failed(
+                    CommandAuthorityLookupFailure::Ambiguous {
+                        matches: rows.len(),
+                    },
+                ));
+            }
+        };
+        let ledger_rows = self.connection()?.query_with_params(
+            "SELECT state FROM host_journal_batch_ledger
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+             LIMIT 2",
+            &journal_identity,
+        )?;
+        let ledger_state: Option<String> = match ledger_rows.as_slice() {
+            [] => None,
+            [ledger] => decode(ledger, 0, "host_journal_batch_ledger.state")?,
+            rows => {
+                return Ok(CommandAuthorityLookup::Failed(
+                    CommandAuthorityLookupFailure::Ambiguous {
+                        matches: rows.len(),
+                    },
+                ));
+            }
+        };
         let payload_version: Option<i64> =
-            decode(terminal, 1, "host_journal_archive.payload_version")?;
+            decode(archive, 0, "host_journal_archive.payload_version")?;
         let payload_digest: Option<String> =
-            decode(terminal, 2, "host_journal_archive.payload_digest")?;
+            decode(archive, 1, "host_journal_archive.payload_digest")?;
         let payload_bytes: Option<i64> =
-            decode(terminal, 3, "host_journal_archive.payload_json.length")?;
-        let ledger_state: Option<String> = decode(terminal, 4, "host_journal_batch_ledger.state")?;
+            decode(archive, 2, "host_journal_archive.payload_json.length")?;
         let Some(payload_digest) = payload_digest else {
             return Err(StorageError::InvalidData {
                 context: "host_command_claims.archive_binding",
@@ -40515,6 +40551,228 @@ mod tests {
             1,
             "the isolated corruption connection must restore foreign-key enforcement"
         );
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real file-owner journey compares keyed command authority with the prior join and the independently observed runtime receipts"
+    )]
+    fn durable_authority_keyed_lookup_preserves_exact_joined_receipts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("durable-authority-keyed-lookup");
+        let path_text = path.to_string_lossy().into_owned();
+        let session = HostSessionId::new(0xc09f);
+        let (mut pipeline, mut owner, mut frontend) =
+            host_checkpoint_file_owner(&path_text, session, 4244);
+        let run_id = pipeline.run_id();
+        let mut clock = 0;
+        let mut observed = Vec::new();
+        for sequence in 1..=3 {
+            let envelope = CommandEnvelope::new(
+                CommandId::from_client_sequence(session.get(), sequence),
+                HostCommand::Step,
+            );
+            let receipt =
+                apply_host_checkpoint_command(&mut frontend, &mut owner, &envelope, &mut clock);
+            assert_eq!(owner.world_tick(), Tick(sequence));
+            observed.push((envelope, receipt));
+        }
+        drop(frontend);
+        drop(owner);
+        pipeline.shutdown()?;
+
+        let before = journal_database_snapshot(&path_text);
+        let storage = Storage::recover_existing_run(&path_text, run_id)?;
+        let observer = HostSessionId::new(session.get() + 1);
+        let session_text = encode_journal_u64(session.get());
+        for (envelope, receipt) in observed {
+            // Keep the old query only as an oracle over actual persisted commands. The
+            // production lookup must select the same archive and ledger among distinct cuts.
+            let joined = storage.connection()?.query_with_params(
+                "SELECT command.journal_sequence, archive.payload_version,
+                        archive.payload_digest, length(CAST(archive.payload_json AS BLOB)),
+                        ledger.state
+                 FROM host_command_records AS command
+                 LEFT JOIN host_journal_archive AS archive
+                   ON archive.run_id = command.run_id
+                  AND archive.host_session_id = command.host_session_id
+                  AND archive.journal_sequence = command.journal_sequence
+                 LEFT JOIN host_journal_batch_ledger AS ledger
+                   ON ledger.run_id = command.run_id
+                  AND ledger.host_session_id = command.host_session_id
+                  AND ledger.journal_sequence = command.journal_sequence
+                 WHERE command.run_id = ?1 AND command.host_session_id = ?2
+                   AND command.command_id = ?3
+                 LIMIT 2",
+                &[
+                    sqlite_run_id(run_id),
+                    session_text.as_str().into(),
+                    envelope.command_id.to_string().into(),
+                ],
+            )?;
+            assert_eq!(joined.len(), 1);
+            let journal: String = joined[0].get_typed(0)?;
+            let digest: String = joined[0].get_typed(2)?;
+            let payload_bytes = usize::try_from(joined[0].get_typed::<i64>(3)?)?;
+            assert_eq!(
+                joined[0].get_typed::<i64>(1)?,
+                i64::from(HOST_JOURNAL_ARCHIVE_VERSION)
+            );
+            assert_eq!(joined[0].get_typed::<String>(4)?, "durable");
+            let record = load_finished_command_journal_record(
+                storage.connection()?,
+                run_id,
+                session,
+                decode_journal_u64("test.journal_sequence", &journal)?,
+                envelope.command_id,
+                &digest,
+                payload_bytes,
+                HostJournalState::Durable,
+            )?;
+            assert_eq!(record.lifecycle.envelope(), &envelope);
+            assert_eq!(
+                record.lifecycle.admission_sequence(),
+                receipt.admission_sequence()
+            );
+            assert_eq!(
+                record
+                    .lifecycle
+                    .terminal()
+                    .expect("recorded command has a terminal application")
+                    .application(),
+                receipt.application()
+            );
+            let status_request = CommandAuthorityRequest::Status {
+                max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+            };
+            let exact_submit = CommandAuthorityRequest::Submit {
+                envelope_postcard_hex: encode_command_envelope_postcard_hex(
+                    "test.command_envelope",
+                    &envelope,
+                )?,
+                policy: CommandClaimPolicy::ReserveIfAbsent,
+                max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+            };
+            let envelope_digest = *blake3::hash(&postcard::to_allocvec(&envelope)?).as_bytes();
+            for request in [&status_request, &exact_submit] {
+                let authority =
+                    storage.resolve_command_authority(observer, envelope.command_id, request)?;
+                assert!(
+                    matches!(authority, CommandAuthorityLookup::Found(authority)
+                        if authority.status() == &receipt
+                            && authority.envelope_digest() == envelope_digest),
+                    "cold lookup must retain the original owner's exact receipt and envelope"
+                );
+            }
+        }
+        assert_eq!(
+            storage.resolve_command_authority(
+                observer,
+                CommandId::from_client_sequence(session.get(), 4),
+                &CommandAuthorityRequest::Status {
+                    max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+                },
+            )?,
+            CommandAuthorityLookup::Absent
+        );
+        storage.close()?;
+        assert_eq!(journal_database_snapshot(&path_text), before);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_authority_keyed_lookup_preserves_pending_and_corruption_refusals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (storage, session, envelope, receipt) =
+            recovered_durable_authority_fixture("durable-authority-keyed-refusals")?;
+        let request = CommandAuthorityRequest::Status {
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        let expected = storage.resolve_command_authority(session, envelope.command_id, &request)?;
+        assert!(
+            matches!(&expected, CommandAuthorityLookup::Found(authority) if authority.status() == &receipt)
+        );
+        let connection = storage.connection()?;
+        let session_text = encode_journal_u64(session.get());
+        let journal: String = connection
+            .query_row_with_params(
+                "SELECT journal_sequence FROM host_command_records
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3",
+                &[
+                    sqlite_run_id(storage.run_id()),
+                    session_text.as_str().into(),
+                    envelope.command_id.to_string().into(),
+                ],
+            )?
+            .get_typed(0)?;
+        let identity = [
+            sqlite_run_id(storage.run_id()),
+            session_text.as_str().into(),
+            journal.as_str().into(),
+        ];
+        for mutation in [
+            "UPDATE host_journal_batch_ledger SET state = 'admitted'
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            "UPDATE host_journal_batch_ledger SET state = 'applied'
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            "UPDATE host_journal_batch_ledger SET state = 'committed_volatile'
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            "DELETE FROM host_journal_batch_ledger
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+        ] {
+            connection.execute("PRAGMA foreign_keys = OFF")?;
+            connection.execute("BEGIN")?;
+            let changed = connection.execute_with_params(mutation, &identity)?;
+            let actual = storage.resolve_command_authority(session, envelope.command_id, &request);
+            connection.execute("ROLLBACK")?;
+            connection.execute("PRAGMA foreign_keys = ON")?;
+            assert_eq!(changed, 1, "the negative must change its bound ledger");
+            assert_eq!(
+                actual?,
+                CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+                "an uncommitted or absent ledger must not become absent command authority"
+            );
+            assert_eq!(
+                storage.resolve_command_authority(session, envelope.command_id, &request)?,
+                expected
+            );
+        }
+        for (mutation, context) in [
+            (
+                "UPDATE host_journal_archive SET payload_version = payload_version + 1
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                "host_command_claims.archive_binding",
+            ),
+            (
+                "UPDATE host_journal_archive
+                 SET payload_digest = '0000000000000000000000000000000000000000000000000000000000000000'
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                "host_journal_archive.payload_digest",
+            ),
+            (
+                "UPDATE host_journal_archive SET payload_json = '{}'
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                "host_journal_archive.payload_digest",
+            ),
+        ] {
+            connection.execute("BEGIN")?;
+            let changed = connection.execute_with_params(mutation, &identity)?;
+            let actual = storage.resolve_command_authority(session, envelope.command_id, &request);
+            connection.execute("ROLLBACK")?;
+            assert_eq!(changed, 1, "the negative must change its bound archive");
+            assert!(
+                matches!(actual, Err(StorageError::InvalidData { context: found, .. }) if found == context),
+                "archive corruption must retain its typed refusal at {context}"
+            );
+            assert_eq!(
+                storage.resolve_command_authority(session, envelope.command_id, &request)?,
+                expected,
+                "rollback must recover the exact original authority"
+            );
+        }
         storage.close()?;
         Ok(())
     }
