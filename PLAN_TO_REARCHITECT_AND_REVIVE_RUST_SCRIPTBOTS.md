@@ -2,6 +2,37 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Persistence and durable command recovery (2026-11-20):**
+[Source implemented; executable qualification blocked — Codex;
+scoped contributions to `bd-50bg` and `bd-2z0.12.2`]
+
+- [x] Replace the durable authority lookup's three-table join with exact keyed
+  reads, preserving claiming-session binding, canonical receipts, pending states
+  and corruption refusals (`c74942c`).
+- [x] Batch births, deaths and migrations within the existing science transaction;
+  preserve lineage conflict handling and migration replacement order (`7ea282a`).
+- [x] Add real-file receipt regressions and multi-chunk lifecycle equivalence,
+  late-failure rollback and exact-retry coverage. Independent source review and
+  the pinned targeted formatter passed; executable Rust results remain pending.
+- [x] Add transactional V20 indexes matching both transition queries' journal
+  identity, retaining all cross-command corruption checks (`186d305`). Preserve
+  the historical V19 migration and exact schema fingerprints; add populated-file
+  upgrade, retained-row/receipt, index-seek and corruption rollback regressions.
+  Two independent source reviews and pinned DSR formatting passed.
+- [ ] Execute the new receipt, lifecycle and migration regressions. The final
+  DSR attempt ended after 606.255 seconds with Cargo exit 101: `rustc` compiling
+  unchanged `asupersync 0.5.0` received SIGKILL, before any ScriptBots crate or
+  Rust test ran. The frozen authority/lifecycle source stayed unchanged; V20
+  has formatting and source review evidence only. An OOM cause was not verified.
+- [ ] Complete DSR Rust execution and the original live server/throughput probes.
+  Source changes alone do not close these beads or establish a measured speedup.
+
+Final DSR run: `scriptbots-storage-bounded-compile/20261120T210902-TUZCZXD6`.
+The run ended and its package-cache and target-directory locks were released.
+The full workspace, Clippy, real-server latency and throughput acceptance remain
+open. Dependency pins, lockfile, scientific row policy and original criteria
+were not changed to obtain a result.
+
 **Spatial rebuild allocation and bounded live streaming (2026-11-20):**
 [Source implemented and independently reviewed; scoped index checks passed —
 broader acceptance remains open under `bd-h33` and `bd-ac4l`]
