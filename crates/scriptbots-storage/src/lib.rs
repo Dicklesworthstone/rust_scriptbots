@@ -2765,6 +2765,9 @@ const AGENT_COLUMNS: &[&str] = &[
 /// Working-set budget for one multi-row scientific INSERT, not the engine's maximum.
 const MAX_SCIENCE_INSERT_BINDINGS: usize = 1_024;
 const DOMAIN_EVENT_INSERT_WIDTH: usize = 10;
+const BIRTH_INSERT_WIDTH: usize = 16;
+const DEATH_INSERT_WIDTH: usize = 19;
+const MIGRATION_INSERT_WIDTH: usize = 10;
 
 /// Number of values bound by [`scriptbots_agent_insert_sql`].
 #[cfg(test)]
@@ -22168,10 +22171,11 @@ impl Storage {
                 brain_kind, brain_key, herbivore_tendency,
                 generation, position_x, position_y, is_hybrid, origin, island_id
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
-        for row in rows {
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert::<BIRTH_INSERT_WIDTH>(
+            tx,
+            sql,
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.agent_uid.into(),
@@ -22188,8 +22192,13 @@ impl Storage {
                     sqlite_bool(row.is_hybrid),
                     row.origin.as_str().into(),
                     row.island_id.into(),
-                ],
-            )?;
+                ]
+            }),
+        )?;
+        // Birth identities and all their lineage edges share the enclosing science
+        // transaction. Keep the existing ignore-on-conflict edge policy separate
+        // from the strict birth inserts and their exact returned-row counts.
+        for row in rows {
             if let Some(parent_a) = row.parent_a {
                 let rel = if row.parent_b.is_some() {
                     "sexual_parent_a"
@@ -22245,10 +22254,11 @@ impl Storage {
                 spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
                 hit_by_carnivore, hit_by_herbivore, island_id
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)";
-        for row in rows {
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert::<DEATH_INSERT_WIDTH>(
+            tx,
+            sql,
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.agent_uid.into(),
@@ -22268,10 +22278,10 @@ impl Storage {
                     sqlite_bool(row.hit_by_carnivore),
                     sqlite_bool(row.hit_by_herbivore),
                     row.island_id.into(),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            }),
+        )
+        .map(|_| ())
     }
 
     /// Insert narrative rows in the same transaction as every scientific table (`bd-erff`).
@@ -22490,10 +22500,11 @@ impl Storage {
                 run_id, tick, seq, island_id_from, island_id_to,
                 agent_uid, agent_uid_to, rule, key_value, rank
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
-        for row in rows {
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert::<MIGRATION_INSERT_WIDTH>(
+            tx,
+            sql,
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.seq.into(),
@@ -22504,10 +22515,10 @@ impl Storage {
                     row.rule.as_str().into(),
                     row.key_value.into(),
                     row.rank.into(),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            }),
+        )
+        .map(|_| ())
     }
 
     fn insert_archive_space(
@@ -30544,7 +30555,11 @@ mod tests {
              WHERE run_id = ?1 AND host_session_id = ?2 AND scientific_event_sequence = ?3",
             &identity,
         )?;
-        assert_eq!(metadata.len(), 1, "zero-event boundaries still need metadata");
+        assert_eq!(
+            metadata.len(),
+            1,
+            "zero-event boundaries still need metadata"
+        );
         assert_eq!(
             metadata[0].get_typed::<i64>(0)?,
             i64::try_from(projection.events.len())?
@@ -30563,7 +30578,10 @@ mod tests {
         assert_eq!(rows.len(), projection.events.len());
         for (row, expected) in rows.iter().zip(&projection.events) {
             assert_eq!(row.get_typed::<i64>(0)?, i64::try_from(expected.ordinal)?);
-            assert_eq!(row.get_typed::<String>(1)?, expected.payload.kind().as_str());
+            assert_eq!(
+                row.get_typed::<String>(1)?,
+                expected.payload.kind().as_str()
+            );
             assert_eq!(
                 row.get_typed::<Option<i64>>(2)?,
                 expected
@@ -30667,7 +30685,10 @@ mod tests {
                 &batch,
                 MAX_HOST_JOURNAL_ARCHIVE_BYTES,
             )?;
-            let projection = prepared.domain_events.as_ref().expect("scientific projection");
+            let projection = prepared
+                .domain_events
+                .as_ref()
+                .expect("scientific projection");
             assert!(projection.events.len() >= founders);
             if founders == 0 {
                 assert!(projection.events.is_empty());
@@ -30705,7 +30726,10 @@ mod tests {
                 &batch,
                 MAX_HOST_JOURNAL_ARCHIVE_BYTES,
             )?;
-            let projection = prepared.domain_events.as_ref().expect("scientific projection");
+            let projection = prepared
+                .domain_events
+                .as_ref()
+                .expect("scientific projection");
             assert!(projection.events.len() >= multi_chunk_count);
             let mut invalid = projection.clone();
             let mut overflowing_birth = projection
@@ -30743,13 +30767,7 @@ mod tests {
                     None,
                 )
                 .expect_err("a late conversion or SQL constraint must refuse the whole projection");
-            assert_domain_projection_rollback(
-                &storage,
-                &prepared,
-                batch.id(),
-                failure,
-                case,
-            )?;
+            assert_domain_projection_rollback(&storage, &prepared, batch.id(), failure, case)?;
             storage.complete_host_journal_archive(
                 batch.id(),
                 batch.scientific_event_sequence(),
@@ -30759,6 +30777,256 @@ mod tests {
                 None,
             )?;
             assert_domain_projection_rows(&storage, projection)?;
+            storage.close()?;
+        }
+        Ok(())
+    }
+
+    fn chunked_lifecycle_fixture() -> Result<StorageBuffer, StorageError> {
+        let narrowest = BIRTH_INSERT_WIDTH
+            .min(DEATH_INSERT_WIDTH)
+            .min(MIGRATION_INSERT_WIDTH);
+        // Cross at least two statement boundaries for every changed table.
+        let count = 2 * (MAX_SCIENCE_INSERT_BINDINGS / narrowest) + 1;
+        let mut buffer = StorageBuffer::default();
+        for index in 0..count {
+            let ordinal = i64::try_from(index).expect("bounded fixture ordinal");
+            let coordinate = f64::from(u32::try_from(index).expect("bounded fixture coordinate"));
+            let uid = u64::try_from(index / 2 + 1).expect("bounded fixture identity");
+            let origin = match index % 3 {
+                0 => BirthOrigin::Seeded,
+                1 => BirthOrigin::Born,
+                _ => BirthOrigin::Injected,
+            };
+            let tick = if origin == BirthOrigin::Seeded { 0 } else { 5 };
+            let mut birth = birth_row_from_record(&sample_birth(tick, uid, origin))?;
+            birth.island_id = ordinal % 2;
+            birth.position_x = coordinate + 0.25;
+            birth.position_y = -coordinate - 0.5;
+            birth.brain_key = (index % 2 == 0).then_some(ordinal);
+            if origin == BirthOrigin::Born {
+                birth.parent_a = Some(10_000 + ordinal);
+                birth.parent_b = (index % 2 == 0).then_some(20_000 + ordinal);
+                birth.is_hybrid = birth.parent_b.is_some();
+                birth.generation = 3;
+            }
+            buffer.births.push(birth);
+
+            let mut death = death_row_from_record(&sample_death(12, uid, DeathCause::Starvation))?;
+            death.island_id = ordinal % 2;
+            death.age = ordinal + 2;
+            death.generation = ordinal + 3;
+            death.energy = coordinate + 0.125;
+            death.food_balance_total = -coordinate - 0.75;
+            death.brain_key = (index % 2 != 0).then_some(ordinal);
+            death.was_hybrid = index % 3 == 0;
+            death.spike_attacker = index % 3 == 1;
+            death.spike_victim = index % 3 == 2;
+            death.hit_carnivore = index % 4 == 0;
+            death.hit_herbivore = index % 4 == 1;
+            death.hit_by_carnivore = index % 4 == 2;
+            death.hit_by_herbivore = index % 4 == 3;
+            buffer.deaths.push(death);
+            buffer.migrations.push(MigrationRow {
+                tick: 7,
+                seq: ordinal,
+                island_id_from: ordinal % 2,
+                island_id_to: 3 + ordinal % 2,
+                agent_uid: i64::try_from(uid).expect("bounded fixture identity"),
+                agent_uid_to: 1_000 + ordinal,
+                rule: "fittest".to_owned(),
+                key_value: coordinate + 0.5,
+                rank: ordinal + 1,
+            });
+        }
+        Ok(buffer)
+    }
+
+    type LifecycleTableSnapshot = BTreeMap<&'static str, Vec<Vec<SqliteValue>>>;
+
+    fn lifecycle_table_snapshot(storage: &Storage) -> Result<LifecycleTableSnapshot, StorageError> {
+        let mut tables = BTreeMap::new();
+        for (table, order) in [
+            ("births", "island_id, agent_uid"),
+            ("deaths", "island_id, agent_uid"),
+            (
+                "lineage_edges",
+                "island_id, child_agent_uid, parent_ordinal",
+            ),
+            ("migrations", "tick, seq"),
+        ] {
+            let rows = storage.connection()?.query_with_params(
+                &format!("SELECT * FROM {table} WHERE run_id = ?1 ORDER BY {order}"),
+                &[sqlite_run_id(storage.run_id)],
+            )?;
+            // These independently created runs have different run IDs. Compare every
+            // scientific column, including nullable fields, island IDs and both UIDs.
+            tables.insert(
+                table,
+                rows.into_iter()
+                    .map(|row| row.values()[1..].to_vec())
+                    .collect(),
+            );
+        }
+        Ok(tables)
+    }
+
+    #[test]
+    fn chunked_lifecycle_inserts_match_single_row_execution_and_replacement_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Storage::unattributed_memory()?;
+        let reference = Storage::unattributed_memory()?;
+        let mut buffer = chunked_lifecycle_fixture()?;
+        // A replacement in a later chunk must win just as it does in sequential SQL.
+        let mut replacement = buffer.migrations[0].clone();
+        replacement.agent_uid_to = 42_424;
+        replacement.rule = "random".to_owned();
+        buffer.migrations.push(replacement);
+        Storage::flush_attempt(
+            storage.connection()?,
+            ":memory:",
+            storage.run_id,
+            &StorageBuffer::default(),
+            &[],
+        )
+        .map_err(|failure| failure.source)?;
+        Storage::flush_attempt(
+            storage.connection()?,
+            ":memory:",
+            storage.run_id,
+            &buffer,
+            &[],
+        )
+        .map_err(|failure| failure.source)?;
+
+        let mut transaction = reference.connection()?.transaction()?;
+        for row in &buffer.births {
+            Storage::insert_births(&transaction, reference.run_id, std::slice::from_ref(row))?;
+        }
+        for row in &buffer.deaths {
+            Storage::insert_deaths(&transaction, reference.run_id, std::slice::from_ref(row))?;
+        }
+        for row in &buffer.migrations {
+            Storage::insert_migrations(&transaction, reference.run_id, std::slice::from_ref(row))?;
+        }
+        transaction.commit()?;
+        drop(transaction);
+        let actual = lifecycle_table_snapshot(&storage)?;
+        assert_eq!(actual, lifecycle_table_snapshot(&reference)?);
+        assert_eq!(actual["births"].len(), buffer.births.len());
+        assert_eq!(actual["deaths"].len(), buffer.deaths.len());
+        assert_eq!(actual["migrations"].len(), buffer.migrations.len() - 1);
+        let edges = buffer
+            .births
+            .iter()
+            .map(|row| usize::from(row.parent_a.is_some()) + usize::from(row.parent_b.is_some()))
+            .sum::<usize>();
+        assert!(edges > 0, "the fixture must exercise lineage creation");
+        assert_eq!(actual["lineage_edges"].len(), edges);
+        let replaced = storage.connection()?.query_row(
+            "SELECT island_id_from, island_id_to, agent_uid, agent_uid_to, rule
+             FROM migrations WHERE tick = 7 AND seq = 0",
+        )?;
+        assert_eq!(replaced.get_typed::<i64>(0)?, 0);
+        assert_eq!(replaced.get_typed::<i64>(1)?, 3);
+        assert_eq!(replaced.get_typed::<i64>(2)?, 1);
+        assert_eq!(replaced.get_typed::<i64>(3)?, 42_424);
+        assert_eq!(replaced.get_typed::<String>(4)?, "random");
+        storage.close()?;
+        reference.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn chunked_lifecycle_late_failures_roll_back_all_tables_and_allow_exact_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for case in [
+            "birth_check",
+            "birth_unique",
+            "death_check",
+            "death_unique",
+            "migration_check",
+        ] {
+            let storage = Storage::unattributed_memory()?;
+            let connection = storage.connection()?;
+            let previous = StorageBuffer {
+                births: vec![birth_row_from_record(&sample_birth(
+                    0,
+                    50_000,
+                    BirthOrigin::Seeded,
+                ))?],
+                deaths: vec![death_row_from_record(&sample_death(
+                    2,
+                    50_000,
+                    DeathCause::Starvation,
+                ))?],
+                ..StorageBuffer::default()
+            };
+            Storage::flush_attempt(connection, ":memory:", storage.run_id, &previous, &[])
+                .map_err(|failure| failure.source)?;
+            let before = lifecycle_table_snapshot(&storage)?;
+            let valid = chunked_lifecycle_fixture()?;
+            let mut invalid = chunked_lifecycle_fixture()?;
+            match case {
+                "birth_check" => invalid.births.last_mut().expect("nonempty").spawn_ordinal = -1,
+                "birth_unique" => {
+                    let first = invalid.births[0].clone();
+                    *invalid.births.last_mut().expect("nonempty") = first;
+                }
+                "death_check" => invalid.deaths.last_mut().expect("nonempty").cause.clear(),
+                "death_unique" => {
+                    let first = invalid.deaths[0].clone();
+                    *invalid.deaths.last_mut().expect("nonempty") = first;
+                }
+                "migration_check" => {
+                    let last = invalid.migrations.last_mut().expect("nonempty");
+                    last.island_id_to = last.island_id_from;
+                }
+                _ => unreachable!("fixture case"),
+            }
+            let failure =
+                Storage::flush_attempt(connection, ":memory:", storage.run_id, &invalid, &[])
+                    .expect_err("a late SQL constraint must roll back the complete science batch");
+            assert_eq!(
+                failure.commit_state,
+                FailureCommitState::RolledBack,
+                "{case}"
+            );
+            let expected = if case.ends_with("unique") {
+                "UNIQUE"
+            } else {
+                "CHECK"
+            };
+            assert!(
+                failure.source.to_string().contains(expected),
+                "{case}: {:?}",
+                failure.source
+            );
+            assert_eq!(
+                lifecycle_table_snapshot(&storage)?,
+                before,
+                "{case}: partial batch escaped rollback"
+            );
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA foreign_keys")?
+                    .get_typed::<i64>(0)?,
+                1
+            );
+            Storage::flush_attempt(connection, ":memory:", storage.run_id, &valid, &[])
+                .map_err(|failure| failure.source)?;
+            let after = lifecycle_table_snapshot(&storage)?;
+            assert_eq!(
+                after["births"].len(),
+                valid.births.len() + before["births"].len(),
+                "{case}"
+            );
+            assert_eq!(
+                after["deaths"].len(),
+                valid.deaths.len() + before["deaths"].len(),
+                "{case}"
+            );
+            assert_eq!(after["migrations"].len(), valid.migrations.len(), "{case}");
             storage.close()?;
         }
         Ok(())
