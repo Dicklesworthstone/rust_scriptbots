@@ -2,6 +2,42 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Indexed carcass reward candidates (2026-11-20):**
+[Implemented and independently reviewed; scoped DSR Rust checks passed —
+Codex; contribution to `bd-h33`, broader performance acceptance remains open]
+
+- Replace the per-corpse all-population candidate search with a fresh spatial
+  index when its rebuild and bucket traversal can be amortized over eligible
+  corpses. Preserve the ordered full scan for expensive sparse grids, broad
+  radii, mismatched index geometry and refused rebuilds.
+- Keep the original f32 toroidal distance predicate and reward arithmetic.
+  Conservatively pad only the broad phase for rounded boundary and subnormal
+  distance cases, and restore dense recipient order before reducing rewards.
+  Avoid sorting a near-full population by using its original ordered scan.
+- Reuse candidate and recipient buffers across corpses. Defer index rebuilding
+  until a mature, spiked, health-dead corpse can actually distribute rewards;
+  positive-health brain-fault deaths remain ineligible recipients.
+- Add four focused regressions with an independent full-scan oracle. Compare
+  resource rejection bits, reward counters, world digests, RNG state and runtime
+  fields across dense-order permutations, seams, translated positions, capped
+  rewards, subnormal/world-spanning radii and index fallbacks. Explicit witnesses
+  require the optimized path to run and demonstrate the unpadded boundary miss.
+
+DSR `scriptbots_core_corrected_final/20261121T002517-UVjAerMW` passed all five
+checks on the final byte-verified source: targeted pinned formatting; all four
+`carcass_index_*` tests with default features plus `economy-faults`; the same
+four tests without default features plus `economy-faults`; strict library
+Clippy with `economy-faults`; and strict production-default library Clippy
+without that feature. Both Clippy commands used `-D warnings`. Source signatures
+matched before and after execution. Existing unused-variable and fixture warnings
+remain in the scalar test configuration; no warnings were suppressed.
+
+This is scoped package evidence. Full-workspace/all-target qualification,
+whole-world application characterization and same-invocation incumbent/candidate
+performance measurements remain pending. No throughput gain or `bd-h33`
+closure is claimed, and dependency pins, scientific baselines and acceptance
+criteria are unchanged.
+
 **Browser world exploration (2026-11-20):**
 [Implemented; DSR JavaScript regressions passed — Codex;
 scoped input/presentation contribution to `bd-2z0.12.3`]
