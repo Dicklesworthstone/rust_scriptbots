@@ -2,6 +2,43 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Spatial rebuild allocation and bounded live streaming (2026-11-20):**
+[Source implemented and independently reviewed; scoped index checks passed —
+broader acceptance remains open under `bd-h33` and `bd-ac4l`]
+
+- Replace per-rebuild dense spatial bucket allocations with retained contiguous
+  entry, offset and scatter arrays. Preserve exact cell traversal, agent order,
+  toroidal queries and sparse-world behavior across every query surface.
+- Bound WebSocket projections with four process-wide reservations. The actual
+  blocking worker owns its reservation through cancellation or timeout, and
+  successful output retains it until its frames are sent or discarded.
+- Poll projection futures alongside socket traffic so ACKs, controls, status and
+  accepted subscription replacement remain responsive. Discard superseded
+  projections before installing new delivery state; old results cannot advance
+  replacement cursors.
+- Add regressions for allocation reuse and exact query ordering, cancelled and
+  timed-out projection workers, cancellation before admission, retained completed
+  output, and real-socket ACK/control/replacement progress while admission waits.
+
+DSR against byte-identical index source passed all 16 unit tests, all-target
+check, strict all-target Clippy and targeted formatting. Its isolated dependency
+lock matches the production lock, including transitive versions and checksums.
+This validates the index package; whole-world scientific equivalence and measured
+throughput gains still require the broader acceptance probes.
+
+The final streaming source passed targeted DSR formatting. The native
+application library check acquired its dependencies and reached compilation,
+then was killed with exit 137 before any application diagnostic. It provides
+neither a typecheck pass nor a source-failure diagnosis. The four new
+concurrency/socket tests did not execute. Full workspace and live contention
+qualification remain open. UBS is unavailable in this environment, so no scanner
+pass is claimed.
+
+The named native checkpoint retry concerns in `bd-5ygz` were also audited.
+Existing commit `85f580f` already repairs the digest-width guard and shared
+REST/MCP branch identity/conflict handling. Dependency acquisition prevented the
+baseline tests from running; source review alone does not close that bead.
+
 **Between-step lifecycle events and archipelago continuation (2026-11-20):**
 [Source implemented; focused runtime regressions passed — Codex; `bd-uxvp`]
 

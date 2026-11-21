@@ -96,6 +96,12 @@ const CONTROL_RUNTIME_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
 const WS_CONTROL_PROTOCOL_VERSION: u16 = 1;
 const MAX_WS_CONTROL_MESSAGE_BYTES: usize = REMOTE_MAX_REQUEST_BYTES;
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_WS_PROJECTIONS: usize = 4;
+// Shared by every listener in this process. A disconnected caller cannot free a
+// running projection's slot. The worker transfers its permit with successful
+// output, retaining admission until the completed batch is delivered or dropped.
+static WS_PROJECTION_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_WS_PROJECTIONS)));
 const LAB_SESSION_HEADER: &str = "x-scriptbots-session";
 const CHECKPOINT_CANVAS_SCHEMA: &str = "scriptbots.checkpoint-canvas.v1";
 const MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
@@ -2453,7 +2459,7 @@ async fn stream_ticks_sse(
 async fn stream_ticks_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> Response {
     ws.max_message_size(MAX_WS_CONTROL_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_CONTROL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_ws_stream(socket, state))
+        .on_upgrade(move |socket| handle_ws_stream(socket, state, Arc::clone(&WS_PROJECTION_SLOTS)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2657,6 +2663,13 @@ struct PreparedRemoteFrame {
     delivered_subscription: RemoteSubscription,
 }
 
+/// Capacity covers both active CPU work and completed output awaiting delivery.
+#[derive(Debug)]
+struct AdmittedRemoteProjection<T> {
+    value: T,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// Cancel queued blocking work when its requesting connection closes. Running
 /// work retains its own resource permit until it reaches its bounded completion.
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -2671,8 +2684,9 @@ async fn prepare_remote_frames(
     mut subscription: RemoteSubscription,
     snapshot: Arc<RenderSnapshot>,
     awaiting_channels: Vec<RemoteChannel>,
-) -> Result<Vec<PreparedRemoteFrame>, AppError> {
-    let mut projection = AbortOnDrop(tokio::task::spawn_blocking(move || {
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<AdmittedRemoteProjection<Vec<PreparedRemoteFrame>>, AppError> {
+    run_remote_projection(slots, move || {
         let mut frames = Vec::with_capacity(subscription.channels().len());
         for channel in subscription.channels().to_vec() {
             if awaiting_channels.contains(&channel) {
@@ -2691,17 +2705,50 @@ async fn prepare_remote_frames(
             }
         }
         Ok::<_, RemoteSubscriptionError>(frames)
-    }));
-    tokio::time::timeout(WS_WRITE_TIMEOUT, &mut projection.0)
-        .await
-        .map_err(|_| {
-            AppError::service_unavailable(
-                "remote projection deadline exceeded; reconnect with the last consumed cursors",
-            )
-        })?
-        .map_err(|error| AppError::internal(format!("remote projection task failed: {error}")))?
-        .map_err(remote_subscription_error)
+    })
+    .await
 }
+
+/// Admission and execution share one deadline. Waiting for a slot creates no
+/// blocking task; dropping a queued caller removes its semaphore waiter. Once
+/// execution starts, its owned permit survives caller timeout or disconnect and
+/// follows successful output until its consumer finishes with that output.
+async fn run_remote_projection<T, F>(
+    slots: Arc<tokio::sync::Semaphore>,
+    operation: F,
+) -> Result<AdmittedRemoteProjection<T>, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RemoteSubscriptionError> + Send + 'static,
+{
+    tokio::time::timeout(WS_WRITE_TIMEOUT, async move {
+        let permit = slots
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::service_unavailable("remote projection admission is closed"))?;
+        let mut projection = AbortOnDrop(tokio::task::spawn_blocking(move || {
+            operation().map(|value| AdmittedRemoteProjection {
+                value,
+                _permit: permit,
+            })
+        }));
+        (&mut projection.0)
+            .await
+            .map_err(|error| AppError::internal(format!("remote projection task failed: {error}")))?
+            .map_err(remote_subscription_error)
+    })
+    .await
+    .map_err(|_| {
+        AppError::service_unavailable(
+            "remote projection deadline exceeded; reconnect with the last consumed cursors",
+        )
+    })?
+}
+
+type PendingRemoteProjection = futures_util::future::BoxFuture<
+    'static,
+    Result<AdmittedRemoteProjection<Vec<PreparedRemoteFrame>>, AppError>,
+>;
 
 /// Deterministic backoff given observed work duration. The requested rate is an
 /// upper bound, not a latency promise; eight cheap samples permit gradual recovery.
@@ -2806,7 +2853,11 @@ async fn send_ws_cadence(
     send_ws_message(socket, WsMessage::Text(notice.to_string().into())).await
 }
 
-async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
+async fn handle_ws_stream(
+    mut socket: WebSocket,
+    state: ApiState,
+    projection_slots: Arc<tokio::sync::Semaphore>,
+) {
     static NEXT_CONNECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let connection_id = NEXT_CONNECTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let handle = state.handle.clone();
@@ -2820,6 +2871,7 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     // command queue, so that wait never prevents returning stream credit.
     let mut pending_control: Option<futures_util::future::BoxFuture<'static, WsControlReply>> =
         None;
+    let mut pending_projection: Option<(tokio::time::Instant, PendingRemoteProjection)> = None;
     let mut cadence = WsStreamCadence::new(Duration::from_millis(50));
     let connected_at = tokio::time::Instant::now();
     debug!(connection_id, "WebSocket connected");
@@ -2833,7 +2885,11 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                 .as_ref()
                 .is_some_and(|window| window.awaiting_channels().len() < stream.channels().len())
         });
-        let dispatch_deadline = schedule.remaining(now, cadence.current, has_credit);
+        let dispatch_deadline = schedule.remaining(
+            now,
+            cadence.current,
+            has_credit && pending_projection.is_none(),
+        );
         tokio::select! {
             reply = async {
                 match pending_control.as_mut() {
@@ -2866,10 +2922,14 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                 // causes at most one bounded empty attempt, never an idle timer.
                 schedule.request();
             }
-            _ = wait_ws_deadline(dispatch_deadline) => {
+            (started, prepared) = async {
+                match pending_projection.as_mut() {
+                    Some((started, operation)) => (*started, operation.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                pending_projection = None;
                 if let Some(stream) = &mut subscription {
-                    let started = tokio::time::Instant::now();
-                    schedule.start(connected_at.elapsed());
                     let window = delivery.as_mut().expect("negotiation installs a delivery window");
                     if window.expired(connected_at.elapsed()) {
                         send_ws_error(&mut socket, None, AppError::service_unavailable(
@@ -2877,19 +2937,10 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                         )).await;
                         break;
                     }
-                    let awaiting_channels = window.awaiting_channels();
-                    if awaiting_channels.len() == stream.channels().len() {
-                        continue;
-                    }
-                    let snapshot = match handle.read_snapshot() {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            send_ws_error(&mut socket, None, AppError::from(error)).await;
-                            break;
-                        }
-                    };
-                    let frames = match prepare_remote_frames(stream.clone(), snapshot, awaiting_channels).await {
-                        Ok(frames) => frames,
+                    // Keep the permit alive for the entire delivery loop, not
+                    // only the worker: a slow socket still retains these bytes.
+                    let AdmittedRemoteProjection { value: frames, _permit } = match prepared {
+                        Ok(batch) => batch,
                         Err(error) => {
                             warn!(connection_id, message = %error.message, "remote stream refused a projection");
                             send_ws_error(&mut socket, None, error).await;
@@ -2929,6 +2980,26 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                     {
                         break;
                     }
+                }
+            }
+            _ = wait_ws_deadline(dispatch_deadline) => {
+                if let Some(stream) = &subscription {
+                    let window = delivery.as_ref().expect("negotiation installs a delivery window");
+                    let awaiting_channels = window.awaiting_channels();
+                    let snapshot = match handle.read_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            send_ws_error(&mut socket, None, AppError::from(error)).await;
+                            break;
+                        }
+                    };
+                    schedule.start(connected_at.elapsed());
+                    // One bounded batch per connection. Capacity waits and CPU
+                    // work remain in select alongside ACKs, controls and close.
+                    pending_projection = Some((tokio::time::Instant::now(), Box::pin(
+                        prepare_remote_frames(stream.clone(), snapshot, awaiting_channels,
+                            Arc::clone(&projection_slots)),
+                    )));
                 }
             }
             _ = legacy_interval.tick(), if subscription.is_none() => {
@@ -3013,6 +3084,10 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                                     if !send_ws_message(&mut socket, WsMessage::Text(ack.to_string().into())).await {
                                         break;
                                     }
+                                    // No prepared frame has committed a cursor yet.
+                                    // Discard the previous mask's pending batch;
+                                    // a running worker retains only its own slot.
+                                    pending_projection = None;
                                     debug!(connection_id, channels = ?stream.channels(), "remote subscription accepted");
                                     cadence = WsStreamCadence::new(stream.interval());
                                     schedule = WsStreamSchedule::default();
@@ -4507,8 +4582,8 @@ fn checkpoint_canvas_response(
             "checkpoint canvas does not match its requested owner and saved scientific cut",
         ));
     }
-    let environment = RemoteEnvironmentSnapshot::capture(&snapshot)
-        .map_err(checkpoint_canvas_protocol_error)?;
+    let environment =
+        RemoteEnvironmentSnapshot::capture(&snapshot).map_err(checkpoint_canvas_protocol_error)?;
     let frame = RemoteFrame {
         identity: snapshot.as_ref().into(),
         playback: snapshot.playback,
@@ -4569,8 +4644,7 @@ async fn get_v1_checkpoint_canvas(
     })?;
     let mut reconstruction = AbortOnDrop(tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let response =
-            checkpoint_canvas_response(&state.handle, &checkpoint_id, expected_session)?;
+        let response = checkpoint_canvas_response(&state.handle, &checkpoint_id, expected_session)?;
         let bytes = serde_json::to_vec(&response)
             .map_err(|error| AppError::internal(format!("checkpoint canvas encoding: {error}")))?;
         if bytes.len() > MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES {
@@ -7372,22 +7446,28 @@ mod tests {
         .await
         .expect("real saved source projects through the endpoint");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL], "no-store");
-        let body = axum::body::to_bytes(
-            response.into_body(),
-            MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES,
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES)
+            .await
+            .unwrap();
         let response: CheckpointCanvasResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(response.schema, CHECKPOINT_CANVAS_SCHEMA);
-        assert_eq!(response.source_session_id, handle.session_id().get().to_string());
+        assert_eq!(
+            response.source_session_id,
+            handle.session_id().get().to_string()
+        );
         assert_eq!(response.checkpoint, saved);
         let binary = base64::engine::general_purpose::STANDARD
             .decode(&response.frame_base64)
             .unwrap();
         let frame = scriptbots_runtime::remote::decode_remote_frame(&binary).unwrap();
-        assert_eq!(frame.identity.session_id, u128::from(handle.session_id().get()));
+        assert_eq!(
+            frame.identity.session_id,
+            u128::from(handle.session_id().get())
+        );
         assert_eq!(frame.identity.tick, saved.tick);
         assert!(frame.playback.paused);
         assert_eq!(frame.coalesced_publications, 0);
@@ -7398,7 +7478,10 @@ mod tests {
         assert_eq!(environment.width, expected_environment.width);
         assert_eq!(environment.height, expected_environment.height);
         assert_eq!(environment.source_width, expected_environment.source_width);
-        assert_eq!(environment.source_height, expected_environment.source_height);
+        assert_eq!(
+            environment.source_height,
+            expected_environment.source_height
+        );
         assert_eq!(environment.cell_size, expected_environment.cell_size);
         assert_eq!(
             environment.food_max.to_bits(),
@@ -7485,7 +7568,9 @@ mod tests {
             let refusal = get_v1_checkpoint_canvas(
                 State(state.clone()),
                 axum::extract::Path("missing-checkpoint".into()),
-                axum::extract::Query(CheckpointCanvasQuery { session_id: session }),
+                axum::extract::Query(CheckpointCanvasQuery {
+                    session_id: session,
+                }),
             )
             .await
             .unwrap_err();
@@ -12015,6 +12100,164 @@ mod tests {
         assert_eq!(owner.handle().status().unwrap().tick, 0);
     }
 
+    #[test]
+    fn websocket_projection_capacity_survives_cancellation_and_timeout_until_worker_exit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for expire in [false, true] {
+                let slots = Arc::new(tokio::sync::Semaphore::new(1));
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let (release, wait) = mpsc::channel();
+                let projection =
+                    tokio::spawn(run_remote_projection(Arc::clone(&slots), move || {
+                        entered.send(()).expect("actual projection worker entered");
+                        wait.recv_timeout(Duration::from_secs(10))
+                            .map_err(|error| RemoteSubscriptionError::Request(error.to_string()))?;
+                        Ok(())
+                    }));
+                started.await.unwrap();
+                let caller_finished = if expire {
+                    projection.await.unwrap().is_err_and(|error| {
+                        error.status == StatusCode::SERVICE_UNAVAILABLE
+                            && error.message.contains("projection deadline exceeded")
+                    })
+                } else {
+                    projection.abort();
+                    projection.await.is_err_and(|error| error.is_cancelled())
+                };
+
+                // The pool has another real thread available. Only the production
+                // admission permit can prevent this successor from entering it.
+                let (successor_entered, mut successor_started) = tokio::sync::oneshot::channel();
+                let successor =
+                    tokio::spawn(run_remote_projection(Arc::clone(&slots), move || {
+                        successor_entered.send(()).unwrap();
+                        Ok(())
+                    }));
+                let entered_early =
+                    tokio::time::timeout(Duration::from_millis(100), &mut successor_started)
+                        .await
+                        .is_ok();
+                let retained_while_running = slots.available_permits();
+
+                // Release actual work before any assertion can unwind the runtime.
+                release.send(()).unwrap();
+                let successor_result = successor.await.unwrap();
+                assert!(
+                    caller_finished,
+                    "caller outcome must match cancellation/timeout"
+                );
+                assert!(
+                    !entered_early,
+                    "cancelled caller released a running worker's slot"
+                );
+                assert_eq!(retained_while_running, 0);
+                successor_result.unwrap();
+                assert_eq!(slots.available_permits(), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn websocket_projection_cancelled_before_admission_never_enters_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let held = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let entered = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&entered);
+            let mut projection =
+                tokio::spawn(run_remote_projection(Arc::clone(&slots), move || {
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                }));
+            let waited = tokio::time::timeout(Duration::from_millis(100), &mut projection)
+                .await
+                .is_err();
+            projection.abort();
+            let cancelled = projection.await.is_err_and(|error| error.is_cancelled());
+            drop(held);
+            run_remote_projection(Arc::clone(&slots), || Ok(()))
+                .await
+                .unwrap();
+            assert!(waited, "exhausted admission must not start projection work");
+            assert!(cancelled);
+            assert!(!entered.load(Ordering::SeqCst));
+            assert_eq!(slots.available_permits(), 1);
+
+            slots.close();
+            let refused = run_remote_projection(Arc::clone(&slots), || Ok(())).await;
+            assert_eq!(refused.unwrap_err().status, StatusCode::SERVICE_UNAVAILABLE);
+        });
+    }
+
+    #[test]
+    fn websocket_completed_projection_retains_capacity_until_its_frames_are_dropped() {
+        let (handle, owner) = handle();
+        let snapshot = handle.read_snapshot().unwrap();
+        let digest = owner.port.scientific_digest_v1().unwrap();
+        let request = RemoteSubscriptionRequest::parse(
+            r#"{"protocol_version":1,"command":"subscribe","channels":["telemetry"],"max_fps":60}"#,
+        )
+        .unwrap();
+        let subscription = RemoteSubscription::new(&request, &snapshot).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let completed = prepare_remote_frames(
+                subscription.clone(),
+                Arc::clone(&snapshot),
+                Vec::new(),
+                Arc::clone(&slots),
+            )
+            .await
+            .unwrap();
+            assert_eq!(completed.value.len(), 1);
+            let expected = completed.value[0].bytes.clone();
+            let encoded = scriptbots_runtime::remote::decode_remote_frame(&expected).unwrap();
+            assert_eq!(
+                encoded.identity,
+                scriptbots_runtime::remote::RemoteFrameIdentity::from(snapshot.as_ref())
+            );
+            assert_eq!(slots.available_permits(), 0);
+
+            // These are complete real encoded frames. A fast producer cannot
+            // replace their admission merely because a slow socket has not
+            // finished sending them yet.
+            let mut successor = tokio::spawn(prepare_remote_frames(
+                subscription,
+                Arc::clone(&snapshot),
+                Vec::new(),
+                Arc::clone(&slots),
+            ));
+            let waited = tokio::time::timeout(Duration::from_millis(100), &mut successor)
+                .await
+                .is_err();
+            drop(completed);
+            let delivered = successor.await.unwrap().unwrap();
+            assert!(
+                waited,
+                "completed output released its admission before delivery/drop"
+            );
+            assert_eq!(delivered.value.len(), 1);
+            assert_eq!(delivered.value[0].bytes, expected);
+            assert_eq!(slots.available_permits(), 0);
+            drop(delivered);
+            assert_eq!(slots.available_permits(), 1);
+        });
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), digest);
+    }
+
     fn connect_websocket(address: SocketAddr) -> TcpStream {
         let mut socket = TcpStream::connect(address).expect("connect WebSocket client");
         socket
@@ -12146,6 +12389,161 @@ mod tests {
             ack["after_event"] = json!(page.next_after_event().to_string());
         }
         send_websocket_text(socket, &ack.to_string());
+    }
+
+    #[test]
+    fn websocket_pending_projection_keeps_acks_controls_and_replacement_live() {
+        use scriptbots_runtime::remote::{RemoteFrameIdentity, RemoteFramePayload};
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(42),
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let handle = owner.handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        // Isolate this listener's actual projection admission from parallel
+        // tests while running the same socket loop, codec and owner boundary.
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut held = None;
+        let listener_slots = Arc::clone(&slots);
+        let app = Router::new()
+            .route(
+                "/api/ws/stream",
+                get(move |ws: WebSocketUpgrade, State(state): State<ApiState>| {
+                    let slots = Arc::clone(&listener_slots);
+                    async move {
+                        ws.max_message_size(MAX_WS_CONTROL_MESSAGE_BYTES)
+                            .max_frame_size(MAX_WS_CONTROL_MESSAGE_BYTES)
+                            .on_upgrade(move |socket| handle_ws_stream(socket, state, slots))
+                    }
+                }),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
+        let mut socket = connect_websocket(address);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            send_websocket_text(
+                &mut socket,
+                r#"{"protocol_version":1,"command":"subscribe","request_id":"before-projection-block","channels":["canvas","telemetry"],"max_fps":60}"#,
+            );
+            assert_eq!(read_remote_json(&mut socket, false)["type"], "subscribed");
+            let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+            assert_eq!(opcode, 2);
+            let canvas = scriptbots_runtime::remote::decode_remote_frame(&bytes).unwrap();
+            assert!(matches!(canvas.payload, RemoteFramePayload::Canvas(_)));
+            let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+            assert_eq!(opcode, 2);
+            let telemetry = scriptbots_runtime::remote::decode_remote_frame(&bytes).unwrap();
+            assert!(matches!(
+                telemetry.payload,
+                RemoteFramePayload::Telemetry(_)
+            ));
+            assert_eq!(canvas.identity, telemetry.identity);
+            // Bytes can reach the client before the server finishes the send
+            // branch and drops its completed-batch permit. Observe that release
+            // instead of assuming socket delivery also completed the branch.
+            let release_deadline = std::time::Instant::now() + WS_WRITE_TIMEOUT;
+            held = Some(loop {
+                match Arc::clone(&slots).try_acquire_owned() {
+                    Ok(permit) => break permit,
+                    Err(error) => {
+                        assert!(
+                            std::time::Instant::now() < release_deadline,
+                            "completed initial batch retained its permit: {error}"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+            // Returning just canvas credit schedules a batch while telemetry
+            // still awaits its ACK. With capacity withheld, that batch must not
+            // block the later ACK or the following real control round trips.
+            acknowledge_remote_frame(&mut socket, &canvas);
+            thread::sleep(Duration::from_millis(100));
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            acknowledge_remote_frame(&mut socket, &telemetry);
+            let step =
+                r#"{"protocol_version":1,"command":"step","request_id":"step-during-projection"}"#;
+            send_websocket_text(&mut socket, step);
+            let reply = read_remote_json(&mut socket, true);
+            assert_eq!(reply["type"], "receipt");
+            assert_eq!(reply["request_id"], "step-during-projection");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while handle.status().unwrap().tick != 1 {
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            send_websocket_text(&mut socket, step);
+            let retry = read_remote_json(&mut socket, true);
+            assert_eq!(
+                retry["receipt"]["command_id"],
+                reply["receipt"]["command_id"]
+            );
+            assert_eq!(handle.status().unwrap().tick, 1);
+            let cut = handle.read_snapshot().unwrap();
+            let digest = owner.port.scientific_digest_v1().unwrap();
+
+            send_websocket_text(
+                &mut socket,
+                r#"{"protocol_version":1,"command":"subscribe","request_id":"replacement-telemetry","channels":["telemetry"],"max_fps":60}"#,
+            );
+            let replacement = read_remote_json(&mut socket, true);
+            assert_eq!(replacement["type"], "subscribed");
+            assert_eq!(replacement["request_id"], "replacement-telemetry");
+            assert_eq!(replacement["channels"], json!(["telemetry"]));
+            // This acknowledgement is impossible unless the socket processed
+            // telemetry's outstanding credit while projection was waiting.
+            drop(held.take());
+            let delivered = read_remote_binary(&mut socket);
+            assert!(
+                matches!(delivered.payload, RemoteFramePayload::Telemetry(_)),
+                "the retired canvas projection must not publish on its replacement"
+            );
+            assert_eq!(delivered.identity, RemoteFrameIdentity::from(cut.as_ref()));
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), digest);
+        }));
+        drop(held);
+        drop(socket);
+        let _ = shutdown.send(());
+        let joined = server.join();
+        if let Err(failure) = result {
+            std::panic::resume_unwind(failure);
+        }
+        joined.unwrap();
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[test]
