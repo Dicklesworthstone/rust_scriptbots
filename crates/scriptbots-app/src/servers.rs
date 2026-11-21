@@ -93,6 +93,18 @@ const CONTROL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stack for every control-runtime worker and blocking thread (bd-6sgk).
 const CONTROL_RUNTIME_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CONTROL_WORK_REQUESTS: usize = 8;
+const MAX_CONTROL_COMMAND_REQUESTS: usize = 16;
+// One pair of budgets across every REST listener, WebSocket control and MCP
+// tool in this process. Expensive reads cannot consume command admission.
+static CONTROL_WORK_SLOTS: std::sync::LazyLock<ControlWorkSlots> = std::sync::LazyLock::new(|| {
+    ControlWorkSlots::new(MAX_CONTROL_WORK_REQUESTS, MAX_CONTROL_COMMAND_REQUESTS)
+});
+// Synchronous FastMCP dispatch has its own bounded outer work. Tools acquire
+// the shared budget above only when dispatch reaches their actual handler.
+static MCP_DISPATCH_SLOTS: std::sync::LazyLock<ControlWorkSlots> = std::sync::LazyLock::new(|| {
+    ControlWorkSlots::new(MAX_CONTROL_WORK_REQUESTS, MAX_CONTROL_COMMAND_REQUESTS)
+});
 const WS_CONTROL_PROTOCOL_VERSION: u16 = 1;
 const MAX_WS_CONTROL_MESSAGE_BYTES: usize = REMOTE_MAX_REQUEST_BYTES;
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1945,22 +1957,71 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Run a waiting or CPU-heavy control operation on the blocking thread pool.
-///
-/// Command admission, database reads and rasterization must not park an async
-/// worker. Bounded reads of immutable host publications run directly so they
-/// remain available when unrelated blocking operations occupy the pool.
-async fn run_control<T, F>(operation: F) -> Result<T, AppError>
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlWorkLane {
+    Work,
+    Command,
+}
+
+struct ControlWorkSlots {
+    work: Arc<tokio::sync::Semaphore>,
+    commands: Arc<tokio::sync::Semaphore>,
+}
+
+impl ControlWorkSlots {
+    fn new(work: usize, commands: usize) -> Self {
+        Self {
+            work: Arc::new(tokio::sync::Semaphore::new(work)),
+            commands: Arc::new(tokio::sync::Semaphore::new(commands)),
+        }
+    }
+
+    fn try_admit(
+        &self,
+        lane: ControlWorkLane,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
+        let (slots, description) = match lane {
+            ControlWorkLane::Work => (&self.work, "query/work"),
+            ControlWorkLane::Command => (&self.commands, "command/status"),
+        };
+        Arc::clone(slots).try_acquire_owned().map_err(|_| {
+            AppError::service_unavailable(format!(
+                "{description} request capacity is exhausted; no operation was started; retry with the same request identity after current work completes"
+            ))
+        })
+    }
+
+    /// Refuse excess work before it can enter Tokio's unbounded blocking queue.
+    /// A cancelled queued job is aborted; a running job retains admission until
+    /// its closure exits, including after the requesting connection disappears.
+    async fn run<T, F>(&self, lane: ControlWorkLane, operation: F) -> Result<T, AppError>
+    where
+        F: FnOnce() -> Result<T, ControlError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = self.try_admit(lane)?;
+        let mut task = AbortOnDrop(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        }));
+        (&mut task.0)
+            .await
+            .map_err(|join_error| {
+                AppError::internal(format!("control operation task failed: {join_error}"))
+            })?
+            .map_err(AppError::from)
+    }
+}
+
+/// Run bounded waiting or CPU-heavy work without parking an async worker.
+/// Lane selection belongs to the statically registered handler, never a client
+/// priority field. Immutable publication fast paths need neither lane.
+async fn run_control<T, F>(lane: ControlWorkLane, operation: F) -> Result<T, AppError>
 where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|join_error| {
-            AppError::internal(format!("control operation task failed: {join_error}"))
-        })?
-        .map_err(AppError::from)
+    CONTROL_WORK_SLOTS.run(lane, operation).await
 }
 
 async fn read_latest_tick_summary(
@@ -1978,7 +2039,7 @@ async fn read_latest_tick_summary(
     }
     // Before the first completed tick, the fallback computes max_age by
     // scanning the published population. Keep that work off async workers.
-    run_control(move || handle.latest_summary()).await
+    run_control(ControlWorkLane::Work, move || handle.latest_summary()).await
 }
 
 #[utoipa::path(
@@ -1988,7 +2049,7 @@ async fn read_latest_tick_summary(
     responses((status = 200, body = [KnobEntry]))
 )]
 async fn get_knobs(State(state): State<ApiState>) -> Result<Json<Vec<KnobEntry>>, AppError> {
-    let mut knobs = run_control(move || state.handle.list_knobs()).await?;
+    let mut knobs = run_control(ControlWorkLane::Work, move || state.handle.list_knobs()).await?;
     knobs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Json(knobs))
 }
@@ -2000,7 +2061,7 @@ async fn get_knobs(State(state): State<ApiState>) -> Result<Json<Vec<KnobEntry>>
     responses((status = 200, body = ConfigSnapshot))
 )]
 async fn get_config(State(state): State<ApiState>) -> Result<Json<ConfigSnapshot>, AppError> {
-    let snapshot = run_control(move || state.handle.snapshot()).await?;
+    let snapshot = run_control(ControlWorkLane::Work, move || state.handle.snapshot()).await?;
     Ok(Json(snapshot))
 }
 
@@ -2030,7 +2091,11 @@ async fn get_latest_tick_summary(
 async fn get_hydrology_snapshot(
     State(state): State<ApiState>,
 ) -> Result<Json<HydrologySnapshot>, AppError> {
-    match run_control(move || state.handle.hydrology_snapshot()).await? {
+    match run_control(ControlWorkLane::Work, move || {
+        state.handle.hydrology_snapshot()
+    })
+    .await?
+    {
         Some(snapshot) => Ok(Json(snapshot)),
         None => Err(AppError::not_found("hydrology state unavailable")),
     }
@@ -2229,12 +2294,12 @@ fn tick_publication_stream(
         // The initial summary can scan the population; keep it, serialization,
         // and protocol validation off the async worker. A slow reader retains
         // only this one prepared publication, never a per-tick outbound queue.
-        let result = tokio::task::spawn_blocking(move || {
+        let result = run_control(ControlWorkLane::Work, move || {
             let result = reader
                 .read_snapshot()
                 .map_err(AppError::from)
                 .and_then(|snapshot| poll_tick_publication(&snapshot, &mut subscription));
-            (subscription, result)
+            Ok((subscription, result))
         })
         .await;
         match result {
@@ -2243,12 +2308,7 @@ fn tick_publication_stream(
                 Some((handle, subscription, interval)),
             )),
             Ok((_, Err(error))) => Some((vec![TickPublicationMessage::error(error)], None)),
-            Err(error) => Some((
-                vec![TickPublicationMessage::error(AppError::internal(format!(
-                    "tick publication task failed: {error}"
-                )))],
-                None,
-            )),
+            Err(error) => Some((vec![TickPublicationMessage::error(error)], None)),
         }
     })
     .flat_map(futures_util::stream::iter)
@@ -2431,11 +2491,11 @@ async fn stream_ticks_sse(
             let last_sent = last_sent.clone();
             let filter = filter.clone();
             async move {
-                tokio::task::spawn_blocking(move || {
-                    poll_tick_summaries_for_sse(&handle, &last_sent, &filter)
+                run_control(ControlWorkLane::Work, move || {
+                    Ok(poll_tick_summaries_for_sse(&handle, &last_sent, &filter))
                 })
                 .await
-                .unwrap_or_default()
+                .unwrap_or_else(|error| vec![TickPublicationMessage::error(error).into_sse()])
             }
         })
         .flat_map(futures_util::stream::iter);
@@ -2572,22 +2632,12 @@ fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
 }
 
 async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsControlReply {
-    struct AbortQueuedControl(tokio::task::JoinHandle<Result<CommandStatusDto, ControlError>>);
-    impl Drop for AbortQueuedControl {
-        fn drop(&mut self) {
-            // A disconnected client must not leave queued blocking work behind.
-            // Work already running may have reached owner admission and cannot
-            // be retracted; its exact request identity remains safe to retry.
-            self.0.abort();
-        }
-    }
-
     let request = match parse_ws_control_message(&text) {
         Ok(request) => request,
         Err(error) => return WsControlReply::error(None, error),
     };
     let request_id = request.request_id.clone();
-    let mut operation = AbortQueuedControl(tokio::task::spawn_blocking(move || {
+    let outcome = run_control(ControlWorkLane::Command, move || {
         use scriptbots_core::ControlCommand;
         let command = match request.command.as_str() {
             "pause" => ControlCommand::Pause,
@@ -2605,11 +2655,8 @@ async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsCont
         // The host owns retry identity and conflicting-payload refusal. A reconnect
         // must not create a second Step after the first receipt was lost.
         handle.submit_command(command, request.request_id.as_deref())
-    }));
-    let outcome = (&mut operation.0)
-        .await
-        .map_err(|error| AppError::internal(format!("WebSocket control task failed: {error}")))
-        .and_then(|result| result.map_err(AppError::from));
+    })
+    .await;
     match outcome {
         Ok(receipt) => WsControlReply {
             protocol_version: WS_CONTROL_PROTOCOL_VERSION,
@@ -3250,7 +3297,10 @@ async fn screenshot_ascii(
 )]
 async fn screenshot_png(State(state): State<ApiState>) -> Result<Response, AppError> {
     // Rasterization is CPU-heavy even though capture reads an immutable publication.
-    let bytes = run_control(move || state.handle.snapshot_png(1024, 576)).await?;
+    let bytes = run_control(ControlWorkLane::Work, move || {
+        state.handle.snapshot_png(1024, 576)
+    })
+    .await?;
     Ok((StatusCode::OK, axum::body::Bytes::from(bytes)).into_response())
 }
 
@@ -3301,11 +3351,11 @@ async fn stream_ticks_ndjson(
             let last_sent = last_sent.clone();
             let filter = filter.clone();
             async move {
-                tokio::task::spawn_blocking(move || {
-                    poll_tick_summaries_for_ndjson(&handle, &last_sent, &filter)
+                run_control(ControlWorkLane::Work, move || {
+                    Ok(poll_tick_summaries_for_ndjson(&handle, &last_sent, &filter))
                 })
                 .await
-                .unwrap_or_default()
+                .unwrap_or_else(|error| vec![TickPublicationMessage::error(error).into_ndjson()])
             }
         })
         .flat_map(futures_util::stream::iter);
@@ -3333,7 +3383,10 @@ async fn get_events_tail(
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(32);
-    let events = run_control(move || state.handle.events_tail(limit)).await?;
+    let events = run_control(ControlWorkLane::Work, move || {
+        state.handle.events_tail(limit)
+    })
+    .await?;
     Ok(Json(events))
 }
 
@@ -3377,7 +3430,10 @@ async fn get_narrative_search(
         limit: params.limit,
         run_id: params.run_id,
     };
-    let hits = run_control(move || state.handle.narrative_search(query)).await?;
+    let hits = run_control(ControlWorkLane::Work, move || {
+        state.handle.narrative_search(query)
+    })
+    .await?;
     Ok(Json(hits))
 }
 
@@ -3413,7 +3469,10 @@ async fn get_narrative_around(
         window: params.window,
         run_id: params.run_id,
     };
-    let hits = run_control(move || state.handle.narrative_around(query)).await?;
+    let hits = run_control(ControlWorkLane::Work, move || {
+        state.handle.narrative_around(query)
+    })
+    .await?;
     Ok(Json(hits))
 }
 
@@ -3432,7 +3491,10 @@ async fn get_scoreboard(
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(10);
-    let board = run_control(move || state.handle.compute_scoreboard(limit)).await?;
+    let board = run_control(ControlWorkLane::Work, move || {
+        state.handle.compute_scoreboard(limit)
+    })
+    .await?;
     Ok(Json(board))
 }
 
@@ -3479,12 +3541,13 @@ async fn get_agents_debug(
     }
 
     let query_for_world = query.clone();
-    let mut agents: Vec<AgentDebugEntryDto> =
-        run_control(move || state.handle.debug_agents(query_for_world))
-            .await?
-            .into_iter()
-            .map(AgentDebugEntryDto::from)
-            .collect();
+    let mut agents: Vec<AgentDebugEntryDto> = run_control(ControlWorkLane::Work, move || {
+        state.handle.debug_agents(query_for_world)
+    })
+    .await?
+    .into_iter()
+    .map(AgentDebugEntryDto::from)
+    .collect();
     // Ensure deterministic ordering and explicit tie-breaks
     match query.sort {
         AgentDebugSort::EnergyDesc => agents.sort_by(|a, b| {
@@ -3563,7 +3626,10 @@ async fn get_agent_inspection(
     axum::extract::Query(params): axum::extract::Query<AgentInspectionParams>,
 ) -> Result<Json<scriptbots_runtime::inspector::AgentInspection>, AppError> {
     let (uid, session_id, epoch) = params.identities()?;
-    let detail = run_control(move || state.handle.inspect_agent(uid, session_id, epoch)).await?;
+    let detail = run_control(ControlWorkLane::Work, move || {
+        state.handle.inspect_agent(uid, session_id, epoch)
+    })
+    .await?;
     detail
         .map(Json)
         .ok_or_else(|| AppError::not_found("creature is no longer present in this host"))
@@ -3590,9 +3656,11 @@ async fn get_brain_activity(
     axum::extract::Query(params): axum::extract::Query<AgentInspectionParams>,
 ) -> Result<Json<scriptbots_runtime::inspector::BrainActivityInspection>, AppError> {
     let (uid, session_id, epoch) = params.identities()?;
-    run_control(move || state.handle.inspect_brain_activity(uid, session_id, epoch))
-        .await
-        .map(Json)
+    run_control(ControlWorkLane::Work, move || {
+        state.handle.inspect_brain_activity(uid, session_id, epoch)
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3640,7 +3708,7 @@ async fn get_genome_inspection(
         epoch: params.epoch,
     };
     let (uid, session_id, epoch) = identities.identities()?;
-    run_control(move || {
+    run_control(ControlWorkLane::Work, move || {
         state.handle.inspect_genome_page(
             uid,
             session_id,
@@ -3676,7 +3744,10 @@ async fn post_selection(
     // 202 is still correct and is now honest rather than incidental: the body
     // says `admitted`, not `applied`, so the status code and the payload agree
     // that this command has been accepted and not yet applied.
-    let status = run_control(move || state.handle.update_selection(update, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.update_selection(update, key.as_deref())
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -3693,7 +3764,10 @@ async fn post_selection(
 async fn get_selection(
     State(state): State<ApiState>,
 ) -> Result<Json<SelectionSnapshotDto>, AppError> {
-    let selection = run_control(move || state.handle.current_selection()).await?;
+    let selection = run_control(ControlWorkLane::Work, move || {
+        state.handle.current_selection()
+    })
+    .await?;
     Ok(Json(selection))
 }
 
@@ -3723,7 +3797,10 @@ async fn get_interventions(
     State(state): State<ApiState>,
     axum::extract::Query(query): axum::extract::Query<InterventionsQuery>,
 ) -> Result<Json<InterventionsPollDto>, AppError> {
-    let poll = run_control(move || state.handle.applied_interventions(query.after_seq)).await?;
+    let poll = run_control(ControlWorkLane::Work, move || {
+        state.handle.applied_interventions(query.after_seq)
+    })
+    .await?;
     Ok(Json(poll))
 }
 
@@ -3745,7 +3822,10 @@ async fn patch_config(
     // though it were current. The old response projected future config: it was
     // built from the REQUESTED values and stamped with the tick at which those
     // values were NOT in effect (bd-k7nq). Read /api/config for applied truth.
-    let status = run_control(move || state.handle.apply_patch(payload.patch)).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.apply_patch(payload.patch)
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -3766,7 +3846,10 @@ async fn apply_updates(
     if payload.updates.is_empty() {
         return Err(AppError::bad_request("updates cannot be empty"));
     }
-    let status = run_control(move || state.handle.apply_updates(&payload.updates)).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.apply_updates(&payload.updates)
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -3779,11 +3862,12 @@ async fn apply_updates(
 async fn get_config_audit(
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<ConfigAuditEntryView>>, AppError> {
-    let mut entries: Vec<ConfigAuditEntryView> = run_control(move || state.handle.audit())
-        .await?
-        .into_iter()
-        .map(ConfigAuditEntryView::from)
-        .collect();
+    let mut entries: Vec<ConfigAuditEntryView> =
+        run_control(ControlWorkLane::Work, move || state.handle.audit())
+            .await?
+            .into_iter()
+            .map(ConfigAuditEntryView::from)
+            .collect();
     entries.sort_by_key(|entry| entry.tick);
     Ok(Json(entries))
 }
@@ -3832,7 +3916,10 @@ async fn apply_preset(
             payload.name
         )));
     };
-    let status = run_control(move || state.handle.apply_patch(kind.patch())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.apply_patch(kind.patch())
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -3847,7 +3934,10 @@ async fn post_control_pause(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.pause(key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.pause(key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3862,7 +3952,10 @@ async fn post_control_resume(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.resume(key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.resume(key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3881,7 +3974,10 @@ async fn post_control_step(
     require_json_content_type(&headers, &bytes)?;
     let count = parse_step_count(&bytes)?;
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.step_count(count, key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3898,7 +3994,10 @@ async fn post_control_speed(
     Json(payload): Json<SpeedRequest>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.set_speed(payload.speed, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.set_speed(payload.speed, key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3911,7 +4010,7 @@ async fn post_control_speed(
 async fn post_control_shutdown(
     State(state): State<ApiState>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
-    let status = run_control(move || state.handle.shutdown()).await?;
+    let status = run_control(ControlWorkLane::Command, move || state.handle.shutdown()).await?;
     Ok(Json(status))
 }
 
@@ -3931,9 +4030,11 @@ async fn get_control_status(
     axum::extract::Path(command_id): axum::extract::Path<String>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let id_for_handle = command_id.clone();
-    let status = run_control(move || state.handle.command_status(&id_for_handle))
-        .await?
-        .ok_or_else(|| AppError::not_found(format!("unknown command id: {command_id}")))?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.command_status(&id_for_handle)
+    })
+    .await?
+    .ok_or_else(|| AppError::not_found(format!("unknown command id: {command_id}")))?;
     Ok(Json(status))
 }
 
@@ -3948,7 +4049,10 @@ async fn post_pause(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.pause(key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.pause(key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3975,7 +4079,7 @@ async fn post_map_generate(
 
     let generator_config = req.generator_config()?;
 
-    let artifact = run_control(move || {
+    let artifact = run_control(ControlWorkLane::Work, move || {
         let (def_w, def_h, def_cell) = state
             .handle
             .read_snapshot()
@@ -4016,7 +4120,7 @@ async fn post_map_apply(
     let key = idempotency_key(&headers).or(payload.idempotency_key);
     let artifact = parse_map_artifact(&payload.artifact)?;
 
-    let status = run_control(move || {
+    let status = run_control(ControlWorkLane::Work, move || {
         state.handle.apply_map(
             artifact,
             payload.existing_agent_policy.into(),
@@ -4044,7 +4148,10 @@ async fn post_control_intervene(
     let key = idempotency_key(&headers).or(payload.idempotency_key.clone());
     let command = parse_intervention_command(&payload)?;
 
-    let status = run_control(move || state.handle.intervene(command, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.intervene(command, key.as_deref())
+    })
+    .await?;
 
     Ok(Json(status))
 }
@@ -4065,9 +4172,11 @@ async fn post_browser_intervention(
     State(state): State<ApiState>,
     Json(request): Json<scriptbots_runtime::remote::BrowserInterventionRequest>,
 ) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionReceipt>, AppError> {
-    run_control(move || state.handle.browser_intervene(&request))
-        .await
-        .map(Json)
+    run_control(ControlWorkLane::Command, move || {
+        state.handle.browser_intervene(&request)
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4096,7 +4205,7 @@ async fn get_browser_intervention_status(
     axum::extract::Path(command_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<BrowserInterventionStatusQuery>,
 ) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionReceipt>, AppError> {
-    run_control(move || {
+    run_control(ControlWorkLane::Command, move || {
         state
             .handle
             .browser_intervention_status(&command_id, &query.session_id)
@@ -4135,7 +4244,7 @@ async fn get_browser_intervention_history(
     State(state): State<ApiState>,
     axum::extract::Query(query): axum::extract::Query<BrowserInterventionHistoryQuery>,
 ) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionHistory>, AppError> {
-    run_control(move || {
+    run_control(ControlWorkLane::Work, move || {
         state.handle.browser_intervention_history(
             &query.session_id,
             &query.epoch,
@@ -4186,7 +4295,10 @@ async fn post_resume(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.resume(key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.resume(key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4209,7 +4321,10 @@ async fn post_step(
     // polling it learns about that one command. Saying so beats implying the
     // receipt covers all of them.
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.step_count(count, key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4226,7 +4341,10 @@ async fn post_speed(
     Json(body): Json<SpeedRequestBody>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.set_speed(body.speed, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.set_speed(body.speed, key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4237,7 +4355,7 @@ async fn post_speed(
     responses((status = 200, body = SimulationStatusDto))
 )]
 async fn get_status(State(state): State<ApiState>) -> Result<Json<SimulationStatusDto>, AppError> {
-    let status = run_control(move || state.handle.status()).await?;
+    let status = run_control(ControlWorkLane::Command, move || state.handle.status()).await?;
     Ok(Json(status))
 }
 
@@ -4257,7 +4375,7 @@ pub struct PaginationQueryParams {
     responses((status = 200, body = ApiVersionDto))
 )]
 async fn get_version(State(state): State<ApiState>) -> Result<Json<ApiVersionDto>, AppError> {
-    let version = run_control(move || Ok(state.handle.version())).await?;
+    let version = run_control(ControlWorkLane::Command, move || Ok(state.handle.version())).await?;
     Ok(Json(version))
 }
 
@@ -4268,7 +4386,7 @@ async fn get_version(State(state): State<ApiState>) -> Result<Json<ApiVersionDto
     responses((status = 200, body = ApiVersionDto))
 )]
 async fn get_v1_version(State(state): State<ApiState>) -> Result<Json<ApiVersionDto>, AppError> {
-    let version = run_control(move || Ok(state.handle.version())).await?;
+    let version = run_control(ControlWorkLane::Command, move || Ok(state.handle.version())).await?;
     Ok(Json(version))
 }
 
@@ -4279,7 +4397,7 @@ async fn get_v1_version(State(state): State<ApiState>) -> Result<Json<ApiVersion
     responses((status = 200, body = ApiSchemaDto))
 )]
 async fn get_schema(State(state): State<ApiState>) -> Result<Json<ApiSchemaDto>, AppError> {
-    let schema = run_control(move || Ok(state.handle.schema())).await?;
+    let schema = run_control(ControlWorkLane::Command, move || Ok(state.handle.schema())).await?;
     Ok(Json(schema))
 }
 
@@ -4290,7 +4408,7 @@ async fn get_schema(State(state): State<ApiState>) -> Result<Json<ApiSchemaDto>,
     responses((status = 200, body = ApiSchemaDto))
 )]
 async fn get_v1_schema(State(state): State<ApiState>) -> Result<Json<ApiSchemaDto>, AppError> {
-    let schema = run_control(move || Ok(state.handle.schema())).await?;
+    let schema = run_control(ControlWorkLane::Command, move || Ok(state.handle.schema())).await?;
     Ok(Json(schema))
 }
 
@@ -4312,7 +4430,10 @@ async fn post_v1_experiments(
     if body.idempotency_key.is_none() {
         body.idempotency_key = idempotency_key(&headers);
     }
-    let status = run_control(move || state.handle.create_experiment(body)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.create_experiment(body)
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(status)))
 }
 
@@ -4327,7 +4448,7 @@ async fn get_v1_experiments(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedExperimentsResponse>, AppError> {
-    let res = run_control(move || {
+    let res = run_control(ControlWorkLane::Work, move || {
         state
             .handle
             .list_experiments(params.limit, params.cursor.as_deref())
@@ -4347,7 +4468,10 @@ async fn get_v1_experiment_by_id(
     State(state): State<ApiState>,
     axum::extract::Path(experiment_id): axum::extract::Path<String>,
 ) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.get_experiment(&experiment_id)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.get_experiment(&experiment_id)
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4405,7 +4529,7 @@ async fn post_v1_experiment_compare(
             "an experiment comparison request is already waiting or running; retry after it finishes",
         )
     })?;
-    let comparison = run_control(move || {
+    let comparison = run_control(ControlWorkLane::Work, move || {
         let _permit = permit;
         state.handle.compare_experiment_variants(
             &experiment_id,
@@ -4429,7 +4553,10 @@ async fn post_v1_experiment_cancel(
     State(state): State<ApiState>,
     axum::extract::Path(experiment_id): axum::extract::Path<String>,
 ) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.cancel_experiment(&experiment_id)).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.cancel_experiment(&experiment_id)
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4447,7 +4574,10 @@ async fn post_v1_experiment_resume(
     State(state): State<ApiState>,
     axum::extract::Path(experiment_id): axum::extract::Path<String>,
 ) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.resume_experiment(&experiment_id)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.resume_experiment(&experiment_id)
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4474,7 +4604,10 @@ async fn post_v1_checkpoints(
     if body.idempotency_key.is_none() {
         body.idempotency_key = idempotency_key(&headers);
     }
-    let meta = run_control(move || state.handle.create_checkpoint(body)).await?;
+    let meta = run_control(ControlWorkLane::Work, move || {
+        state.handle.create_checkpoint(body)
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(meta)))
 }
 
@@ -4489,7 +4622,7 @@ async fn get_v1_checkpoints(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedCheckpointsResponse>, AppError> {
-    let res = run_control(move || {
+    let res = run_control(ControlWorkLane::Work, move || {
         state
             .handle
             .list_checkpoints(params.limit, params.cursor.as_deref())
@@ -4509,7 +4642,10 @@ async fn get_v1_checkpoint_by_id(
     State(state): State<ApiState>,
     axum::extract::Path(checkpoint_id): axum::extract::Path<String>,
 ) -> Result<Json<CheckpointMetadataDto>, AppError> {
-    let meta = run_control(move || state.handle.get_checkpoint(&checkpoint_id)).await?;
+    let meta = run_control(ControlWorkLane::Work, move || {
+        state.handle.get_checkpoint(&checkpoint_id)
+    })
+    .await?;
     Ok(Json(meta))
 }
 
@@ -4687,7 +4823,7 @@ async fn get_v1_checkpoint_branches(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedCheckpointBranchesResponse>, AppError> {
-    let page = run_control(move || {
+    let page = run_control(ControlWorkLane::Work, move || {
         state
             .handle
             .list_checkpoint_branches(params.limit, params.cursor.as_deref())
@@ -4746,7 +4882,10 @@ async fn post_v1_checkpoint_branches(
             ));
         }
     }
-    let status = run_control(move || state.handle.create_checkpoint_branch(body)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.create_checkpoint_branch(body)
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -4764,7 +4903,10 @@ async fn get_v1_checkpoint_branch(
     State(state): State<ApiState>,
     axum::extract::Path(branch_id): axum::extract::Path<String>,
 ) -> Result<Json<CheckpointBranchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.get_checkpoint_branch(&branch_id)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.get_checkpoint_branch(&branch_id)
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4789,7 +4931,7 @@ async fn get_v1_checkpoint_branch_artifacts(
     axum::extract::Path(branch_id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedArtifactsResponse>, AppError> {
-    let artifacts = run_control(move || {
+    let artifacts = run_control(ControlWorkLane::Work, move || {
         state.handle.list_checkpoint_branch_artifacts(
             &branch_id,
             params.limit,
@@ -4814,7 +4956,10 @@ async fn post_v1_checkpoint_branch_cancel(
     State(state): State<ApiState>,
     axum::extract::Path(branch_id): axum::extract::Path<String>,
 ) -> Result<Json<CheckpointBranchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.cancel_checkpoint_branch(&branch_id)).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.cancel_checkpoint_branch(&branch_id)
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4829,7 +4974,7 @@ async fn get_v1_artifacts(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedArtifactsResponse>, AppError> {
-    let res = run_control(move || {
+    let res = run_control(ControlWorkLane::Work, move || {
         state
             .handle
             .list_artifacts(params.limit, params.cursor.as_deref())
@@ -4849,7 +4994,10 @@ async fn get_v1_artifact_by_id(
     State(state): State<ApiState>,
     axum::extract::Path(artifact_id): axum::extract::Path<String>,
 ) -> Result<Json<ArtifactMetadataDto>, AppError> {
-    let meta = run_control(move || state.handle.get_artifact(&artifact_id)).await?;
+    let meta = run_control(ControlWorkLane::Work, move || {
+        state.handle.get_artifact(&artifact_id)
+    })
+    .await?;
     Ok(Json(meta))
 }
 
@@ -4864,7 +5012,10 @@ async fn get_v1_artifact_download(
     State(state): State<ApiState>,
     axum::extract::Path(artifact_id): axum::extract::Path<String>,
 ) -> Result<Response, AppError> {
-    let (meta, bytes) = run_control(move || state.handle.read_artifact_bytes(&artifact_id)).await?;
+    let (meta, bytes) = run_control(ControlWorkLane::Work, move || {
+        state.handle.read_artifact_bytes(&artifact_id)
+    })
+    .await?;
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, meta.content_type)
@@ -5850,6 +6001,7 @@ fn register_tool(
     kind: ControlToolKind,
     handle: ControlHandle,
 ) -> ServerBuilder {
+    debug_assert_eq!(ControlToolKind::from_name(name), Some(kind));
     builder.tool(ControlTool {
         handle,
         kind,
@@ -5862,6 +6014,8 @@ fn register_tool(
 /// Shared per-process MCP HTTP state: one negotiated session guarded by
 /// `dispatch_request_concurrent`. FastMCP retains the session mutex while a
 /// handler runs because tool annotations do not guarantee mutation safety.
+/// Separate work/command admission preserves capacity, not execution priority
+/// over another request already holding this same session mutex.
 #[derive(Clone)]
 struct McpHttpState {
     server: Arc<Server>,
@@ -5894,21 +6048,31 @@ async fn handle_mcp_http_request(
     State(state): State<McpHttpState>,
     Json(request): Json<JsonRpcRequest>,
 ) -> Response {
+    dispatch_mcp_http_request(state, request, &MCP_DISPATCH_SLOTS).await
+}
+
+async fn dispatch_mcp_http_request(
+    state: McpHttpState,
+    request: JsonRpcRequest,
+    slots: &ControlWorkSlots,
+) -> Response {
     let method = request.method.clone();
     let id = request.id.clone();
+    let lane = mcp_request_work_lane(&request);
     let cx = state.request_cx();
     // FastMCP dispatch and its session mutex are synchronous. Capture the
     // caller's context before moving that work off the HTTP async worker.
-    match tokio::task::spawn_blocking(move || {
-        state.server.dispatch_request_concurrent(
-            &cx,
-            &state.session,
-            request,
-            &state.notification_sender,
-            &state.request_sender,
-        )
-    })
-    .await
+    match slots
+        .run(lane, move || {
+            Ok(state.server.dispatch_request_concurrent(
+                &cx,
+                &state.session,
+                request,
+                &state.notification_sender,
+                &state.request_sender,
+            ))
+        })
+        .await
     {
         Ok(Some(message)) => Json(message).into_response(),
         Ok(None) => {
@@ -5938,7 +6102,26 @@ async fn handle_mcp_http_request(
             }
         }
         Err(error) => {
-            warn!(%error, "MCP HTTP dispatch task failed");
+            warn!(?error, "MCP HTTP dispatch task failed");
+            if error.status == StatusCode::SERVICE_UNAVAILABLE {
+                return if let Some(request_id) = id {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "error": {
+                                "code": -32000,
+                                "message": error.message,
+                                "data": {"kind": "capacity", "retryable": true, "operation_started": false}
+                            }
+                        })),
+                    ).into_response()
+                } else {
+                    // A refused notification was not accepted for dispatch.
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                };
+            }
             if let Some(request_id) = id {
                 Json(json!({
                     "jsonrpc": "2.0",
@@ -6038,7 +6221,7 @@ struct McpCheckpointBranchIdRequest {
     branch_id: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlToolKind {
     ListPresets,
     ApplyPreset,
@@ -6077,6 +6260,105 @@ enum ControlToolKind {
     ArtifactGet,
 }
 
+impl ControlToolKind {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "list_presets" => Self::ListPresets,
+            "apply_preset" => Self::ApplyPreset,
+            "list_knobs" => Self::ListKnobs,
+            "get_config" => Self::GetConfig,
+            "apply_updates" => Self::ApplyUpdates,
+            "apply_patch" => Self::ApplyPatch,
+            "pause" => Self::Pause,
+            "resume" => Self::Resume,
+            "step" => Self::Step,
+            "set_speed" => Self::SetSpeed,
+            "get_status" => Self::GetStatus,
+            "shutdown" => Self::Shutdown,
+            "get_command_status" => Self::GetCommandStatus,
+            "map_generate" => Self::MapGenerate,
+            "map_apply" => Self::MapApply,
+            "intervene" => Self::Intervene,
+            "narrative_search" => Self::NarrativeSearch,
+            "narrative_around" => Self::NarrativeAround,
+            "get_version" => Self::GetVersion,
+            "get_schema" => Self::GetSchema,
+            "experiment_create" => Self::ExperimentCreate,
+            "experiment_list" => Self::ExperimentList,
+            "experiment_status" => Self::ExperimentStatus,
+            "experiment_compare" => Self::ExperimentCompare,
+            "experiment_cancel" => Self::ExperimentCancel,
+            "experiment_resume" => Self::ExperimentResume,
+            "checkpoint_create" => Self::CheckpointCreate,
+            "checkpoint_list" => Self::CheckpointList,
+            "checkpoint_status" => Self::CheckpointStatus,
+            "checkpoint_branch_create" => Self::CheckpointBranchCreate,
+            "checkpoint_branch_list" => Self::CheckpointBranchList,
+            "checkpoint_branch_status" => Self::CheckpointBranchStatus,
+            "checkpoint_branch_cancel" => Self::CheckpointBranchCancel,
+            "artifact_list" => Self::ArtifactList,
+            "artifact_get" => Self::ArtifactGet,
+            _ => return None,
+        })
+    }
+
+    const fn work_lane(self) -> ControlWorkLane {
+        match self {
+            Self::ApplyPreset
+            | Self::ApplyUpdates
+            | Self::ApplyPatch
+            | Self::Pause
+            | Self::Resume
+            | Self::Step
+            | Self::SetSpeed
+            | Self::GetStatus
+            | Self::Shutdown
+            | Self::GetCommandStatus
+            | Self::Intervene
+            | Self::GetVersion
+            | Self::GetSchema
+            | Self::ExperimentCancel
+            | Self::CheckpointBranchCancel => ControlWorkLane::Command,
+            Self::ListPresets
+            | Self::ListKnobs
+            | Self::GetConfig
+            | Self::MapGenerate
+            | Self::MapApply
+            | Self::NarrativeSearch
+            | Self::NarrativeAround
+            | Self::ExperimentCreate
+            | Self::ExperimentList
+            | Self::ExperimentStatus
+            | Self::ExperimentCompare
+            | Self::ExperimentResume
+            | Self::CheckpointCreate
+            | Self::CheckpointList
+            | Self::CheckpointStatus
+            | Self::CheckpointBranchCreate
+            | Self::CheckpointBranchList
+            | Self::CheckpointBranchStatus
+            | Self::ArtifactList
+            | Self::ArtifactGet => ControlWorkLane::Work,
+        }
+    }
+}
+
+fn mcp_request_work_lane(request: &JsonRpcRequest) -> ControlWorkLane {
+    match request.method.as_str() {
+        "initialize" | "notifications/initialized" | "ping" | "tools/list" => {
+            ControlWorkLane::Command
+        }
+        "tools/call" => request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            .and_then(ControlToolKind::from_name)
+            .map_or(ControlWorkLane::Work, ControlToolKind::work_lane),
+        _ => ControlWorkLane::Work,
+    }
+}
+
 impl ToolHandler for ControlTool {
     fn definition(&self) -> fastmcp_rust::Tool {
         fastmcp_rust::Tool {
@@ -6092,6 +6374,12 @@ impl ToolHandler for ControlTool {
     }
 
     fn call(&self, _ctx: &fastmcp_rust::McpContext, arguments: Value) -> McpResult<Vec<Content>> {
+        // Includes stdio/direct callers. The dispatch budget is distinct, so
+        // HTTP never recursively acquires the same limited permit. This scope
+        // owns admission through the joined large-stack worker and formatting.
+        let _permit = CONTROL_WORK_SLOTS
+            .try_admit(self.kind.work_lane())
+            .map_err(|error| McpError::new(McpErrorCode::ToolExecutionError, error.message))?;
         if matches!(
             self.kind,
             ControlToolKind::Step
@@ -6640,15 +6928,21 @@ where
     })
 }
 
-/// MCP twin of [`run_control`]: a contended world mutex parks a blocking-pool
-/// thread instead of the MCP server's async worker (bd-134).
+/// MCP twin of [`run_control`] with the original typed control-error mapping.
 #[allow(dead_code)]
 async fn run_control_mcp<T, F>(operation: F) -> Result<T, McpError>
 where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
+    let permit = CONTROL_WORK_SLOTS
+        .try_admit(ControlWorkLane::Work)
+        .map_err(|error| McpError::new(McpErrorCode::ToolExecutionError, error.message))?;
+    let mut task = AbortOnDrop(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    }));
+    (&mut task.0)
         .await
         .map_err(|join_error| {
             McpError::new(
@@ -6761,7 +7055,8 @@ mod tests {
         // Assembled at runtime: a source-scanning test that spells out its own
         // needle matches itself and passes forever.
         let openers = [
-            format!("run_control(move || {}.", "state.handle"),
+            format!("run_control({}::Command, move || ", "ControlWorkLane"),
+            format!("run_control({}::Work, move || ", "ControlWorkLane"),
             format!("run_control_mcp_sync(move || {}.", "handle"),
         ];
         let bound_openers: Vec<String> = openers
@@ -11729,6 +12024,209 @@ mod tests {
         assert!(!poll_seq.gap_detected);
     }
 
+    #[tokio::test]
+    async fn control_work_capacity_stays_owned_after_running_caller_cancellation() {
+        let slots = Arc::new(ControlWorkSlots::new(1, 1));
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = mpsc::channel();
+        let worker_slots = Arc::clone(&slots);
+        let worker = tokio::spawn(async move {
+            worker_slots
+                .run(ControlWorkLane::Work, move || {
+                    entered.send(()).expect("worker started");
+                    let _ = wait.recv();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .expect("worker start deadline")
+            .expect("worker entered");
+        worker.abort();
+        assert!(worker.await.expect_err("caller cancelled").is_cancelled());
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let refused_executed = Arc::clone(&executed);
+        let refusal = slots
+            .run(ControlWorkLane::Work, move || {
+                refused_executed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect_err("running worker must still own the only slot");
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!executed.load(Ordering::SeqCst));
+        assert_eq!(
+            slots.run(ControlWorkLane::Command, || Ok(7)).await.unwrap(),
+            7
+        );
+
+        release.send(()).expect("release running worker");
+        let reclaimed = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&slots.work).acquire_owned(),
+        )
+        .await
+        .expect("worker completion deadline")
+        .expect("slot reclaimed");
+        drop(reclaimed);
+        slots
+            .run(ControlWorkLane::Work, move || {
+                executed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect("completed worker releases capacity");
+    }
+
+    #[test]
+    fn control_work_disconnect_cancels_queued_mutation_before_admission() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("one blocking worker");
+        let (entered, started) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::channel();
+        let occupied = runtime.spawn_blocking(move || {
+            entered.send(()).expect("occupied pool");
+            let _ = wait.recv();
+        });
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pool occupied");
+        let slots = ControlWorkSlots::new(1, 1);
+        let mutated = Arc::new(AtomicBool::new(false));
+        let operation_mutated = Arc::clone(&mutated);
+        let queued = runtime.block_on(async {
+            let mut operation = Box::pin(slots.run(ControlWorkLane::Command, move || {
+                operation_mutated.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+            let blocked = tokio::time::timeout(Duration::from_millis(100), &mut operation).await;
+            let reserved = slots.commands.available_permits();
+            drop(operation);
+            (blocked, reserved)
+        });
+        release.send(()).expect("release unrelated blocking work");
+        runtime.block_on(occupied).expect("occupied worker joined");
+        runtime
+            .block_on(runtime.spawn_blocking(|| ()))
+            .expect("queue drained");
+        assert!(queued.0.is_err(), "fixture must really queue the mutation");
+        assert_eq!(queued.1, 0, "queued work reserves its capacity");
+        assert!(
+            !mutated.load(Ordering::SeqCst),
+            "disconnected queued work must not execute later"
+        );
+        assert_eq!(slots.commands.available_permits(), 1);
+    }
+
+    #[test]
+    fn mcp_work_lane_cannot_be_selected_by_client_priority_fields() {
+        for request in [
+            json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+                "name":"narrative_search", "lane":"command", "arguments":{"priority":"command"}}}),
+            json!({"jsonrpc":"2.0", "id":1, "method":"pause", "params":{"name":"pause"}}),
+            json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"unknown"}}),
+            json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":["pause"]}}),
+        ] {
+            let request = serde_json::from_value(request).expect("JSON-RPC request");
+            assert_eq!(mcp_request_work_lane(&request), ControlWorkLane::Work);
+        }
+        let request = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"pause"}
+        }))
+        .expect("known owner command");
+        assert_eq!(mcp_request_work_lane(&request), ControlWorkLane::Command);
+    }
+
+    #[tokio::test]
+    async fn control_work_pressure_preserves_real_step_retry_and_mcp_refusal_identity() {
+        let (handle, owner) = handle();
+        let before = handle
+            .read_snapshot()
+            .expect("initial publication")
+            .world
+            .tick;
+        let slots = ControlWorkSlots::new(1, 1);
+        let busy_work = slots
+            .try_admit(ControlWorkLane::Work)
+            .expect("occupy work capacity");
+        let state = mcp_http_test_state(handle.clone(), ServerBuilder::new("work-capacity", "0"));
+        let initialize = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                "clientInfo":{"name":"work-capacity", "version":"0"}}
+        }))
+        .expect("initialize request");
+        let response = dispatch_mcp_http_request(state.clone(), initialize, &slots).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let query = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":"refused-query", "method":"tools/call",
+            "params":{"name":"narrative_search", "arguments":{"query":"birth"}}
+        }))
+        .expect("query request");
+        let response = dispatch_mcp_http_request(state.clone(), query, &slots).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .expect("refusal body");
+        let response: Value = serde_json::from_slice(&body).expect("JSON-RPC refusal");
+        assert_eq!(response["id"], "refused-query");
+        assert_eq!(response["error"]["code"], -32000);
+        assert_eq!(response["error"]["data"]["retryable"], true);
+        assert_eq!(response["error"]["data"]["operation_started"], false);
+
+        let first_handle = handle.clone();
+        let first = slots
+            .run(ControlWorkLane::Command, move || {
+                first_handle.step_count(1, Some("capacity-exact-step"))
+            })
+            .await
+            .expect("work pressure leaves command admission available");
+        owner.wait_applied(&first);
+        let retry = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
+                "name":"step", "arguments":{"count":1, "idempotency_key":"capacity-exact-step"}}
+        }))
+        .expect("exact retry request");
+        let response = dispatch_mcp_http_request(state.clone(), retry, &slots).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .expect("retry body");
+        let response: Value = serde_json::from_slice(&body).expect("MCP response");
+        let retried: CommandStatusDto = serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("command receipt text"),
+        )
+        .expect("canonical receipt");
+        owner.wait_applied(&retried);
+        assert_eq!(retried.command_id, first.command_id);
+        assert_eq!(handle.read_snapshot().unwrap().world.tick, before + 1);
+
+        let busy_commands = slots
+            .try_admit(ControlWorkLane::Command)
+            .expect("occupy command capacity");
+        let notification = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "method":"notifications/initialized"
+        }))
+        .expect("notification");
+        let response = dispatch_mcp_http_request(state, notification, &slots).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            axum::body::to_bytes(response.into_body(), 16_384)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop((busy_work, busy_commands));
+    }
+
     #[test]
     fn published_latest_tick_does_not_wait_for_the_blocking_pool() {
         let mut world = WorldState::new(ScriptBotsConfig {
@@ -11822,7 +12320,9 @@ mod tests {
             // never occupied the pool and cannot discriminate the old handlers.
             let queued = tokio::time::timeout(
                 Duration::from_millis(100),
-                run_control(move || queued_handle.latest_summary()),
+                run_control(ControlWorkLane::Work, move || {
+                    queued_handle.latest_summary()
+                }),
             )
             .await;
             let mut initial_read = tokio::spawn(get_latest_tick_summary(State(initial_state)));
