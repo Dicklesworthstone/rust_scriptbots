@@ -709,9 +709,10 @@ const SCRIPTBOTS_SCHEMA_V16_VERSION: i64 = 16;
 /// Schema version introducing MAP-Elites behavioral archive tables (bd-16g.6.1).
 pub const SCRIPTBOTS_SCHEMA_V17_VERSION: i64 = 17;
 const SCRIPTBOTS_SCHEMA_V18_VERSION: i64 = 18;
+const SCRIPTBOTS_SCHEMA_V19_VERSION: i64 = 19;
 
 /// Current schema version for new `ScriptBots` run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 19;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 20;
 
 /// Historical schema migration alias for MAP-Elites behavioral archive (bd-16g.6.1).
 pub const SCRIPTBOTS_SCHEMA_V3: &str = SCRIPTBOTS_SCHEMA_V17;
@@ -2357,6 +2358,17 @@ const SCRIPTBOTS_SCHEMA_V19: &str = r#"
     PRAGMA user_version = 19;
 "#;
 
+/// Journal reconstruction checks every transition attached to the archive's full identity,
+/// including misplaced rows from another command. The command-keyed primary keys cannot
+/// narrow that check by journal sequence. Keep the checks intact and index their actual key.
+const SCRIPTBOTS_SCHEMA_V20: &str = r#"
+    CREATE INDEX host_command_application_transitions_run_session_journal_index
+        ON host_command_application_transitions (run_id, host_session_id, journal_sequence);
+    CREATE INDEX host_command_storage_transitions_run_session_journal_index
+        ON host_command_storage_transitions (run_id, host_session_id, journal_sequence);
+    PRAGMA user_version = 20;
+"#;
+
 const SCRIPTBOTS_MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         SCRIPTBOTS_SCHEMA_V6_VERSION,
@@ -2424,9 +2436,14 @@ const SCRIPTBOTS_MIGRATIONS: &[(i64, &str, &str)] = &[
         SCRIPTBOTS_SCHEMA_V18,
     ),
     (
-        SCRIPTBOTS_SCHEMA_VERSION,
+        SCRIPTBOTS_SCHEMA_V19_VERSION,
         "index_island_narrative_identities",
         SCRIPTBOTS_SCHEMA_V19,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_VERSION,
+        "index_command_transitions_by_journal",
+        SCRIPTBOTS_SCHEMA_V20,
     ),
 ];
 
@@ -32920,8 +32937,12 @@ mod tests {
                 "partition_genomes_and_narratives_by_island",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V19_VERSION,
                 "index_island_narrative_identities",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "index_command_transitions_by_journal",
             ),
         ];
         assert_eq!(migrations.len(), expected.len());
@@ -32950,6 +32971,337 @@ mod tests {
             "idempotent install duplicated its ledger"
         );
         connection.close()?;
+        Ok(())
+    }
+
+    const COMMAND_TRANSITION_JOURNAL_INDEXES: [(&str, &str, &str); 2] = [
+        (
+            "host_command_application_transitions",
+            "host_command_application_transitions_run_session_journal_index",
+            "command_id, transition_ordinal, boundary_tick, boundary_control_revision,
+             boundary_scientific_revision, boundary_config_revision, application_state,
+             application_postcard_hex, archive_payload_digest",
+        ),
+        (
+            "host_command_storage_transitions",
+            "host_command_storage_transitions_run_session_journal_index",
+            "command_id, transition_ordinal, storage_state, archive_payload_digest",
+        ),
+    ];
+
+    fn command_transition_journal_query(table: &str, columns: &str, scan: bool) -> String {
+        let hint = if scan { " NOT INDEXED" } else { "" };
+        format!(
+            "SELECT {columns} FROM {table}{hint}
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+             ORDER BY transition_ordinal ASC"
+        )
+    }
+
+    fn command_transition_rows(
+        connection: &Connection,
+        sql: &str,
+        parameters: &[SqliteValue],
+    ) -> Result<Vec<Vec<SqliteValue>>, FrankenError> {
+        connection
+            .query_with_params(sql, parameters)
+            .map(|rows| rows.into_iter().map(|row| row.values().to_vec()).collect())
+    }
+
+    fn assert_command_transition_index_seek(
+        connection: &Connection,
+        index: &str,
+        sql: &str,
+        parameters: &[SqliteValue],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root_page = connection
+            .query_row_with_params(
+                "SELECT rootpage FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+                &[index.into()],
+            )?
+            .get_typed::<i64>(0)?;
+        let bytecode = connection.query_with_params(&format!("EXPLAIN {sql}"), parameters)?;
+        // The pinned engine exposes addr/opcode/p1/p2/p3/p4/p5/comment. Resolve the
+        // actual index cursor by its root page, then require a key seek on that cursor.
+        // Merely opening an index or reporting a logical plan is not a seek.
+        let mut index_cursors = Vec::new();
+        for instruction in &bytecode {
+            if instruction.get_typed::<String>(1)? == "OpenRead"
+                && instruction.get_typed::<i64>(3)? == root_page
+            {
+                index_cursors.push(instruction.get_typed::<i64>(2)?);
+            }
+        }
+        let mut seeks_index = false;
+        for instruction in &bytecode {
+            if matches!(
+                instruction.get_typed::<String>(1)?.as_str(),
+                "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT" | "NotFound" | "NoConflict"
+            ) && index_cursors.contains(&instruction.get_typed::<i64>(2)?)
+            {
+                seeks_index = true;
+            }
+        }
+        assert!(
+            seeks_index,
+            "journal lookup did not seek {index}: {:?}",
+            bytecode.iter().map(Row::values).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    fn assert_indexed_journal_lookup_rejects_cross_command_rows(
+        storage: &Storage,
+        session: HostSessionId,
+        first: &CommandEnvelope,
+        second: &CommandEnvelope,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let connection = storage.connection()?;
+        let session_text = encode_journal_u64(session.get());
+        let journal: String = connection
+            .query_row_with_params(
+                "SELECT journal_sequence FROM host_command_records
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3",
+                &[
+                    sqlite_run_id(storage.run_id()),
+                    session_text.as_str().into(),
+                    first.command_id.to_string().into(),
+                ],
+            )?
+            .get_typed(0)?;
+        let parameters = [
+            sqlite_run_id(storage.run_id()),
+            session_text.as_str().into(),
+            journal.as_str().into(),
+        ];
+        let request = CommandAuthorityRequest::Status {
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        let original = storage.resolve_command_authority(session, first.command_id, &request)?;
+        assert!(matches!(original, CommandAuthorityLookup::Found(_)));
+        for (table, _, columns) in COMMAND_TRANSITION_JOURNAL_INDEXES {
+            let sql = command_transition_journal_query(table, columns, false);
+            let before = command_transition_rows(connection, &sql, &parameters)?;
+            connection.execute("BEGIN")?;
+            let changed = connection.execute_with_params(
+                &format!(
+                    "UPDATE {table} SET journal_sequence = ?3
+                     WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?4"
+                ),
+                &[
+                    parameters[0].clone(),
+                    parameters[1].clone(),
+                    parameters[2].clone(),
+                    second.command_id.to_string().into(),
+                ],
+            )?;
+            let misplaced = command_transition_rows(connection, &sql, &parameters)?;
+            let result = storage.resolve_command_authority(session, first.command_id, &request);
+            connection.execute("ROLLBACK")?;
+            assert!(changed > 0, "the corruption control must move {table} rows");
+            assert_eq!(misplaced.len(), before.len() + changed);
+            assert!(
+                misplaced
+                    .iter()
+                    .any(|row| row[0] == SqliteValue::from(second.command_id.to_string()))
+            );
+            assert!(
+                matches!(result, Err(StorageError::InvalidData { .. })),
+                "indexed journal reconstruction hid another command's {table} rows: {result:?}"
+            );
+            assert_eq!(
+                command_transition_rows(connection, &sql, &parameters)?,
+                before
+            );
+            assert_eq!(
+                storage.resolve_command_authority(session, first.command_id, &request)?,
+                original
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one populated file upgrade proves exact archive preservation, executed index seeks, and cold receipt reconstruction across runs and sessions"
+    )]
+    fn v20_transition_indexes_preserve_v19_recovery_and_exact_journal_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-v20-command-transition-indexes");
+        let path_text = path.to_string_lossy().into_owned();
+        let runs = [RunId::new(0x2019), RunId::new(0x2020)];
+        let sessions = [HostSessionId::new(0x201), HostSessionId::new(0x202)];
+        let mut observed = Vec::new();
+        for (run_index, run_id) in runs.into_iter().enumerate() {
+            let manifest = unattributed_manifest_at(run_id, 20);
+            let mut pipeline = if run_index == 0 {
+                StoragePipeline::create_new_file_for_run(&path_text, manifest)?
+            } else {
+                StoragePipeline::append_run(&path_text, manifest)?
+            };
+            for session in sessions {
+                let journal = pipeline.journal_port(session, StorageJournalOptions::default())?;
+                let mut owner = HostCore::with_journal(
+                    session,
+                    journal_fault_world_with_interval(1),
+                    journal_fault_host_options(),
+                    Box::new(journal),
+                )?;
+                let mut frontend = NullFrontend::new(owner.local_port(), session.get() ^ 0xfeed);
+                let mut clock = 0;
+                let speeds = [[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]][run_index];
+                for (offset, speed) in speeds.into_iter().enumerate() {
+                    let envelope = CommandEnvelope::new(
+                        CommandId::from_client_sequence(session.get(), u64::try_from(offset + 1)?),
+                        HostCommand::SetSpeed(speed),
+                    );
+                    let receipt = apply_host_checkpoint_command(
+                        &mut frontend,
+                        &mut owner,
+                        &envelope,
+                        &mut clock,
+                    );
+                    observed.push((run_id, session, envelope, receipt));
+                }
+            }
+            pipeline.shutdown()?;
+        }
+
+        let connection = Connection::open(&path_text)?;
+        // Only the additive V20 objects are removed. Requiring the complete V19
+        // fingerprint makes this a real upgrade fixture, including retained archives.
+        connection.execute_batch(
+            "DROP INDEX host_command_application_transitions_run_session_journal_index;
+             DROP INDEX host_command_storage_transitions_run_session_journal_index;
+             DELETE FROM _schema_migrations WHERE version = 20;
+             PRAGMA user_version = 19;",
+        )?;
+        let old_schema = read_schema_objects(&connection)?;
+        assert_eq!(
+            old_schema,
+            canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V19_VERSION)?
+        );
+        assert_eq!(
+            Storage::validate_supported_existing_scriptbots_schema(&connection)?,
+            SCRIPTBOTS_SCHEMA_V19_VERSION
+        );
+        let mut before = BTreeMap::new();
+        for (table, _, _) in COMMAND_TRANSITION_JOURNAL_INDEXES {
+            before.insert(
+                table,
+                command_transition_rows(
+                    &connection,
+                    &format!(
+                        "SELECT * FROM {table}
+                         ORDER BY run_id, host_session_id, command_id, transition_ordinal"
+                    ),
+                    &[],
+                )?,
+            );
+            assert!(
+                !before[table].is_empty(),
+                "upgrade fixture must contain {table}"
+            );
+        }
+        connection.close()?;
+
+        for run_id in runs {
+            let storage = Storage::recover_existing_run(&path_text, run_id)?;
+            let connection = storage.connection()?;
+            Storage::validate_existing_scriptbots_schema(connection)?;
+            let upgraded_schema = read_schema_objects(connection)?;
+            assert_eq!(upgraded_schema, canonical_schema_objects()?);
+            let added: Vec<_> = upgraded_schema
+                .iter()
+                .filter(|object| !old_schema.contains(object))
+                .collect();
+            assert_eq!(added.len(), COMMAND_TRANSITION_JOURNAL_INDEXES.len());
+            assert!(
+                old_schema
+                    .iter()
+                    .all(|object| upgraded_schema.contains(object))
+            );
+            for (table, index, columns) in COMMAND_TRANSITION_JOURNAL_INDEXES {
+                assert!(
+                    added
+                        .iter()
+                        .any(|object| object.name == index && object.object_type == "index")
+                );
+                assert_eq!(
+                    command_transition_rows(
+                        connection,
+                        &format!(
+                            "SELECT * FROM {table}
+                             ORDER BY run_id, host_session_id, command_id, transition_ordinal"
+                        ),
+                        &[],
+                    )?,
+                    before[table],
+                    "index backfill changed retained {table} evidence"
+                );
+                let indexed = command_transition_journal_query(table, columns, false);
+                let scanned = command_transition_journal_query(table, columns, true);
+                for (expected_run, session, envelope, _) in &observed {
+                    if *expected_run != run_id {
+                        continue;
+                    }
+                    let journal: String = connection
+                        .query_row_with_params(
+                            "SELECT journal_sequence FROM host_command_records
+                             WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3",
+                            &[
+                                sqlite_run_id(*expected_run),
+                                encode_journal_u64(session.get()).into(),
+                                envelope.command_id.to_string().into(),
+                            ],
+                        )?
+                        .get_typed(0)?;
+                    let parameters = [
+                        sqlite_run_id(*expected_run),
+                        encode_journal_u64(session.get()).into(),
+                        journal.into(),
+                    ];
+                    let actual = command_transition_rows(connection, &indexed, &parameters)?;
+                    assert_eq!(
+                        actual,
+                        command_transition_rows(connection, &scanned, &parameters)?
+                    );
+                    assert!(!actual.is_empty(), "journal lookup lost {table} rows");
+                    assert!(actual.iter().all(|row| row[0] == SqliteValue::from(envelope.command_id.to_string())));
+                    assert_command_transition_index_seek(connection, index, &indexed, &parameters)?;
+                }
+            }
+            for (expected_run, session, envelope, receipt) in &observed {
+                if *expected_run != run_id {
+                    continue;
+                }
+                let authority = storage.resolve_command_authority(
+                    HostSessionId::new(session.get() + 100),
+                    envelope.command_id,
+                    &CommandAuthorityRequest::Status {
+                        max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+                    },
+                )?;
+                assert!(
+                    matches!(authority, CommandAuthorityLookup::Found(authority) if authority.status() == receipt),
+                    "V19 recovery must retain the exact original command receipt"
+                );
+            }
+            let session_commands: Vec<_> = observed
+                .iter()
+                .filter(|(expected_run, session, _, _)| {
+                    *expected_run == run_id && *session == sessions[0]
+                })
+                .collect();
+            assert_indexed_journal_lookup_rejects_cross_command_rows(
+                &storage,
+                sessions[0],
+                &session_commands[0].2,
+                &session_commands[1].2,
+            )?;
+            storage.close()?;
+        }
         Ok(())
     }
 
@@ -34222,8 +34574,12 @@ mod tests {
                 "partition_genomes_and_narratives_by_island",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V19_VERSION,
                 "index_island_narrative_identities",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "index_command_transitions_by_journal",
             ),
         ]
         .into_iter()
@@ -35291,7 +35647,9 @@ mod tests {
             connection.execute(&format!("DROP TABLE {table}"))?;
         }
         connection.execute_batch(
-            "DROP TABLE host_command_claims;
+            "DROP INDEX host_command_application_transitions_run_session_journal_index;
+             DROP INDEX host_command_storage_transitions_run_session_journal_index;
+             DROP TABLE host_command_claims;
              DELETE FROM _schema_migrations WHERE version >= 13;
              PRAGMA user_version = 12;",
         )?;
