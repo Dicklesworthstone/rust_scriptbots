@@ -164,19 +164,42 @@ original `bd-2z0.14.1.18.1`; verify existing `bd-2z0.14.1.18.4`, scopes unchange
   execute the eight IndexedDB adapter tests, actual Chromium lifecycle cases,
   and the real freshly packaged WASM save/reload/restore journey. Retain abort,
   corruption, stale-owner and exact-next-tick assertions and evidence classes.
-- [ ] Correct the second-pass duplicate-key regression in `bd-qjh2`: check the
+- [x] Correct the second-pass duplicate-key regression in `bd-qjh2`: check the
   original body's object shape and deserialize it directly, retaining Serde's
   duplicate-field refusal. Exercise raw repeated and escaped count keys on both
   REST aliases under the existing no-admission owner barrier; run required
   checks, the complete server module and scanner before committing this fix.
+  Exact patch `27190624` passes eight DSR checks, all 67 server tests and a
+  zero-critical scanner result; source committed as `e8d32e50`.
 - [ ] Build the final optimized app with the duplicate-key correction, bind its
   actual source and binary hashes, and use that binary for the native 1×/2× run.
-- [ ] Preserve the later native GPUI Lab and Bevy AgentUid contributions through
+- [x] Preserve the later native GPUI Lab and Bevy AgentUid contributions through
   pinned `e8afd206`; review the application callbacks, worker cancellation,
   projections, native button regressions and original incoming plan entries.
+  Canonical `6ab144aa` retains all source, one incoming tracker comment and
+  existing local tracker/plan content. Its source remains unqualified.
+- [x] Retain the formatted GPUI preflight's real E0521 selector-lifetime error;
+  the application `gui,bevy_render` strict check passed, but workspace test
+  compilation failed. Correct only the button helper's literal selector lifetime;
+  all native button assertions remain. Corrective patch `9e446803` passes all
+  nine DSR checks: three GPUI component cases, two actual provider cases and
+  zero-critical UBS over five files. Reviewed source is committed as `569f1165`.
 - [ ] Format and qualify the integrated GPUI source, including the actual new
   provider and native-button tests plus the `gui` application feature, required
   workspace checks and full Bevy/application suites with observed provenance.
+- [x] Retain the complete clean `569f1165` application result: 781 passed,
+  zero failed and one existing live-provider ignore; the unchanged full-publication
+  tournament barrier passes with actually observed clean/status/diff provenance.
+  The overall 19-check run is incomplete because its separate Bevy fixture failed.
+- [x] Repair the empty-world selected-UID fixture without weakening its exact
+  assertions. Retain the first repair's valid tick-48 seeded-arrival refusal;
+  use the existing injected-arrival API instead. Exact patch `0e15bffc` passes
+  nine DSR checks, including 299 Bevy library and seven integration tests,
+  required compiler/lint/format checks and the changed-file scanner. Reviewed
+  source is committed as `1f144470`; the only later Rust difference from the
+  complete app run is this one line inside the Bevy test module.
+- [ ] Run the complete renderer library suite as well as the new focused cases;
+  the added Lab tabs also interact with existing window and presentation behavior.
 - [ ] Execute matched-seed comparison, columnar/text export and observed-order
   historical replay regressions against the combined source; leave broader
   original scientific acceptance open unless its full requirements are observed.
