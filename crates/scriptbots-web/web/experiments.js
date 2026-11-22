@@ -2,13 +2,18 @@
 // This controller owns requests and observations, never a world or a scientific clock.
 import { exactIdentity } from "./inspector.js";
 import { interventionRequestId } from "./interventions.js";
-import { prepareExperimentRequest, validateExperimentCatalog, validateExperimentStatus,
-  validateExperimentComparison, experimentCanResume } from "./experiment-protocol.js";
+import { EXPERIMENT_LIMITS, prepareExperimentRequest, validateExperimentCatalog, validateExperimentStatus,
+  validateExperimentComparison, validateExperimentRunArtifacts, experimentRunArtifactPath,
+  experimentCanResume } from "./experiment-protocol.js";
 
 export const EXPERIMENT_PAGE_SIZE = 12;
 export const EXPERIMENT_RUN_PAGE_SIZE = 16;
 const POLL_MS = 2000;
 const ACTIVE = new Set(["pending", "running", "cancelling"]);
+const ZIP_CRC_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
+  for (let bit = 0; bit < 8; bit += 1) value = (value >>> 1) ^ (0xedb88320 & -(value & 1));
+  return value >>> 0;
+});
 const errorText = (error) => String(error?.message || error || "Unknown experiment failure").slice(0, 1024);
 
 function freeze(value) {
@@ -28,11 +33,97 @@ function completedVariants(status) {
   return new Set([...variants].filter(([, complete]) => complete).map(([id]) => id));
 }
 
+function requireDownloadActive(signal) {
+  if (signal.aborted) throw new Error("Run download was cancelled; no file was exported");
+}
+
+async function verifiedRunFile(result, expected, signal) {
+  requireDownloadActive(signal);
+  if (!result || !(result.blob instanceof Blob) || result.blob.size !== expected.byte_size
+      || result.filename !== expected.filename
+      || Object.keys(expected).some((key) => result.metadata?.[key] !== expected[key])) {
+    throw new Error("Downloaded file does not match the selected run's immutable inventory");
+  }
+  const bytes = new Uint8Array(await result.blob.arrayBuffer());
+  requireDownloadActive(signal);
+  if (!globalThis.crypto?.subtle) throw new Error("Verified downloads require Web Crypto on a secure connection");
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+  requireDownloadActive(signal);
+  const actual = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  if (actual !== expected.checksum_sha256) throw new Error("Downloaded run file failed SHA-256 verification");
+  return bytes;
+}
+
+// Store original verified bytes without recompression or renaming. The bounded
+// inventory fits classic ZIP; no ZIP64, host paths, or external archive dependency.
+function runBundleZip(files) {
+  const local = [], central = [];
+  let offset = 0, centralBytes = 0;
+  for (const { path, bytes } of files) {
+    const name = new TextEncoder().encode(path);
+    let crc = 0xffffffff;
+    for (const byte of bytes) crc = (crc >>> 8) ^ ZIP_CRC_TABLE[(crc ^ byte) & 0xff];
+    crc = (crc ^ 0xffffffff) >>> 0;
+    const header = new Uint8Array(30), h = new DataView(header.buffer);
+    h.setUint32(0, 0x04034b50, true);
+    h.setUint16(4, 20, true);
+    h.setUint16(6, 0x800, true);
+    h.setUint16(12, 33, true); // 1980-01-01; the manifest retains scientific provenance.
+    h.setUint32(14, crc, true);
+    h.setUint32(18, bytes.length, true);
+    h.setUint32(22, bytes.length, true);
+    h.setUint16(26, name.length, true);
+    const entry = new Uint8Array(46), c = new DataView(entry.buffer);
+    c.setUint32(0, 0x02014b50, true);
+    c.setUint16(4, 20, true);
+    c.setUint16(6, 20, true);
+    c.setUint16(8, 0x800, true);
+    c.setUint16(14, 33, true);
+    c.setUint32(16, crc, true);
+    c.setUint32(20, bytes.length, true);
+    c.setUint32(24, bytes.length, true);
+    c.setUint16(28, name.length, true);
+    c.setUint32(42, offset, true);
+    local.push(header, name, bytes);
+    central.push(entry, name);
+    offset += header.length + name.length + bytes.length;
+    centralBytes += entry.length + name.length;
+  }
+  const end = new Uint8Array(22), e = new DataView(end.buffer);
+  e.setUint32(0, 0x06054b50, true);
+  e.setUint16(8, files.length, true);
+  e.setUint16(10, files.length, true);
+  e.setUint32(12, centralBytes, true);
+  e.setUint32(16, offset, true);
+  return new Blob([...local, ...central, end], { type: "application/zip" });
+}
+
+function verifyBundleIndex(files, inventory) {
+  const bytes = files.find((file) => file.path === "bundle_manifest.json")?.bytes;
+  // Inspect only the portable artifact index. Preserve all original bytes;
+  // full-width seeds inside the manifest are never interpreted or reserialized.
+  const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  const expected = new Map(inventory.artifacts.filter((artifact) =>
+    experimentRunArtifactPath(artifact, inventory) !== "bundle_manifest.json")
+    .map((artifact) => [experimentRunArtifactPath(artifact, inventory), artifact]));
+  if (manifest?.bundle_version !== "scriptbots.run-bundle.v1" || !Array.isArray(manifest.artifacts)
+      || manifest.artifacts.length !== expected.size || manifest.digests?.max_tick !== inventory.run.total_ticks) {
+    throw new Error("Run bundle manifest does not match the complete downloaded inventory");
+  }
+  for (const entry of manifest.artifacts) {
+    const artifact = expected.get(entry?.relative_path);
+    if (!artifact || entry.bytes_len !== artifact.byte_size || entry.blake3_hex !== artifact.checksum_blake3) {
+      throw new Error("Run bundle manifest has a missing, replaced, or duplicated artifact");
+    }
+    expected.delete(entry.relative_path);
+  }
+}
+
 /** One in-flight operation and one exact uncertain creation request per observed source. */
 export class ExperimentController {
-  constructor({ list, create, status, cancel, resume, retryFailed, compare, onChange = () => {},
+  constructor({ list, create, status, cancel, resume, retryFailed, compare, artifacts, download, onChange = () => {},
     id = interventionRequestId, now = () => performance.now() }) {
-    this.services = { list, create, status, cancel, resume, retryFailed, compare };
+    this.services = { list, create, status, cancel, resume, retryFailed, compare, artifacts, download };
     this.onChange = onChange;
     this.id = id;
     this.now = now;
@@ -50,6 +141,9 @@ export class ExperimentController {
     this.creation = null;
     this.failedRetry = null;
     this.comparison = null;
+    this.artifactRunId = null;
+    this.runArtifacts = null;
+    this.selectedArtifact = null;
     this.runPageIndex = 0;
     this.lastCatalogRead = -Infinity;
     this.lastStatusRead = -Infinity;
@@ -71,6 +165,10 @@ export class ExperimentController {
     && this.selected?.failed_runs > 0
     && ["stopped", "cancelled", "failed"].includes(this.selected.status); }
   get canCompare() { return this.canOperate && completedVariants(this.selected).size >= 2; }
+  get completedRuns() { return this.selected?.runs.filter((run) => run.state === "completed") ?? []; }
+  get canReadArtifacts() { return this.canOperate && this.completedRuns.some((run) => run.run_id === this.artifactRunId); }
+  get canDownloadBundle() { return this.canReadArtifacts && this.runArtifacts?.run.run_id === this.artifactRunId; }
+  get canDownloadArtifact() { return this.canDownloadBundle && this.selectedArtifact !== null; }
   get totalRunPages() { return Math.max(1, Math.ceil((this.selected?.runs.length ?? 0) / EXPERIMENT_RUN_PAGE_SIZE)); }
   get visibleRuns() {
     const start = this.runPageIndex * EXPERIMENT_RUN_PAGE_SIZE;
@@ -242,6 +340,11 @@ export class ExperimentController {
       this.comparison = null;
     }
     this.selected = copy(checked);
+    if (!previous || !this.completedRuns.some((run) => run.run_id === this.artifactRunId)) {
+      this.artifactRunId = this.completedRuns[0]?.run_id ?? null;
+      this.runArtifacts = null;
+      this.selectedArtifact = null;
+    }
     if (this.failedRetry) {
       if (checked.experiment_id !== this.failedRetry.experimentId
           || checked.generation > this.failedRetry.generation) this.failedRetry = null;
@@ -326,6 +429,82 @@ export class ExperimentController {
   }
 
   clearComparison() { this.comparison = null; this.emit(); }
+
+  selectArtifactRun(runId) {
+    if (!this.canOperate || !this.completedRuns.some((run) => run.run_id === runId)) return false;
+    if (this.artifactRunId !== runId) {
+      this.artifactRunId = runId;
+      this.runArtifacts = null;
+      this.selectedArtifact = null;
+    }
+    this.emit();
+    return true;
+  }
+
+  loadRunArtifacts() {
+    if (!this.canReadArtifacts) return Promise.resolve(null);
+    const status = this.selected;
+    const request = copy({ sessionId: this.source.sessionId, experimentId: status.experiment_id, runId: this.artifactRunId });
+    this.runArtifacts = null;
+    this.selectedArtifact = null;
+    this.notice = "Verifying the selected completed run and discovering its portable files.";
+    return this.run("Completed run files unavailable", (signal) => this.services.artifacts(request, signal), (value) => {
+      this.runArtifacts = copy(validateExperimentRunArtifacts(value, { status, runId: request.runId }));
+      this.selectedArtifact = this.runArtifacts.artifacts.find((artifact) =>
+        experimentRunArtifactPath(artifact, this.runArtifacts) === "bundle_manifest.json");
+      this.notice = "The host verified this completed run. Choose an individual file or download the complete portable bundle.";
+      return this.runArtifacts;
+    });
+  }
+
+  selectArtifact(artifactId) {
+    if (!this.canDownloadBundle) return false;
+    const selected = this.runArtifacts.artifacts.find((artifact) => artifact.artifact_id === artifactId);
+    if (!selected) return false;
+    this.selectedArtifact = selected;
+    this.emit();
+    return true;
+  }
+
+  downloadSelectedArtifact() {
+    if (!this.canDownloadArtifact) return Promise.resolve(null);
+    const expected = this.selectedArtifact;
+    const request = copy({ sessionId: this.source.sessionId, artifactId: expected.artifact_id,
+      expected, maxBytes: EXPERIMENT_LIMITS.maxRunArtifactBytes });
+    this.notice = "Downloading and checking the selected run file.";
+    return this.run("Run file download unavailable", async (signal) => {
+      const result = await this.services.download(request, signal);
+      await verifiedRunFile(result, expected, signal);
+      return { blob: result.blob, filename: expected.filename };
+    }, (result) => {
+      this.notice = "Verified run file is ready to save. Your browser manages the final file save.";
+      return result;
+    });
+  }
+
+  downloadRunBundle() {
+    if (!this.canDownloadBundle) return Promise.resolve(null);
+    const inventory = this.runArtifacts;
+    const sessionId = this.source.sessionId;
+    this.notice = "Downloading and checking every file before preparing the portable run bundle.";
+    return this.run("Run bundle download unavailable", async (signal) => {
+      const files = [];
+      for (const expected of inventory.artifacts) {
+        requireDownloadActive(signal);
+        const request = copy({ sessionId, artifactId: expected.artifact_id, expected,
+          maxBytes: EXPERIMENT_LIMITS.maxRunArtifactBytes });
+        const result = await this.services.download(request, signal);
+        const bytes = await verifiedRunFile(result, expected, signal);
+        files.push({ path: experimentRunArtifactPath(expected, inventory), bytes });
+      }
+      requireDownloadActive(signal);
+      verifyBundleIndex(files, inventory);
+      return { blob: runBundleZip(files), filename: inventory.run.run_id + ".zip" };
+    }, (result) => {
+      this.notice = "Complete verified run bundle is ready to save. Extract the ZIP to preserve its manifest and relative paths.";
+      return result;
+    });
+  }
 
   previousRuns() {
     if (this.runPageIndex > 0) { this.runPageIndex -= 1; this.emit(); }

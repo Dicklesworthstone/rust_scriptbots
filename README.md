@@ -2544,6 +2544,48 @@ History is bounded to 16 retry generations; reaching that limit refuses another
 retry and preserves the evidence. Interrupted publication can recover only when
 the retained failure record, successor status and executable continuations agree.
 
+#### Download a completed experiment run
+
+A completed run can be downloaded while other runs in the same experiment are
+still active or have failed. Read `experiment status ID`, choose a completed
+`run_id`, then inspect or download its entire portable bundle:
+
+```bash
+cargo run -p scriptbots-app --bin control_cli -- experiment run-artifacts \
+  food-pause-recovery RUN_ID
+cargo run -p scriptbots-app --bin control_cli -- experiment download-run \
+  food-pause-recovery RUN_ID --out runs/downloaded-result
+cargo run -p scriptbots-app --bin scriptbots-app -- \
+  --verify-bundle runs/downloaded-result
+```
+
+Replace `RUN_ID` with the exact identifier returned by status. `run-artifacts`
+prints the verified run, plan digest, observed generation and complete immutable
+file inventory. `download-run` checks every metadata record, response size,
+BLAKE3/SHA-256 checksum and manifest entry before creating the destination. It
+preserves the original bytes and relative paths, then uses the existing offline
+verifier to restore the final owner and compare its scientific result. Success
+prints a JSON receipt with the destination, file/byte counts, manifest digest,
+verified tick and final scientific digest. This verifies the saved endpoint;
+it does not rerun the experiment's complete history.
+
+The destination must be new. Network, inventory, checksum and manifest-index
+failures create no destination directory. Write, sync or final-owner verification
+errors report failure and retain the output for inspection; an existing result
+is never overwritten. Run downloads use the per-run bounds documented above,
+including 33 files and 48 MiB total, and preserve full-width integer seeds.
+
+In the connected browser's **Matched-seed experiments** panel, open a retained
+experiment and use **Completed run downloads**. Choose the completed run, select
+**Load verified run files**, then download an individual file or choose
+**Download complete run bundle (.zip)**. The browser checks the selected source,
+plan, run, file metadata, byte counts and SHA-256. The complete ZIP also checks
+its manifest index and retains all original paths and file bytes. Extract the
+archive before using `--verify-bundle`; no server-local bundle path is required.
+Changing the source or hiding the panel aborts an in-flight download, and no
+partial ZIP is offered. **Export browser observation JSON** remains a separate
+export of observed status and comparisons.
+
 #### Checkpoints and artifacts from the shell
 
 The same control CLI captures checkpoints and discovers retained artifacts. Use

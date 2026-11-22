@@ -460,6 +460,62 @@ function experimentTransport() {
   return { client, prepared, sessionId: client.tracker.sessionId };
 }
 
+test("run artifact inventory uses the same host and session, exact seeds and a bounded nonpaginated response", async () => {
+  const original = globalThis.fetch, requests = [];
+  try {
+    const { client, sessionId } = experimentTransport();
+    globalThis.fetch = async (url, options) => {
+      requests.push({ url: new URL(url), ...options });
+      return new Response('{"run":{"seed":18446744073709551615}}');
+    };
+    const result = await client.experimentRunArtifacts("cohort.example", "cohort.example-control-seed18446744073709551615", { sessionId });
+    assert.equal(result.run.seed, "18446744073709551615");
+    assert.equal(requests[0].url.href, "https://lab.example/prefix/api/v1/experiments/cohort.example/runs/cohort.example-control-seed18446744073709551615/artifacts");
+    assert.equal(requests[0].method, "GET");
+    assert.equal(requests[0].headers["X-ScriptBots-Session"], sessionId);
+    assert.equal(requests[0].credentials, "omit");
+    for (const id of ["../other", ".", "run/escape", "x".repeat(129)]) {
+      await assert.rejects(client.experimentRunArtifacts("cohort.example", id, { sessionId }));
+    }
+    await assert.rejects(client.experimentRunArtifacts("cohort.example", "run", { sessionId: "7" }));
+    assert.equal(requests.length, 1);
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(EXPERIMENT_LIMITS.maxRunArtifactResponseBytes + 1)); },
+      cancel() { cancelled = true; },
+    }));
+    await assert.rejects(client.experimentRunArtifacts("cohort.example", "run", { sessionId }), /exceeds/);
+    assert.equal(cancelled, true);
+    let respond;
+    globalThis.fetch = () => new Promise((resolve) => { respond = resolve; });
+    const pending = client.experimentRunArtifacts("cohort.example", "run", { sessionId });
+    client.generation += 1;
+    respond(new Response("{}"));
+    await assert.rejects(pending, /connection changed/);
+  } finally { globalThis.fetch = original; }
+});
+
+test("artifact download refuses moved paths or changed provenance before requesting any file bytes", async () => {
+  const original = globalThis.fetch;
+  const expected = { artifact_id: "experiment-" + "a".repeat(64), filename: "bundle_manifest.json",
+    content_type: "application/json", byte_size: 2, checksum_blake3: "b".repeat(64),
+    checksum_sha256: "c".repeat(64), created_at_utc: "1794456010",
+    relative_path: "experiments/cohort/run/bundle_manifest.json" };
+  try {
+    const { client, sessionId } = experimentTransport();
+    for (const [key, value] of [["relative_path", "experiments/foreign/run/bundle_manifest.json"],
+      ["content_type", "application/octet-stream"], ["created_at_utc", "1794456011"]]) {
+      let calls = 0;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ ...expected, [key]: value }));
+      };
+      await assert.rejects(client.downloadArtifact(expected.artifact_id, { sessionId, expected }), /differs/);
+      assert.equal(calls, 1, "a replaced catalog entry cannot trigger a byte download");
+    }
+  } finally { globalThis.fetch = original; }
+});
+
 test("failed-run retry transport binds the generation and source before HTTP admission", async () => {
   const original = globalThis.fetch, requests = [];
   globalThis.fetch = async (url, options) => {

@@ -3,7 +3,8 @@
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
 **Native experiment recovery and portable results (2026-11-21):**
-[Currently In Progress — Codex; functional contributions to the native Lab,
+[Implemented and independently reviewed; browser and archive checks passed,
+native execution qualification blocked — Codex; contributions to the native Lab,
 `bd-2z0.5.11`, `bd-2z0.12.2` and `bd-2z0.12.3`; broader acceptance retained]
 
 - Implemented explicit generation-guarded failed-run retry in the shared native
@@ -20,10 +21,19 @@
   includes all indexed files and the manifest; it preserves the original artifact
   root and uses existing verified byte downloads. Bounds are 33 files, 16 MiB per
   file, 32 MiB indexed data plus 16 MiB manifest, and 256 KiB response JSON.
-- Deliver those results through the control CLI and browser, preserving bundle
-  paths and checking downloaded bytes against the observed artifact identities.
-- Validate the actual changed paths through DSR and report native execution
-  separately from source review, formatting and browser tests.
+- Added CLI `experiment run-artifacts` and `experiment download-run --out`.
+  Download all bounded files and verify metadata, both checksums and the complete
+  manifest index before claiming a new output directory. Preserve paths and bytes,
+  refuse existing destinations and retain partial output on write/sync failures.
+  The existing offline verifier then restores the saved final owner and checks
+  the requested endpoint before a success receipt is emitted.
+- Added browser completed-run selection, verified inventory discovery, individual
+  file download and a complete portable ZIP. Source/run/plan checks, explicit
+  transfer bounds, SHA-256 verification and exact manifest-index membership
+  prevent foreign, changed or incomplete results from being exported. A source
+  change or hidden panel aborts the transfer; other cohort progress preserves an
+  already observed completed run's inventory. Original scientific bytes and
+  full-width seed tokens are never reserialized into replacement artifacts.
 
 Native retry source and enum dispatch were independently reviewed; the six Rust
 files were parsed through DSR with the pinned formatter. Existing formatting
@@ -45,6 +55,29 @@ for all three artifact-backend files. Native artifact tests have been authored
 for portable reassembly, corrupt/unfinished/failed companions, foreign-owner
 substitution, cold catalogs, root changes and actual REST/MCP listeners; these
 tests remain unexecuted behind the native compiler blocker described above.
+
+DSR `scriptbots_web_node_2/20261121T223113-A5NNPMrn` passed all 267 Node tests
+with zero skips or failures; changed browser modules also passed syntax checks.
+The frozen suite includes real SHA-256 transfer checks, malformed/incomplete
+inventories, corrupt bytes and metadata, source/visibility cancellation, and
+complete ZIP path/offset/CRC32 checks. DSR
+`scriptbots_zip_interop/20261121T223340-YdE6Bexl` then passed 2/2 independent
+archive checks: Python `zipfile` read the unchanged controller test's actual ZIP,
+verified all four fixture entries and CRCs, and compared the original CSV,
+binary checkpoint-fixture and full-width-seed JSON bytes. These are browser
+controller and archive-format observations, not native checkpoint execution or
+graphical end-to-end qualification. The earlier broad Node glob also picked up
+two Playwright scripts whose required module was unavailable; those did not run.
+
+DSR `scriptbots_cli_final_format/20261121T224020-sIJ8IPYx` passed the final CLI
+source formatting check after independent review corrected the 16-hex scientific
+digest distinction and typed manifest run-ID comparison. CLI regressions cover
+real REST download/reassembly, immutable existing outputs, companion independence,
+socket-level metadata/payload corruption and bounded portable paths; they are
+authored but unexecuted. The final evidence comparison matched all six native
+retry files, three backend files, 34 browser files and the CLI source byte-for-byte
+to their respective DSR snapshots. Workspace check/Clippy and graphical/native
+execution remain unqualified; no broader bead is closed by these scoped results.
 
 **Bounded API work and failed-study recovery (2026-11-21):**
 [Implemented and independently reviewed; final browser and changed-Rust-format

@@ -444,6 +444,11 @@ export class RemoteStreamClient {
       sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, parse: parseExperimentJson });
   }
 
+  async experimentRunArtifacts(experimentId, runId, { sessionId, signal } = {}) {
+    return this.labJson(`/api/v1/experiments/${experimentIdentifier(experimentId)}/runs/${experimentIdentifier(runId)}/artifacts`,
+      sessionId, EXPERIMENT_LIMITS.maxRunArtifactResponseBytes, { signal, parse: parseExperimentJson });
+  }
+
   async cancelExperiment(experimentId, { sessionId, signal } = {}) {
     return this.labJson("/api/v1/experiments/" + experimentIdentifier(experimentId) + "/cancel",
       sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, method: "POST", parse: parseExperimentJson });
@@ -567,7 +572,9 @@ export class RemoteStreamClient {
     }
     if (metadata.artifact_id !== artifactId || (expected && (
       (expected.artifact_id ?? expected.checkpoint_id) !== artifactId
-      || ["byte_size", "checksum_blake3", "checksum_sha256"].some((key) => metadata[key] !== expected[key])))) {
+      || ["byte_size", "checksum_blake3", "checksum_sha256"].some((key) => metadata[key] !== expected[key])
+      || ["filename", "relative_path", "content_type", "created_at_utc"].some((key) =>
+        Object.hasOwn(expected, key) && metadata[key] !== expected[key])))) {
       throw new Error("Artifact catalog entry differs from the selected saved source");
     }
     const url = this.apiUrl(`/api/v1/artifacts/${artifactId}/download`, sessionId);

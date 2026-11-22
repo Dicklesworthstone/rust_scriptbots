@@ -176,6 +176,7 @@ const experimentPanel = document.getElementById("experiment-lab");
 const experimentForm = document.getElementById("experiment-form");
 const experimentFormError = document.getElementById("experiment-form-error");
 let experimentExportUrl = null;
+let experimentDownloadUrl = null;
 const experiments = new ExperimentController({
   list: (request, signal) => remoteClient.listExperiments({ ...request, signal }),
   create: (request, signal) => remoteClient.createExperiment(request, { signal }),
@@ -184,6 +185,8 @@ const experiments = new ExperimentController({
   resume: (request, signal) => remoteClient.resumeExperiment(request.experimentId, { sessionId: request.sessionId, signal }),
   retryFailed: (request, signal) => remoteClient.retryFailedExperiment(request.experimentId, { ...request, signal }),
   compare: (request, signal) => remoteClient.compareExperiment(request.experimentId, { ...request, signal }),
+  artifacts: (request, signal) => remoteClient.experimentRunArtifacts(request.experimentId, request.runId, { ...request, signal }),
+  download: (request, signal) => remoteClient.downloadArtifact(request.artifactId, { ...request, signal }),
   onChange: (controller) => renderExperimentLab(experimentPanel, controller),
 });
 
@@ -219,6 +222,24 @@ experimentForm?.addEventListener("submit", (event) => {
 document.getElementById("experiment-select")?.addEventListener("change", (event) => {
   if (event.target.value) void experimentAction(() => experiments.open(event.target.value));
 });
+document.getElementById("experiment-artifact-run")?.addEventListener("change", (event) => {
+  experiments.selectArtifactRun(event.target.value);
+});
+document.getElementById("experiment-artifact-select")?.addEventListener("change", (event) => {
+  experiments.selectArtifact(event.target.value);
+});
+async function saveExperimentDownload(action) {
+  const result = await action();
+  if (!result) return;
+  if (experimentDownloadUrl) URL.revokeObjectURL(experimentDownloadUrl);
+  experimentDownloadUrl = URL.createObjectURL(result.blob);
+  const anchor = document.createElement("a");
+  anchor.href = experimentDownloadUrl;
+  anchor.download = result.filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
 for (const [id, action] of [
   ["catalog-refresh", () => experiments.refreshCatalog(true)],
   ["catalog-first", () => experiments.firstPage()],
@@ -228,6 +249,9 @@ for (const [id, action] of [
   ["cancel", () => experiments.cancel()],
   ["resume", () => experiments.resume()],
   ["retry-failed", () => experiments.retryFailed()],
+  ["artifacts-load", () => experiments.loadRunArtifacts()],
+  ["artifact-download", () => saveExperimentDownload(() => experiments.downloadSelectedArtifact())],
+  ["bundle-download", () => saveExperimentDownload(() => experiments.downloadRunBundle())],
   ["run-previous", () => experiments.previousRuns()],
   ["run-next", () => experiments.nextRuns()],
   ["compare", () => experiments.compare({
@@ -1468,6 +1492,8 @@ window.addEventListener("pagehide", () => {
   experiments.setEnabled(false);
   if (experimentExportUrl) URL.revokeObjectURL(experimentExportUrl);
   experimentExportUrl = null;
+  if (experimentDownloadUrl) URL.revokeObjectURL(experimentDownloadUrl);
+  experimentDownloadUrl = null;
   if (labPollTimer !== null) clearInterval(labPollTimer);
   labPollTimer = null;
   if (labDownloadUrl) URL.revokeObjectURL(labDownloadUrl);

@@ -4,6 +4,7 @@ import {
   EXPERIMENT_LIMITS, EXPERIMENT_ENDPOINT_METRICS, prepareExperimentRequest,
   parseExperimentJson, validateExperimentStatus, validateExperimentCatalog,
   validateExperimentComparison, validateExperimentIdentifier, experimentCanResume,
+  validateExperimentRunArtifacts, experimentRunArtifactPath,
 } from "../experiment-protocol.js";
 
 const hash = (letter) => letter.repeat(64);
@@ -67,6 +68,81 @@ function catalogFixture() {
       max_grid_cells: 1_048_576, reserved_grid_cells: 0, reserved_batches: 0 },
   };
 }
+
+function artifactsFixture(status = statusFixture()) {
+  const run = clone(status.runs.find((run) => run.seed === largestSeed && run.state === "completed"));
+  const artifacts = ["bundle_manifest.json", "exports/summary.csv", "evidence/run.json", "checkpoints/final.checkpoint"]
+    .map((path, index) => ({
+      artifact_id: "experiment-" + String(index + 1).padStart(64, "0"),
+      filename: path.split("/").at(-1), content_type: "application/octet-stream", byte_size: 10 + index,
+      checksum_blake3: hash("a"), checksum_sha256: hash("b"), created_at_utc: "1794456010",
+      relative_path: `experiments/${status.experiment_id}/${run.run_id}/${path}`,
+    }));
+  return { experiment_id: status.experiment_id, plan_digest: status.plan_digest,
+    status_generation: status.generation, run, artifacts,
+    total_bytes: artifacts.reduce((sum, artifact) => sum + artifact.byte_size, 0) };
+}
+
+test("completed-run inventory preserves full-width seeds while companion runs advance or fail", () => {
+  const observed = statusFixture();
+  observed.status = "failed";
+  observed.completed_runs -= 1;
+  observed.failed_runs = 1;
+  Object.assign(observed.runs[0], { state: "failed", total_ticks: 0, final_digest: null,
+    bundle_path: null, error_reason: "companion run failed" });
+  const inventory = artifactsFixture(observed);
+  inventory.status_generation += 3;
+  inventory.run.checkpoint_progress = { state: "unavailable", reason: "awaiting_publication" };
+  const wire = JSON.stringify(inventory).replace('"seed":"' + largestSeed + '"', '"seed":' + largestSeed);
+  const checked = validateExperimentRunArtifacts(parseExperimentJson(wire), { status: observed, runId: inventory.run.run_id });
+  assert.equal(checked.run.seed, largestSeed);
+  assert.equal(checked.status_generation, observed.generation + 3);
+  assert.equal(experimentRunArtifactPath(checked.artifacts[3], checked), "checkpoints/final.checkpoint");
+  assert.ok(Object.isFrozen(checked.artifacts[0]));
+  assert.throws(() => validateExperimentRunArtifacts(inventory, { status: observed, runId: observed.runs[0].run_id }), /completed/);
+});
+
+test("run inventories reject replaced owners, incomplete file sets, paths, duplicates and byte bounds", () => {
+  const observed = statusFixture();
+  const original = artifactsFixture(observed);
+  const context = { status: observed, runId: original.run.run_id };
+  const path = (value, relative) => {
+    value.artifacts[1].relative_path = `experiments/${value.experiment_id}/${value.run.run_id}/${relative}`;
+    value.artifacts[1].filename = relative.split("/").at(-1);
+  };
+  const defects = [
+    (v) => { v.experiment_id = "foreign"; },
+    (v) => { v.plan_digest = hash("d"); },
+    (v) => { v.status_generation -= 1; },
+    (v) => { v.run.final_digest = worldDigest("e"); },
+    (v) => { v.run.bundle_path = "/foreign/owner"; },
+    (v) => { v.run.brain_family = "dwraon.baseline"; },
+    (v) => { v.run.seed = "7"; },
+    (v) => { v.artifacts[0].artifact_id = "checkpoint-foreign"; },
+    (v) => { v.artifacts[1].artifact_id = v.artifacts[0].artifact_id; },
+    (v) => { v.artifacts[0].checksum_sha256 = "invalid"; },
+    (v) => { v.artifacts[0].download_url = "https://foreign.example"; },
+    (v) => { v.artifacts.pop(); v.total_bytes -= 13; },
+    (v) => path(v, "exports/another.csv"),
+    (v) => path(v, "../escape.csv"),
+    (v) => path(v, "exports//summary.csv"),
+    (v) => path(v, "exports/summary.csv."),
+    (v) => path(v, "CON.txt"),
+    (v) => path(v, "BUNDLE_MANIFEST.JSON"),
+    (v) => path(v, "bundle_manifest.json/summary.csv"),
+    (v) => { v.artifacts[1].relative_path = v.artifacts[1].relative_path.replace(v.run.run_id, "other-run"); },
+    (v) => { v.total_bytes += 1; },
+    (v) => { v.artifacts[0].byte_size = EXPERIMENT_LIMITS.maxRunArtifactBytes + 1; },
+    (v) => { v.artifacts[2].byte_size = -1; },
+    (v) => { for (const artifact of v.artifacts) artifact.byte_size = EXPERIMENT_LIMITS.maxRunArtifactBytes;
+      v.total_bytes = v.artifacts.length * EXPERIMENT_LIMITS.maxRunArtifactBytes; },
+  ];
+  for (const defect of defects) {
+    const value = clone(original);
+    defect(value);
+    assert.throws(() => validateExperimentRunArtifacts(value, context), undefined, defect.toString());
+  }
+});
 
 test("prepared requests freeze exact full-width seeds and retain identical retry bytes", () => {
   const original = requestFixture();

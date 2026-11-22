@@ -707,6 +707,19 @@
                 <button id="experiment-run-previous" type="button" disabled>Previous run page</button>
                 <button id="experiment-run-next" type="button" disabled>Next run page</button>
                 <ol id="experiment-runs" aria-label="Observed experiment runs"></ol>
+                <h3>Completed run downloads</h3>
+                <label>Completed run
+                    <select id="experiment-artifact-run" disabled><option value="">No completed runs observed</option></select>
+                </label>
+                <button id="experiment-artifacts-load" type="button" disabled>Load verified run files</button>
+                <p id="experiment-artifact-summary" role="status"></p>
+                <label>Run file
+                    <select id="experiment-artifact-select" disabled><option value="">Load a completed run's files</option></select>
+                </label>
+                <p id="experiment-artifact-detail"></p>
+                <button id="experiment-artifact-download" type="button" disabled>Download selected file</button>
+                <button id="experiment-bundle-download" type="button" disabled>Download complete run bundle (.zip)</button>
+                <p>The host verifies the completed run and its saved owner. Downloads check byte counts and SHA-256. The ZIP preserves the original manifest and relative paths; extract it for bundle verification or replay tools. Preparing a download does not replay the experiment.</p>
                 <h3>Paired endpoint comparison</h3>
                 <p>Choose two fully completed arms and one terminal metric. Each distinct matched seed contributes one pair. Results report challenger minus baseline; larger values alone do not imply better fitness.</p>
                 <label>Baseline arm

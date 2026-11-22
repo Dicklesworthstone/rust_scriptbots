@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { ExperimentController, EXPERIMENT_RUN_PAGE_SIZE } from "../experiments.js";
 import { RemoteOwnerHttpError } from "../remote.js";
 
@@ -94,10 +95,10 @@ function comparison(observed) {
 }
 
 async function harness(page = catalog()) {
-  const calls = { list: [], create: [], status: [], cancel: [], resume: [], retryFailed: [], compare: [] };
+  const calls = { list: [], create: [], status: [], cancel: [], resume: [], retryFailed: [], compare: [], artifacts: [], download: [] };
   let clock = 0, sequence = 0;
   const services = {};
-  for (const kind of ["create", "status", "cancel", "resume", "retryFailed", "compare"]) {
+  for (const kind of ["create", "status", "cancel", "resume", "retryFailed", "compare", "artifacts", "download"]) {
     services[kind] = (request, signal) => new Promise((resolve, reject) => {
       calls[kind].push({ request, signal, resolve, reject });
     });
@@ -123,6 +124,172 @@ async function launch(h, observed = status(), input = request()) {
 }
 
 const pair = { baselineVariant: "control", challengerVariant: "treatment", metric: "alive_agents" };
+
+// Transfer fixtures use real SHA-256 bytes and a mutually consistent manifest
+// index. They do not claim to be native checkpoints or scientific replay proof.
+function bundleFixture(observed, runId, alterManifest = () => {}) {
+  const run = observed.runs.find((run) => run.run_id === runId);
+  const files = new Map();
+  const artifacts = [];
+  const add = (path, content) => {
+    const bytes = new Uint8Array(typeof content === "string" ? Buffer.from(content) : content);
+    const metadata = { artifact_id: "experiment-" + String(artifacts.length + 1).padStart(64, "0"),
+      filename: path.split("/").at(-1), content_type: "application/octet-stream", byte_size: bytes.length,
+      checksum_blake3: DIGEST, checksum_sha256: createHash("sha256").update(bytes).digest("hex"),
+      created_at_utc: "1794456010", relative_path: `experiments/${observed.experiment_id}/${runId}/${path}` };
+    artifacts.push(metadata);
+    files.set(metadata.artifact_id, { blob: new Blob([bytes]), filename: metadata.filename, metadata, bytes });
+  };
+  add("exports/summary.csv", "123456789");
+  add("evidence/run.json", '{"seed":18446744073709551615,"fixture":true}\n');
+  add("checkpoints/final.checkpoint", new Uint8Array([0, 255, 128, 7, 0]));
+  const manifest = { bundle_version: "scriptbots.run-bundle.v1", digests: { max_tick: run.total_ticks },
+    artifacts: artifacts.map((artifact) => ({ relative_path: artifact.relative_path.split(runId + "/")[1],
+      blake3_hex: artifact.checksum_blake3, bytes_len: artifact.byte_size, artifact_type: "fixture" })) };
+  alterManifest(manifest);
+  add("bundle_manifest.json", JSON.stringify(manifest));
+  return { files, inventory: { experiment_id: observed.experiment_id, plan_digest: observed.plan_digest,
+    status_generation: observed.generation, run: clone(run), artifacts,
+    total_bytes: artifacts.reduce((total, artifact) => total + artifact.byte_size, 0) } };
+}
+
+async function loadBundleFixture(h, observed = failedStatus(), alterManifest) {
+  await launch(h, observed);
+  const fixture = bundleFixture(observed, h.controller.artifactRunId, alterManifest);
+  const loading = h.controller.loadRunArtifacts();
+  assert.equal(h.calls.artifacts.at(-1).request.runId, fixture.inventory.run.run_id);
+  h.calls.artifacts.at(-1).resolve(clone(fixture.inventory));
+  assert.ok(await loading);
+  return fixture;
+}
+
+async function serveBundle(h, fixture, action = () => h.controller.downloadRunBundle(), mutate = () => {}) {
+  const pending = action();
+  let index = 0;
+  const deadline = Date.now() + 5000;
+  while (h.controller.busy) {
+    const call = h.calls.download[index++];
+    assert.ok(call, "each file is requested sequentially");
+    const result = { ...fixture.files.get(call.request.artifactId) };
+    mutate(result, index);
+    call.resolve(result);
+    // Hashing is asynchronous Web Crypto work, not just a microtask.
+    while (h.controller.busy && h.calls.download.length < index + 1) {
+      assert.ok(Date.now() < deadline, "bounded fixture download must settle");
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  }
+  return pending;
+}
+
+test("a completed run downloads as a byte-identical portable ZIP despite a failed companion", async () => {
+  const h = await harness();
+  const fixture = await loadBundleFixture(h);
+  assert.equal(h.controller.canDownloadBundle, true);
+  assert.equal(h.controller.selectedArtifact.filename, "bundle_manifest.json");
+  const output = await serveBundle(h, fixture);
+  assert.equal(output.filename, fixture.inventory.run.run_id + ".zip");
+  assert.equal(output.blob.type, "application/zip");
+  assert.equal(h.calls.download.length, fixture.inventory.artifacts.length);
+  for (const call of h.calls.download) {
+    assert.equal(call.request.sessionId, SESSION);
+    assert.ok(Object.isFrozen(call.request.expected));
+  }
+  const bytes = new Uint8Array(await output.blob.arrayBuffer()), view = new DataView(bytes.buffer);
+  const entries = new Map();
+  let position = 0;
+  while (view.getUint32(position, true) === 0x04034b50) {
+    assert.equal(view.getUint16(position + 8, true), 0, "original files are stored without compression");
+    const size = view.getUint32(position + 18, true);
+    const names = view.getUint16(position + 26, true);
+    assert.equal(view.getUint16(position + 28, true), 0);
+    const path = new TextDecoder().decode(bytes.slice(position + 30, position + 30 + names));
+    const data = bytes.slice(position + 30 + names, position + 30 + names + size);
+    entries.set(path, data);
+    if (path === "exports/summary.csv") assert.equal(view.getUint32(position + 14, true), 0xcbf43926, "standard CRC32 check vector");
+    position += 30 + names + size;
+  }
+  const centralOffset = position;
+  for (const [path, data] of entries) {
+    assert.equal(view.getUint32(position, true), 0x02014b50);
+    const names = view.getUint16(position + 28, true);
+    assert.equal(new TextDecoder().decode(bytes.slice(position + 46, position + 46 + names)), path);
+    assert.equal(view.getUint32(position + 24, true), data.length);
+    const localOffset = view.getUint32(position + 42, true);
+    assert.equal(view.getUint32(localOffset, true), 0x04034b50);
+    assert.equal(view.getUint32(localOffset + 14, true), view.getUint32(position + 16, true));
+    position += 46 + names;
+  }
+  assert.equal(view.getUint32(position, true), 0x06054b50);
+  assert.equal(view.getUint16(position + 10, true), entries.size);
+  assert.equal(view.getUint32(position + 12, true), position - centralOffset);
+  assert.equal(view.getUint32(position + 16, true), centralOffset);
+  assert.equal(position + 22, bytes.length);
+  for (const artifact of fixture.inventory.artifacts) {
+    const path = artifact.relative_path.split(fixture.inventory.run.run_id + "/")[1];
+    assert.deepEqual(entries.get(path), fixture.files.get(artifact.artifact_id).bytes);
+  }
+  assert.match(new TextDecoder().decode(entries.get("evidence/run.json")), /18446744073709551615/);
+});
+
+test("individual run files are verified and complete ZIP export refuses corruption or a truncated manifest index", async () => {
+  const individual = await harness();
+  const fixture = await loadBundleFixture(individual);
+  const output = await serveBundle(individual, fixture, () => individual.controller.downloadSelectedArtifact());
+  assert.equal(output.filename, "bundle_manifest.json");
+  assert.equal(individual.calls.download.length, 1);
+  for (const defect of ["bytes", "metadata", "manifest"]) {
+    const h = await harness();
+    const fixture = await loadBundleFixture(h, failedStatus(), (manifest) => {
+      if (defect === "manifest") manifest.artifacts.pop();
+    });
+    const output = await serveBundle(h, fixture, undefined, (result, index) => {
+      if (index !== 1) return;
+      if (defect === "bytes") result.blob = new Blob(["987654321"]);
+      if (defect === "metadata") result.metadata = { ...result.metadata, relative_path: "experiments/foreign/run/summary.csv" };
+    });
+    assert.equal(output, null, defect + " must never produce a downloadable ZIP");
+    assert.match(h.controller.notice, /download unavailable/);
+    if (defect !== "manifest") assert.equal(h.calls.download.length, 1);
+    assert.equal(h.controller.canDownloadBundle, true, "failure permits an explicit fresh download");
+  }
+});
+
+test("run inventory survives peer progress but is cleared on selection and source changes", async () => {
+  const h = await harness();
+  const fixture = await loadBundleFixture(h);
+  const retained = h.controller.runArtifacts;
+  const retry = h.controller.retryFailed();
+  h.calls.retryFailed[0].resolve(retriedStatus());
+  assert.ok(await retry);
+  assert.equal(h.controller.runArtifacts, retained);
+  const other = h.controller.completedRuns.find((run) => run.run_id !== fixture.inventory.run.run_id);
+  h.controller.selectArtifactRun(other.run_id);
+  assert.equal(h.controller.runArtifacts, null);
+  assert.equal(h.controller.canDownloadBundle, false);
+  const loading = h.controller.loadRunArtifacts();
+  const pending = h.calls.artifacts.at(-1);
+  h.controller.observe({ identity: { sessionId: "99" } }, "wss://another.example/ws");
+  pending.resolve(fixture.inventory);
+  assert.equal(await loading, null);
+  assert.equal(pending.signal.aborted, true);
+  assert.equal(h.controller.runArtifacts, null);
+  assert.equal(h.controller.artifactRunId, null);
+});
+
+test("hiding the experiment panel aborts a bundle download without fetching further files or exporting late bytes", async () => {
+  const h = await harness();
+  const fixture = await loadBundleFixture(h);
+  const pending = h.controller.downloadRunBundle();
+  const first = h.calls.download[0];
+  assert.equal(h.controller.selectArtifactRun(h.controller.completedRuns[1].run_id), false);
+  h.controller.setEnabled(false);
+  first.resolve(fixture.files.get(first.request.artifactId));
+  assert.equal(await pending, null);
+  assert.equal(first.signal.aborted, true);
+  assert.equal(h.calls.download.length, 1);
+  assert.equal(h.controller.busy, false);
+});
 
 test("lost admission retains one immutable exact request and retries its original identity", async () => {
   const h = await harness();

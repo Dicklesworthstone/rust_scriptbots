@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,12 +26,14 @@ use reqwest::{Client, StatusCode};
 use scriptbots_app::control::{
     ApiSchemaDto, ArtifactMetadataDto, CheckpointBranchRequest, CheckpointBranchStatusDto,
     CheckpointCreateRequest, CheckpointMetadataDto, ExperimentBatchStatusDto,
-    ExperimentComparisonDto, ExperimentCreateRequest, MAX_ARTIFACT_DOWNLOAD_BYTES,
-    MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MapApplyAgentPolicy, PaginatedArtifactsResponse,
-    PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse,
-    PaginatedExperimentsResponse, compute_blake3, compute_sha256,
+    ExperimentComparisonDto, ExperimentCreateRequest, ExperimentRunArtifactsDto,
+    MAX_ARTIFACT_DOWNLOAD_BYTES, MAX_CHECKPOINT_BRANCH_REQUEST_BYTES,
+    MAX_EXPERIMENT_RUN_ARTIFACT_BYTES, MAX_EXPERIMENT_RUN_ARTIFACTS,
+    MAX_EXPERIMENT_RUN_ARTIFACTS_RESPONSE_BYTES, MAX_EXPERIMENT_RUN_TOTAL_ARTIFACT_BYTES,
+    MapApplyAgentPolicy, PaginatedArtifactsResponse, PaginatedCheckpointBranchesResponse,
+    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, compute_blake3, compute_sha256,
 };
-use scriptbots_app::experiment_runner::EXPERIMENT_ENDPOINT_METRICS;
+use scriptbots_app::experiment_runner::{EXPERIMENT_ENDPOINT_METRICS, verify_portable_run_bundle};
 use scriptbots_app::{
     CommandStatusDto, ConfigPatchRequest, ConfigSnapshot, HydrologySnapshot, KnobApplyRequest,
     KnobEntry, KnobKind, KnobUpdate, STORAGE_SIDECAR_SUFFIXES, default_control_rest_base_url,
@@ -40,7 +42,9 @@ use scriptbots_app::{
         execute_narrative_around, execute_narrative_search, format_hits_table,
     },
 };
-use scriptbots_storage::{DomainEventPayload, StorageReader};
+use scriptbots_storage::{
+    DomainEventPayload, RUN_BUNDLE_SCHEMA_VERSION, RunBundleV1, StorageReader,
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -253,6 +257,16 @@ enum ExperimentSubcommand {
     },
     /// Read the saved status and per-run results as JSON.
     Status { id: String },
+    /// Inspect every verified downloadable file of one completed run as JSON.
+    RunArtifacts { id: String, run_id: String },
+    /// Download and verify one complete portable run bundle into a new directory.
+    DownloadRun {
+        id: String,
+        run_id: String,
+        /// Fresh directory; existing files or directories are never replaced.
+        #[arg(long, value_name = "DIRECTORY")]
+        out: PathBuf,
+    },
     /// Request a cooperative stop; returned status may still be 'cancelling'.
     Cancel { id: String },
     /// Resume a stopped batch from its verified saved progress.
@@ -693,13 +707,20 @@ where
 }
 
 async fn data_response<T: DeserializeOwned>(request: reqwest::RequestBuilder) -> Result<T> {
+    data_response_with_limit(request, MAX_DATA_JSON_BYTES).await
+}
+
+async fn data_response_with_limit<T: DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    success_limit: usize,
+) -> Result<T> {
     let response =
         request.timeout(DATA_REQUEST_TIMEOUT).send().await.context(
             "control data request failed; inspect saved status before retrying a mutation",
         )?;
     let status = response.status();
     let limit = if status.is_success() {
-        MAX_DATA_JSON_BYTES
+        success_limit
     } else {
         MAX_DATA_ERROR_BYTES
     };
@@ -788,6 +809,13 @@ async fn experiment_request(
                 client.get(data_api_url(base_url, &["experiments", &id])?),
             )
             .await
+        }
+        ExperimentSubcommand::RunArtifacts { id, run_id } => {
+            let (inventory, _) = read_run_artifacts(client, base_url, &id, &run_id).await?;
+            Ok(serde_json::to_value(inventory)?)
+        }
+        ExperimentSubcommand::DownloadRun { id, run_id, out } => {
+            download_experiment_run(client, base_url, &id, &run_id, &out).await
         }
         ExperimentSubcommand::Cancel { id } => {
             data_json::<ExperimentBatchStatusDto>(
@@ -1026,7 +1054,7 @@ async fn artifact_request(
 
 fn ensure_new_download_destination(out: &Path) -> Result<()> {
     if out.file_name().is_none() {
-        bail!("download destination must name a new file");
+        bail!("download destination must name a new path");
     }
     match fs::symlink_metadata(out) {
         Ok(_) => bail!(
@@ -1138,6 +1166,35 @@ fn save_verified_download(out: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+async fn fetch_artifact_payload(
+    client: &Client,
+    base_url: &str,
+    metadata: &ArtifactMetadataDto,
+) -> Result<Vec<u8>> {
+    let size = artifact_download_size(metadata)?;
+    let response = client
+        .get(data_api_url(
+            base_url,
+            &["artifacts", &metadata.artifact_id, "download"],
+        )?)
+        .timeout(DATA_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .context("artifact download request failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = bounded_response_bytes(response, MAX_DATA_ERROR_BYTES).await?;
+        bail!(
+            "artifact download failed ({status}): {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    verify_artifact_headers(&response, metadata)?;
+    let bytes = bounded_response_bytes(response, size).await?;
+    verify_artifact_payload(metadata, &bytes)?;
+    Ok(bytes)
+}
+
 async fn download_artifact(
     client: &Client,
     base_url: &str,
@@ -1151,7 +1208,7 @@ async fn download_artifact(
     if metadata.artifact_id != id {
         bail!("artifact response identity differs from the requested artifact");
     }
-    let size = artifact_download_size(&metadata)?;
+    artifact_download_size(&metadata)?;
     if let Some(checkpoint) = checkpoint
         && (metadata.artifact_id != checkpoint.checkpoint_id
             || metadata.byte_size != checkpoint.byte_size
@@ -1160,23 +1217,7 @@ async fn download_artifact(
     {
         bail!("artifact metadata does not describe the requested saved checkpoint");
     }
-    let response = client
-        .get(data_api_url(base_url, &["artifacts", id, "download"])?)
-        .timeout(DATA_REQUEST_TIMEOUT)
-        .send()
-        .await
-        .context("artifact download request failed")?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = bounded_response_bytes(response, MAX_DATA_ERROR_BYTES).await?;
-        bail!(
-            "artifact download failed ({status}): {}",
-            String::from_utf8_lossy(&body)
-        );
-    }
-    verify_artifact_headers(&response, &metadata)?;
-    let bytes = bounded_response_bytes(response, size).await?;
-    verify_artifact_payload(&metadata, &bytes)?;
+    let bytes = fetch_artifact_payload(client, base_url, &metadata).await?;
     // Network, metadata and checksum failures leave no final-name output.
     save_verified_download(out, &bytes)?;
     Ok(serde_json::json!({
@@ -1185,6 +1226,391 @@ async fn download_artifact(
         "byte_size": bytes.len(),
         "checksum_blake3": metadata.checksum_blake3,
         "checksum_sha256": metadata.checksum_sha256,
+    }))
+}
+
+fn lowercase_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn scientific_digest_is_valid(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn portable_download_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && path.split('/').count() <= 16
+        && path.split('/').all(|component| {
+            let stem = component
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let device = matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
+                || (stem.len() == 4
+                    && (stem.starts_with("com") || stem.starts_with("lpt"))
+                    && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+            !component.is_empty()
+                && component != "."
+                && !component.contains("..")
+                && !component.ends_with('.')
+                && !device
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+}
+
+fn validate_run_artifacts(
+    inventory: &ExperimentRunArtifactsDto,
+    experiment_id: &str,
+    run_id: &str,
+) -> Result<Vec<String>> {
+    // Apply the same identity grammar even when called without an HTTP request.
+    data_api_url(
+        "http://localhost",
+        &["experiments", experiment_id, "runs", run_id],
+    )?;
+    data_api_url("http://localhost", &[&inventory.run.variant_id])?;
+    if inventory.experiment_id != experiment_id
+        || inventory.run.run_id != run_id
+        || run_id
+            != format!(
+                "{experiment_id}-{}-seed{}",
+                inventory.run.variant_id, inventory.run.seed
+            )
+        || inventory.run.state != "completed"
+        || inventory.run.error_reason.is_some()
+        || inventory.run.target_ticks == 0
+        || inventory.run.total_ticks != inventory.run.target_ticks
+        || !lowercase_digest(&inventory.plan_digest)
+        || !inventory
+            .run
+            .final_digest
+            .as_deref()
+            .is_some_and(scientific_digest_is_valid)
+    {
+        bail!(
+            "run inventory does not describe the requested completed run and exact final boundary"
+        );
+    }
+    if inventory.artifacts.is_empty() || inventory.artifacts.len() > MAX_EXPERIMENT_RUN_ARTIFACTS {
+        bail!("run inventory exceeds its complete file-count bound");
+    }
+    let prefix = format!("experiments/{experiment_id}/{run_id}/");
+    let mut paths = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(inventory.artifacts.len());
+    let mut total = 0_u64;
+    let mut indexed_bytes = 0_u64;
+    for artifact in &inventory.artifacts {
+        artifact_download_size(artifact)?;
+        let relative = artifact
+            .relative_path
+            .strip_prefix(&prefix)
+            .filter(|relative| portable_download_path(relative))
+            .ok_or_else(|| {
+                anyhow::anyhow!("run artifact path is not canonical or belongs to another run")
+            })?;
+        let folded = relative.to_ascii_lowercase();
+        if artifact.filename != relative.rsplit('/').next().unwrap_or_default()
+            || artifact.artifact_id
+                != format!(
+                    "experiment-{}",
+                    compute_blake3(artifact.relative_path.as_bytes())
+                )
+            || artifact.byte_size > MAX_EXPERIMENT_RUN_ARTIFACT_BYTES
+            || artifact.content_type.is_empty()
+            || artifact.content_type.len() > 128
+            || artifact.content_type.chars().any(char::is_control)
+            || !identities.insert(artifact.artifact_id.clone())
+            || paths.iter().any(|path: &String| {
+                &folded == path
+                    || folded
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                    || path
+                        .strip_prefix(folded.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+        {
+            bail!(
+                "run artifact metadata has an invalid identity, size, type or conflicting portable path"
+            );
+        }
+        total = total
+            .checked_add(artifact.byte_size)
+            .filter(|sum| *sum <= MAX_EXPERIMENT_RUN_TOTAL_ARTIFACT_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("run download exceeds its total-byte bound"))?;
+        if relative != "bundle_manifest.json" {
+            indexed_bytes = indexed_bytes
+                .checked_add(artifact.byte_size)
+                .filter(|sum| {
+                    *sum <= MAX_EXPERIMENT_RUN_TOTAL_ARTIFACT_BYTES
+                        - MAX_EXPERIMENT_RUN_ARTIFACT_BYTES
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("run download exceeds its indexed-artifact byte bound")
+                })?;
+        }
+        paths.insert(folded);
+        ordered.push(relative.to_owned());
+    }
+    if total != inventory.total_bytes
+        || [
+            "bundle_manifest.json",
+            "exports/summary.csv",
+            "evidence/run.json",
+            "checkpoints/final.checkpoint",
+        ]
+        .iter()
+        .any(|required| !ordered.iter().any(|path| path.as_str() == *required))
+    {
+        bail!(
+            "run inventory is missing required experiment files or disagrees with its total byte count"
+        );
+    }
+    Ok(ordered)
+}
+
+async fn read_run_artifacts(
+    client: &Client,
+    base_url: &str,
+    experiment_id: &str,
+    run_id: &str,
+) -> Result<(ExperimentRunArtifactsDto, Vec<String>)> {
+    let inventory = data_response_with_limit::<ExperimentRunArtifactsDto>(
+        client.get(data_api_url(
+            base_url,
+            &["experiments", experiment_id, "runs", run_id, "artifacts"],
+        )?),
+        MAX_EXPERIMENT_RUN_ARTIFACTS_RESPONSE_BYTES,
+    )
+    .await?;
+    let paths = validate_run_artifacts(&inventory, experiment_id, run_id)?;
+    Ok((inventory, paths))
+}
+
+fn verify_downloaded_run_index(
+    inventory: &ExperimentRunArtifactsDto,
+    files: &[(String, Vec<u8>)],
+) -> Result<()> {
+    let bytes = |path: &str| -> Result<&[u8]> {
+        files
+            .iter()
+            .find(|(relative, _)| relative == path)
+            .map(|(_, bytes)| bytes.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("completed run bundle is missing {path}"))
+    };
+    let bundle: RunBundleV1 = serde_json::from_slice(bytes("bundle_manifest.json")?)
+        .context("invalid portable run bundle manifest")?;
+    if bundle.bundle_version != RUN_BUNDLE_SCHEMA_VERSION
+        || bundle.digests.run_id != bundle.manifest.run_id.to_string()
+        || bundle.digests.max_tick != inventory.run.total_ticks
+        || bundle.artifacts.len() + 1 != files.len()
+    {
+        bail!("portable manifest identity, final boundary or complete artifact count differs");
+    }
+    let mut indexed = BTreeSet::new();
+    for entry in &bundle.artifacts {
+        if entry.relative_path == "bundle_manifest.json"
+            || !portable_download_path(&entry.relative_path)
+            || !indexed.insert(entry.relative_path.as_str())
+        {
+            bail!("portable manifest contains a duplicate or invalid artifact path");
+        }
+        let payload = bytes(&entry.relative_path)?;
+        if entry.bytes_len != payload.len() as u64 || entry.blake3_hex != compute_blake3(payload) {
+            bail!(
+                "portable manifest disagrees with the downloaded artifact {}",
+                entry.relative_path
+            );
+        }
+    }
+    for (path, role) in [
+        ("exports/summary.csv", "experiment-summary"),
+        ("evidence/run.json", "experiment-run-evidence"),
+        (
+            "checkpoints/final.checkpoint",
+            "experiment-final-checkpoint",
+        ),
+    ] {
+        if !bundle
+            .artifacts
+            .iter()
+            .any(|entry| entry.relative_path == path && entry.artifact_type == role)
+        {
+            bail!("portable experiment bundle must contain {path} as {role}");
+        }
+    }
+    let evidence: Value = serde_json::from_slice(bytes("evidence/run.json")?)
+        .context("invalid portable experiment evidence")?;
+    for (field, expected) in [
+        ("schema", "scriptbots.experiment-run-evidence.v2"),
+        ("experiment_id", inventory.experiment_id.as_str()),
+        ("run_id", inventory.run.run_id.as_str()),
+        ("plan_digest", inventory.plan_digest.as_str()),
+        ("variant_id", inventory.run.variant_id.as_str()),
+        ("brain_family", inventory.run.brain_family.as_str()),
+        (
+            "final_digest",
+            inventory.run.final_digest.as_deref().unwrap_or_default(),
+        ),
+    ] {
+        if evidence.get(field).and_then(Value::as_str) != Some(expected) {
+            bail!("downloaded experiment evidence {field} differs from the selected run");
+        }
+    }
+    if evidence.get("seed").and_then(Value::as_u64) != Some(inventory.run.seed)
+        || evidence.get("total_ticks").and_then(Value::as_u64) != Some(inventory.run.total_ticks)
+        || evidence
+            .get("summary_schema_version")
+            .and_then(Value::as_u64)
+            != Some(2)
+    {
+        bail!("downloaded experiment evidence has a different seed, horizon or summary schema");
+    }
+    Ok(())
+}
+
+fn save_verified_run_files(out: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
+    ensure_new_download_destination(out)?;
+    let parent = out
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    fs::create_dir(out).with_context(|| {
+        format!(
+            "cannot claim fresh bundle directory {}; existing paths are never overwritten",
+            out.display()
+        )
+    })?;
+    let root = out.canonicalize()?;
+    let mut directories = BTreeSet::from([root.clone()]);
+    for (relative, bytes) in files {
+        if !portable_download_path(relative) {
+            bail!("refusing noncanonical downloaded bundle path");
+        }
+        let mut components = relative.split('/').peekable();
+        let mut path = root.clone();
+        while let Some(component) = components.next() {
+            path.push(component);
+            if components.peek().is_some() {
+                match fs::create_dir(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let metadata = fs::symlink_metadata(&path)?;
+                        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                            bail!(
+                                "downloaded bundle directory changed or is aliased: {}",
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                directories.insert(path.clone());
+            } else {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                file.write_all(bytes)?;
+                file.sync_all()?;
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        for directory in directories.iter().rev() {
+            fs::File::open(directory)?.sync_all()?;
+        }
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+async fn download_experiment_run(
+    client: &Client,
+    base_url: &str,
+    experiment_id: &str,
+    run_id: &str,
+    out: &Path,
+) -> Result<Value> {
+    ensure_new_download_destination(out)?;
+    let (inventory, paths) = read_run_artifacts(client, base_url, experiment_id, run_id).await?;
+    let mut files = Vec::with_capacity(paths.len());
+    for (expected, relative) in inventory.artifacts.iter().zip(paths) {
+        let observed: ArtifactMetadataDto = data_response_with_limit(
+            client.get(data_api_url(
+                base_url,
+                &["artifacts", &expected.artifact_id],
+            )?),
+            MAX_EXPERIMENT_RUN_ARTIFACTS_RESPONSE_BYTES,
+        )
+        .await?;
+        if &observed != expected {
+            bail!("artifact metadata changed after the completed run inventory was observed");
+        }
+        files.push((
+            relative,
+            fetch_artifact_payload(client, base_url, expected).await?,
+        ));
+    }
+    verify_downloaded_run_index(&inventory, &files)?;
+    // Every response, checksum and manifest entry was verified before claiming --out.
+    save_verified_run_files(out, &files).with_context(|| {
+        format!(
+            "bundle write or sync failed; partial output is preserved at {}",
+            out.display()
+        )
+    })?;
+    drop(files);
+    let directory = out.to_path_buf();
+    let verified = std::thread::Builder::new()
+        .name("scriptbots-download-verify".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || verify_portable_run_bundle(&directory))
+        .context("could not start portable bundle verification")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("portable bundle verification worker failed"))?
+        .with_context(|| {
+            format!(
+                "downloaded bundle verification failed; output preserved at {}",
+                out.display()
+            )
+        })?;
+    let final_state = verified
+        .final_state
+        .context("downloaded bundle did not verify an experiment final owner")?;
+    if final_state.run_id != run_id
+        || final_state.tick != inventory.run.total_ticks
+        || Some(&final_state.scientific_digest) != inventory.run.final_digest.as_ref()
+    {
+        bail!(
+            "verified final owner differs from the selected run; output preserved at {}",
+            out.display()
+        );
+    }
+    Ok(serde_json::json!({
+        "experiment_id": experiment_id,
+        "run_id": run_id,
+        "plan_digest": inventory.plan_digest,
+        "status_generation": inventory.status_generation,
+        "path": out.display().to_string(),
+        "files": inventory.artifacts.len(),
+        "total_bytes": inventory.total_bytes,
+        "bundle_manifest_digest": verified.bundle_manifest_digest,
+        "final_digest": final_state.scientific_digest,
+        "verified_tick": final_state.tick,
     }))
 }
 
@@ -2876,6 +3302,29 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["control", "experiment", "create"]).is_err());
         assert!(
+            Cli::try_parse_from(["control", "experiment", "run-artifacts", "study-1", "run-1"])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "control",
+                "experiment",
+                "download-run",
+                "study-1",
+                "run-1",
+                "--out",
+                "new-bundle"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["control", "experiment", "download-run", "study-1", "run-1"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["control", "experiment", "run-artifacts", "study-1"]).is_err()
+        );
+        assert!(
             Cli::try_parse_from([
                 "control",
                 "--idempotency-key",
@@ -3399,6 +3848,7 @@ mod tests {
         assert_eq!(comparison["mean_difference"], 0.0);
         assert_eq!(comparison["plan_digest"], completed["plan_digest"]);
         assert_eq!(comparison["descriptive_only"], false);
+        assert_completed_run_download(&client, &server, root.path(), &completed).await?;
         assert!(
             experiment_request(
                 &client,
@@ -3422,6 +3872,133 @@ mod tests {
             before
         );
         server.stop()?;
+        Ok(())
+    }
+
+    async fn assert_completed_run_download(
+        client: &Client,
+        server: &LiveDataServer,
+        root: &Path,
+        completed: &Value,
+    ) -> Result<()> {
+        let run_id = completed["runs"][0]["run_id"].as_str().unwrap();
+        let inventory: ExperimentRunArtifactsDto = serde_json::from_value(
+            experiment_request(
+                client,
+                &server.base_url,
+                ExperimentSubcommand::RunArtifacts {
+                    id: "cli-study".into(),
+                    run_id: run_id.into(),
+                },
+                None,
+            )
+            .await?,
+        )?;
+        assert_eq!(
+            inventory.plan_digest,
+            completed["plan_digest"].as_str().unwrap()
+        );
+        let out = root.join("portable/run");
+        let command = || ExperimentSubcommand::DownloadRun {
+            id: "cli-study".into(),
+            run_id: run_id.into(),
+            out: out.clone(),
+        };
+        let receipt = experiment_request(client, &server.base_url, command(), None).await?;
+        assert_eq!(receipt["run_id"], run_id);
+        assert_eq!(
+            receipt["final_digest"],
+            completed["runs"][0]["final_digest"]
+        );
+        assert_eq!(receipt["verified_tick"], 2);
+        assert_eq!(receipt["files"], inventory.artifacts.len());
+        assert_eq!(receipt["total_bytes"], inventory.total_bytes);
+        let paths = validate_run_artifacts(&inventory, "cli-study", run_id)?;
+        let mut files = Vec::new();
+        for (metadata, relative) in inventory.artifacts.iter().zip(paths) {
+            let bytes = fs::read(out.join(&relative))?;
+            assert_eq!(
+                bytes,
+                fs::read(
+                    server
+                        .handle
+                        .as_ref()
+                        .unwrap()
+                        .artifacts_dir()
+                        .join(&metadata.relative_path)
+                )?
+            );
+            files.push((relative, bytes));
+        }
+        verify_downloaded_run_index(&inventory, &files)?;
+        assert!(
+            experiment_request(client, &server.base_url, command(), None)
+                .await
+                .is_err()
+        );
+        for (relative, bytes) in &files {
+            assert_eq!(
+                &fs::read(out.join(relative))?,
+                bytes,
+                "repeat download must preserve files"
+            );
+        }
+        // Full byte integrity alone cannot authorize a different scientific run.
+        let mut wrong_source = inventory.clone();
+        wrong_source.run.seed = wrong_source.run.seed.wrapping_add(1);
+        assert!(verify_downloaded_run_index(&wrong_source, &files).is_err());
+        let manifest_index = files
+            .iter()
+            .position(|(path, _)| path == "bundle_manifest.json")
+            .unwrap();
+        let original_manifest = files[manifest_index].1.clone();
+        let mut manifest: RunBundleV1 = serde_json::from_slice(&original_manifest)?;
+        manifest.artifacts.remove(0);
+        files[manifest_index].1 = serde_json::to_vec(&manifest)?;
+        assert!(
+            verify_downloaded_run_index(&inventory, &files).is_err(),
+            "omitted manifest entries must not become partial bundles"
+        );
+        files[manifest_index].1 = original_manifest;
+        let selected = &inventory.artifacts[0];
+        let damaged = server
+            .handle
+            .as_ref()
+            .unwrap()
+            .artifacts_dir()
+            .join(&selected.relative_path);
+        fs::write(&damaged, b"corrupt retained artifact")?;
+        let rejected = root.join("refused/bundle");
+        assert!(
+            experiment_request(
+                client,
+                &server.base_url,
+                ExperimentSubcommand::DownloadRun {
+                    id: "cli-study".into(),
+                    run_id: run_id.into(),
+                    out: rejected.clone(),
+                },
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(!rejected.exists());
+        assert!(!rejected.parent().unwrap().exists());
+        // Completed companion results remain independently downloadable.
+        let peer_id = completed["runs"][1]["run_id"].as_str().unwrap();
+        let peer = experiment_request(
+            client,
+            &server.base_url,
+            ExperimentSubcommand::DownloadRun {
+                id: "cli-study".into(),
+                run_id: peer_id.into(),
+                out: root.join("portable/peer"),
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(peer["final_digest"], completed["runs"][1]["final_digest"]);
         Ok(())
     }
 
@@ -3480,6 +4057,312 @@ mod tests {
             created_at_utc: "123".into(),
             relative_path: "../remote-path-is-not-a-local-path".into(),
         }
+    }
+
+    fn run_artifact_metadata_fixture(relative: &str) -> ArtifactMetadataDto {
+        let mut metadata = artifact_metadata_fixture();
+        metadata.relative_path = format!("experiments/study/study-baseline-seed7/{relative}");
+        metadata.artifact_id = format!(
+            "experiment-{}",
+            compute_blake3(metadata.relative_path.as_bytes())
+        );
+        metadata.filename = relative.rsplit('/').next().unwrap().into();
+        metadata
+    }
+
+    fn run_artifacts_fixture() -> ExperimentRunArtifactsDto {
+        use scriptbots_app::{
+            control::ExperimentRunRecordDto,
+            experiment_runner::{CheckpointProgressUnavailable, ExperimentCheckpointProgress},
+        };
+        let artifacts = [
+            "bundle_manifest.json",
+            "exports/summary.csv",
+            "evidence/run.json",
+            "checkpoints/final.checkpoint",
+        ]
+        .map(run_artifact_metadata_fixture)
+        .to_vec();
+        ExperimentRunArtifactsDto {
+            experiment_id: "study".into(),
+            plan_digest: "a".repeat(64),
+            status_generation: 7,
+            run: ExperimentRunRecordDto {
+                run_id: "study-baseline-seed7".into(),
+                variant_id: "baseline".into(),
+                brain_family: "mlp".into(),
+                seed: 7,
+                state: "completed".into(),
+                total_ticks: 2,
+                target_ticks: 2,
+                checkpoint_progress: ExperimentCheckpointProgress::Unavailable {
+                    reason: CheckpointProgressUnavailable::NoCommittedCheckpoint,
+                },
+                final_digest: Some("b".repeat(16)),
+                bundle_path: Some("remote-only".into()),
+                error_reason: None,
+            },
+            total_bytes: 12,
+            artifacts,
+        }
+    }
+
+    #[test]
+    fn run_inventory_refuses_wrong_sources_aliases_collisions_and_resource_overruns() -> Result<()>
+    {
+        let inventory = run_artifacts_fixture();
+        let run_id = inventory.run.run_id.as_str();
+        assert_eq!(MAX_EXPERIMENT_RUN_ARTIFACTS, 33);
+        assert_eq!(MAX_EXPERIMENT_RUN_ARTIFACT_BYTES, 16 * 1024 * 1024);
+        assert_eq!(MAX_EXPERIMENT_RUN_TOTAL_ARTIFACT_BYTES, 48 * 1024 * 1024);
+        assert_eq!(
+            validate_run_artifacts(&inventory, "study", run_id)?.len(),
+            4
+        );
+        for path in [
+            "../escape",
+            "/absolute",
+            "a//b",
+            "a/./b",
+            "a\\b",
+            "C:drive",
+            "a/../b",
+            "a./b",
+            "a/summary.csv.",
+            "CON",
+            "prn.json",
+            "aux/file",
+            "NUL",
+            "COM1.txt",
+            "lpt9/file",
+        ] {
+            let mut changed = inventory.clone();
+            changed.artifacts[1] = run_artifact_metadata_fixture(path);
+            assert!(
+                validate_run_artifacts(&changed, "study", run_id).is_err(),
+                "{path}"
+            );
+        }
+        for failure in [
+            "duplicate",
+            "case duplicate",
+            "prefix",
+            "parent",
+            "case parent",
+            "missing manifest",
+            "missing summary",
+            "missing evidence",
+            "missing cut",
+            "filename",
+            "artifact ID",
+            "file bytes",
+            "total",
+            "count",
+            "state",
+            "tick",
+            "zero tick",
+            "seed",
+            "plan",
+            "digest",
+            "wide digest",
+            "short digest",
+            "uppercase digest",
+        ] {
+            let mut changed = inventory.clone();
+            match failure {
+                "duplicate" => changed.artifacts[1] = changed.artifacts[0].clone(),
+                "case duplicate" => {
+                    changed
+                        .artifacts
+                        .push(run_artifact_metadata_fixture("EXPORTS/SUMMARY.CSV"));
+                    changed.total_bytes += 3;
+                }
+                "prefix" => changed.artifacts[1] = run_artifact_metadata_fixture("evidence"),
+                "parent" => changed.artifacts[2] = run_artifact_metadata_fixture("exports"),
+                "case parent" => changed.artifacts[2] = run_artifact_metadata_fixture("EXPORTS"),
+                "missing manifest" => {
+                    changed.artifacts[0] = run_artifact_metadata_fixture("other.json")
+                }
+                "missing summary" => {
+                    changed.artifacts[1] = run_artifact_metadata_fixture("other.csv")
+                }
+                "missing evidence" => {
+                    changed.artifacts[2] = run_artifact_metadata_fixture("other.json")
+                }
+                "missing cut" => {
+                    changed.artifacts[3] = run_artifact_metadata_fixture("other.checkpoint")
+                }
+                "filename" => changed.artifacts[1].filename = "mismatch".into(),
+                "artifact ID" => changed.artifacts[1].artifact_id = "artifact-elsewhere".into(),
+                "file bytes" => {
+                    changed.artifacts[0].byte_size = MAX_EXPERIMENT_RUN_ARTIFACT_BYTES + 1
+                }
+                "total" => changed.total_bytes += 1,
+                "count" => changed.artifacts.resize(
+                    MAX_EXPERIMENT_RUN_ARTIFACTS + 1,
+                    inventory.artifacts[0].clone(),
+                ),
+                "state" => changed.run.state = "failed".into(),
+                "tick" => changed.run.target_ticks += 1,
+                "zero tick" => {
+                    changed.run.target_ticks = 0;
+                    changed.run.total_ticks = 0;
+                }
+                "seed" => changed.run.seed += 1,
+                "plan" => changed.plan_digest = "not-a-digest".into(),
+                "digest" => changed.run.final_digest = None,
+                "wide digest" => changed.run.final_digest = Some("b".repeat(64)),
+                "short digest" => changed.run.final_digest = Some("b".repeat(15)),
+                "uppercase digest" => changed.run.final_digest = Some("B".repeat(16)),
+                _ => unreachable!(),
+            }
+            let error = validate_run_artifacts(&changed, "study", run_id).unwrap_err();
+            if matches!(
+                failure,
+                "duplicate" | "case duplicate" | "prefix" | "parent" | "case parent"
+            ) {
+                assert!(
+                    error.to_string().contains("conflicting portable path"),
+                    "{failure}: {error:#}"
+                );
+            }
+        }
+        assert!(validate_run_artifacts(&inventory, "other", run_id).is_err());
+        assert!(validate_run_artifacts(&inventory, "study", "other").is_err());
+        let mut oversized = inventory.clone();
+        for artifact in &mut oversized.artifacts {
+            artifact.byte_size = MAX_EXPERIMENT_RUN_ARTIFACT_BYTES;
+        }
+        oversized.total_bytes = 4 * MAX_EXPERIMENT_RUN_ARTIFACT_BYTES;
+        assert!(validate_run_artifacts(&oversized, "study", run_id).is_err());
+        for artifact in &mut oversized.artifacts {
+            artifact.byte_size = 11 * 1024 * 1024;
+        }
+        oversized.total_bytes = 44 * 1024 * 1024;
+        assert!(
+            validate_run_artifacts(&oversized, "study", run_id)
+                .unwrap_err()
+                .to_string()
+                .contains("indexed-artifact")
+        );
+        for (artifact, mebibytes) in oversized.artifacts.iter_mut().zip([16, 16, 8, 8]) {
+            artifact.byte_size = mebibytes * 1024 * 1024;
+        }
+        oversized.total_bytes = 48 * 1024 * 1024;
+        assert!(validate_run_artifacts(&oversized, "study", run_id).is_ok());
+        Ok(())
+    }
+
+    fn run_download_wire_peer(
+        replies: Vec<(Vec<u8>, String)>,
+    ) -> Result<(String, std::thread::JoinHandle<Result<Vec<String>>>)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let worker = std::thread::spawn(move || -> Result<Vec<String>> {
+            use std::io::BufRead;
+            let mut requests = Vec::new();
+            for (body, headers) in replies {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                let mut reader = io::BufReader::new(stream.try_clone()?);
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line)? == 0 || request.len() > MAX_DATA_ERROR_BYTES {
+                        bail!("incomplete or excessive run-download request headers");
+                    }
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                assert!(request.starts_with("GET "));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )?;
+                stream.write_all(&body)?;
+                stream.flush()?;
+                requests.push(request);
+            }
+            Ok(requests)
+        });
+        Ok((format!("http://{address}"), worker))
+    }
+
+    #[tokio::test]
+    async fn run_download_transport_refuses_changed_metadata_and_corruption_before_creating_output()
+    -> Result<()> {
+        let client = Client::new();
+        let root = tempdir()?;
+        let inventory = run_artifacts_fixture();
+        let run_id = inventory.run.run_id.as_str();
+        for failure in ["metadata", "payload"] {
+            let mut metadata = inventory.artifacts[0].clone();
+            if failure == "metadata" {
+                metadata.created_at_utc = "changed-after-inventory".into();
+            }
+            let json_headers = "Content-Type: application/json\r\n".to_owned();
+            let mut replies = vec![
+                (serde_json::to_vec(&inventory)?, json_headers.clone()),
+                (serde_json::to_vec(&metadata)?, json_headers),
+            ];
+            if failure == "payload" {
+                replies.push((b"abd".to_vec(), format!(
+                    "Content-Type: {}\r\nX-Scriptbots-Checksum-Blake3: {}\r\nX-Scriptbots-Checksum-Sha256: {}\r\n",
+                    metadata.content_type, metadata.checksum_blake3, metadata.checksum_sha256,
+                )));
+            }
+            let (base, peer) = run_download_wire_peer(replies)?;
+            let out = root.path().join(failure).join("bundle");
+            let error = download_experiment_run(&client, &base, "study", run_id, &out)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(if failure == "metadata" {
+                    "metadata changed"
+                } else {
+                    "checksum mismatch"
+                }),
+                "{error:#}"
+            );
+            assert!(!out.exists());
+            assert!(!out.parent().unwrap().exists());
+            let requests = peer.join().unwrap()?;
+            assert!(requests[0].starts_with(&format!(
+                "GET /api/v1/experiments/study/runs/{run_id}/artifacts "
+            )));
+            assert_eq!(requests.len(), if failure == "metadata" { 2 } else { 3 });
+        }
+        let (base, peer) = data_wire_peer(
+            "200 OK",
+            Vec::new(),
+            Some(MAX_EXPERIMENT_RUN_ARTIFACTS_RESPONSE_BYTES + 1),
+        );
+        let out = root.path().join("oversized/bundle");
+        assert!(
+            download_experiment_run(&client, &base, "study", run_id, &out)
+                .await
+                .is_err()
+        );
+        peer.join().unwrap()?;
+        assert!(!out.parent().unwrap().exists());
+        Ok(())
     }
 
     #[test]
