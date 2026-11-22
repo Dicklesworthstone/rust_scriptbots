@@ -37,6 +37,9 @@ use tracing::{error, info};
 
 const STATUS_SCHEMA_VERSION: u16 = 2;
 pub(crate) const MAX_STATUS_BYTES: u64 = 16 * 1024 * 1024;
+// Retrying never erases the failed status that justified a new attempt. Retain
+// at most this many complete generations instead of growing an unbounded log.
+const MAX_FAILED_RETRY_GENERATIONS: usize = 16;
 pub(crate) const MAX_BUNDLE_ARTIFACTS: usize = 32;
 pub(crate) const MAX_BUNDLE_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_BUNDLE_TOTAL_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
@@ -1840,7 +1843,10 @@ impl MatchedSeedExperimentRunner {
     /// Read one bounded, plan-validated snapshot without writing or taking the
     /// batch's writer lease. Before the first atomic publication, expose the
     /// actual initial plan rather than an invented schema or empty identity.
-    pub(crate) fn status_snapshot(
+    ///
+    /// # Errors
+    /// Refuses an invalid plan or malformed, aliased or incompatible saved status.
+    pub fn status_snapshot(
         &self,
         state_file: &Path,
     ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
@@ -2031,12 +2037,30 @@ impl MatchedSeedExperimentRunner {
                 });
             }
         };
+        let mut _retry_leases = Vec::new();
         if let Some(bytes) = &committed_bytes {
             let committed = self.decode_status(state_file, bytes, plan)?;
             if committed.generation.checked_add(1) != Some(candidate.generation) {
                 return Err(interrupted());
             }
-            self.validate_status_transition(state_file, &committed, &candidate)?;
+            if let Err(error) = self.validate_status_transition(state_file, &committed, &candidate)
+            {
+                if !committed
+                    .runs
+                    .iter()
+                    .zip(&candidate.runs)
+                    .any(|(old, new)| {
+                        old.state == RunState::Failed && new.state == RunState::Running
+                    })
+                {
+                    return Err(error);
+                }
+                // A completed retry publication may be recovered only through
+                // its exact retained failure witness and executable sources.
+                // Ordinary save_status remains strictly monotonic.
+                self.validate_failed_retry_transition(state_file, &committed, &candidate, bytes)?;
+                _retry_leases = self.validate_failed_retry_sources(&committed, plan)?;
+            }
         } else if candidate != self.initial_status(plan) {
             return Err(interrupted());
         }
@@ -2285,6 +2309,170 @@ impl MatchedSeedExperimentRunner {
         let plan = self.validated_plan()?;
         let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
         self.save_status_transition_locked(state_file, status, &plan)
+    }
+
+    /// Explicitly admit another attempt for every failed run in an existing batch.
+    ///
+    /// Ordinary execution and resume leave failures terminal. This operation
+    /// first verifies their exact executable continuation cuts (or completed
+    /// bundles), then retains the original status bytes in
+    /// `<status-file>.retries/generation-<N>.json` before publishing one new
+    /// status generation. Completed and unfinished companions are unchanged.
+    /// It does not advance a world; [`Self::execute_batch`] performs the actual
+    /// continuation. The expected generation is checked under the writer lease,
+    /// so a lost response cannot authorize a retry of a later failed attempt.
+    ///
+    /// # Errors
+    ///
+    /// Refuses missing, corrupt, foreign or leased evidence and ambiguous
+    /// interrupted writes. The history retains at most 16 generations, each
+    /// bounded by the existing status byte limit. A refusal never resets a run
+    /// to tick zero or discards its previous failure record.
+    pub fn retry_failed_runs(
+        &self,
+        state_file: &Path,
+        expected_generation: u64,
+    ) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+        self.validate_execution_workload()?;
+        let plan = self.validated_plan()?;
+        let _lease = ExperimentStatusWriterLease::acquire(state_file)?;
+        // Unlike ordinary execution, an explicit retry cannot initialize a new
+        // batch when the caller points at the wrong output directory.
+        let observed = self.load_existing_status(state_file, &plan)?;
+        if observed.generation != expected_generation {
+            return Err(ExperimentRunnerError::StaleStatusGeneration {
+                path: state_file.to_path_buf(),
+                proposed: expected_generation,
+                committed: observed.generation,
+            });
+        }
+        let committed = self.load_or_create_status_locked(state_file, &plan)?;
+        if committed.generation != expected_generation {
+            return Err(ExperimentRunnerError::StaleStatusGeneration {
+                path: state_file.to_path_buf(),
+                proposed: expected_generation,
+                committed: committed.generation,
+            });
+        }
+        self.verify_completed_status(state_file, &committed)?;
+        if committed.failed_runs == 0 {
+            return Ok(committed);
+        }
+        let bytes = read_experiment_file_bounded(state_file, MAX_STATUS_BYTES)?;
+        if self.decode_status(state_file, &bytes, &plan)? != committed {
+            return Err(invalid_retry_status(
+                state_file,
+                "committed status changed during retry",
+            ));
+        }
+        let candidate = failed_retry_status_candidate(state_file, &committed)?;
+        // Keep every per-run lease until status publication. A concurrent
+        // single-run execution cannot replace a validated cut in that interval.
+        let _run_leases = self.validate_failed_retry_sources(&committed, &plan)?;
+        retain_failed_status_for_retry(state_file, committed.generation, &bytes)?;
+        self.validate_failed_retry_transition(state_file, &committed, &candidate, &bytes)?;
+        if read_experiment_file_bounded(state_file, MAX_STATUS_BYTES)? != bytes {
+            return Err(invalid_retry_status(
+                state_file,
+                "committed status changed before retry publication",
+            ));
+        }
+        self.write_status_atomically(state_file, &candidate, &plan)?;
+        info!(
+            experiment_id = %self.experiment_id,
+            failed_generation = committed.generation,
+            retry_generation = candidate.generation,
+            retried_runs = committed.failed_runs,
+            "retained failed experiment status and admitted verified continuations"
+        );
+        Ok(candidate)
+    }
+
+    fn validate_failed_retry_sources(
+        &self,
+        status: &ExperimentBatchStatus,
+        plan: &ValidatedPlan,
+    ) -> Result<Vec<ExperimentStatusWriterLease>, ExperimentRunnerError> {
+        let mut leases = Vec::with_capacity(status.failed_runs);
+        for failed in status
+            .runs
+            .iter()
+            .filter(|run| run.state == RunState::Failed)
+        {
+            let (variant, family) = &plan.variants[&failed.variant_id];
+            let path = self.run_checkpoint_path(&failed.run_id);
+            leases.push(ExperimentStatusWriterLease::acquire(&path)?);
+            let mut continuing = failed.clone();
+            continuing.state = RunState::Running;
+            continuing.error_reason = None;
+            match self.recover_completed_run(&continuing, variant, *family, &plan.digest) {
+                Ok(_) => continue,
+                Err(ExperimentRunnerError::ResumeCheckpointUnavailable { .. }) => {}
+                Err(error) => return Err(error),
+            }
+            let checkpoint = self
+                .load_run_checkpoint(
+                    variant,
+                    failed.seed,
+                    &failed.run_id,
+                    &plan.digest,
+                    MAX_RUN_POPULATION,
+                )?
+                .ok_or_else(|| ExperimentRunnerError::ResumeCheckpointUnavailable {
+                    run_id: failed.run_id.clone(),
+                    completed_ticks: failed.total_ticks,
+                })?;
+            if experiment_path_exists(
+                &self.staged_bundle_path(&failed.run_id),
+                "inspect failed run bundle staging before retry",
+            )? && checkpoint.owner.host_checkpoint().tick().0 != self.max_ticks
+            {
+                return Err(invalid_checkpoint(
+                    &path,
+                    "failed run has bundle staging without a sealed final owner cut",
+                ));
+            }
+            drop(restore_run_owner(
+                &checkpoint,
+                *family,
+                &failed.run_id,
+                &path,
+            )?);
+        }
+        Ok(leases)
+    }
+
+    fn validate_failed_retry_transition(
+        &self,
+        state_file: &Path,
+        committed: &ExperimentBatchStatus,
+        proposed: &ExperimentBatchStatus,
+        committed_bytes: &[u8],
+    ) -> Result<(), ExperimentRunnerError> {
+        if committed.failed_runs == 0
+            || *proposed != failed_retry_status_candidate(state_file, committed)?
+        {
+            return Err(invalid_retry_status(
+                state_file,
+                "retry must change all and only failed runs to running in the next generation",
+            ));
+        }
+        let directory = failed_retry_history_directory(state_file)?;
+        let generations = inspect_failed_retry_history(&directory)?;
+        if !generations.contains(&committed.generation) {
+            return Err(invalid_retry_status(
+                state_file,
+                "retry has no retained failed status",
+            ));
+        }
+        let retained = failed_retry_history_path(&directory, committed.generation);
+        if read_experiment_file_bounded(&retained, MAX_STATUS_BYTES)? != committed_bytes {
+            return Err(invalid_retry_status(
+                &retained,
+                "retained failed status differs from the committed generation",
+            ));
+        }
+        Ok(())
     }
 
     /// Derive the bundle's stable `RunId` from the runner's human-readable run identity.
@@ -4067,6 +4255,208 @@ impl MatchedSeedExperimentRunner {
             reason: format!("restored final checkpoint verification failed: {error}"),
         })
     }
+}
+
+fn invalid_retry_status(path: &Path, reason: impl Into<String>) -> ExperimentRunnerError {
+    ExperimentRunnerError::InvalidStatus {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
+fn failed_retry_status_candidate(
+    state_file: &Path,
+    committed: &ExperimentBatchStatus,
+) -> Result<ExperimentBatchStatus, ExperimentRunnerError> {
+    let mut candidate = committed.clone();
+    candidate.generation = candidate
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| invalid_retry_status(state_file, "status generation exhausted u64"))?;
+    for record in &mut candidate.runs {
+        if record.state == RunState::Failed {
+            record.state = RunState::Running;
+            record.error_reason = None;
+        }
+    }
+    recompute_status_counts(&mut candidate);
+    Ok(candidate)
+}
+
+fn failed_retry_history_directory(state_file: &Path) -> Result<PathBuf, ExperimentRunnerError> {
+    let mut name = state_file
+        .file_name()
+        .ok_or_else(|| invalid_retry_status(state_file, "status path has no file name"))?
+        .to_os_string();
+    name.push(".retries");
+    Ok(state_file.with_file_name(name))
+}
+
+fn failed_retry_history_path(directory: &Path, generation: u64) -> PathBuf {
+    directory.join(format!("generation-{generation:020}.json"))
+}
+
+fn inspect_failed_retry_history(directory: &Path) -> Result<BTreeSet<u64>, ExperimentRunnerError> {
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(source) => {
+            return Err(ExperimentRunnerError::Io {
+                operation: "inspect failed experiment retry history",
+                path: directory.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid_retry_status(
+            directory,
+            "retry history must be a directory without a symlink alias",
+        ));
+    }
+    let entries = fs::read_dir(directory).map_err(|source| ExperimentRunnerError::Io {
+        operation: "read failed experiment retry history",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    let mut generations = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ExperimentRunnerError::Io {
+            operation: "read failed experiment retry history entry",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        if generations.len() >= MAX_FAILED_RETRY_GENERATIONS {
+            return Err(invalid_retry_status(
+                directory,
+                format!(
+                    "retry history exceeds its {MAX_FAILED_RETRY_GENERATIONS}-generation limit"
+                ),
+            ));
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let generation = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("generation-"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|number| number.parse::<u64>().ok())
+            .filter(|generation| failed_retry_history_path(directory, *generation) == path)
+            .ok_or_else(|| {
+                invalid_retry_status(&path, "retry history contains an unknown entry")
+            })?;
+        let metadata = fs::symlink_metadata(&path).map_err(|source| ExperimentRunnerError::Io {
+            operation: "inspect retained failed experiment status",
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_STATUS_BYTES
+        {
+            return Err(invalid_retry_status(
+                &path,
+                "retry history entry is not a bounded regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Err(invalid_retry_status(
+                    &path,
+                    "multiply linked retry history is refused",
+                ));
+            }
+        }
+        generations.insert(generation);
+    }
+    Ok(generations)
+}
+
+fn retain_failed_status_for_retry(
+    state_file: &Path,
+    generation: u64,
+    bytes: &[u8],
+) -> Result<(), ExperimentRunnerError> {
+    let directory = failed_retry_history_directory(state_file)?;
+    let generations = inspect_failed_retry_history(&directory)?;
+    let retained = failed_retry_history_path(&directory, generation);
+    if generations.contains(&generation) {
+        if read_experiment_file_bounded(&retained, MAX_STATUS_BYTES)? != bytes {
+            return Err(invalid_retry_status(
+                &retained,
+                "retained failed status differs; original evidence was preserved",
+            ));
+        }
+    } else {
+        if generations.len() >= MAX_FAILED_RETRY_GENERATIONS {
+            return Err(invalid_retry_status(
+                &directory,
+                format!(
+                    "retry history reached its {MAX_FAILED_RETRY_GENERATIONS}-generation limit; original evidence was preserved"
+                ),
+            ));
+        }
+        if !experiment_path_exists(
+            &directory,
+            "inspect retry history directory before creation",
+        )? {
+            fs::create_dir(&directory).map_err(|source| ExperimentRunnerError::Io {
+                operation: "create failed experiment retry history",
+                path: directory.clone(),
+                source,
+            })?;
+        }
+        // A second admission check catches an alias or unexpected entry installed
+        // while validating the source cuts. Never replace an existing archive.
+        inspect_failed_retry_history(&directory)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&retained)
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "reserve failed experiment status evidence",
+                path: retained.clone(),
+                source,
+            })?;
+        file.write_all(bytes)
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "retain failed experiment status evidence",
+                path: retained.clone(),
+                source,
+            })?;
+        file.sync_all()
+            .map_err(|source| ExperimentRunnerError::Io {
+                operation: "sync failed experiment status evidence",
+                path: retained.clone(),
+                source,
+            })?;
+    }
+    // Reused complete evidence may have survived an interrupted sync. Seal it
+    // again before any retry publication names the following generation.
+    let mut options = OpenOptions::new();
+    options.read(true).write(cfg!(windows));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    options
+        .open(&retained)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| ExperimentRunnerError::Io {
+            operation: "seal retained failed experiment status",
+            path: retained,
+            source,
+        })?;
+    sync_parent_directory(&directory)?;
+    sync_parent_directory(
+        state_file
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
 }
 
 fn experiment_path_exists(
@@ -6311,6 +6701,403 @@ mod tests {
         assert_eq!(fs::read(&state_file).unwrap(), status_bytes);
         assert_eq!(fs::read(&path).unwrap(), retained);
         assert!(!runner.output_dir.join(&record.run_id).exists());
+    }
+
+    fn failed_retry_fixture(
+        directory: &Path,
+        seeds: Vec<u64>,
+    ) -> (MatchedSeedExperimentRunner, PathBuf, ExperimentBatchStatus) {
+        let runner = progress_runner(directory, seeds);
+        let state_file = directory.join("status.json");
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        for record in &mut status.runs {
+            let (variant, family) = &plan.variants[&record.variant_id];
+            runner
+                .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+                .unwrap();
+            record.state = RunState::Running;
+        }
+        runner.save_status(&state_file, &mut status).unwrap();
+        for record in &mut status.runs {
+            record.state = RunState::Failed;
+            record.error_reason = Some(format!("retained failure for {}", record.run_id));
+        }
+        recompute_status_counts(&mut status);
+        runner.save_status(&state_file, &mut status).unwrap();
+        (runner, state_file, status)
+    }
+
+    #[test]
+    fn explicit_failed_retry_continues_the_exact_nonzero_owner_and_retains_failure_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = population_budget_runner(directory.path());
+        runner.variants[0]
+            .config_overrides
+            .insert("population_spawn_interval".into(), serde_json::json!(2));
+        let state_file = directory.path().join("status.json");
+        let plan = runner.validated_plan().unwrap();
+        let record = &plan.runs[0];
+        let (variant, family) = &plan.variants[&record.variant_id];
+        runner
+            .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+            .unwrap();
+        let path = runner.run_checkpoint_path(&record.run_id);
+        let initial = read_optional_run_checkpoint(&path).unwrap().unwrap();
+        let population_limit = u64::try_from(
+            initial
+                .owner
+                .host_checkpoint()
+                .world_checkpoint()
+                .agent_count(),
+        )
+        .unwrap();
+        let failed = runner
+            .execute_batch_with_budget(
+                &state_file,
+                RunExecutionBudget {
+                    cancel: &std::sync::atomic::AtomicBool::new(false),
+                    population_limit,
+                },
+            )
+            .unwrap();
+        assert_eq!(failed.failed_runs, 1);
+        assert!(
+            failed.runs[0]
+                .error_reason
+                .as_ref()
+                .unwrap()
+                .contains("tick 2")
+        );
+        let failed_bytes = fs::read(&state_file).unwrap();
+        let mut cut = read_optional_run_checkpoint(&path).unwrap().unwrap();
+        assert_eq!(cut.owner.host_checkpoint().tick().0, 1);
+        let original_manifest = cut.metadata.manifest.canonical_json_bytes().unwrap();
+        // Add an actual same-tick owner barrier. Tick-zero replay would produce
+        // the same science, but it would lose this retained journal observation.
+        let mut oracle = restore_run_owner(&cut, *family, &record.run_id, &path).unwrap();
+        let (_, namespace) = host_identifiers(&record.run_id);
+        let mut frontend = NullFrontend::new(oracle.local_port(), namespace);
+        let mut now = 0;
+        seal_run_checkpoint(&record.run_id, &mut frontend, &mut oracle, &mut now).unwrap();
+        cut.owner = oracle.capture_volatile_host_checkpoint_v1().unwrap();
+        let retained_cut = cut.encode(&path).unwrap();
+        write_run_checkpoint(&path, &retained_cut).unwrap();
+        for tick in 2..=runner.max_ticks {
+            let submitted = frontend
+                .submit_envelope(CommandEnvelope::new(
+                    CommandId::from_client_sequence(namespace, tick),
+                    HostCommand::Step,
+                ))
+                .unwrap();
+            drive_command_to_volatile_commit(
+                &record.run_id,
+                "failed retry continuation oracle",
+                &mut frontend,
+                &mut oracle,
+                submitted.command_id(),
+                tick,
+                0,
+                &mut now,
+            )
+            .unwrap();
+            seal_run_checkpoint(&record.run_id, &mut frontend, &mut oracle, &mut now).unwrap();
+        }
+        let expected_digest = oracle.scientific_digest_v1().unwrap().overall;
+        let expected_journal = oracle
+            .capture_volatile_host_checkpoint_v1()
+            .unwrap()
+            .host_checkpoint()
+            .journal_cut();
+        drop(frontend);
+        drop(oracle);
+
+        assert_eq!(runner.execute_batch(&state_file).unwrap(), failed);
+        assert_eq!(fs::read(&state_file).unwrap(), failed_bytes);
+        let admitted = runner
+            .retry_failed_runs(&state_file, failed.generation)
+            .unwrap();
+        assert_eq!(admitted.generation, failed.generation + 1);
+        assert_eq!(admitted.failed_runs, 0);
+        assert_eq!(admitted.runs[0].state, RunState::Running);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            retained_cut,
+            "retry admission cannot advance science"
+        );
+        let history = failed_retry_history_directory(&state_file).unwrap();
+        let original = failed_retry_history_path(&history, failed.generation);
+        assert_eq!(fs::read(&original).unwrap(), failed_bytes);
+        assert!(matches!(
+            runner.retry_failed_runs(&state_file, failed.generation),
+            Err(ExperimentRunnerError::StaleStatusGeneration { .. })
+        ));
+        let completed = runner.execute_batch(&state_file).unwrap();
+        assert_eq!(completed.completed_runs, 1, "{completed:?}");
+        assert_eq!(completed.failed_runs, 0);
+        assert_eq!(
+            completed.runs[0].final_digest.as_deref(),
+            Some(expected_digest.as_str())
+        );
+        let final_cut = read_optional_run_checkpoint(&path).unwrap().unwrap();
+        assert_eq!(
+            final_cut.owner.host_checkpoint().journal_cut(),
+            expected_journal
+        );
+        assert_eq!(
+            final_cut.metadata.manifest.canonical_json_bytes().unwrap(),
+            original_manifest
+        );
+        assert_eq!(fs::read(&original).unwrap(), failed_bytes);
+        assert_eq!(
+            runner
+                .retry_failed_runs(&state_file, completed.generation)
+                .unwrap(),
+            completed
+        );
+        assert_eq!(inspect_failed_retry_history(&history).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn explicit_failed_retry_refuses_missing_corrupt_and_foreign_peer_cuts_atomically() {
+        for damage in ["missing", "corrupt", "foreign"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (runner, state_file, failed) = failed_retry_fixture(directory.path(), vec![7, 11]);
+            let failed_bytes = fs::read(&state_file).unwrap();
+            let first = runner.run_checkpoint_path(&failed.runs[0].run_id);
+            let first_bytes = fs::read(&first).unwrap();
+            let path = runner.run_checkpoint_path(&failed.runs[1].run_id);
+            let original = fs::read(&path).unwrap();
+            fs::rename(&path, directory.path().join("original.checkpoint")).unwrap();
+            match damage {
+                "missing" => {}
+                "corrupt" => fs::write(&path, b"truncated checkpoint").unwrap(),
+                "foreign" => {
+                    let mut cut = RunCheckpointV1::decode(&original, &path).unwrap();
+                    cut.metadata.run_id = "another-run".into();
+                    fs::write(&path, cut.encode(&path).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                runner
+                    .retry_failed_runs(&state_file, failed.generation)
+                    .is_err(),
+                "{damage}"
+            );
+            assert_eq!(fs::read(&state_file).unwrap(), failed_bytes, "{damage}");
+            assert_eq!(fs::read(&first).unwrap(), first_bytes, "{damage}");
+            assert!(
+                !failed_retry_history_directory(&state_file)
+                    .unwrap()
+                    .exists()
+            );
+            assert_eq!(
+                fs::read(directory.path().join("original.checkpoint")).unwrap(),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_failed_retry_recovers_only_the_exact_retained_generation_transition() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runner, state_file, failed) = failed_retry_fixture(directory.path(), vec![7, 11]);
+        let original = fs::read(&state_file).unwrap();
+        let candidate = failed_retry_status_candidate(&state_file, &failed).unwrap();
+        let temporary = status_temporary_path(&state_file).unwrap();
+        fs::write(&temporary, canonical_status_bytes(&candidate).unwrap()).unwrap();
+        assert!(
+            runner.load_or_create_status(&state_file).is_err(),
+            "a status alone cannot authorize retry"
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), original);
+        retain_failed_status_for_retry(&state_file, failed.generation, &original).unwrap();
+        let mut subset = candidate.clone();
+        subset.runs[1] = failed.runs[1].clone();
+        recompute_status_counts(&mut subset);
+        fs::write(&temporary, canonical_status_bytes(&subset).unwrap()).unwrap();
+        assert!(
+            runner.load_or_create_status(&state_file).is_err(),
+            "one failed peer cannot be omitted"
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), original);
+
+        fs::write(&temporary, canonical_status_bytes(&candidate).unwrap()).unwrap();
+        let recovered = runner.load_or_create_status(&state_file).unwrap();
+        assert_eq!(recovered, candidate);
+        assert_eq!(runner.execute_batch(&state_file).unwrap().completed_runs, 2);
+        let history = failed_retry_history_directory(&state_file).unwrap();
+        assert_eq!(
+            fs::read(failed_retry_history_path(&history, failed.generation)).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn explicit_failed_retry_publication_recovery_revalidates_the_owner_cut() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runner, state_file, failed) = failed_retry_fixture(directory.path(), vec![7]);
+        let original = fs::read(&state_file).unwrap();
+        retain_failed_status_for_retry(&state_file, failed.generation, &original).unwrap();
+        let candidate = failed_retry_status_candidate(&state_file, &failed).unwrap();
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let successor = canonical_status_bytes(&candidate).unwrap();
+        fs::write(&temporary, &successor).unwrap();
+        let path = runner.run_checkpoint_path(&failed.runs[0].run_id);
+        fs::rename(&path, directory.path().join("original.checkpoint")).unwrap();
+        fs::write(&path, b"invalid saved owner cut").unwrap();
+        assert!(runner.load_or_create_status(&state_file).is_err());
+        assert_eq!(fs::read(&state_file).unwrap(), original);
+        assert_eq!(fs::read(&temporary).unwrap(), successor);
+        let history = failed_retry_history_directory(&state_file).unwrap();
+        assert_eq!(
+            fs::read(failed_retry_history_path(&history, failed.generation)).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn explicit_failed_retry_torn_publication_retains_the_failure_and_can_be_reissued() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runner, state_file, failed) = failed_retry_fixture(directory.path(), vec![7]);
+        let original = fs::read(&state_file).unwrap();
+        retain_failed_status_for_retry(&state_file, failed.generation, &original).unwrap();
+        let candidate = failed_retry_status_candidate(&state_file, &failed).unwrap();
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let mut torn = canonical_status_bytes(&candidate).unwrap();
+        torn.truncate(torn.len() / 2);
+        assert!(
+            serde_json::from_slice::<ExperimentBatchStatus>(&torn)
+                .unwrap_err()
+                .is_eof()
+        );
+        fs::write(&temporary, &torn).unwrap();
+        assert_eq!(runner.load_or_create_status(&state_file).unwrap(), failed);
+        assert_eq!(fs::read(&state_file).unwrap(), original);
+        assert_eq!(
+            fs::read(temporary.with_extension("interrupted").join("status.tmp")).unwrap(),
+            torn
+        );
+        assert_eq!(runner.execute_batch(&state_file).unwrap(), failed);
+        assert_eq!(
+            runner
+                .retry_failed_runs(&state_file, failed.generation)
+                .unwrap(),
+            candidate
+        );
+        assert_eq!(runner.execute_batch(&state_file).unwrap().completed_runs, 1);
+        let history = failed_retry_history_directory(&state_file).unwrap();
+        assert_eq!(
+            fs::read(failed_retry_history_path(&history, failed.generation)).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn explicit_failed_retry_keeps_ordinary_saves_monotonic_and_rejects_stale_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runner, state_file, failed) = failed_retry_fixture(directory.path(), vec![7]);
+        let original = fs::read(&state_file).unwrap();
+        let mut candidate = failed_retry_status_candidate(&state_file, &failed).unwrap();
+        candidate.generation = failed.generation;
+        assert!(runner.save_status(&state_file, &mut candidate).is_err());
+        retain_failed_status_for_retry(&state_file, failed.generation, &original).unwrap();
+        assert!(
+            runner.save_status(&state_file, &mut candidate).is_err(),
+            "retained history cannot loosen ordinary saves"
+        );
+        let history = failed_retry_history_directory(&state_file).unwrap();
+        let retained = failed_retry_history_path(&history, failed.generation);
+        let mut forged = failed.clone();
+        forged.runs[0].error_reason = Some("substituted failure".into());
+        fs::write(&retained, canonical_status_bytes(&forged).unwrap()).unwrap();
+        assert!(
+            runner
+                .retry_failed_runs(&state_file, failed.generation)
+                .is_err()
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), original);
+        let torn = b"{\"schema_version\":";
+        fs::write(&retained, torn).unwrap();
+        assert!(
+            runner
+                .retry_failed_runs(&state_file, failed.generation)
+                .is_err()
+        );
+        assert_eq!(fs::read(&retained).unwrap(), torn);
+        assert_eq!(fs::read(&state_file).unwrap(), original);
+    }
+
+    #[test]
+    fn explicit_failed_retry_history_is_bounded_and_lost_responses_cannot_retry_later_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runner, state_file, mut failed) = failed_retry_fixture(directory.path(), vec![7]);
+        let first_generation = failed.generation;
+        let history = failed_retry_history_directory(&state_file).unwrap();
+        for attempt in 0..MAX_FAILED_RETRY_GENERATIONS {
+            let bytes = fs::read(&state_file).unwrap();
+            let generation = failed.generation;
+            let mut running = runner.retry_failed_runs(&state_file, generation).unwrap();
+            assert_eq!(
+                fs::read(failed_retry_history_path(&history, generation)).unwrap(),
+                bytes
+            );
+            running.runs[0].state = RunState::Failed;
+            running.runs[0].error_reason = Some(format!("later failure {attempt}"));
+            recompute_status_counts(&mut running);
+            runner.save_status(&state_file, &mut running).unwrap();
+            failed = running;
+            let failed_bytes = fs::read(&state_file).unwrap();
+            assert!(matches!(
+                runner.retry_failed_runs(&state_file, first_generation),
+                Err(ExperimentRunnerError::StaleStatusGeneration { .. })
+            ));
+            assert_eq!(fs::read(&state_file).unwrap(), failed_bytes);
+        }
+        let bytes = fs::read(&state_file).unwrap();
+        let error = runner
+            .retry_failed_runs(&state_file, failed.generation)
+            .unwrap_err();
+        assert!(error.to_string().contains("generation limit"), "{error}");
+        assert_eq!(fs::read(&state_file).unwrap(), bytes);
+        assert_eq!(
+            inspect_failed_retry_history(&history).unwrap().len(),
+            MAX_FAILED_RETRY_GENERATIONS
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_failed_retry_refuses_linked_history_without_touching_external_evidence() {
+        use std::os::unix::fs::symlink;
+        for link_directory in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let (runner, state_file, failed) = failed_retry_fixture(directory.path(), vec![7]);
+            let original = fs::read(&state_file).unwrap();
+            let external = directory.path().join("external");
+            fs::create_dir(&external).unwrap();
+            let outside_status = external.join("status.json");
+            fs::write(&outside_status, &original).unwrap();
+            let history = failed_retry_history_directory(&state_file).unwrap();
+            if link_directory {
+                symlink(&external, &history).unwrap();
+            } else {
+                fs::create_dir(&history).unwrap();
+                fs::hard_link(
+                    &outside_status,
+                    failed_retry_history_path(&history, failed.generation),
+                )
+                .unwrap();
+            }
+            assert!(
+                runner
+                    .retry_failed_runs(&state_file, failed.generation)
+                    .is_err()
+            );
+            assert_eq!(fs::read(&state_file).unwrap(), original);
+            assert_eq!(fs::read(&outside_status).unwrap(), original);
+        }
     }
 
     #[test]

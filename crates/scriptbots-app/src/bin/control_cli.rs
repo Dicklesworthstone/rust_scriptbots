@@ -257,6 +257,13 @@ enum ExperimentSubcommand {
     Cancel { id: String },
     /// Resume a stopped batch from its verified saved progress.
     Resume { id: String },
+    /// Retry failed runs from verified checkpoints, preserving failure evidence.
+    RetryFailed {
+        id: String,
+        /// Exact generation printed by experiment status; stale requests refuse.
+        #[arg(long)]
+        expected_generation: u64,
+    },
     /// Compare verified completed cohorts (challenger minus baseline), as JSON.
     Compare {
         id: String,
@@ -791,6 +798,20 @@ async fn experiment_request(
         ExperimentSubcommand::Resume { id } => {
             data_json::<ExperimentBatchStatusDto>(
                 client.post(data_api_url(base_url, &["experiments", &id, "resume"])?),
+            )
+            .await
+        }
+        ExperimentSubcommand::RetryFailed {
+            id,
+            expected_generation,
+        } => {
+            data_json::<ExperimentBatchStatusDto>(
+                client
+                    .post(data_api_url(
+                        base_url,
+                        &["experiments", &id, "retry-failed"],
+                    )?)
+                    .json(&serde_json::json!({ "expected_generation": expected_generation })),
             )
             .await
         }
@@ -3052,6 +3073,31 @@ mod tests {
             "completed_runs": 0, "failed_runs": 0, "runs": [], "error_reason": null,
             "created_at_utc": "123", "updated_at_utc": "456"
         })
+    }
+
+    #[tokio::test]
+    async fn experiment_retry_failed_http_preserves_full_width_generation() -> Result<()> {
+        let client = Client::new();
+        let expected = experiment_status_fixture("running");
+        let bytes = serde_json::to_vec(&expected)?;
+        let (base, worker) = data_wire_peer("200 OK", bytes.clone(), Some(bytes.len()));
+        let observed = experiment_request(
+            &client,
+            &base,
+            ExperimentSubcommand::RetryFailed {
+                id: "cli-study".into(),
+                expected_generation: u64::MAX,
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(observed, expected);
+        let request = worker.join().expect("wire peer joined")?;
+        assert!(
+            request.starts_with("POST /api/v1/experiments/cli-study/retry-failed HTTP/1.1\r\n")
+        );
+        assert!(request.ends_with("{\"expected_generation\":18446744073709551615}"));
+        Ok(())
     }
 
     #[tokio::test]

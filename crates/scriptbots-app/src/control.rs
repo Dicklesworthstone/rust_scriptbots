@@ -295,6 +295,15 @@ pub struct CommandStatusDto {
     pub scientific_revision: u64,
 }
 
+/// Retry authority for exactly the observed failed experiment generation.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentRetryFailedRequest {
+    /// Generation from the last observed experiment status. A repeated request
+    /// cannot authorize another attempt after the status has advanced.
+    pub expected_generation: u64,
+}
+
 /// Request payload for setting simulation speed multiplier.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SpeedRequest {
@@ -4365,6 +4374,7 @@ impl ControlHandle {
                 "config_patching".into(),
                 "experiments_batch".into(),
                 "experiment_comparisons".into(),
+                "experiment_failed_run_retry".into(),
                 "checkpoints_v1".into(),
                 "checkpoint_branch_catalog_v1".into(),
                 "artifacts_storage".into(),
@@ -4397,6 +4407,7 @@ impl ControlHandle {
                 "/api/v1/experiments/{experiment_id}/compare".into(),
                 "/api/v1/experiments/{experiment_id}/cancel".into(),
                 "/api/v1/experiments/{experiment_id}/resume".into(),
+                "/api/v1/experiments/{experiment_id}/retry-failed".into(),
                 "/api/v1/checkpoints".into(),
                 "/api/v1/checkpoints/{checkpoint_id}".into(),
                 "/api/v1/checkpoints/branches".into(),
@@ -4434,6 +4445,7 @@ impl ControlHandle {
                 "experiment_compare".into(),
                 "experiment_cancel".into(),
                 "experiment_resume".into(),
+                "experiment_retry_failed".into(),
                 "checkpoint_create".into(),
                 "checkpoint_list".into(),
                 "checkpoint_status".into(),
@@ -4452,6 +4464,7 @@ impl ControlHandle {
                 "ExperimentComparisonDto".into(),
                 "ExperimentComparisonRequest".into(),
                 "ExperimentCreateRequest".into(),
+                "ExperimentRetryFailedRequest".into(),
                 "ExperimentVariantDto".into(),
                 "ScenarioInterventionV1".into(),
                 "CheckpointCreateRequest".into(),
@@ -4927,6 +4940,24 @@ impl ControlHandle {
         &self,
         experiment_id: &str,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        self.start_retained_experiment(experiment_id, None)
+    }
+
+    /// Explicitly retry failed runs from verified continuations, retaining their
+    /// original failure evidence. Completed runs are never executed again.
+    pub fn retry_failed_experiment(
+        &self,
+        experiment_id: &str,
+        expected_generation: u64,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        self.start_retained_experiment(experiment_id, Some(expected_generation))
+    }
+
+    fn start_retained_experiment(
+        &self,
+        experiment_id: &str,
+        retry_generation: Option<u64>,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
         self.data_services.recover_experiment(experiment_id)?;
         let mut lock = self
             .data_services
@@ -4937,6 +4968,15 @@ impl ControlHandle {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
         let current = job.status_dto(false)?;
+        let retry_failed = retry_generation.is_some();
+        if let Some(expected) = retry_generation
+            && current.generation != expected
+        {
+            return Err(ControlError::Conflict(format!(
+                "experiment '{experiment_id}' generation changed: expected {expected}, observed {}; refresh status before retrying failed runs",
+                current.generation
+            )));
+        }
         match current.status.as_str() {
             "running" | "pending" => {
                 return Err(ControlError::Conflict(format!(
@@ -4950,7 +4990,12 @@ impl ControlHandle {
             }
             _ => {}
         }
-        if current.completed_runs + current.failed_runs == current.total_runs {
+        if retry_failed && current.failed_runs == 0 {
+            return Err(ControlError::Conflict(format!(
+                "experiment '{experiment_id}' has no failed runs to retry"
+            )));
+        }
+        if !retry_failed && current.completed_runs + current.failed_runs == current.total_runs {
             return Err(ControlError::Conflict(format!(
                 "experiment '{experiment_id}' has no pending runs to resume (status {})",
                 current.status
@@ -4962,7 +5007,10 @@ impl ControlHandle {
         let run_slots = current
             .runs
             .iter()
-            .filter(|run| matches!(run.state.as_str(), "pending" | "running"))
+            .filter(|run| {
+                matches!(run.state.as_str(), "pending" | "running")
+                    || (retry_failed && run.state == "failed")
+            })
             .count()
             .min(job.runner.max_concurrency);
         let grid_cells = job
@@ -4978,6 +5026,19 @@ impl ControlHandle {
             run_slots,
             grid_cells,
         )?;
+        if let Some(expected_generation) = retry_generation {
+            // Reserve the whole execution wave before changing retained status.
+            // A refusal must leave both failure evidence and continuation cuts
+            // intact; the reservation drops if validation or publication fails.
+            job.runner
+                .retry_failed_runs(&job.state_file, expected_generation)
+                .map_err(|error| match error {
+                    error @ crate::experiment_runner::ExperimentRunnerError::StaleStatusGeneration { .. } => {
+                        ControlError::Conflict(error.to_string())
+                    }
+                    error => experiment_catalog_error(&job.state_file, error),
+                })?;
+        }
         job.cancel
             .store(false, std::sync::atomic::Ordering::Release);
         if let Ok(mut error) = job.last_error.lock() {
@@ -6007,9 +6068,11 @@ impl ControlHandle {
                 "checkpoint discovery directory budget exceeded".into(),
             ));
         }
-        if retention.requests.values().any(|request| {
-            !request.acknowledged && request.metadata.checkpoint_id == checkpoint_id
-        }) {
+        if retention
+            .requests
+            .values()
+            .any(|request| !request.acknowledged && request.metadata.checkpoint_id == checkpoint_id)
+        {
             return Err(ControlError::NotFound(
                 "checkpoint completion is pending; retry its original capture request".into(),
             ));
@@ -6161,8 +6224,8 @@ impl ControlHandle {
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         continuity: Option<&scriptbots_core::WorldHostCheckpointV1>,
     ) -> Result<(WorldState, Option<crate::BrainPreset>), ControlError> {
-        let registry = crate::brains::create_brain_registry_for_checkpoint(checkpoint)
-            .map_err(|error| {
+        let registry =
+            crate::brains::create_brain_registry_for_checkpoint(checkpoint).map_err(|error| {
                 ControlError::BadRequest(format!(
                     "checkpoint registry does not match the compiled application adapters: {error}"
                 ))
@@ -8742,7 +8805,6 @@ pub(crate) mod tests {
             ("temperature_discomfort_rate".into(), serde_json::json!(0.0)),
             ("spike_damage".into(), serde_json::json!(0.0)),
             ("spike_energy_cost".into(), serde_json::json!(0.0)),
-
         ]);
         let variants = [("baseline", 0.0), ("challenger", 10.0)]
             .into_iter()
@@ -9264,6 +9326,157 @@ pub(crate) mod tests {
             services.reserve_experiment_execution("new", 1, 1),
             Err(ControlError::ExperimentShuttingDown)
         ));
+    }
+
+    pub(crate) fn failed_retry_catalog_fixture(
+        handle: ControlHandle,
+        root: &std::path::Path,
+        experiment_id: &str,
+    ) -> (
+        ControlHandle,
+        crate::experiment_runner::ExperimentBatchStatus,
+        [crate::experiment_runner::RunRecord; 2],
+    ) {
+        use crate::experiment_runner::{
+            MatchedSeedCohort, MatchedSeedExperimentRunner, RunState, ScenarioVariant,
+        };
+        use std::sync::atomic::AtomicBool;
+
+        let handle = handle.with_artifacts_dir(root.to_path_buf()).unwrap();
+        let directory = root.join("experiments").join(experiment_id);
+        let runner = Arc::new(MatchedSeedExperimentRunner::new(
+            experiment_id,
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![7, 11],
+            },
+            vec![ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::from([
+                    ("world_width".into(), json!(100)),
+                    ("world_height".into(), json!(100)),
+                    ("food_cell_size".into(), json!(50)),
+                ]),
+                interventions: Vec::new(),
+            }],
+            3,
+            1,
+            directory.clone(),
+        ));
+        // Real completed owners/bundles model a failure publishing one final
+        // status; the successful peer's saved owner must remain unchanged.
+        let completed = [7, 11].map(|seed| {
+            runner
+                .execute_single_run(&runner.variants[0], seed)
+                .unwrap()
+        });
+        let state_file = directory.join("status.json");
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        for run in &mut status.runs {
+            run.state = RunState::Running;
+        }
+        runner.save_status(&state_file, &mut status).unwrap();
+        status.runs[0].state = RunState::Failed;
+        status.runs[0].error_reason = Some("completion status publication failed".into());
+        status.runs[1] = completed[1].clone();
+        status.completed_runs = 1;
+        status.failed_runs = 1;
+        runner.save_status(&state_file, &mut status).unwrap();
+        handle.data_services.experiments.lock().unwrap().insert(
+            experiment_id.into(),
+            ExperimentJob {
+                runner,
+                state_file: state_file.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                running: Arc::new(AtomicBool::new(false)),
+                last_error: Arc::new(Mutex::new(None)),
+                created_at_utc: "1".into(),
+                artifact_root: root.to_path_buf(),
+                artifact_generation: Mutex::new(None),
+                worker: None,
+            },
+        );
+        (handle, status, completed)
+    }
+
+    #[test]
+    fn experiment_failed_retry_reserves_capacity_and_keeps_generation_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let (handle, status, completed) =
+            failed_retry_catalog_fixture(handle, root.path(), "failed-retry");
+        let directory = root.path().join("experiments/failed-retry");
+        let state_file = directory.join("status.json");
+        let generation = status.generation;
+        let before = fs::read(&state_file).unwrap();
+        let cuts = status
+            .runs
+            .iter()
+            .map(|run| {
+                let path = directory.join(format!("{}.checkpoint", run.run_id));
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            handle.resume_experiment("failed-retry"),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            handle.retry_failed_experiment("failed-retry", generation + 1),
+            Err(ControlError::Conflict(message)) if message.contains("generation changed")
+        ));
+        handle.clone().with_experiment_run_capacity(0).unwrap();
+        assert!(matches!(
+            handle.retry_failed_experiment("failed-retry", generation),
+            Err(ControlError::ExperimentCapacity(_))
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), before);
+        for (path, bytes) in &cuts {
+            assert_eq!(&fs::read(path).unwrap(), bytes);
+        }
+        assert!(!directory.join("status.json.retries").exists());
+        handle.clone().with_experiment_run_capacity(1).unwrap();
+        let admitted = handle
+            .retry_failed_experiment("failed-retry", generation)
+            .unwrap();
+        assert!(admitted.generation > generation);
+        assert_eq!(admitted.failed_runs, 0);
+        handle
+            .data_services
+            .experiments
+            .lock()
+            .unwrap()
+            .get_mut("failed-retry")
+            .unwrap()
+            .join_worker()
+            .unwrap();
+        let final_status = handle.get_experiment("failed-retry").unwrap();
+        assert_eq!(final_status.status, "completed", "{final_status:?}");
+        assert_eq!(final_status.completed_runs, 2);
+        for (observed, expected) in final_status.runs.iter().zip(&completed) {
+            assert_eq!(observed.total_ticks, expected.total_ticks);
+            assert_eq!(observed.final_digest, expected.final_digest);
+            assert_eq!(observed.bundle_path, expected.bundle_path);
+        }
+        assert_eq!(fs::read(&cuts[1].0).unwrap(), cuts[1].1);
+        assert_eq!(
+            fs::read(directory.join(format!(
+                "status.json.retries/generation-{generation:020}.json"
+            )))
+            .unwrap(),
+            before
+        );
+        let after = fs::read(&state_file).unwrap();
+        assert!(matches!(
+            handle.retry_failed_experiment("failed-retry", generation),
+            Err(ControlError::Conflict(message)) if message.contains("generation changed")
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), after);
+        let capacity = *handle.data_services.execution_capacity.lock().unwrap();
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
     }
 
     #[test]
@@ -14490,7 +14703,11 @@ pub(crate) mod tests {
                 _ => unreachable!(),
             }
             write_checkpoint_catalog(&directory, &metadata).unwrap();
-            assert!(!directory.join(format!("{}.bin", metadata.checkpoint_id)).exists());
+            assert!(
+                !directory
+                    .join(format!("{}.bin", metadata.checkpoint_id))
+                    .exists()
+            );
             assert!(matches!(
                 handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
                 Err(ControlError::PayloadTooLarge(_))
@@ -14509,7 +14726,10 @@ pub(crate) mod tests {
             handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
             Err(ControlError::PayloadTooLarge(_))
         ));
-        assert_eq!(host.port.scientific_digest_v1().unwrap().overall, saved.world_digest_v1);
+        assert_eq!(
+            host.port.scientific_digest_v1().unwrap().overall,
+            saved.world_digest_v1
+        );
     }
 
     #[test]
@@ -14546,7 +14766,11 @@ pub(crate) mod tests {
             metadata.checksum_blake3 = compute_blake3(&bytes);
             metadata.checksum_sha256 = compute_sha256(&bytes);
             write_checkpoint_catalog(&directory, &metadata).unwrap();
-            fs::write(directory.join(format!("{}.bin", metadata.checkpoint_id)), &bytes).unwrap();
+            fs::write(
+                directory.join(format!("{}.bin", metadata.checkpoint_id)),
+                &bytes,
+            )
+            .unwrap();
             assert!(matches!(
                 handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
                 Err(ControlError::PayloadTooLarge(reason)) if reason.contains("history")
@@ -14624,7 +14848,10 @@ pub(crate) mod tests {
         let (restored, preset) =
             ControlHandle::restore_canvas_world_and_preset(&checkpoint, None).unwrap();
         assert_eq!(preset, None);
-        assert_eq!(restored.world_digest_v1().unwrap(), *checkpoint.source_digest());
+        assert_eq!(
+            restored.world_digest_v1().unwrap(),
+            *checkpoint.source_digest()
+        );
         host.wait_applied(&handle.step().unwrap());
         let live = host.port.scientific_digest_v1().unwrap();
         let publication = handle.read_snapshot().unwrap();

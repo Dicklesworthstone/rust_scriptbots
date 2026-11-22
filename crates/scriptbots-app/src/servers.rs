@@ -42,9 +42,9 @@ use crate::control::{
     CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto, ConfigSnapshot, ControlError,
     ControlHandle, DietClassDto, EventEntry, EventKind, ExperimentBatchStatusDto,
     ExperimentComparisonDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
-    ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot,
-    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate,
-    MAX_CHECKPOINT_BRANCH_ID_BYTES, MAX_CHECKPOINT_BRANCH_KEY_BYTES,
+    ExperimentRetryFailedRequest, ExperimentRunRecordDto, ExperimentSummaryDto,
+    ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody, InterventionsPollDto, KnobEntry,
+    KnobUpdate, MAX_CHECKPOINT_BRANCH_ID_BYTES, MAX_CHECKPOINT_BRANCH_KEY_BYTES,
     MAX_CHECKPOINT_BRANCH_NAME_BYTES, MAX_CHECKPOINT_BRANCH_REQUEST_BYTES,
     MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH, MapApplyAgentPolicy, MapApplyRequestBody,
     MapGenerateRequestBody, PaginatedArtifactsResponse, PaginatedCheckpointBranchesResponse,
@@ -1727,6 +1727,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
         post_v1_experiment_compare,
         post_v1_experiment_cancel,
         post_v1_experiment_resume,
+        post_v1_experiment_retry_failed,
         post_v1_checkpoints,
         get_v1_checkpoints,
         get_v1_checkpoint_by_id,
@@ -1782,6 +1783,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
             ScenarioInterventionV1,
             ExperimentVariantDto,
             ExperimentCreateRequest,
+            ExperimentRetryFailedRequest,
             ExperimentRunRecordDto,
             ExperimentBatchStatusDto,
             ExperimentComparisonRequest,
@@ -4583,6 +4585,54 @@ async fn post_v1_experiment_resume(
 
 #[utoipa::path(
     post,
+    path = "/api/v1/experiments/{experiment_id}/retry-failed",
+    tag = "experiments",
+    params(("experiment_id" = String, Path, description = "Unique experiment identifier")),
+    request_body = ExperimentRetryFailedRequest,
+    responses(
+        (status = 200, description = "Failed runs admitted from verified saved owner cuts; poll status for completion", body = ExperimentBatchStatusDto),
+        (status = 400, description = "Missing or malformed generation guard"),
+        (status = 404, description = "Experiment not found"),
+        (status = 409, description = "Observed generation changed, experiment is running, or retry evidence is unavailable"),
+        (status = 413, description = "Request exceeds the 4 KiB body limit"),
+        (status = 415, description = "Request body must use a JSON content type"),
+        (status = 500, description = "Saved status or owner evidence failed verification"),
+        (status = 503, description = "Execution capacity exhausted; failed runs remain unchanged")
+    )
+)]
+async fn post_v1_experiment_retry_failed(
+    State(state): State<ApiState>,
+    axum::extract::Path(experiment_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
+    require_json_content_type(&headers, &bytes)?;
+    if bytes.len() > 4096 {
+        return Err(AppError::payload_too_large(
+            "experiment failed-run retry request exceeds 4096 bytes",
+        ));
+    }
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(AppError::bad_request(
+            "experiment failed-run retry request must be a JSON object with expected_generation",
+        ));
+    }
+    let body: ExperimentRetryFailedRequest = serde_json::from_slice(&bytes).map_err(|error| {
+        AppError::bad_request(format!(
+            "invalid experiment failed-run retry request: {error}"
+        ))
+    })?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state
+            .handle
+            .retry_failed_experiment(&experiment_id, body.expected_generation)
+    })
+    .await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
     path = "/api/v1/checkpoints",
     tag = "checkpoints",
     request_body(content = Option<CheckpointCreateRequest>, description = "Optional checkpoint creation configuration"),
@@ -5068,6 +5118,10 @@ fn prepare_rest_server(
         .route(
             "/api/v1/experiments/{experiment_id}/resume",
             post(post_v1_experiment_resume),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/retry-failed",
+            post(post_v1_experiment_retry_failed).layer(DefaultBodyLimit::max(4096)),
         )
         .route(
             "/api/v1/checkpoints",
@@ -5784,6 +5838,23 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
 
     builder = register_tool(
         builder,
+        "experiment_retry_failed",
+        "Explicitly retry failed experiment runs from verified saved owner cuts, retaining failure evidence. Pass the observed status generation; poll experiment_status for completion.",
+        json!({
+            "type": "object",
+            "properties": {
+                "experiment_id": {"type": "string"},
+                "expected_generation": {"type": "integer", "minimum": 0}
+            },
+            "required": ["experiment_id", "expected_generation"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentRetryFailed,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
         "checkpoint_create",
         "Create a simulation checkpoint from current world state and persist as artifact",
         json!({
@@ -6221,6 +6292,13 @@ struct McpCheckpointBranchIdRequest {
     branch_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpExperimentRetryFailedRequest {
+    experiment_id: String,
+    expected_generation: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlToolKind {
     ListPresets,
@@ -6249,6 +6327,7 @@ enum ControlToolKind {
     ExperimentCompare,
     ExperimentCancel,
     ExperimentResume,
+    ExperimentRetryFailed,
     CheckpointCreate,
     CheckpointList,
     CheckpointStatus,
@@ -6289,6 +6368,7 @@ impl ControlToolKind {
             "experiment_compare" => Self::ExperimentCompare,
             "experiment_cancel" => Self::ExperimentCancel,
             "experiment_resume" => Self::ExperimentResume,
+            "experiment_retry_failed" => Self::ExperimentRetryFailed,
             "checkpoint_create" => Self::CheckpointCreate,
             "checkpoint_list" => Self::CheckpointList,
             "checkpoint_status" => Self::CheckpointStatus,
@@ -6331,6 +6411,7 @@ impl ControlToolKind {
             | Self::ExperimentStatus
             | Self::ExperimentCompare
             | Self::ExperimentResume
+            | Self::ExperimentRetryFailed
             | Self::CheckpointCreate
             | Self::CheckpointList
             | Self::CheckpointStatus
@@ -6384,6 +6465,7 @@ impl ToolHandler for ControlTool {
             self.kind,
             ControlToolKind::Step
                 | ControlToolKind::ExperimentCompare
+                | ControlToolKind::ExperimentRetryFailed
                 | ControlToolKind::CheckpointBranchCreate
                 | ControlToolKind::CheckpointBranchList
                 | ControlToolKind::CheckpointBranchStatus
@@ -6769,6 +6851,23 @@ impl ToolHandler for ControlTool {
                 let handle = self.handle.clone();
                 let res = run_control_mcp_sync(move || handle.resume_experiment(&experiment_id))?;
                 make_tool_result(res)
+            }
+            ControlToolKind::ExperimentRetryFailed => {
+                let request: McpExperimentRetryFailedRequest =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid experiment_retry_failed parameters: {error}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let status = run_control_mcp_sync(move || {
+                    handle.retry_failed_experiment(
+                        &request.experiment_id,
+                        request.expected_generation,
+                    )
+                })?;
+                make_tool_result(status)
             }
             ControlToolKind::CheckpointCreate => {
                 let req: CheckpointCreateRequest = serde_json::from_value(Value::Object(arguments))
@@ -10040,6 +10139,307 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(experiment_failed_retry_http)]
+    async fn experiment_failed_retry_http_and_mcp_preserve_saved_peers_and_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = test_host();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Http {
+                bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            },
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let rest_address = reservation.rest_address().unwrap();
+        let mcp_address = reservation.mcp_http_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let client = reqwest::Client::new();
+        let mcp_url = format!("http://{mcp_address}/mcp");
+        let initialized: Value = client
+            .post(&mcp_url)
+            .json(&json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                    "clientInfo":{"name":"failed-retry-test", "version":"0"}}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(initialized.get("error").is_none(), "{initialized}");
+
+        for (experiment_id, via_mcp) in [("rest-retry", false), ("mcp-retry", true)] {
+            let (handle, failed, completed) = crate::control::tests::failed_retry_catalog_fixture(
+                handle.clone(),
+                root.path(),
+                experiment_id,
+            );
+            let directory = root.path().join("experiments").join(experiment_id);
+            let state_file = directory.join("status.json");
+            let original = std::fs::read(&state_file).unwrap();
+            let peer_cut = directory.join(format!("{}.checkpoint", failed.runs[1].run_id));
+            let peer_bytes = std::fs::read(&peer_cut).unwrap();
+            let status_url = format!("http://{rest_address}/api/v1/experiments/{experiment_id}");
+            let retry_url = format!("{status_url}/retry-failed");
+            let mut unchanged_status = original.clone();
+            for (index, (generation, admit)) in [
+                (failed.generation + 1, false),
+                (failed.generation, true),
+                (failed.generation, false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let request = if via_mcp {
+                    client.post(&mcp_url).json(&json!({
+                        "jsonrpc":"2.0", "id":index + 2, "method":"tools/call",
+                        "params":{"name":"experiment_retry_failed", "arguments":{
+                            "experiment_id":experiment_id, "expected_generation":generation
+                        }}
+                    }))
+                } else {
+                    client
+                        .post(&retry_url)
+                        .json(&json!({"expected_generation":generation}))
+                };
+                let response = request.send().await.unwrap();
+                let code = response.status().as_u16();
+                let body: Value = response.json().await.unwrap();
+                if !admit {
+                    assert_eq!(code, if via_mcp { 200 } else { 409 }, "{body}");
+                    if via_mcp {
+                        assert!(body.get("error").is_none(), "{body}");
+                        assert_eq!(body["result"]["isError"], true, "{body}");
+                    }
+                    assert!(body.to_string().contains("generation changed"), "{body}");
+                    assert_eq!(std::fs::read(&state_file).unwrap(), unchanged_status);
+                    continue;
+                }
+
+                assert_eq!(code, 200, "{body}");
+                let admitted: ExperimentBatchStatusDto = if via_mcp {
+                    assert!(body.get("error").is_none(), "{body}");
+                    assert_ne!(body["result"]["isError"], true, "{body}");
+                    serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap()
+                } else {
+                    serde_json::from_value(body).unwrap()
+                };
+                assert!(admitted.generation > failed.generation);
+                assert_eq!(admitted.failed_runs, 0);
+                assert_eq!(admitted.runs[1].final_digest, completed[1].final_digest);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let final_status = loop {
+                    let observed: ExperimentBatchStatusDto = client
+                        .get(&status_url)
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    if observed.status == "completed" {
+                        break observed;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "{observed:?}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                assert_eq!(final_status.completed_runs, 2);
+                for (observed, expected) in final_status.runs.iter().zip(&completed) {
+                    assert_eq!(observed.total_ticks, expected.total_ticks);
+                    assert_eq!(observed.final_digest, expected.final_digest);
+                    assert_eq!(observed.bundle_path, expected.bundle_path);
+                }
+                assert_eq!(std::fs::read(&peer_cut).unwrap(), peer_bytes);
+                assert_eq!(
+                    std::fs::read(directory.join(format!(
+                        "status.json.retries/generation-{:020}.json",
+                        failed.generation
+                    )))
+                    .unwrap(),
+                    original
+                );
+                unchanged_status = std::fs::read(&state_file).unwrap();
+            }
+            assert_eq!(handle.get_experiment(experiment_id).unwrap().failed_runs, 0);
+        }
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+        server.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(experiment_failed_retry_http)]
+    async fn experiment_failed_retry_http_requires_bounded_guarded_json_before_catalog_access() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = test_host();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/api/v1/experiments/not-created/retry-failed");
+        for body in [
+            "",
+            " ",
+            "null",
+            "[]",
+            "[0]",
+            "{}",
+            r#"{"expected_generation":null}"#,
+            r#"{"expected_generation":"0"}"#,
+            r#"{"expected_generation":-1}"#,
+            r#"{"expected_generation":0.5}"#,
+            r#"{"expected_generation":18446744073709551616}"#,
+            r#"{"expected_generation":0,"force":true}"#,
+            r#"{"expected_generation":0,"expected_generation":1}"#,
+        ] {
+            let refused = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status().as_u16(), 400, "{body}");
+        }
+        let valid = r#"{"expected_generation":0}"#;
+        for (length, expected) in [(4096, 404), (4097, 413)] {
+            let body = format!("{valid}{}", " ".repeat(length - valid.len()));
+            let response = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), expected, "{length}");
+        }
+        let full_width = client
+            .post(&url)
+            .json(&json!({"expected_generation":u64::MAX}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(full_width.status().as_u16(), 404);
+        let wrong_type = client
+            .post(&url)
+            .header("Content-Type", "text/plain")
+            .body(valid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_type.status().as_u16(), 415);
+        let stale_session = client
+            .post(&url)
+            .header(
+                "X-ScriptBots-Session",
+                handle.session_id().get().wrapping_add(1).to_string(),
+            )
+            .json(&json!({"expected_generation":0}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale_session.status().as_u16(), 409);
+        assert!(!root.path().join("experiments").exists());
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+        server.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn experiment_failed_retry_mcp_rejects_missing_or_malformed_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let tool = ControlTool {
+            handle: handle.clone(),
+            kind: ControlToolKind::ExperimentRetryFailed,
+            name: "experiment_retry_failed".into(),
+            description: "Retry failed runs".into(),
+            schema: json!({"type":"object"}),
+        };
+        let runtime = mcp_context_test_runtime();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let ctx = fastmcp_rust::McpContext::new(cx, 1);
+        let mcp = experiment_comparison_mcp(handle.clone()).await;
+        let mut cases = vec![
+            json!(null),
+            json!([]),
+            json!(["missing", 0]),
+            json!(false),
+            json!({}),
+            json!({"experiment_id":"missing"}),
+            json!({"expected_generation":0}),
+            json!({"experiment_id":7,"expected_generation":0}),
+            json!({"experiment_id":"missing","expected_generation":0,"force":true}),
+        ];
+        for generation in [json!(null), json!("0"), json!(-1), json!(0.5), json!(1e100)] {
+            cases.push(json!({"experiment_id":"missing","expected_generation":generation}));
+        }
+        for (index, arguments) in cases.into_iter().enumerate() {
+            let direct = tool
+                .call(&ctx, arguments.clone())
+                .expect_err("strict retry tool input");
+            assert_eq!(
+                direct.code,
+                McpErrorCode::InvalidParams,
+                "{arguments}: {direct}"
+            );
+            assert!(!direct.message.contains("not found"), "{direct}");
+            let response = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc":"2.0", "id":index + 2, "method":"tools/call",
+                    "params":{"name":"experiment_retry_failed", "arguments":arguments}
+                }),
+            )
+            .await;
+            if let Some(error) = response.get("error") {
+                assert_eq!(
+                    error["code"],
+                    i32::from(McpErrorCode::InvalidParams),
+                    "{response}"
+                );
+            } else {
+                // JSON Schema can admit a mathematically integral JSON number
+                // outside u64; the typed handler still refuses it explicitly.
+                assert_eq!(response["result"]["isError"], true, "{response}");
+                assert_eq!(response["result"]["content"][0]["text"], direct.message);
+            }
+        }
+        assert!(!root.path().join("experiments").exists());
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+    }
+
     async fn experiment_comparison_mcp(handle: ControlHandle) -> McpHttpState {
         let state = mcp_http_test_state(handle, ServerBuilder::new("experiment-comparison", "0"));
         let initialized = map_policy_mcp_request(
@@ -11674,6 +12074,13 @@ mod tests {
     fn mcp_tool_roster_is_complete() {
         let (control, _receiver) = handle();
         let discovery = control.schema();
+        assert!(
+            control
+                .version()
+                .capabilities
+                .iter()
+                .any(|capability| capability == "experiment_failed_run_retry")
+        );
         let server = register_control_tools(
             ServerBuilder::new("scriptbots-control-test", "0.0.0"),
             control,
@@ -11709,6 +12116,7 @@ mod tests {
             "experiment_compare",
             "experiment_cancel",
             "experiment_resume",
+            "experiment_retry_failed",
             "checkpoint_create",
             "checkpoint_list",
             "checkpoint_status",
@@ -11773,6 +12181,53 @@ mod tests {
                 crate::experiment_runner::MAX_RUN_COMPONENT_BYTES
             );
         }
+        let retry = &tools
+            .iter()
+            .find(|tool| tool.name == "experiment_retry_failed")
+            .unwrap()
+            .input_schema;
+        assert_eq!(retry["additionalProperties"], false);
+        assert_eq!(
+            retry["required"],
+            json!(["experiment_id", "expected_generation"])
+        );
+        assert_eq!(
+            retry["properties"]["expected_generation"]["type"],
+            "integer"
+        );
+        assert_eq!(retry["properties"]["expected_generation"]["minimum"], 0);
+        assert!(
+            discovery
+                .routes
+                .iter()
+                .any(|path| path == "/api/v1/experiments/{experiment_id}/retry-failed")
+        );
+        assert!(
+            discovery
+                .schemas
+                .iter()
+                .any(|name| name == "ExperimentRetryFailedRequest")
+        );
+        let request: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"experiment_retry_failed", "lane":"command", "arguments":{
+                "experiment_id":"saved", "expected_generation":0
+            }}
+        }))
+        .unwrap();
+        assert_eq!(mcp_request_work_lane(&request), ControlWorkLane::Work);
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let operation =
+            &openapi["paths"]["/api/v1/experiments/{experiment_id}/retry-failed"]["post"];
+        assert_eq!(operation["requestBody"]["required"], true);
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ExperimentRetryFailedRequest"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ExperimentRetryFailedRequest"]["required"],
+            json!(["expected_generation"])
+        );
     }
 
     /// Collect the `/api/...` literal that follows each occurrence of `marker`.
