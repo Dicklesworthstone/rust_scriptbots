@@ -917,7 +917,7 @@ async function runOwnerLifecycleCases(page, context) {
     const { BrowserContinuationStore } = await import("/continuation-store.js");
     window.__storedGoodRecord = await new BrowserContinuationStore(1024).read();
     window.__replaceStoredRecord = (record) => new Promise((resolve, reject) => {
-      const open = indexedDB.open("scriptbots-continuations", 1);
+      const open = indexedDB.open("scriptbots-continuations", 2);
       open.onerror = () => reject(open.error);
       open.onsuccess = () => {
         const database = open.result;
@@ -1079,7 +1079,7 @@ async function runOwnerLifecycleCases(page, context) {
   await setSpeed(1);
   await context.clock.runFor(64);
   await setSpeed(0);
-  const changedRecoveryTick = String(activeOwner(await state()).tick);
+  let changedRecoveryTick = String(activeOwner(await state()).tick);
   if (changedRecoveryTick === firstRecovery.tick) throw new Error("Recovery fixture did not create a newer scientific state");
   await page.evaluate(() => {
     const put = IDBObjectStore.prototype.put;
@@ -1100,9 +1100,147 @@ async function runOwnerLifecycleCases(page, context) {
     return (await new BrowserContinuationStore(1024).readRecovery()).tick;
   });
   if (retainedRecoveryTick !== firstRecovery.tick) throw new Error("Quota refusal replaced the committed recovery slot");
-  await page.evaluate(() => document.getElementById("checkpoint-recovery-retry").click());
-  await context.clock.runFor(32);
-  await waitRecovery({ state: "enabled", tick: changedRecoveryTick });
+
+  // A second page shares the actual origin's IndexedDB, but has no simulation
+  // timer. Its fixture checkpoints use the same explicit byte format above.
+  const competingPage = await context.newPage();
+  const recoveryRaces = {};
+  try {
+    await competingPage.goto(new URL("/continuation-store.js", page.url()).href);
+    await page.bringToFront();
+    await competingPage.evaluate(async () => {
+      const { BrowserContinuationStore } = await import("/continuation-store.js");
+      window.__competingStore = new BrowserContinuationStore(1024);
+      await window.__competingStore.readRecovery();
+    });
+    const sharedRecovery = () => competingPage.evaluate(async () => {
+      const current = await window.__competingStore.readRecovery({ observe: false });
+      return { tick: current.tick, source: current.source, writeToken: current.writeToken,
+        bytes: Array.from(new Uint8Array(await current.blob.arrayBuffer())),
+        manualTick: (await window.__competingStore.read()).tick };
+    });
+    const competingSave = (tick, observe = true) => competingPage.evaluate(async ({ tick, observe }) => {
+      if (observe) await window.__competingStore.readRecovery();
+      const bytes = new Uint8Array(9);
+      bytes[0] = 42;
+      new DataView(bytes.buffer).setBigUint64(1, BigInt(tick), true);
+      try {
+        await window.__competingStore.saveRecovery(new Blob([bytes]), { sessionId: "9001", tick,
+          scientificRevision: String(BigInt(tick) + 100n), controlRevision: "20", configRevision: "10" });
+        return "saved";
+      } catch (error) {
+        return error.code;
+      }
+    }, { tick, observe });
+    const unchangedRecovery = async (expected, reason) => {
+      const current = await sharedRecovery();
+      if (JSON.stringify(current) !== JSON.stringify(expected)) throw new Error(reason);
+      return current;
+    };
+
+    // The UI is still latched on its own quota failure. A routine retry may
+    // retry that comparison, but cannot implicitly take another tab's save.
+    if (await competingSave("777") !== "saved") throw new Error("Competing page could not create its recovery fixture");
+    const foreign = await sharedRecovery();
+    await page.evaluate(() => document.getElementById("checkpoint-recovery-retry").click());
+    await context.clock.runFor(32);
+    recoveryRaces.quotaRetryConflict = await waitRecovery({ state: "error", text: "Another tab changed" });
+    await unchangedRecovery(foreign, "Quota retry silently replaced the competing tab's checkpoint");
+    if ((await page.textContent("#checkpoint-recovery-retry")) !== "Use this world for recovery") {
+      throw new Error("A cross-tab conflict did not require an explicit recovery choice");
+    }
+    await context.clock.runFor(60_000);
+    await unchangedRecovery(foreign, "Latched recovery continued writing in the background");
+
+    await page.evaluate(() => document.getElementById("checkpoint-recovery-retry").click());
+    await waitRecovery({ state: "enabled", text: "This world will replace" });
+    await context.clock.runFor(32);
+    await waitRecovery({ state: "enabled", tick: changedRecoveryTick });
+    const taken = await sharedRecovery();
+    if (taken.tick !== changedRecoveryTick || taken.source.sessionId !== firstRecovery.source.sessionId
+        || taken.writeToken === foreign.writeToken || taken.manualTick !== "37") {
+      throw new Error("Explicit recovery takeover did not commit the selected owner with a fresh compare token");
+    }
+    if (await competingSave("778", false) !== "conflict") throw new Error("A stale competing tab overwrote the successful takeover");
+    await unchangedRecovery(taken, "A refused competing save changed the committed recovery bytes");
+
+    // A subsequent foreign change must fence this page again. Advance its
+    // owner first so the controller has new state to save after the interval.
+    if (await competingSave("779") !== "saved") throw new Error("Explicit competing refresh did not authorize its next write");
+    const newerForeign = await sharedRecovery();
+    await enableRecovery(false);
+    await setSpeed(1);
+    await context.clock.runFor(64);
+    await setSpeed(0);
+    await enableRecovery(true);
+    await context.clock.runFor(32);
+    recoveryRaces.repeatedConflict = await waitRecovery({ state: "error", text: "Another tab changed" });
+    await unchangedRecovery(newerForeign, "A later tab change bypassed the next compare token");
+
+    // Hold a real transaction while the explicit refresh queues behind it.
+    // The request pump has a hard bound and is released/aborted in finally.
+    await competingPage.evaluate(() => new Promise((resolve, reject) => {
+      const open = indexedDB.open("scriptbots-continuations", 2);
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const database = open.result;
+        const transaction = database.transaction("continuations", "readwrite");
+        const hold = window.__recoveryHold = { active: true, requests: 0, exhausted: false,
+          release: () => { hold.active = false; }, abort: () => { hold.active = false; transaction.abort(); } };
+        transaction.oncomplete = () => database.close();
+        transaction.onabort = () => database.close();
+        const pump = () => {
+          const request = transaction.objectStore("continuations").get("recovery");
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => {
+            hold.requests += 1;
+            if (hold.requests === 1) resolve();
+            if (hold.active && hold.requests < 10_000) pump();
+            else if (hold.active) { hold.exhausted = true; hold.abort(); }
+          };
+        };
+        pump();
+      };
+    }));
+    await page.evaluate(() => document.getElementById("checkpoint-recovery-retry").click());
+    await waitRecovery({ state: "error", text: "Checking the shared recovery" });
+    await replace("reset");
+    await setSpeed(0);
+    const replacement = activeOwner(await state());
+    await competingPage.evaluate(() => window.__recoveryHold.release());
+    recoveryRaces.staleOwnerRefusal = await waitRecovery({ state: "off", text: "Recovery replacement cancelled" });
+    await context.clock.runFor(32);
+    if (activeOwner(await state()).id !== replacement.id || await page.isChecked("#checkpoint-recovery-enabled")
+        || await competingPage.evaluate(() => window.__recoveryHold.exhausted)) {
+      throw new Error("A delayed explicit recovery refresh reclaimed a replaced owner or exhausted its barrier");
+    }
+    await unchangedRecovery(newerForeign, "A stale-owner recovery refresh wrote the newly selected world's checkpoint");
+
+    const oldVersion = await competingPage.evaluate(() => new Promise((resolve) => {
+      const open = indexedDB.open("scriptbots-continuations", 1);
+      open.onerror = (event) => { event.preventDefault(); resolve(open.error?.name); };
+      open.onsuccess = () => { open.result.close(); resolve("opened"); };
+    }));
+    if (oldVersion !== "VersionError") throw new Error("An old unconditional writer could still open the updated recovery database");
+    recoveryRaces.oldVersion = oldVersion;
+    recoveryRaces.retainedForeign = newerForeign;
+    recoveryRaces.explicitTakeover = taken;
+
+    // The new owner's separate explicit opt-in remains usable after the stale
+    // request was rejected; leave a valid fixture for the restore test below.
+    changedRecoveryTick = String(activeOwner(await state()).tick);
+    await enableRecovery(true);
+    await context.clock.runFor(32);
+    await waitRecovery({ state: "enabled", tick: changedRecoveryTick });
+    if ((await sharedRecovery()).source.sessionId !== String(2000 + replacement.id)) {
+      throw new Error("Fresh opt-in did not save the replacement owner");
+    }
+  } finally {
+    await competingPage.evaluate(() => {
+      try { window.__recoveryHold?.abort(); } catch (_) { /* The held transaction already completed. */ }
+    }).catch(() => {});
+    await competingPage.close();
+  }
 
   await replace("reset");
   if (await page.isChecked("#checkpoint-recovery-enabled")) throw new Error("Reset inherited the previous owner's recovery opt-in");
@@ -1115,7 +1253,7 @@ async function runOwnerLifecycleCases(page, context) {
     throw new Error("Recovery restore did not install exactly one paused owner with fresh opt-in");
   }
   observations.browserRecovery = { firstRecovery, recoveryQuota, restoredTick: changedRecoveryTick,
-    restoredOwner: activeOwner(restoredRecovery).id };
+    restoredOwner: activeOwner(restoredRecovery).id, recoveryRaces };
 
   // Production DOM/controller integration with the explicit WASM double above.
   // This proves presentation and owner lifetime, not real detector generation.

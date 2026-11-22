@@ -17,61 +17,99 @@ class IndexedDbEvents {
     this.recovery = undefined;
     this.opens = 0;
     this.closes = 0;
+    this.creates = 0;
+    this.storeExists = stored !== undefined;
     this.transactions = [];
     this.waiters = [];
     this.ready = [];
+    this.active = null;
+    this.queued = [];
   }
 
-  open() {
+  open(name, version) {
+    assert.equal(name, "scriptbots-continuations");
+    assert.equal(version, 2, "updated clients must fence old unconditional version-one writers");
     this.opens += 1;
     if (this.openError) throw this.openError;
     const factory = this;
     const database = {
-      createObjectStore(name) { assert.equal(name, "continuations"); },
+      objectStoreNames: { contains(name) { assert.equal(name, "continuations"); return factory.storeExists; } },
+      createObjectStore(name) {
+        assert.equal(name, "continuations");
+        assert.equal(factory.storeExists, false, "upgrades preserve the existing object store");
+        factory.storeExists = true;
+        factory.creates += 1;
+      },
       close() { factory.closes += 1; },
       transaction(name, mode) {
         assert.equal(name, "continuations");
         const transaction = {
+          mode,
           error: null,
-          candidate: undefined,
-          slot: null,
+          candidates: new Map(),
+          requests: [],
+          notified: false,
+          finished: false,
           request: null,
           objectStore() {
-            const issue = (result, candidate) => {
+            const issue = (operation) => {
               if (factory.operationError) throw factory.operationError;
-              transaction.candidate = candidate;
-              transaction.request = { result, error: null };
-              const waiter = factory.waiters.shift();
-              if (waiter) waiter(transaction);
-              else factory.ready.push(transaction);
+              transaction.request = { result: undefined, error: null, operation };
+              transaction.requests.push(transaction.request);
+              factory.admit();
               return transaction.request;
             };
             return {
               get(key) {
                 assert.ok(["latest", "recovery"].includes(key));
-                return issue(key === "latest" ? factory.stored : factory.recovery);
+                return issue(() => transaction.candidates.has(key) ? transaction.candidates.get(key)
+                  : key === "latest" ? factory.stored : factory.recovery);
               },
               put(value, key) {
                 assert.ok(["latest", "recovery"].includes(key));
-                transaction.slot = key;
-                return issue(key, structuredClone(value));
+                assert.equal(mode, "readwrite");
+                if (factory.writeError) throw factory.writeError;
+                const copied = structuredClone(value);
+                return issue(() => { transaction.candidates.set(key, copied); return key; });
               },
             };
           },
-          succeed() { transaction.request.onsuccess(); },
-          complete() {
-            if (mode === "readwrite") {
-              if (transaction.slot === "latest") factory.stored = transaction.candidate;
-              else factory.recovery = transaction.candidate;
+          succeed() {
+            assert.equal(factory.active, transaction, "overlapping transactions cannot read stale committed state");
+            while (transaction.requests.length && !transaction.finished) {
+              const request = transaction.requests.shift();
+              request.result = request.operation();
+              request.onsuccess();
             }
+          },
+          complete() {
+            assert.equal(factory.active, transaction);
+            assert.equal(transaction.finished, false);
+            assert.equal(transaction.requests.length, 0, "commit must wait for every request");
+            for (const [slot, candidate] of transaction.candidates) {
+              if (slot === "latest") factory.stored = candidate;
+              else factory.recovery = candidate;
+            }
+            transaction.finished = true;
             transaction.oncomplete();
+            factory.active = null;
+            factory.admit();
           },
           abort(error = new DOMException("Controlled abort", "AbortError")) {
+            if (transaction.finished) throw new DOMException("Transaction is finished", "InvalidStateError");
+            transaction.finished = true;
             transaction.error = error;
-            queueMicrotask(() => { transaction.onerror?.(); transaction.onabort(); });
+            queueMicrotask(() => {
+              transaction.onerror?.();
+              transaction.onabort();
+              if (factory.active === transaction) factory.active = null;
+              factory.queued = factory.queued.filter((pending) => pending !== transaction);
+              factory.admit();
+            });
           },
         };
         factory.transactions.push(transaction);
+        factory.queued.push(transaction);
         return transaction;
       },
     };
@@ -86,6 +124,18 @@ class IndexedDbEvents {
       }
     });
     return request;
+  }
+
+  // Serialize this single-store test backend. In IndexedDB, overlapping
+  // readwrite transactions wait for earlier transactions to finish before
+  // their requests can observe or modify the store.
+  admit() {
+    this.active ??= this.queued.shift() ?? null;
+    if (!this.active || this.active.notified || this.active.requests.length === 0) return;
+    this.active.notified = true;
+    const waiter = this.waiters.shift();
+    if (waiter) waiter(this.active);
+    else this.ready.push(this.active);
   }
 
   nextTransaction() {
@@ -222,22 +272,47 @@ test("denied storage and synchronous operation errors release ownership", async 
   assert.equal((await finishRead(store, factory)).tick, "7");
 });
 
+test("storage version refusal requests reload and upgrades preserve existing records", async () => {
+  const previous = record();
+  const factory = new IndexedDbEvents(previous);
+  const store = new BrowserContinuationStore(8, factory);
+  factory.openError = new DOMException("Requested version is lower than the current version", "VersionError");
+  await assert.rejects(store.read(), (error) => codeIs("version")(error) && error.message.includes("Reload"));
+  assert.equal(factory.stored, previous);
+  factory.openError = null;
+  assert.equal(await finishRead(store, factory), previous);
+  assert.equal(factory.creates, 0, "an existing store is never recreated during upgrade");
+  const empty = new IndexedDbEvents(undefined);
+  assert.equal(await finishRead(new BrowserContinuationStore(8, empty), empty), null);
+  assert.equal(empty.creates, 1);
+});
+
 const source = (overrides = {}) => ({ sessionId: "340282366920938463463374607431768211455",
   scientificRevision: "9007199254740993", controlRevision: "21", configRevision: "5", tick: "9007199254740993", ...overrides });
 
-async function finishRecoveryRead(store, factory) {
-  const read = store.readRecovery();
+async function finishRecoveryRead(store, factory, options) {
+  const read = store.readRecovery(options);
   const transaction = await factory.nextTransaction();
   transaction.succeed();
-  transaction.complete();
+  if (!transaction.finished) transaction.complete();
   return read;
+}
+
+async function finishRecoverySave(store, factory, blob, observed = source(), options = {}) {
+  const saved = store.saveRecovery(blob, observed, { savedAt: SAVED_AT, ...options });
+  const transaction = await factory.nextTransaction();
+  transaction.succeed();
+  if (!transaction.finished) transaction.complete();
+  return saved;
 }
 
 test("recovery is a separately versioned slot and waits for actual commit", async () => {
   const manual = record();
   const factory = new IndexedDbEvents(manual);
   const store = new BrowserContinuationStore(8, factory);
+  assert.equal(store.recoveryObserved, false);
   assert.equal(await finishRecoveryRead(store, factory), null);
+  assert.equal(store.recoveryObserved, true);
   let acknowledged = false;
   const save = store.saveRecovery(new Blob(["next"]), source(), { savedAt: SAVED_AT })
     .then((value) => { acknowledged = true; return value; });
@@ -275,11 +350,181 @@ test("recovery validates source integers and retained bytes before restore alloc
   const base = { schema: "scriptbots.browser-recovery.v1", tick: source().tick, savedAt: SAVED_AT,
     blob: new Blob(["x"]), source: source() };
   for (const [mutation, code] of [[{ schema: "scriptbots.browser-recovery.v2" }, "schema"],
-    [{ tick: "7" }, "source"], [{ source: null }, "source"], [{ blob: new Blob([new Uint8Array(9)]) }, "oversized"]]) {
+    [{ tick: "7" }, "source"], [{ source: null }, "source"], [{ blob: new Blob([new Uint8Array(9)]) }, "oversized"],
+    [{ writeToken: null }, "metadata"], [{ writeToken: "0".repeat(31) }, "metadata"],
+    [{ writeToken: "A".repeat(32) }, "metadata"]]) {
     factory.recovery = { ...base, ...mutation };
     await assert.rejects(finishRecoveryRead(store, factory), codeIs(code));
     assert.equal(factory.stored.tick, "7");
   }
+});
+
+test("two tabs cannot replace a recovery slot they have not observed or no longer own", async () => {
+  const factory = new IndexedDbEvents(record());
+  const first = new BrowserContinuationStore(16, factory);
+  const second = new BrowserContinuationStore(16, factory);
+  await assert.rejects(first.saveRecovery(new Blob(["first"]), source()), codeIs("unobserved"));
+  assert.equal(factory.opens, 0, "an unobserved save cannot allocate a storage operation");
+  await finishRecoveryRead(first, factory);
+  await finishRecoveryRead(second, factory);
+
+  const firstSave = first.saveRecovery(new Blob(["first"]), source(), { savedAt: SAVED_AT });
+  const secondSave = second.saveRecovery(new Blob(["second"]), source({ sessionId: "7" }), { savedAt: SAVED_AT });
+  const secondRefusal = assert.rejects(secondSave, codeIs("conflict"));
+  const winning = await factory.nextTransaction();
+  winning.succeed();
+  assert.equal(factory.recovery, undefined, "request success cannot claim the shared slot");
+  winning.complete();
+  await firstSave;
+  const retained = factory.recovery;
+  assert.match(retained.writeToken, /^[0-9a-f]{32}$/);
+
+  const stale = await factory.nextTransaction();
+  stale.succeed();
+  await secondRefusal;
+  assert.equal(factory.recovery, retained);
+  assert.equal(await retained.blob.text(), "first");
+  assert.equal(first.recoveryObserved, true);
+  assert.equal(second.recoveryObserved, false);
+  const transactions = factory.transactions.length;
+  await assert.rejects(second.saveRecovery(new Blob(["second"]), source({ sessionId: "7" })), codeIs("unobserved"));
+  assert.equal(factory.transactions.length, transactions, "a conflict requires a separate explicit read");
+
+  assert.equal((await finishRecoveryRead(second, factory)).writeToken, retained.writeToken);
+  await finishRecoverySave(second, factory, new Blob(["second"]), source({ sessionId: "7" }));
+  const replacement = factory.recovery;
+  assert.notEqual(replacement.writeToken, retained.writeToken);
+  assert.equal(await replacement.blob.text(), "second");
+  await assert.rejects(finishRecoverySave(first, factory, new Blob(["stale-first"])), codeIs("conflict"));
+  assert.equal(factory.recovery, replacement, "an explicit takeover also fences the former writer");
+  assert.equal(factory.stored.tick, "7", "the manual save is outside the recovery CAS");
+});
+
+test("recovery write identities reject ABA even when every previous metadata field and byte returns", async () => {
+  const factory = new IndexedDbEvents(record());
+  const writer = new BrowserContinuationStore(16, factory);
+  const observer = new BrowserContinuationStore(16, factory);
+  await finishRecoveryRead(writer, factory);
+  await finishRecoverySave(writer, factory, new Blob(["original"]));
+  const observed = await finishRecoveryRead(observer, factory);
+  await finishRecoverySave(writer, factory, new Blob(["intervening"]), source({ sessionId: "7" }));
+  await finishRecoverySave(writer, factory, new Blob(["original"]));
+  const current = factory.recovery;
+  assert.deepEqual(current.source, observed.source);
+  assert.equal(current.schema, observed.schema);
+  assert.equal(current.savedAt, observed.savedAt);
+  assert.equal(current.tick, observed.tick);
+  assert.equal(await current.blob.text(), await observed.blob.text());
+  assert.notEqual(current.writeToken, observed.writeToken);
+  await assert.rejects(finishRecoverySave(observer, factory, new Blob(["stale"])), codeIs("conflict"));
+  assert.equal(factory.recovery, current);
+});
+
+test("legacy recovery adoption preserves bytes and metadata and shares one atomic identity", async () => {
+  const factory = new IndexedDbEvents(record());
+  const legacy = { schema: "scriptbots.browser-recovery.v1", tick: source().tick,
+    savedAt: SAVED_AT, blob: new Blob([new Uint8Array([0, 255, 1, 128])]), source: source(), retained: "metadata" };
+  factory.recovery = legacy;
+  const first = new BrowserContinuationStore(16, factory);
+  const second = new BrowserContinuationStore(16, factory);
+  let acknowledged = false;
+  const read = first.readRecovery().then((value) => { acknowledged = true; return value; });
+  const otherRead = second.readRecovery();
+  const adoption = await factory.nextTransaction();
+  adoption.succeed();
+  await Promise.resolve();
+  assert.equal(acknowledged, false);
+  assert.equal(first.recoveryObserved, false);
+  assert.equal(factory.recovery, legacy);
+  adoption.complete();
+  const adopted = await read;
+  const follower = await factory.nextTransaction();
+  follower.succeed();
+  follower.complete();
+  const alsoObserved = await otherRead;
+  assert.equal(alsoObserved.writeToken, adopted.writeToken);
+  assert.match(adopted.writeToken, /^[0-9a-f]{32}$/);
+  assert.deepEqual(Object.keys(adopted).sort(), [...Object.keys(legacy), "writeToken"].sort());
+  for (const field of ["schema", "tick", "savedAt", "retained"]) assert.equal(adopted[field], legacy[field]);
+  assert.deepEqual(adopted.source, legacy.source);
+  assert.deepEqual(new Uint8Array(await adopted.blob.arrayBuffer()), new Uint8Array(await legacy.blob.arrayBuffer()));
+  assert.equal(first.recoveryObserved, true);
+  assert.equal(second.recoveryObserved, true);
+  assert.equal(follower.candidates.size, 0, "an observed current record does not receive a new token");
+});
+
+test("cancelled or quota-refused legacy adoption leaves the original recovery exactly intact", async () => {
+  for (const outcome of ["cancelled", "quota"]) {
+    const factory = new IndexedDbEvents(record());
+    const legacy = { schema: "scriptbots.browser-recovery.v1", tick: source().tick,
+      savedAt: SAVED_AT, blob: new Blob(["legacy"]), source: source() };
+    factory.recovery = legacy;
+    const store = new BrowserContinuationStore(16, factory);
+    const abort = new AbortController();
+    const read = store.readRecovery({ signal: abort.signal });
+    const refused = assert.rejects(read, codeIs(outcome === "cancelled" ? "aborted" : "quota"));
+    const transaction = await factory.nextTransaction();
+    transaction.succeed();
+    if (outcome === "cancelled") abort.abort();
+    else transaction.abort(new DOMException("Controlled quota failure", "QuotaExceededError"));
+    await refused;
+    assert.equal(store.recoveryObserved, false);
+    assert.equal(factory.recovery, legacy);
+    assert.equal(Object.hasOwn(legacy, "writeToken"), false);
+    const adopted = await finishRecoveryRead(store, factory);
+    assert.equal(await adopted.blob.text(), "legacy");
+    assert.match(adopted.writeToken, /^[0-9a-f]{32}$/);
+  }
+});
+
+test("write-refused legacy adoption still permits a readonly restore without granting write authority", async () => {
+  const factory = new IndexedDbEvents(record());
+  const legacy = { schema: "scriptbots.browser-recovery.v1", tick: source().tick,
+    savedAt: SAVED_AT, blob: new Blob(["legacy"]), source: source() };
+  factory.recovery = legacy;
+  factory.writeError = new DOMException("Controlled write quota refusal", "QuotaExceededError");
+  const store = new BrowserContinuationStore(16, factory);
+  await assert.rejects(finishRecoveryRead(store, factory), codeIs("quota"));
+  assert.equal(store.recoveryObserved, false);
+  assert.equal(factory.recovery, legacy);
+  const readable = await finishRecoveryRead(store, factory, { observe: false });
+  assert.equal(readable, legacy);
+  assert.equal(await readable.blob.text(), "legacy");
+  assert.equal(factory.transactions.at(-1).mode, "readonly");
+  assert.equal(factory.transactions.at(-1).candidates.size, 0);
+  assert.equal(store.recoveryObserved, false);
+  await assert.rejects(store.saveRecovery(new Blob(["replacement"]), source()), codeIs("unobserved"));
+});
+
+test("an aborted replacement retains the prior compare identity for a safe retry", async () => {
+  const factory = new IndexedDbEvents(record());
+  const store = new BrowserContinuationStore(16, factory);
+  await finishRecoveryRead(store, factory);
+  await finishRecoverySave(store, factory, new Blob(["retained"]));
+  const retained = factory.recovery;
+  const save = store.saveRecovery(new Blob(["uncommitted"]), source());
+  const refused = assert.rejects(save, codeIs("quota"));
+  const transaction = await factory.nextTransaction();
+  transaction.succeed();
+  transaction.abort(new DOMException("Controlled quota failure", "QuotaExceededError"));
+  await refused;
+  assert.equal(factory.recovery, retained);
+  assert.equal(store.recoveryObserved, true);
+  await finishRecoverySave(store, factory, new Blob(["retried"]));
+  assert.equal(await factory.recovery.blob.text(), "retried");
+  assert.notEqual(factory.recovery.writeToken, retained.writeToken);
+});
+
+test("a legacy replacement cannot bypass an already observed recovery token", async () => {
+  const factory = new IndexedDbEvents(record());
+  const store = new BrowserContinuationStore(16, factory);
+  await finishRecoveryRead(store, factory);
+  await finishRecoverySave(store, factory, new Blob(["current"]));
+  const { writeToken: _token, ...legacy } = factory.recovery;
+  factory.recovery = legacy; // An older page does not implement the new protocol.
+  await assert.rejects(finishRecoverySave(store, factory, new Blob(["stale"])), codeIs("conflict"));
+  assert.equal(factory.recovery, legacy);
+  assert.equal(Object.hasOwn(factory.recovery, "writeToken"), false, "a failed save never silently adopts a foreign record");
 });
 
 test("cancelling an opening recovery releases the operation and shares its single pending open", async () => {
@@ -288,8 +533,8 @@ test("cancelling an opening recovery releases the operation and shares its singl
   factory.stallOpen = true;
   const store = new BrowserContinuationStore(8, factory);
   const abort = new AbortController();
-  const save = store.saveRecovery(new Blob(["new"]), source(), { signal: abort.signal });
-  const refused = assert.rejects(save, codeIs("aborted"));
+  const observed = store.readRecovery({ signal: abort.signal });
+  const refused = assert.rejects(observed, codeIs("aborted"));
   abort.abort();
   await refused;
   assert.equal(factory.transactions.length, 0);
@@ -302,6 +547,7 @@ test("cancelling an opening recovery releases the operation and shares its singl
   assert.equal(await read, manual);
   assert.equal(factory.recovery, undefined);
   assert.equal(factory.closes, 1);
+  assert.equal(store.recoveryObserved, false);
 });
 
 test("a cancelled open with no waiter closes its late result and admits later work", async () => {
@@ -309,8 +555,8 @@ test("a cancelled open with no waiter closes its late result and admits later wo
   factory.stallOpen = true;
   const store = new BrowserContinuationStore(8, factory);
   const abort = new AbortController();
-  const save = store.saveRecovery(new Blob(["new"]), source(), { signal: abort.signal });
-  const refused = assert.rejects(save, codeIs("aborted"));
+  const observed = store.readRecovery({ signal: abort.signal });
+  const refused = assert.rejects(observed, codeIs("aborted"));
   abort.abort();
   await refused;
   factory.lastOpen.onsuccess();
@@ -324,6 +570,7 @@ test("a cancelled open with no waiter closes its late result and admits later wo
 test("cancellation after request success aborts recovery before acknowledgement", async () => {
   const factory = new IndexedDbEvents(record());
   const store = new BrowserContinuationStore(8, factory);
+  await finishRecoveryRead(store, factory);
   const abort = new AbortController();
   const save = store.saveRecovery(new Blob(["new"]), source(), { signal: abort.signal });
   const refused = assert.rejects(save, codeIs("aborted"));
@@ -336,18 +583,20 @@ test("cancellation after request success aborts recovery before acknowledgement"
   assert.equal((await finishRead(store, factory)).tick, "7");
 });
 
-function recoveryHarness() {
+async function recoveryHarness() {
   const factory = new IndexedDbEvents(record());
   const saved = [];
   let now = 0;
   let current = source();
   let captures = 0;
-  const controller = new BrowserRecoveryController(new BrowserContinuationStore(16, factory), {
+  const store = new BrowserContinuationStore(16, factory);
+  await finishRecoveryRead(store, factory);
+  const controller = new BrowserRecoveryController(store, {
     now: () => now, onSaved: (value) => saved.push(value),
   });
   const owner = {};
   controller.attach(owner);
-  return { factory, saved, controller, owner,
+  return { factory, store, saved, controller, owner,
     time: (value) => { now = value; },
     source: (value) => { current = value; },
     captures: () => captures,
@@ -355,16 +604,16 @@ function recoveryHarness() {
     finish: async () => {
       const transaction = await factory.nextTransaction();
       transaction.succeed();
-      transaction.complete();
+      if (!transaction.finished) transaction.complete();
     },
   };
 }
 
 test("recovery requires opt-in, bounds in-flight work and coalesces to the newest owner cut", async () => {
-  const h = recoveryHarness();
+  const h = await recoveryHarness();
   assert.equal(await h.poll(), false);
   assert.equal(h.captures(), 0);
-  assert.equal(h.factory.opens, 0);
+  assert.equal(h.factory.opens, 1, "only the explicit recovery observation has opened storage");
   h.controller.setEnabled(true);
   const first = h.poll();
   assert.equal(h.controller.pending, true);
@@ -385,7 +634,7 @@ test("recovery requires opt-in, bounds in-flight work and coalesces to the newes
 });
 
 test("unchanged paused states skip writes but same-tick configuration changes are recovered", async () => {
-  const h = recoveryHarness();
+  const h = await recoveryHarness();
   h.controller.setEnabled(true);
   const first = h.poll();
   await h.finish();
@@ -409,7 +658,7 @@ test("unchanged paused states skip writes but same-tick configuration changes ar
 });
 
 test("owner replacement cancels a pending recovery and requires explicit opt-in again", async () => {
-  const h = recoveryHarness();
+  const h = await recoveryHarness();
   h.controller.setEnabled(true);
   const pending = h.poll();
   const transaction = await h.factory.nextTransaction();
@@ -432,7 +681,7 @@ test("owner replacement cancels a pending recovery and requires explicit opt-in 
 });
 
 test("recovery storage faults latch without recapturing until the user retries", async () => {
-  const h = recoveryHarness();
+  const h = await recoveryHarness();
   h.controller.setEnabled(true);
   const failed = h.poll();
   const transaction = await h.factory.nextTransaction();
@@ -454,6 +703,33 @@ test("recovery storage faults latch without recapturing until the user retries",
   assert.equal(await h.poll(), false);
   assert.equal(h.controller.error.code, "source");
   assert.equal(h.captures(), 2, "regressing identity is refused before encoding another checkpoint");
+});
+
+test("a cross-tab conflict latches recovery until an explicit reread and retry", async () => {
+  const h = await recoveryHarness();
+  const other = new BrowserContinuationStore(16, h.factory);
+  await finishRecoveryRead(other, h.factory);
+  await finishRecoverySave(other, h.factory, new Blob(["other"]), source({ sessionId: "7" }));
+  const foreign = h.factory.recovery;
+  h.controller.setEnabled(true);
+  const conflicted = h.poll();
+  await h.finish();
+  assert.equal(await conflicted, false);
+  assert.equal(h.controller.error.code, "conflict");
+  h.time(90_000);
+  assert.equal(await h.poll(), false);
+  assert.equal(h.captures(), 1);
+  h.controller.retry();
+  assert.equal(await h.poll(), false);
+  assert.equal(h.controller.error.code, "unobserved");
+  assert.equal(h.factory.recovery, foreign, "retry alone never authorizes replacing a different tab's world");
+  await finishRecoveryRead(h.store, h.factory);
+  h.controller.retry();
+  const retried = h.poll();
+  await h.finish();
+  assert.equal(await retried, true);
+  assert.equal(h.saved.length, 1);
+  assert.equal(h.factory.recovery.source.sessionId, source().sessionId);
 });
 
 test("capture must retain the same source and disabled recovery cannot acknowledge a late commit", async () => {

@@ -2,6 +2,33 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser host authority and recovery conflicts (2026-11-22):**
+[Implemented and independently reviewed; Node checks passed, browser execution
+blocked — Codex; scoped contributions to `bd-2z0.12.2`, `bd-2z0.12.3` and
+`bd-ywtv`; original acceptance retained]
+
+- Preserve native 128-bit host session IDs across browser experiment, checkpoint,
+  artifact and intervention workflows, while retaining 64-bit bounds for ticks,
+  epochs and revisions. The full-width fixtures reproduce 95 failures against
+  the original sources; all 270 Node tests pass with commit `d78d8e6`.
+- Compare an explicitly observed recovery token and replace the shared IndexedDB
+  slot in one transaction. Concurrent tabs, stale writers and ABA replacements
+  cannot silently overwrite a newer checkpoint. Abort/quota retries preserve the
+  previous observation; conflicts require an explicit choice to use the current
+  world. Owner changes cancel stale refreshes. Legacy adoption preserves original
+  checkpoint bytes and metadata; readonly restore does not require a write.
+- Upgrade the database to version 2 without replacing its object store or saved
+  worlds, fencing already-loaded version-1 writers that lack conflict checks.
+  Extend unit coverage and the real-IndexedDB two-page browser journey, retaining
+  the latter's explicit WASM owner double and existing deadlines.
+
+The combined DSR Node check passes all 279 tests with no failures or skips.
+Chromium is blocked before page creation by the executor's socket permission;
+no browser assertions ran. Its failed launch log is retained, and the enclosing
+DSR run was stopped during its final aggregate source hash after executor
+instability, so this is not a passing aggregate receipt. Native/WASM execution
+qualification and the broader durable journal/SQLite-image acceptance remain open.
+
 **Native experiment recovery and portable results (2026-11-21):**
 [Implemented and independently reviewed; browser and archive checks passed,
 native execution qualification blocked — Codex; contributions to the native Lab,

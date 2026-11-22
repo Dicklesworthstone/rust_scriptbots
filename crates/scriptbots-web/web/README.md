@@ -178,6 +178,17 @@ history/credit handling; nonempty narrative delivery requires observed records.
   One capture/write can be pending, with newer changes coalesced into the next
   eligible save. The panel shows the last transaction-confirmed tick and time.
   A storage failure pauses recovery until **Retry Recovery** is selected.
+  The recovery slot is shared by tabs on the same site. Each automatic save
+  atomically checks that the saved checkpoint has not changed since this tab
+  last observed or saved it. If another tab writes first, recovery stops and
+  preserves that tab's checkpoint. **Restore Recovery World** opens the saved
+  world; **Use this world for recovery** explicitly observes the latest slot
+  and permits this world's next save to replace it. A further competing write
+  stops that attempt too. An ordinary quota/abort retry does not acquire
+  permission to overwrite another tab's newer save.
+  The storage upgrade retains existing saved worlds and prevents older loaded
+  pages from using their former unconditional recovery writes. Reload an older
+  tab before saving again; close it if it blocks the upgrade.
   Reset, restore and local/remote owner changes disable recovery and cancel an
   outstanding write when the browser still permits it. Enabling it for a new
   owner is explicit. After reload, **Restore Recovery World (paused)** validates the saved

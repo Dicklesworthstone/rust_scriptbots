@@ -996,17 +996,23 @@ function updateCheckpointControls() {
 
 function renderRecoveryControls() {
   const busy = browserStorePending || checkpointLoadPending;
+  const conflict = browserRecovery?.error?.code === "conflict";
+  const unobserved = browserRecovery?.error?.code === "unobserved";
   if (recoveryEnabled) {
     recoveryEnabled.checked = browserRecovery?.enabled === true;
     recoveryEnabled.disabled = !browserRecovery || remoteMode || !simHandle || activeBrainPreset === "wander" || busy;
   }
   if (recoveryRestoreButton) recoveryRestoreButton.disabled = remoteMode || !wasmInitialized
     || !browserContinuationStore || busy || browserRecovery?.pending === true;
-  if (recoveryRetryButton) recoveryRetryButton.disabled = remoteMode || !browserRecovery?.enabled
-    || !browserRecovery.error || busy || browserRecovery.pending;
+  if (recoveryRetryButton) {
+    recoveryRetryButton.disabled = remoteMode || !browserRecovery?.enabled
+      || !browserRecovery.error || busy || browserRecovery.pending;
+    recoveryRetryButton.textContent = conflict || unobserved ? "Use this world for recovery" : "Retry Recovery";
+  }
   if (!recoveryStatus) return;
   let state = "Recovery is off for this world.";
   if (browserRecovery?.pending) state = browserRecovery.enabled ? "Saving a recovery checkpoint…" : "Cancelling the previous world's recovery write…";
+  else if (conflict || unobserved) state = `Recovery stopped: ${browserRecovery.error.message} Restore the saved recovery world, or choose Use this world for recovery to replace the shared recovery with this world's next checkpoint.`;
   else if (browserRecovery?.error) state = `Recovery stopped: ${browserRecovery.error.message} Use Retry Recovery after resolving the error.`;
   else if (browserRecovery?.enabled) state = browserRecovery.available
     ? "Recovery is on: saving changed owner state at most once every 30 seconds."
@@ -2182,10 +2188,37 @@ recoveryEnabled?.addEventListener("change", () => {
   browserRecovery.setEnabled(recoveryEnabled.checked);
 });
 
-recoveryRetryButton?.addEventListener("click", () => {
-  if (!browserRecovery?.enabled || remoteMode || browserStorePending || checkpointLoadPending || browserRecovery.pending) return;
-  recoveryReadStatus = "";
-  browserRecovery.retry();
+recoveryRetryButton?.addEventListener("click", async () => {
+  if (!browserRecovery?.enabled || !browserRecovery.error || remoteMode || browserStorePending
+      || checkpointLoadPending || browserRecovery.pending) return;
+  if (!["conflict", "unobserved"].includes(browserRecovery.error.code)) {
+    // A quota/abort retry retains its original comparison. It must not silently
+    // authorize replacing a newer checkpoint saved by another tab meanwhile.
+    recoveryReadStatus = "";
+    browserRecovery.retry();
+    return;
+  }
+  const generation = simulationGeneration;
+  const original = simHandle;
+  browserStorePending = true;
+  recoveryReadStatus = "Checking the shared recovery before using this world…";
+  updateCheckpointControls();
+  try {
+    const record = await browserContinuationStore.readRecovery();
+    if (continuationReadIsStale(generation, original)) {
+      recoveryReadStatus = "Recovery replacement cancelled because the active world changed.";
+      return;
+    }
+    recoveryRecord = record ? { tick: record.tick, savedAt: record.savedAt,
+      byteLength: record.blob.size, source: record.source } : null;
+    recoveryReadStatus = "This world will replace the observed recovery at its next save; a further change in another tab will stop the write.";
+    browserRecovery.retry();
+  } catch (error) {
+    recoveryReadStatus = `Recovery refresh failed: ${error.message || error}`;
+  } finally {
+    browserStorePending = false;
+    updateCheckpointControls();
+  }
 });
 
 recoveryRestoreButton?.addEventListener("click", async () => {
@@ -2198,7 +2231,9 @@ recoveryRestoreButton?.addEventListener("click", async () => {
   recoveryReadStatus = "Reading the recovery checkpoint…";
   updateCheckpointControls();
   try {
-    const record = await browserContinuationStore.readRecovery();
+    // Restoring a valid saved world must also work when the browser refuses
+    // writes. Reading here does not authorize automatic replacement of it.
+    const record = await browserContinuationStore.readRecovery({ observe: false });
     if (continuationReadIsStale(generation, original)) {
       recoveryReadStatus = "Recovery restore cancelled because the active world changed.";
       return;

@@ -1,12 +1,24 @@
 // Manual and recovery copies of the canonical owner checkpoint. This does not
 // turn the checkpoint's volatile journal into a durable SQL/batch journal.
 const DATABASE = "scriptbots-continuations";
+// Older pages open version 1 and write recovery unconditionally. Advancing the
+// database version fences those writers without replacing any retained record.
+const DATABASE_VERSION = 2;
 const STORE = "continuations";
 const SLOT = "latest";
 const SCHEMA = "scriptbots.browser-continuation.v1";
 const RECOVERY_SLOT = "recovery";
 const RECOVERY_SCHEMA = "scriptbots.browser-recovery.v1";
 const SOURCE_FIELDS = ["sessionId", "scientificRevision", "controlRevision", "configRevision", "tick"];
+const WRITE_TOKEN = /^[0-9a-f]{32}$/;
+
+function newWriteToken() {
+  if (typeof globalThis.crypto?.getRandomValues !== "function") {
+    throw new ContinuationStoreError("unavailable", "Secure browser randomness is unavailable; recovery storage was not changed.");
+  }
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 function recoverySource(source) {
   if (!source || SOURCE_FIELDS.some((field) => {
@@ -40,6 +52,9 @@ function storageError(error) {
   if (error?.name === "SecurityError" || error?.name === "NotAllowedError") {
     return new ContinuationStoreError("unavailable", "Browser storage is unavailable or permission was refused.");
   }
+  if (error?.name === "VersionError") {
+    return new ContinuationStoreError("version", "A newer ScriptBots version has updated browser storage. Reload this tab before saving or restoring.");
+  }
   if (error?.name === "AbortError") {
     return new ContinuationStoreError("aborted", "The browser storage transaction was aborted; the previous saved continuation is unchanged.");
   }
@@ -52,6 +67,9 @@ export class BrowserContinuationStore {
   #busy = false;
   #blockedOpen = false;
   #opening = null;
+  // Undefined is unobserved, null is an observed empty slot. Only a completed
+  // read or write establishes authority to replace the shared recovery slot.
+  #recoveryToken;
 
   constructor(maxBytes, factory) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
@@ -60,6 +78,8 @@ export class BrowserContinuationStore {
     this.#maxBytes = maxBytes;
     this.#factory = factory;
   }
+
+  get recoveryObserved() { return this.#recoveryToken !== undefined; }
 
   #validate(record, schema = SCHEMA) {
     if (!record || record.schema !== schema) {
@@ -84,31 +104,78 @@ export class BrowserContinuationStore {
   }
 
   async read() {
-    const record = await this.#transaction("readonly", (store) => store.get(SLOT));
+    const record = await this.#transaction("readonly", (store, request) => request(store.get(SLOT)));
     return record === undefined ? null : this.#validate(record);
   }
 
   async save(blob, tick, savedAt = new Date().toISOString()) {
     const record = this.#validate({ schema: SCHEMA, tick, savedAt, blob });
-    await this.#transaction("readwrite", (store) => store.put(record, SLOT));
+    await this.#transaction("readwrite", (store, request) => request(store.put(record, SLOT)));
     return { tick: record.tick, savedAt: record.savedAt, byteLength: record.blob.size };
   }
 
-  async readRecovery() {
-    const record = await this.#transaction("readonly", (store) => store.get(RECOVERY_SLOT));
-    if (record === undefined) return null;
+  #validateRecovery(record) {
     this.#validate(record, RECOVERY_SCHEMA);
     const source = recoverySource(record.source);
     if (source.tick !== record.tick) {
       throw new ContinuationStoreError("source", "The recovery tick differs from its owner observation.");
     }
+    if (Object.hasOwn(record, "writeToken")
+        && (typeof record.writeToken !== "string" || !WRITE_TOKEN.test(record.writeToken))) {
+      throw new ContinuationStoreError("metadata", "The saved recovery has an invalid write identity.");
+    }
+    return record;
+  }
+
+  async readRecovery({ signal, observe = true } = {}) {
+    if (!observe) {
+      // Restoring retained bytes must work even when quota or a read-only
+      // browser policy prevents adopting legacy metadata for future writes.
+      const record = await this.#transaction("readonly", (store, request) => request(store.get(RECOVERY_SLOT)), signal);
+      return record === undefined ? null : this.#validateRecovery(record);
+    }
+    const record = await this.#transaction("readwrite", (store, request) => {
+      // Invalidate an older observation only after this operation is admitted.
+      // A refused concurrent read must not revoke a write already in flight.
+      this.#recoveryToken = undefined;
+      request(store.get(RECOVERY_SLOT), (current) => {
+        if (current === undefined) return null;
+        this.#validateRecovery(current);
+        if (Object.hasOwn(current, "writeToken")) return current;
+
+        // Earlier v1 records have no compare token. Adopt one atomically while
+        // retaining every original checkpoint byte and metadata field. Comparing
+        // only their source/time/size would permit an ABA overwrite.
+        const adopted = { ...current, writeToken: newWriteToken() };
+        request(store.put(adopted, RECOVERY_SLOT), () => adopted);
+        return undefined;
+      });
+    }, signal);
+    this.#recoveryToken = record === null ? null : record.writeToken;
     return record;
   }
 
   async saveRecovery(blob, source, { savedAt = new Date().toISOString(), signal } = {}) {
     source = recoverySource(source);
     const record = this.#validate({ schema: RECOVERY_SCHEMA, tick: source.tick, savedAt, blob, source }, RECOVERY_SCHEMA);
-    await this.#transaction("readwrite", (store) => store.put(record, RECOVERY_SLOT), signal);
+    const expected = this.#recoveryToken;
+    if (expected === undefined) {
+      throw new ContinuationStoreError("unobserved", "Read the saved recovery before enabling or retrying recovery; no checkpoint was replaced.");
+    }
+    record.writeToken = newWriteToken();
+    if (record.writeToken === expected) {
+      throw new ContinuationStoreError("unavailable", "Recovery could not obtain a new write identity; the previous checkpoint is unchanged.");
+    }
+    await this.#transaction("readwrite", (store, request) => request(store.get(RECOVERY_SLOT), (current) => {
+      if (current === undefined ? expected !== null
+        : current?.writeToken !== expected || typeof expected !== "string") {
+        this.#recoveryToken = undefined;
+        throw new ContinuationStoreError("conflict", "Another tab changed the saved recovery. Inspect the current save and explicitly retry; no checkpoint was replaced.");
+      }
+      if (current !== undefined) this.#validateRecovery(current);
+      request(store.put(record, RECOVERY_SLOT));
+    }), signal);
+    this.#recoveryToken = record.writeToken;
     return { tick: record.tick, savedAt: record.savedAt, byteLength: record.blob.size, source };
   }
 
@@ -141,7 +208,7 @@ export class BrowserContinuationStore {
       try {
         const factory = this.#factory ?? globalThis.indexedDB;
         if (!factory) throw new ContinuationStoreError("unavailable", "This browser does not provide IndexedDB storage.");
-        request = factory.open(DATABASE, 1);
+        request = factory.open(DATABASE, DATABASE_VERSION);
       } catch (error) {
         this.#opening = null;
         refuse(error);
@@ -159,7 +226,7 @@ export class BrowserContinuationStore {
           return;
         }
         try {
-          request.result.createObjectStore(STORE);
+          if (!request.result.objectStoreNames.contains(STORE)) request.result.createObjectStore(STORE);
         } catch (error) {
           opening.refused = true;
           request.transaction.abort();
@@ -193,7 +260,7 @@ export class BrowserContinuationStore {
       if (signal?.aborted) throw new DOMException("Recovery cancelled", "AbortError");
       return await new Promise((resolve, reject) => {
         let transaction;
-        let request;
+        let lastRequest;
         let result;
         let failure;
         const cancel = () => {
@@ -210,14 +277,24 @@ export class BrowserContinuationStore {
           transaction = database.transaction(STORE, mode);
           transaction.onabort = () => settle(reject, storageError(failure || transaction.error
             || new DOMException("Transaction aborted", "AbortError")));
-          transaction.onerror = () => { failure ||= transaction.error || request?.error; };
+          transaction.onerror = () => { failure ||= transaction.error || lastRequest?.error; };
           // A request can succeed and its transaction still fail at commit.
           // Only the transaction's complete event acknowledges a saved record.
           transaction.oncomplete = () => settle(resolve, result);
           signal?.addEventListener("abort", cancel, { once: true });
-          request = operation(transaction.objectStore(STORE));
-          request.onsuccess = () => { result = request.result; };
-          request.onerror = () => { failure = request.error; };
+          const request = (next, observe = (value) => value) => {
+            lastRequest = next;
+            next.onsuccess = () => {
+              try {
+                result = observe(next.result);
+              } catch (error) {
+                failure = error;
+                try { transaction.abort(); } catch (_) { settle(reject, storageError(error)); }
+              }
+            };
+            next.onerror = () => { failure = next.error; };
+          };
+          operation(transaction.objectStore(STORE), request);
         } catch (error) {
           failure = error;
           if (transaction) {
