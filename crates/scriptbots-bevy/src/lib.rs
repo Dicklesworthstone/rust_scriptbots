@@ -15939,6 +15939,7 @@ mod hud_event_feed_tests {
 }
 
 const OWNER_INSPECTOR_REFRESH: Duration = Duration::from_millis(250);
+const OWNER_INSPECTOR_PRESENTATION_WAIT: Duration = Duration::from_secs(1);
 const OWNER_INSPECTOR_DEADLINE: Duration = Duration::from_millis(500);
 const INSPECTOR_ROWS_PER_PAGE: usize = 8;
 
@@ -16140,6 +16141,7 @@ struct OwnerInspector {
     job: Option<OwnerInspectorJob>,
     sample: Option<OwnerInspectorSample>,
     pending_sample: Option<OwnerInspectorSample>,
+    pending_since: Option<Instant>,
     last_request: Option<Instant>,
     last_attempt: Option<InspectorTarget>,
     last_attempt_offset: usize,
@@ -16155,6 +16157,7 @@ impl OwnerInspector {
             job: None,
             sample: None,
             pending_sample: None,
+            pending_since: None,
             last_request: None,
             last_attempt: None,
             last_attempt_offset: 0,
@@ -16190,6 +16193,7 @@ impl OwnerInspector {
                 || sample.genome_paging.map_or(0, |paging| paging.page_offset) != self.genome_offset
         }) {
             self.pending_sample = None;
+            self.pending_since = None;
             // A later return to the discarded slice must be able to request
             // it again even when the presented publication has not advanced.
             self.last_attempt = None;
@@ -16204,7 +16208,18 @@ impl OwnerInspector {
                 .pending_sample
                 .take()
                 .expect("visible pending sample exists");
+            self.pending_since = None;
             self.install_visible_sample(sample);
+        }
+        if self.pending_sample.is_some()
+            && self.pending_since.is_some_and(|at| {
+                now.saturating_duration_since(at) >= OWNER_INSPECTOR_PRESENTATION_WAIT
+            })
+        {
+            self.pending_sample = None;
+            self.pending_since = None;
+            self.status = "unavailable: detail publication not presented (I to retry)".into();
+            self.last_failure = Some("detail publication not presented".into());
         }
         // Never join a running worker from an Update system. A completed thread
         // can be reaped without waiting for owner work or channel admission.
@@ -16232,6 +16247,7 @@ impl OwnerInspector {
                             // Keep the last presented sample until this
                             // response's publication is actually on screen.
                             self.pending_sample = Some(sample);
+                            self.pending_since = Some(now);
                         }
                         self.last_failure = None;
                         self.status = "waiting for detail matching this frame".into();
@@ -16239,6 +16255,7 @@ impl OwnerInspector {
                     (Ok(()), Ok(Ok(_))) => {
                         self.sample = None;
                         self.pending_sample = None;
+                        self.pending_since = None;
                         self.last_failure = None;
                         self.status = "unavailable: subject no longer exists (I to retry)".into();
                     }
@@ -16908,6 +16925,7 @@ fn handle_inspector_page(
             && (inspector.sample.is_none() || inspector.last_failure.is_some())
         {
             inspector.pending_sample = None;
+            inspector.pending_since = None;
             inspector.last_attempt = None;
             inspector.last_request = None;
             inspector.status = "retry queued".into();
@@ -20107,7 +20125,7 @@ mod owner_inspector_tests {
         assert_eq!(inspector.pending_sample.as_ref().unwrap().target, future);
 
         frame.owner_source = Some((future.source, future.epoch));
-        inspector.poll(Some(future), now);
+        inspector.poll(Some(future), now + OWNER_INSPECTOR_PRESENTATION_WAIT);
         assert!(inspector.panel(&frame, 0).contains("future"));
         assert!(inspector.pending_sample.is_none());
         inspector.install_visible_sample(sample(current, "older"));
@@ -20119,6 +20137,50 @@ mod owner_inspector_tests {
         inspector.poll(None, now);
         assert!(inspector.sample.is_none());
         assert!(inspector.pending_sample.is_none());
+    }
+
+    #[test]
+    fn stalled_future_owner_response_expires_without_hiding_the_last_sample() {
+        let owner = TestOwner::new();
+        let frame = owner.frame();
+        let current = InspectorTarget::from_frame(&frame).unwrap();
+        let mut future = current;
+        future.source.published_snapshot =
+            scriptbots_runtime::SnapshotRevision::new(current.source.published_snapshot.get() + 1);
+        let sample = |target, text: &str| OwnerInspectorSample {
+            target,
+            sensors: [0.0; scriptbots_core::INPUT_SIZE],
+            outputs: [0.0; scriptbots_core::OUTPUT_SIZE],
+            trait_modifiers: None,
+            life_summary: None,
+            pages: vec![format!("Life\n{text}")],
+            sections: InspectorSectionStarts::default(),
+            genome_paging: None,
+            genome_deltas: vec![],
+        };
+        let now = Instant::now();
+        let mut inspector = OwnerInspector::new(owner.port.clone());
+        inspector.sample = Some(sample(current, "visible"));
+        inspector.pending_sample = Some(sample(future, "future"));
+        inspector.pending_since = Some(now);
+        inspector.last_attempt = Some(current);
+        inspector.last_request = Some(now);
+
+        inspector.poll(
+            Some(current),
+            now + OWNER_INSPECTOR_PRESENTATION_WAIT - Duration::from_millis(1),
+        );
+        assert!(inspector.pending_sample.is_some());
+        assert!(inspector.panel(&frame, 0).contains("visible"));
+
+        inspector.poll(Some(current), now + OWNER_INSPECTOR_PRESENTATION_WAIT);
+        assert!(inspector.pending_sample.is_none());
+        assert!(inspector.pending_since.is_none());
+        assert!(inspector.job.is_none(), "a stationary frame must not spin");
+        let panel = inspector.panel(&frame, 0);
+        assert!(panel.contains("visible"));
+        assert!(panel.contains("Refresh failed: detail publication not presented"));
+        assert!(!panel.contains("future"));
     }
 
     #[test]
