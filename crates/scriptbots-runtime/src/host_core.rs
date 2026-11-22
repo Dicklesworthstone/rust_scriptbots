@@ -25,9 +25,10 @@ use scriptbots_core::{
     BrainInspectionError, BrainInspectionRequest, BrainInspectionRevision, CharacterizationError,
     CompletedStepFault, ConfigAuditEntry, ControlCommand, ControlDisposition, DynamicAgentSnapshot,
     DynamicAgentVisuals, DynamicWorldSnapshot, MigratingAgent, NullPersistence,
-    PersistenceAdmissionSession, PersistenceSessionError, ScientificStateError, ScriptBotsConfig,
-    SelectionState, Tick, TickSummary, WorldDigestV1, WorldState, WorldStepTrace, WorldStepTracer,
-    apply_control_command, rng_domains::IslandId,
+    PersistenceAdmissionSession, PersistenceBatch, PersistenceCommitAuthority,
+    PersistenceSessionError, ScientificStateError, ScriptBotsConfig, SelectionState, Tick,
+    TickSummary, WorldDigestV1, WorldState, WorldStepTrace, WorldStepTracer, apply_control_command,
+    rng_domains::IslandId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
@@ -2663,6 +2664,13 @@ struct InflightJournal {
     committed_volatile: bool,
 }
 
+struct PendingJournalPersistence {
+    batch_id: JournalBatchId,
+    batch: Arc<PersistenceBatch>,
+    authority: PersistenceCommitAuthority,
+    requirement: ShutdownCommitRequirement,
+}
+
 #[derive(Clone)]
 struct SnapshotLayerCache {
     revisions: SnapshotLayerRevisions,
@@ -3211,6 +3219,7 @@ pub struct HostCore {
     retained_blocker: Option<HostBlocker>,
     event_pressure: Option<HostBlocker>,
     inflight_journal: HashMap<JournalBatchId, InflightJournal>,
+    pending_journal_persistence: Option<PendingJournalPersistence>,
     shutdown_receipt: Option<(JournalBatchId, ShutdownCommitRequirement)>,
     failed_journal_batches: HashSet<JournalBatchId>,
     latched_fault: Option<HostFault>,
@@ -3535,6 +3544,7 @@ impl HostCore {
             retained_blocker: None,
             event_pressure: None,
             inflight_journal: HashMap::new(),
+            pending_journal_persistence: None,
             shutdown_receipt: None,
             failed_journal_batches: HashSet::new(),
             latched_fault: None,
@@ -3769,7 +3779,7 @@ impl HostCore {
             self.scheduled_failure_shutdown = true;
         }
         self.active_journal_batch = Some(Arc::clone(&batch));
-        let admission = self.journal.try_admit(&batch);
+        let admission = self.try_admit_journal(&batch)?;
         self.finish_journal_admission(&batch, admission, false)?;
         self.active_journal_batch = None;
         self.synchronize_health()?;
@@ -4686,6 +4696,19 @@ impl HostCore {
                 HostDriveInterest::Draining
             };
         }
+        if let Some(HostFault::Scientific { tick, .. }) = &self.latched_fault
+            && self
+                .pending_journal_persistence
+                .as_ref()
+                .is_some_and(|pending| pending.batch.summary.tick == *tick)
+            && self.failed_journal_batches.is_empty()
+        {
+            // The fault was discovered after a completed tick. Its exact persistence work
+            // still needs the qualifying receipt that synchronous admission used to await
+            // before surfacing the fault. Drain that obligation without allowing more science;
+            // a journal/protocol failure or its settlement restores the ordinary fault exit.
+            return HostDriveInterest::Draining;
+        }
         if self.health.fault().is_some() {
             return HostDriveInterest::Faulted;
         }
@@ -4696,6 +4719,11 @@ impl HostCore {
             return HostDriveInterest::Draining;
         }
         if self.event_pressure.is_some() {
+            return HostDriveInterest::Draining;
+        }
+        if self.pending_journal_persistence.is_some() {
+            // Keep polling the owner without a busy loop on a science command that cannot
+            // pass its persistence barrier. Playback-only commands still run on these drives.
             return HostDriveInterest::Draining;
         }
         if self.active_command_is_retryable() {
@@ -4811,15 +4839,27 @@ impl HostCore {
 
     /// Explicitly retry the exact retained journal allocation once.
     ///
-    /// A successful retry seals the corresponding core persistence boundary,
-    /// but its command's `JournalState` still advances only through a later
-    /// receipt polled by [`ManualHostDriver::drive`].
+    /// A successful retry admits the retained work. A matching persistence owner keeps its
+    /// core boundary pending until a qualifying receipt; an independent sink is acknowledged
+    /// synchronously. The command's `JournalState` advances only through receipts polled by
+    /// [`ManualHostDriver::drive`]. Terminal pre-dispatch failures cannot be retried.
     pub fn retry_retained_journal(&mut self) -> Result<Option<JournalAdmission>, HostAccessError> {
         let Some(batch) = self.retained_journal.as_ref().map(Arc::clone) else {
             return Ok(None);
         };
+        if self.failed_journal_batches.contains(&batch.id())
+            && !matches!(
+                self.retained_blocker,
+                Some(HostBlocker::JournalClosed { batch_id }) if batch_id == batch.id()
+            )
+        {
+            return Err(protocol_violation(format!(
+                "terminally failed journal batch {:?} cannot be retried",
+                batch.id()
+            )));
+        }
         self.active_journal_batch = Some(Arc::clone(&batch));
-        let admission = self.journal.try_admit(&batch);
+        let admission = self.try_admit_journal(&batch)?;
         let result = self.finish_journal_admission(&batch, admission, true);
         if result.is_ok() {
             self.active_journal_batch = None;
@@ -4886,6 +4926,106 @@ impl HostCore {
             })
     }
 
+    fn retain_journal_persistence(
+        &mut self,
+        batch: &Arc<JournalBatch>,
+    ) -> Result<(), HostAccessError> {
+        let authority = self
+            .journal
+            .persistence_commit_authority()
+            .filter(|authority| self.persistence.accepts_commit_authority(authority));
+        let Some(authority) = authority else {
+            // Custom sinks, NullPersistence, and a different storage owner retain their
+            // original obligation. A journal may never silently replace an unrelated sink.
+            return self.seal_core_persistence();
+        };
+        if let Some(persistence) = batch.persistence() {
+            if self.pending_journal_persistence.is_some() {
+                return Err(protocol_violation(
+                    "another journal batch already owns the pending persistence boundary",
+                ));
+            }
+            self.pending_journal_persistence = Some(PendingJournalPersistence {
+                batch_id: batch.id(),
+                batch: Arc::clone(persistence),
+                authority,
+                requirement: self.journal.shutdown_commit_requirement(),
+            });
+        } else if self.persistence.has_pending_batch() && self.pending_journal_persistence.is_none()
+        {
+            return Err(protocol_violation(
+                "accepted journal omitted the pending persistence batch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn try_admit_journal(
+        &mut self,
+        batch: &Arc<JournalBatch>,
+    ) -> Result<JournalAdmission, HostAccessError> {
+        if let Some(persistence) = batch.persistence()
+            && let Some(authority) = self.journal.persistence_commit_authority()
+            && self.persistence.accepts_commit_authority(&authority)
+            && let Err(error) =
+                self.persistence
+                    .reserve_pending_for_journal(&self.world, persistence, &authority)
+        {
+            // This is a proven pre-dispatch refusal, not an indeterminate handoff. Keep both
+            // exact allocations diagnosable, publish terminal failure, and never call try_admit.
+            let message = format!("could not reserve journal persistence: {error}");
+            let failure = JournalFailure {
+                code: "persistence_reservation_failed".to_owned(),
+                message: message.clone(),
+            };
+            self.retained_journal = Some(Arc::clone(batch));
+            self.retained_blocker = None;
+            self.active_journal_batch = None;
+            self.update_scheduled_journal(batch.id(), JournalState::Failed(failure.clone()));
+            if batch.requires_runtime_journal()
+                && let Some(command_id) = batch.command_id()
+            {
+                self.update_command_journal(command_id, JournalState::Failed(failure.clone()))?;
+            }
+            if let Some(event_sequence) = batch.scientific_event_sequence() {
+                self.events.update_commitment(
+                    batch.id(),
+                    event_sequence,
+                    EventCommitment::Failed(failure),
+                )?;
+            }
+            self.failed_journal_batches.insert(batch.id());
+            self.latch_protocol_fault("persistence_reservation_failed", message.clone())?;
+            return Err(protocol_violation(message));
+        }
+        Ok(self.journal.try_admit(batch))
+    }
+
+    fn settle_journal_persistence(
+        &mut self,
+        receipt: &JournalReceipt,
+    ) -> Result<bool, HostAccessError> {
+        let Some(pending) = self.pending_journal_persistence.as_ref() else {
+            return Ok(false);
+        };
+        if pending.batch_id != receipt.batch_id() {
+            return Ok(false);
+        }
+        let committed = matches!(receipt.state(), JournalReceiptState::Durable)
+            || (pending.requirement == ShutdownCommitRequirement::CommittedVolatile
+                && matches!(receipt.state(), JournalReceiptState::CommittedVolatile));
+        if !committed {
+            return Ok(false);
+        }
+        self.persistence
+            .acknowledge_committed(&mut self.world, &pending.batch, &pending.authority)
+            .map_err(|error| {
+                protocol_violation(format!("could not settle journal persistence: {error}"))
+            })?;
+        self.pending_journal_persistence = None;
+        Ok(true)
+    }
+
     fn fail_closed_batch(&mut self, batch: &Arc<JournalBatch>) -> Result<(), HostAccessError> {
         self.retained_journal = Some(Arc::clone(batch));
         if let Some(command_id) = batch.command_id() {
@@ -4933,6 +5073,10 @@ impl HostCore {
                 changed = true;
                 continue;
             };
+
+            // Resolve the exact core obligation before exposing commitment or dropping its
+            // inflight identity. A weaker receipt, another batch, or failure cannot seal it.
+            changed |= self.settle_journal_persistence(&receipt)?;
 
             let journal_state = match receipt.state() {
                 JournalReceiptState::CommittedVolatile => JournalState::CommittedVolatile,
@@ -5126,6 +5270,11 @@ impl HostCore {
             HostHealth::Faulted(fault.clone())
         } else if let Some(blocker) = self.retained_blocker {
             HostHealth::Blocked(blocker)
+        } else if let Some(pending) = &self.pending_journal_persistence {
+            HostHealth::Blocked(HostBlocker::PersistencePending {
+                batch_id: pending.batch_id,
+                tick: pending.batch.summary.tick,
+            })
         } else if let Some(blocker) = self.event_pressure {
             HostHealth::Blocked(blocker)
         } else {
@@ -5329,6 +5478,7 @@ impl HostCore {
             Arc::clone(&self.config_audit)
         };
         (config, config_audit)
+    }
 
     fn snapshot_command_queue_state(&self) -> (usize, Option<CommandId>) {
         let shared = self.shared.borrow();
@@ -5423,6 +5573,30 @@ impl HostCore {
             .queue
             .front()
             .is_some_and(|admitted| admitted.envelope.command.requests_step())
+    }
+
+    fn next_command_requires_persistence_boundary(&self) -> bool {
+        let requires_boundary = |command: &HostCommand| {
+            !matches!(
+                command,
+                HostCommand::Pause
+                    | HostCommand::Resume
+                    | HostCommand::SetSpeed(_)
+                    | HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
+                        step_once: false,
+                        ..
+                    })
+            )
+        };
+        if let Some(active) = &self.active_command {
+            return self.active_command_is_retryable()
+                && requires_boundary(&active.envelope.command);
+        }
+        self.shared
+            .borrow()
+            .queue
+            .front()
+            .is_some_and(|admitted| requires_boundary(&admitted.envelope.command))
     }
 
     fn ensure_journal_sequence_available(&self) -> Result<(), HostAccessError> {
@@ -6045,8 +6219,8 @@ impl HostCore {
     /// Stage and journal the partial persistence tail without advancing a tick (bd-2mpi).
     ///
     /// The batch is the same projection shutdown stages, and it travels through the same
-    /// journal admission, so the world reaches a sealed boundary only once the journal has
-    /// accepted the work. Unlike shutdown, the host keeps running and control state is
+    /// journal admission, so the world reaches a sealed boundary only once its persistence
+    /// obligation is acknowledged. Unlike shutdown, the host keeps running and control state is
     /// unchanged, so no control revision is consumed.
     fn apply_flush_persistence_command(
         &mut self,
@@ -6179,7 +6353,7 @@ impl HostCore {
             persistence,
         ));
         self.active_journal_batch = Some(Arc::clone(&batch));
-        let admission = self.journal.try_admit(&batch);
+        let admission = self.try_admit_journal(&batch)?;
         let result = self.finish_journal_admission(&batch, admission, false);
         if result.is_ok() {
             self.active_journal_batch = None;
@@ -6217,7 +6391,7 @@ impl HostCore {
             None,
         ));
         self.active_journal_batch = Some(Arc::clone(&batch));
-        let admission = self.journal.try_admit(&batch);
+        let admission = self.try_admit_journal(&batch)?;
         let result = self.finish_journal_admission(&batch, admission, false);
         if result.is_ok() {
             self.active_journal_batch = None;
@@ -6248,7 +6422,7 @@ impl HostCore {
             persistence,
         ));
         self.active_journal_batch = Some(Arc::clone(&batch));
-        let admission = self.journal.try_admit(&batch);
+        let admission = self.try_admit_journal(&batch)?;
         let result = self.finish_journal_admission(&batch, admission, false);
         if result.is_ok() {
             self.active_journal_batch = None;
@@ -6275,7 +6449,7 @@ impl HostCore {
                 if batch.uses_ingress_audit_slot() {
                     self.shared.borrow_mut().release_pre_admission_audit()?;
                 }
-                self.seal_core_persistence()?;
+                self.retain_journal_persistence(batch)?;
                 let shutdown_requirement = if batch.is_applied_shutdown() {
                     Some(self.journal.shutdown_commit_requirement())
                 } else {
@@ -6294,7 +6468,7 @@ impl HostCore {
                     self.retained_journal = None;
                     self.retained_blocker = None;
                 }
-                Ok(false)
+                Ok(self.pending_journal_persistence.is_some())
             }
             JournalAdmission::Full { capacity, .. } => {
                 self.retained_journal = Some(Arc::clone(batch));
@@ -6509,6 +6683,11 @@ impl ManualHostDriver for HostCore {
         };
         if !audit_blocked {
             loop {
+                if self.pending_journal_persistence.is_some()
+                    && self.next_command_requires_persistence_boundary()
+                {
+                    break;
+                }
                 let requests_science = self.next_command_requires_scientific_event();
                 if (self.scheduled_barrier.is_some() || requests_science)
                     && !self.service_due_config_patch(requests_science)?
@@ -6559,6 +6738,7 @@ impl ManualHostDriver for HostCore {
             && self.lifecycle == HostLifecycle::Running
             && !self.playback.paused
             && self.retained_journal.is_none()
+            && self.pending_journal_persistence.is_none()
             && self.scheduled_barrier.is_none()
             && self.latched_fault.is_none()
             && self.event_pressure.is_none()
@@ -13116,6 +13296,558 @@ mod tests {
 
         fn command_authority_mode(&self) -> CommandAuthorityMode {
             CommandAuthorityMode::ProcessLocal
+        }
+    }
+
+    struct ReceiptPersistenceSink {
+        authority: Option<PersistenceCommitAuthority>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl scriptbots_core::WorldPersistence for ReceiptPersistenceSink {
+        fn on_tick(
+            &mut self,
+            _: &PersistenceBatch,
+        ) -> Result<(), scriptbots_core::PersistenceAdmissionError> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        fn commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+            self.authority.clone()
+        }
+    }
+
+    struct ReceiptPersistenceJournal {
+        journal: FakeJournal,
+        authority: Option<PersistenceCommitAuthority>,
+        requirement: ShutdownCommitRequirement,
+    }
+
+    impl JournalPort for ReceiptPersistenceJournal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            self.journal.try_admit(batch)
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            self.journal.poll_receipts(limit)
+        }
+
+        fn command_authority_mode(&self) -> CommandAuthorityMode {
+            CommandAuthorityMode::ProcessLocal
+        }
+
+        fn persistence_commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+            self.authority.clone()
+        }
+
+        fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+            self.requirement
+        }
+    }
+
+    struct ReceiptPersistenceFixture {
+        core: HostCore,
+        port: LocalHostPort,
+        state: Rc<RefCell<FakeJournalState>>,
+        sink_calls: Arc<Mutex<usize>>,
+    }
+
+    fn receipt_persistence_fixture(
+        journal_authority: Option<PersistenceCommitAuthority>,
+        sink_authority: Option<PersistenceCommitAuthority>,
+        requirement: ShutdownCommitRequirement,
+        paused: bool,
+    ) -> ReceiptPersistenceFixture {
+        let world = world(1);
+        let sink_calls = Arc::new(Mutex::new(0));
+        let persistence = world
+            .bind_persistence(Box::new(ReceiptPersistenceSink {
+                authority: sink_authority,
+                calls: Arc::clone(&sink_calls),
+            }))
+            .unwrap();
+        let state = Rc::new(RefCell::new(FakeJournalState {
+            suppress_receipts: true,
+            ..FakeJournalState::default()
+        }));
+        let core = HostCore::with_journal_and_persistence(
+            HostSessionId::new(0x5107),
+            world,
+            options(paused),
+            Box::new(ReceiptPersistenceJournal {
+                journal: FakeJournal {
+                    state: Rc::clone(&state),
+                },
+                authority: journal_authority,
+                requirement,
+            }),
+            persistence,
+        )
+        .unwrap();
+        let port = core.local_port();
+        ReceiptPersistenceFixture {
+            core,
+            port,
+            state,
+            sink_calls,
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered journey proves responsive control, exact receipt binding, and unchanged commitment strength"
+    )]
+    fn journal_persistence_waits_for_matching_commitment_without_blocking_owner() {
+        let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+        let ReceiptPersistenceFixture {
+            mut core,
+            mut port,
+            state,
+            sink_calls,
+        } = receipt_persistence_fixture(
+            Some(authority.clone()),
+            Some(authority),
+            ShutdownCommitRequirement::Durable,
+            false,
+        );
+        submit(&mut port, 1, HostCommand::Step);
+        let first = core.drive(ManualInstant::from_nanos(0)).unwrap();
+        let batch = Arc::clone(&state.borrow().attempts[0]);
+        let pending = HostBlocker::PersistencePending {
+            batch_id: batch.id(),
+            tick: Tick(1),
+        };
+        assert_eq!(first.scientific_steps, 1);
+        assert_eq!(first.blocker, Some(pending));
+        assert_eq!(*sink_calls.lock().unwrap(), 0);
+        assert_eq!(core.persistence.last_admitted_tick(), None);
+        assert!(core.persistence.has_pending_batch());
+        assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+        assert!(core.capture_host_checkpoint_v1().is_err());
+        let history = core.with_world(|world| world.history().cloned().collect::<Vec<_>>());
+        let waiting = core.drive(ManualInstant::from_nanos(1_000)).unwrap();
+        assert_eq!(waiting.scientific_steps, 0);
+        assert_eq!(waiting.blocker, Some(pending));
+        assert_eq!(
+            core.with_world(|world| world.history().cloned().collect::<Vec<_>>()),
+            history
+        );
+
+        // A playback command can still apply at this owner boundary while scientific work
+        // remains pending. Its own receipt cannot settle the earlier science batch.
+        submit(&mut port, 2, HostCommand::Pause);
+        let control = core.drive(ManualInstant::from_nanos(1_001)).unwrap();
+        assert_eq!(control.commands_completed, 1);
+        assert!(core.latest_snapshot().playback.paused);
+        let pause_id = state.borrow().attempts[1].id();
+        state
+            .borrow_mut()
+            .receipts
+            .push_back(JournalReceipt::new(pause_id, JournalReceiptState::Durable));
+        core.drive(ManualInstant::from_nanos(1_002)).unwrap();
+        assert_eq!(core.persistence.last_admitted_tick(), None);
+        assert_eq!(status(&mut port, 1).journal(), &JournalState::Pending);
+
+        state.borrow_mut().receipts.push_back(JournalReceipt::new(
+            batch.id(),
+            JournalReceiptState::CommittedVolatile,
+        ));
+        let weaker = core.drive(ManualInstant::from_nanos(1_003)).unwrap();
+        assert_eq!(weaker.blocker, Some(pending));
+        assert_eq!(core.persistence.last_admitted_tick(), None);
+        assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+        submit(&mut port, 3, HostCommand::Step);
+        assert_eq!(
+            core.drive(ManualInstant::from_nanos(1_004))
+                .unwrap()
+                .commands_completed,
+            0
+        );
+        assert_eq!(
+            status(&mut port, 3).application(),
+            &ApplicationState::Admitted
+        );
+        assert_eq!(core.world_tick(), Tick(1));
+
+        state.borrow_mut().receipts.push_back(JournalReceipt::new(
+            batch.id(),
+            JournalReceiptState::Durable,
+        ));
+        let resumed = core.drive(ManualInstant::from_nanos(1_005)).unwrap();
+        assert_eq!(resumed.scientific_steps, 1);
+        assert_eq!(core.world_tick(), Tick(2));
+        assert_eq!(core.persistence.last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(status(&mut port, 1).journal(), &JournalState::Durable);
+        assert!(core.persistence.has_pending_batch());
+        assert_eq!(*sink_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn journal_persistence_full_retry_and_failure_retain_the_exact_core_batch() {
+        let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+        let ReceiptPersistenceFixture {
+            mut core,
+            mut port,
+            state,
+            sink_calls,
+        } = receipt_persistence_fixture(
+            Some(authority.clone()),
+            Some(authority),
+            ShutdownCommitRequirement::Durable,
+            true,
+        );
+        state.borrow_mut().full = true;
+        submit(&mut port, 1, HostCommand::Step);
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        let batch = core.pending_journal_batch().unwrap();
+        let persistence = Arc::clone(batch.persistence().unwrap());
+        assert!(core.pending_journal_persistence.is_none());
+        assert_eq!(core.persistence.last_admitted_tick(), None);
+        assert_eq!(*sink_calls.lock().unwrap(), 0);
+        state.borrow_mut().full = false;
+        assert_eq!(
+            core.retry_retained_journal().unwrap(),
+            Some(JournalAdmission::Accepted {
+                batch_id: batch.id()
+            })
+        );
+        assert!(core.pending_journal_batch().is_none());
+        assert!(Arc::ptr_eq(
+            &persistence,
+            &core.pending_journal_persistence.as_ref().unwrap().batch
+        ));
+        assert_eq!(core.persistence.last_admitted_tick(), None);
+        let failure = JournalFailure {
+            code: "injected_storage_failure".to_owned(),
+            message: "the connection owner could not commit the batch".to_owned(),
+        };
+        state.borrow_mut().receipts.push_back(JournalReceipt::new(
+            batch.id(),
+            JournalReceiptState::Failed(failure.clone()),
+        ));
+        core.drive(ManualInstant::from_nanos(1)).unwrap();
+        assert_eq!(
+            core.health(),
+            &HostHealth::Faulted(HostFault::Journal {
+                batch_id: batch.id(),
+                failure,
+            })
+        );
+        assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+        assert_eq!(core.persistence.last_admitted_tick(), None);
+        assert!(std::ptr::eq(
+            core.persistence.pending_batch().unwrap(),
+            persistence.as_ref()
+        ));
+        assert!(core.capture_host_checkpoint_v1().is_err());
+        core.drive(ManualInstant::from_nanos(10)).unwrap();
+        assert_eq!(core.world_tick(), Tick(1));
+        assert_eq!(*sink_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn journal_persistence_receipts_preserve_ordered_shutdown_for_file_and_memory() {
+        for requirement in [
+            ShutdownCommitRequirement::CommittedVolatile,
+            ShutdownCommitRequirement::Durable,
+        ] {
+            let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+            let ReceiptPersistenceFixture {
+                mut core,
+                mut port,
+                state,
+                sink_calls,
+            } = receipt_persistence_fixture(
+                Some(authority.clone()),
+                Some(authority),
+                requirement,
+                true,
+            );
+            submit(&mut port, 1, HostCommand::Step);
+            core.drive(ManualInstant::from_nanos(0)).unwrap();
+            let science_id = state.borrow().attempts[0].id();
+            submit(&mut port, 2, HostCommand::Shutdown);
+            let waiting = core.drive(ManualInstant::from_nanos(1)).unwrap();
+            assert_eq!(waiting.commands_completed, 0);
+            assert_eq!(
+                status(&mut port, 2).application(),
+                &ApplicationState::Admitted
+            );
+            assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Running);
+            let commitment = match requirement {
+                ShutdownCommitRequirement::CommittedVolatile => {
+                    JournalReceiptState::CommittedVolatile
+                }
+                ShutdownCommitRequirement::Durable => JournalReceiptState::Durable,
+            };
+            state
+                .borrow_mut()
+                .receipts
+                .push_back(JournalReceipt::new(science_id, commitment.clone()));
+            core.drive(ManualInstant::from_nanos(2)).unwrap();
+            assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopping);
+            assert_eq!(core.persistence.last_admitted_tick(), Some(Tick(1)));
+            assert!(!core.persistence.has_pending_batch());
+            let shutdown = Arc::clone(&state.borrow().attempts[1]);
+            assert!(shutdown.persistence().is_none());
+            state
+                .borrow_mut()
+                .receipts
+                .push_back(JournalReceipt::new(shutdown.id(), commitment));
+            core.drive(ManualInstant::from_nanos(3)).unwrap();
+            assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+            assert_eq!(core.world_tick(), Tick(1));
+            assert_eq!(*sink_calls.lock().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn journal_persistence_partial_flush_tail_waits_before_shutdown_can_finalize() {
+        let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+        let ReceiptPersistenceFixture {
+            mut core,
+            mut port,
+            state,
+            sink_calls,
+        } = receipt_persistence_fixture(
+            Some(authority.clone()),
+            Some(authority),
+            ShutdownCommitRequirement::Durable,
+            true,
+        );
+        let config = ScriptBotsConfig {
+            persistence_interval: 60,
+            ..core.world.config().clone()
+        };
+        submit(&mut port, 1, HostCommand::UpdateConfig(Box::new(config)));
+        submit(&mut port, 2, HostCommand::Step);
+        submit(&mut port, 3, HostCommand::FlushPersistence);
+        core.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(core.world_tick(), Tick(1));
+        assert_eq!(state.borrow().attempts.len(), 3);
+        let flush = Arc::clone(&state.borrow().attempts[2]);
+        assert_eq!(flush.persistence().unwrap().summary.tick, Tick(1));
+        assert_eq!(core.persistence.last_admitted_tick(), None);
+        assert!(matches!(
+            core.health(),
+            HostHealth::Blocked(HostBlocker::PersistencePending { batch_id, .. })
+                if *batch_id == flush.id()
+        ));
+        submit(&mut port, 4, HostCommand::Shutdown);
+        let earlier = state.borrow().attempts[..2]
+            .iter()
+            .map(|batch| JournalReceipt::new(batch.id(), JournalReceiptState::Durable))
+            .collect::<Vec<_>>();
+        state.borrow_mut().receipts.extend(earlier);
+        core.drive(ManualInstant::from_nanos(1)).unwrap();
+        assert_eq!(
+            status(&mut port, 4).application(),
+            &ApplicationState::Admitted
+        );
+        assert_eq!(core.persistence.last_admitted_tick(), None);
+        assert!(core.capture_host_checkpoint_v1().is_err());
+
+        state.borrow_mut().receipts.push_back(JournalReceipt::new(
+            flush.id(),
+            JournalReceiptState::Durable,
+        ));
+        core.drive(ManualInstant::from_nanos(2)).unwrap();
+        assert_eq!(core.persistence.last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopping);
+        let shutdown = Arc::clone(&state.borrow().attempts[3]);
+        assert!(shutdown.persistence().is_none());
+        state.borrow_mut().receipts.push_back(JournalReceipt::new(
+            shutdown.id(),
+            JournalReceiptState::Durable,
+        ));
+        core.drive(ManualInstant::from_nanos(3)).unwrap();
+        assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopped);
+        assert_eq!(*sink_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn journal_persistence_closed_or_foreign_receipt_cannot_seal_core_science() {
+        for closed in [false, true] {
+            let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+            let ReceiptPersistenceFixture {
+                mut core,
+                mut port,
+                state,
+                sink_calls,
+            } = receipt_persistence_fixture(
+                Some(authority.clone()),
+                Some(authority),
+                ShutdownCommitRequirement::Durable,
+                true,
+            );
+            state.borrow_mut().closed = closed;
+            submit(&mut port, 1, HostCommand::Step);
+            core.drive(ManualInstant::from_nanos(0)).unwrap();
+            let batch = Arc::clone(&state.borrow().attempts[0]);
+            if closed {
+                assert!(core.pending_journal_persistence.is_none());
+                assert!(Arc::ptr_eq(&batch, &core.pending_journal_batch().unwrap()));
+                assert_eq!(
+                    core.retry_retained_journal().unwrap(),
+                    Some(JournalAdmission::Closed {
+                        batch_id: batch.id()
+                    })
+                );
+            } else {
+                state.borrow_mut().receipts.push_back(JournalReceipt::new(
+                    JournalBatchId::new(HostSessionId::new(0x5108), batch.id().sequence()),
+                    JournalReceiptState::Durable,
+                ));
+                core.drive(ManualInstant::from_nanos(1)).unwrap();
+                assert!(matches!(
+                    core.health(),
+                    HostHealth::Faulted(HostFault::Protocol { code, .. })
+                        if code == "unknown_journal_receipt"
+                ));
+            }
+            assert_eq!(core.persistence.last_admitted_tick(), None);
+            assert!(std::ptr::eq(
+                core.persistence.pending_batch().unwrap(),
+                batch.persistence().unwrap().as_ref()
+            ));
+            assert!(core.capture_host_checkpoint_v1().is_err());
+            assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+            core.drive(ManualInstant::from_nanos(2)).unwrap();
+            assert_eq!(core.world_tick(), Tick(1));
+            assert_eq!(*sink_calls.lock().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a completed brain-fault matrix covers retained admission, withheld and weak receipts, commitment, and storage failure"
+    )]
+    fn journal_persistence_drains_a_completed_brain_fault_before_the_driver_exits() {
+        for initially_full in [false, true] {
+            for commit_succeeds in [false, true] {
+                let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+                let ReceiptPersistenceFixture {
+                    mut core,
+                    mut port,
+                    state,
+                    sink_calls,
+                } = receipt_persistence_fixture(
+                    Some(authority.clone()),
+                    Some(authority),
+                    ShutdownCommitRequirement::Durable,
+                    true,
+                );
+                let config = ScriptBotsConfig {
+                    population_minimum: 1,
+                    population_spawn_interval: 0,
+                    closed: false,
+                    ..core.world.config().clone()
+                };
+                core.world.apply_config_update(config).unwrap();
+                core.world
+                    .brain_registry_mut()
+                    .unwrap()
+                    .register("test.receipt-fault", |_rng| {
+                        Err(BrainSpawnError::new(
+                            "test.receipt-fault",
+                            std::io::Error::other("deliberate completed population failure"),
+                        ))
+                    });
+                state.borrow_mut().full = initially_full;
+                submit(&mut port, 1, HostCommand::Step);
+                let completed = core.drive(ManualInstant::from_nanos(0)).unwrap();
+                assert_eq!(completed.scientific_steps, 1);
+                assert_eq!(core.world_tick(), Tick(1));
+                assert!(matches!(
+                    core.health(),
+                    HostHealth::Faulted(HostFault::Scientific { code, .. })
+                        if code == "brain_spawn"
+                ));
+                let batch = Arc::clone(&state.borrow().attempts[0]);
+                assert!(batch.scientific().unwrap().fault().is_some());
+                assert!(batch.persistence().is_some());
+                if initially_full {
+                    // Preserve the existing explicit retry contract for non-admission. Once
+                    // accepted, this exact obligation must be drained before returning Faulted.
+                    assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+                    state.borrow_mut().full = false;
+                    assert_eq!(
+                        core.retry_retained_journal().unwrap(),
+                        Some(JournalAdmission::Accepted {
+                            batch_id: batch.id()
+                        })
+                    );
+                }
+                assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+                assert_eq!(core.persistence.last_admitted_tick(), None);
+                assert_eq!(*sink_calls.lock().unwrap(), 0);
+                let waiting = core.drive(ManualInstant::from_nanos(1)).unwrap();
+                assert_eq!(waiting.scientific_steps, 0);
+                assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+                state.borrow_mut().receipts.push_back(JournalReceipt::new(
+                    batch.id(),
+                    JournalReceiptState::CommittedVolatile,
+                ));
+                core.drive(ManualInstant::from_nanos(2)).unwrap();
+                assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+                assert_eq!(core.persistence.last_admitted_tick(), None);
+                let terminal = if commit_succeeds {
+                    JournalReceiptState::Durable
+                } else {
+                    JournalReceiptState::Failed(JournalFailure {
+                        code: "injected_fault_tick_storage_failure".to_owned(),
+                        message: "the faulting tick did not reach commitment".to_owned(),
+                    })
+                };
+                state
+                    .borrow_mut()
+                    .receipts
+                    .push_back(JournalReceipt::new(batch.id(), terminal));
+                core.drive(ManualInstant::from_nanos(3)).unwrap();
+                assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+                assert_eq!(core.world_tick(), Tick(1));
+                assert_eq!(
+                    core.persistence.last_admitted_tick(),
+                    commit_succeeds.then_some(Tick(1))
+                );
+                assert_eq!(core.persistence.has_pending_batch(), !commit_succeeds);
+                assert!(core.world.brain_fault().is_some());
+                assert!(core.capture_host_checkpoint_v1().is_err());
+                assert_eq!(*sink_calls.lock().unwrap(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn journal_persistence_cannot_replace_an_unrelated_or_unidentified_sink() {
+        let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+        let foreign = PersistenceCommitAuthority::from_owner(Arc::new(()));
+        for (journal_authority, sink_authority) in [
+            (Some(authority.clone()), Some(foreign)),
+            (Some(authority.clone()), None),
+            (None, Some(authority)),
+        ] {
+            let ReceiptPersistenceFixture {
+                mut core,
+                mut port,
+                sink_calls,
+                ..
+            } = receipt_persistence_fixture(
+                journal_authority,
+                sink_authority,
+                ShutdownCommitRequirement::Durable,
+                true,
+            );
+            submit(&mut port, 1, HostCommand::Step);
+            core.drive(ManualInstant::from_nanos(0)).unwrap();
+            assert_eq!(*sink_calls.lock().unwrap(), 1);
+            assert_eq!(core.persistence.last_admitted_tick(), Some(Tick(1)));
+            assert!(!core.persistence.has_pending_batch());
+            assert!(core.pending_journal_persistence.is_none());
+            assert_eq!(status(&mut port, 1).journal(), &JournalState::Pending);
         }
     }
 

@@ -9006,6 +9006,65 @@ pub struct StepCompletion {
     pub fault: Option<CompletedStepFault>,
 }
 
+/// Opaque identity shared by a persistence sink and its connection-owning journal.
+///
+/// Clones identify the same owner by allocation identity, never by a path or run label.
+/// Possessing this identity does not prove admission or durability; the caller must still
+/// obtain the journal's qualifying receipt for the exact retained batch before acknowledging it.
+#[derive(Clone)]
+pub struct PersistenceCommitAuthority {
+    owner: Arc<dyn Send + Sync>,
+}
+
+impl PersistenceCommitAuthority {
+    /// Bind an authority to one shared owner allocation for its entire lifetime.
+    #[must_use]
+    pub fn from_owner<T: Send + Sync + 'static>(owner: Arc<T>) -> Self {
+        Self { owner }
+    }
+
+    fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
+    }
+}
+
+impl fmt::Debug for PersistenceCommitAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistenceCommitAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque resource reservation retained until an exact journal batch is acknowledged.
+pub struct PersistenceJournalReservation {
+    _guard: Box<dyn Send>,
+}
+
+impl PersistenceJournalReservation {
+    /// Keep an owner's byte permits or other bounded admission resources alive.
+    #[must_use]
+    pub fn new<T: Send + 'static>(guard: T) -> Self {
+        Self {
+            _guard: Box::new(guard),
+        }
+    }
+
+    /// A reservation for an explicitly opted-in sink with no additional resources to charge.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(())
+    }
+}
+
+impl fmt::Debug for PersistenceJournalReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistenceJournalReservation")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Persistence sink invoked after each tick.
 pub trait WorldPersistence: Send {
     /// Admit a completed tick without silently discarding an unacknowledged batch.
@@ -9015,6 +9074,27 @@ pub trait WorldPersistence: Send {
     /// retry through stable identity and exact-payload deduplication. A changed payload is never
     /// a valid retry for the same completed tick.
     fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError>;
+
+    /// Optional identity of the owner whose journal may acknowledge this sink's exact work.
+    ///
+    /// The default keeps admission entirely on [`Self::on_tick`]. A sink may opt in only when
+    /// a matching journal receipt proves the same persistence obligation without another write.
+    fn commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+        None
+    }
+
+    /// Validate and reserve the exact batch before a matching journal may enqueue it.
+    ///
+    /// This may perform bounded borrowed measurements, but must not materialize another full
+    /// payload, issue database I/O, or wait for worker progress. A refusal proves non-admission.
+    /// The session calls this only for an opted-in authority and retains the returned guard
+    /// across backpressure, receipt delays, and terminal failures.
+    fn reserve_journal_batch(
+        &mut self,
+        _payload: &PersistenceBatch,
+    ) -> Result<PersistenceJournalReservation, PersistenceAdmissionError> {
+        Ok(PersistenceJournalReservation::empty())
+    }
 }
 
 /// Payload-free state of the world's current persistence boundary.
@@ -9030,7 +9110,7 @@ pub enum PersistenceBoundaryStatus {
         /// Tick of the current boundary.
         tick: Tick,
     },
-    /// The external sink acknowledged the immutable batch for this tick.
+    /// The external sink or its matching committed journal acknowledged the immutable batch.
     Sealed {
         /// Tick of the current boundary.
         tick: Tick,
@@ -9049,6 +9129,7 @@ struct PersistenceSessionToken {
 struct PendingPersistenceAdmission {
     batch: Arc<PersistenceBatch>,
     error: Option<PersistenceAdmissionError>,
+    journal_reservation: Option<PersistenceJournalReservation>,
 }
 
 /// External owner of persistence admission state for exactly one [`WorldState`].
@@ -9134,6 +9215,27 @@ pub enum PersistenceSessionError {
     /// The sink did not acknowledge the exact retained batch.
     #[error(transparent)]
     Admission(#[from] PersistenceAdmissionError),
+    /// A journal receipt came from a different owner than this session's bound sink.
+    #[error("persistence receipt authority does not match the bound sink")]
+    CommitAuthorityMismatch,
+    /// A receipt did not refer to the exact retained immutable batch allocation.
+    #[error("persistence receipt for tick {tick} does not match the retained batch allocation")]
+    ReceiptBatchMismatch {
+        /// Tick carried by the attempted acknowledgement.
+        tick: Tick,
+    },
+    /// A journal cannot acknowledge work whose sink admission resources were never reserved.
+    #[error("persistence batch for tick {tick} has no journal admission reservation")]
+    MissingJournalReservation {
+        /// Tick whose reservation is unavailable.
+        tick: Tick,
+    },
+    /// Reserved journal work cannot also be sent through the synchronous sink.
+    #[error("persistence batch for tick {tick} is reserved for a matching journal receipt")]
+    JournalReceiptRequired {
+        /// Tick whose journal owns the admission obligation.
+        tick: Tick,
+    },
 }
 
 /// What the caller knows about a completed batch after admission failed.
@@ -34248,6 +34350,7 @@ impl PersistenceAdmissionSession {
         self.pending = Some(PendingPersistenceAdmission {
             batch: Arc::clone(batch),
             error: None,
+            journal_reservation: None,
         });
         world.persistence_boundary = PersistenceBoundaryStatus::Pending { tick };
     }
@@ -34396,6 +34499,9 @@ impl PersistenceAdmissionSession {
                 boundary: world.persistence_boundary,
             });
         }
+        if pending.journal_reservation.is_some() {
+            return Err(PersistenceSessionError::JournalReceiptRequired { tick });
+        }
 
         match self.sink.on_tick(pending.batch.as_ref()) {
             Ok(()) => {
@@ -34411,6 +34517,98 @@ impl PersistenceAdmissionSession {
         }
     }
 
+    /// Whether a journal belongs to the exact owner of this session's sink.
+    #[must_use]
+    pub fn accepts_commit_authority(&self, authority: &PersistenceCommitAuthority) -> bool {
+        self.sink
+            .commit_authority()
+            .is_some_and(|bound| bound.same_owner(authority))
+    }
+
+    /// Reserve sink admission resources once before the matching journal is first offered work.
+    ///
+    /// Exact retries reuse the original guard. No acknowledgement cursor or world boundary
+    /// advances here, and a failed reservation retains the exact batch with its typed refusal.
+    pub fn reserve_pending_for_journal(
+        &mut self,
+        world: &WorldState,
+        batch: &Arc<PersistenceBatch>,
+        authority: &PersistenceCommitAuthority,
+    ) -> Result<(), PersistenceSessionError> {
+        let tick = self.validate_journal_batch(world, batch, authority)?;
+        let pending = self
+            .pending
+            .as_mut()
+            .ok_or(PersistenceSessionError::MissingPendingBatch { tick })?;
+        if pending.journal_reservation.is_some() {
+            return Ok(());
+        }
+        match self.sink.reserve_journal_batch(batch.as_ref()) {
+            Ok(reservation) => {
+                pending.journal_reservation = Some(reservation);
+                pending.error = None;
+                Ok(())
+            }
+            Err(error) => {
+                pending.error = Some(error.clone());
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Seal an exact retained batch after its matching journal proves commitment.
+    ///
+    /// This performs no sink I/O. The host must call it only after the journal's required
+    /// commitment has been observed, never on queue admission. Owner identity, world binding,
+    /// the pending boundary, and allocation identity are all checked before any state changes.
+    /// Equal contents in a different allocation cannot acknowledge the session's work.
+    pub fn acknowledge_committed(
+        &mut self,
+        world: &mut WorldState,
+        batch: &Arc<PersistenceBatch>,
+        authority: &PersistenceCommitAuthority,
+    ) -> Result<(), PersistenceSessionError> {
+        let tick = self.validate_journal_batch(world, batch, authority)?;
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.journal_reservation.is_none())
+        {
+            return Err(PersistenceSessionError::MissingJournalReservation { tick });
+        }
+        self.last_admitted_tick = Some(tick);
+        self.pending = None;
+        world.persistence_boundary = PersistenceBoundaryStatus::Sealed { tick };
+        Ok(())
+    }
+
+    fn validate_journal_batch(
+        &self,
+        world: &WorldState,
+        batch: &Arc<PersistenceBatch>,
+        authority: &PersistenceCommitAuthority,
+    ) -> Result<Tick, PersistenceSessionError> {
+        if !self.accepts_commit_authority(authority) {
+            return Err(PersistenceSessionError::CommitAuthorityMismatch);
+        }
+        self.ensure_binding(world)?;
+        let tick = batch.summary.tick;
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or(PersistenceSessionError::MissingPendingBatch { tick })?;
+        if !Arc::ptr_eq(&pending.batch, batch) {
+            return Err(PersistenceSessionError::ReceiptBatchMismatch { tick });
+        }
+        if world.persistence_boundary != (PersistenceBoundaryStatus::Pending { tick }) {
+            return Err(PersistenceSessionError::BoundaryMismatch {
+                pending_tick: tick,
+                boundary: world.persistence_boundary,
+            });
+        }
+        Ok(tick)
+    }
+
     /// Retry the exact retained batch, or report that this session has no staged work.
     pub fn retry_pending(
         &mut self,
@@ -34421,11 +34619,12 @@ impl PersistenceAdmissionSession {
 
     /// Project the final partial cadence tail without performing downstream I/O.
     ///
-    /// The returned [`Arc`] is the exact allocation owned by this admission
-    /// session. A host may embed a clone in its own immutable journal envelope,
-    /// retain that envelope under backpressure, and call [`Self::admit_pending`]
-    /// only after the outer journal accepts the same work. An already-staged
-    /// retry returns the original allocation.
+    /// The returned [`Arc`] is the exact allocation owned by this admission session. A host
+    /// may embed a clone in its immutable journal envelope and retain it under backpressure.
+    /// An independent sink uses [`Self::admit_pending`] after journal admission. A matching
+    /// journal owner instead calls [`Self::reserve_pending_for_journal`] before admission
+    /// and [`Self::acknowledge_committed`] only after its required commitment receipt.
+    /// An already-staged retry returns the original allocation.
     pub fn stage_final_batch(
         &mut self,
         world: &mut WorldState,
@@ -34470,7 +34669,7 @@ impl PersistenceAdmissionSession {
         self.pending.is_some()
     }
 
-    /// Most recent tick synchronously acknowledged by the owned sink.
+    /// Most recent tick acknowledged by the owned sink or its matching committed journal.
     #[must_use]
     pub const fn last_admitted_tick(&self) -> Option<Tick> {
         self.last_admitted_tick
@@ -48197,6 +48396,98 @@ mod tests {
             path: "agent".to_owned(),
             tick,
         }
+    }
+
+    struct JournalOnlyPersistence(PersistenceCommitAuthority);
+
+    impl WorldPersistence for JournalOnlyPersistence {
+        fn on_tick(&mut self, _: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
+            panic!("a committed journal batch must not be submitted a second time")
+        }
+
+        fn commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn committed_journal_receipt_requires_owner_world_and_exact_pending_allocation() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            rng_seed: Some(0xA11D_5EED),
+            ..ScriptBotsConfig::default()
+        };
+        let owner = Arc::new(());
+        let authority = PersistenceCommitAuthority::from_owner(Arc::clone(&owner));
+        let (mut world, mut session) =
+            world_with_session(config.clone(), JournalOnlyPersistence(authority.clone()));
+        let completion = session.step_outcome(&mut world).expect("staged tick");
+        let batch = ready_batch_arc(&completion.outcome.persistence);
+        let digest = world
+            .world_digest_v1_inner(false)
+            .expect("diagnostic pending scientific state");
+        let foreign_authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+        assert_eq!(
+            session.acknowledge_committed(&mut world, &batch, &foreign_authority),
+            Err(PersistenceSessionError::CommitAuthorityMismatch)
+        );
+        let (mut foreign_world, _) = world_with_session(config, NullPersistence);
+        assert_eq!(
+            session.acknowledge_committed(&mut foreign_world, &batch, &authority),
+            Err(PersistenceSessionError::WrongWorld)
+        );
+        let equal_contents = Arc::new(batch.as_ref().clone());
+        assert_eq!(
+            session.acknowledge_committed(&mut world, &equal_contents, &authority),
+            Err(PersistenceSessionError::ReceiptBatchMismatch { tick: Tick(1) })
+        );
+        assert_same_staged_batch(&session, &batch);
+        assert_eq!(session.last_admitted_tick(), None);
+        assert_eq!(
+            world.persistence_boundary_status(),
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
+        assert!(session.step_outcome(&mut world).is_err());
+        assert_eq!(world.world_digest_v1_inner(false).unwrap(), digest);
+
+        // Independently wrapping a clone of the same owner is valid; equal data in a new
+        // owner allocation above was not. No synchronous sink call is needed in either case.
+        let same_owner = PersistenceCommitAuthority::from_owner(owner);
+        assert_eq!(
+            session.acknowledge_committed(&mut world, &batch, &same_owner),
+            Err(PersistenceSessionError::MissingJournalReservation { tick: Tick(1) })
+        );
+        session
+            .reserve_pending_for_journal(&world, &batch, &same_owner)
+            .expect("reserve the exact pending batch");
+        session
+            .reserve_pending_for_journal(&world, &batch, &same_owner)
+            .expect("an exact journal retry reuses its reservation");
+        assert_eq!(
+            session.admit_pending(&mut world),
+            Err(PersistenceSessionError::JournalReceiptRequired { tick: Tick(1) })
+        );
+        session
+            .acknowledge_committed(&mut world, &batch, &same_owner)
+            .expect("matching committed journal receipt");
+        assert!(!session.has_pending_batch());
+        assert_eq!(session.last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(
+            world.persistence_boundary_status(),
+            PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
+        );
+        assert_eq!(world.world_digest_v1().unwrap(), digest);
+        assert_eq!(
+            session.acknowledge_committed(&mut world, &batch, &authority),
+            Err(PersistenceSessionError::MissingPendingBatch { tick: Tick(1) })
+        );
+        session
+            .step_outcome(&mut world)
+            .expect("next science boundary");
+        assert_eq!(world.tick(), Tick(2));
     }
 
     #[test]

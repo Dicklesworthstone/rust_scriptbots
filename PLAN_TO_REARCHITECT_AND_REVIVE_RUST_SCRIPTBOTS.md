@@ -2,6 +2,42 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Owner responsiveness during persistence (2026-11-22):**
+[Implemented and independently reviewed; native execution qualification pending
+— Codex; scoped contributions to `bd-w1oi` and `bd-kgob`; original acceptance retained]
+
+The storage journal already carries and commits the exact scientific persistence
+batch. A paired sink and journal now settle that obligation through the matching
+terminal receipt, removing the second synchronous submission and its worker wait.
+The owner can continue maintenance and permitted playback controls while science
+waits at an explicit `PersistencePending` boundary. Existing command-authority and
+FIFO rules still apply. File storage requires `Durable`; memory storage requires
+`CommittedVolatile`. Queue acceptance never advances the persistence watermark.
+
+- Bind acknowledgement to the same storage owner, world and exact immutable batch.
+  Custom or unrelated sinks retain their existing admission path.
+- Apply the existing borrowed payload measurement, record limits, preparation
+  deadline and independent scientific/narrative byte reservations before dispatch.
+  Retain the reservations through backpressure and failure; exact retries cannot
+  charge twice, bypass operator limits or re-dispatch a terminal refusal.
+- Preserve partial flushes, ordered shutdown, checkpoint refusal while unresolved,
+  and the completed scientific-fault batch's commitment before driver exit.
+- Add identity, delayed/weaker/foreign receipt, refusal, retry, shutdown and fault
+  regressions, plus a real paused-worker memory/file journey checking one journal
+  write, retained reservations, committed watermarks and persisted readback.
+
+This removes a redundant owner-thread wait; it does not establish flat database
+commit cost or resolve the upstream engine throughput acceptance. DSR native
+qualification and the original long-running storage reproductions remain open.
+
+**Observed communication (2026-11-22):**
+[Currently In Progress — Codex; scoped contribution to `bd-16g.7`]
+
+Align the communication analysis with the exact emitter snapshot consumed by
+sensing, including initial founders and population changes, and preserve truthful
+sample windows across checkpoint continuation and measurement re-enablement. The
+separate multiband protocol and behavioral-emergence acceptance remain open.
+
 **Browser host authority and recovery conflicts (2026-11-22):**
 [Implemented and independently reviewed; Node checks passed, browser execution
 blocked — Codex; scoped contributions to `bd-2z0.12.2`, `bd-2z0.12.3` and

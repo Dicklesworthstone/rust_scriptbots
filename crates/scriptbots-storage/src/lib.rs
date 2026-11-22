@@ -523,9 +523,10 @@ use scriptbots_core::{
     BrainFamilyCodec, BrainGenomeEnvelope, DeathCause, DeathRecord, Generation,
     INTERACTION_EVENTS_OBSERVED_KIND, INTERACTION_EVENTS_PERSISTED_KIND,
     INTERACTION_EVENTS_SAMPLED_OUT_KIND, INTERACTION_EVENTS_TRUNCATED_KIND, PersistedGenome,
-    PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind,
-    Position, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayInteractionKind,
-    ReplayRngScope, Tick, WorldPersistence,
+    PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch,
+    PersistenceCommitAuthority, PersistenceEventKind, PersistenceJournalReservation, Position,
+    ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick,
+    WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
     narrative::{
         EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord,
@@ -24218,25 +24219,24 @@ impl StorageSink {
         self.submit_with_receipt_using_clock_for_island(payload, IslandId(0), clock)
     }
 
-    fn submit_with_receipt_using_clock_for_island<Clock>(
+    /// Measure borrowed rows and reserve both independent budgets before either admission path.
+    /// The journal keeps these same permits until its receipt settles the core obligation;
+    /// sharing the checks prevents a journal from bypassing operator-specified sink limits.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "scientific and narrative measurement and reservation form one ordered admission policy"
+    )]
+    fn reserve_payload_observed<Observer>(
         &self,
         payload: &PersistenceBatch,
-        island: IslandId,
-        clock: &mut Clock,
-    ) -> Result<AdmissionReceipt, StorageError>
+        observer: &mut Observer,
+        progress: &mut PreparationProgress,
+    ) -> Result<(InFlightPermit, Option<InFlightPermit>), StorageError>
     where
-        Clock: FnMut(PreparationStage) -> Instant,
+        Observer: PreparationObserver,
     {
         let tick = payload.summary.tick.0;
-        let mut progress = PreparationProgress::default();
-        let mut preparation = PreparationDeadline::new(
-            clock,
-            self.deadlines.preparation,
-            Arc::clone(&self.path),
-            tick,
-        );
-
-        // MEASURE BEFORE ALLOCATING. `from_batch` below materializes the entire
+        // MEASURE BEFORE ALLOCATING. `from_batch` materializes the entire
         // batch; if the batch is pathological, the memory is already gone by the
         // time any deadline or admission gate gets a say. So the size is computed
         // from the batch's borrowed shape first — no cloning or serialization —
@@ -24245,9 +24245,8 @@ impl StorageSink {
         // This is a NotAdmitted outcome in the strictest sense: the caller still
         // holds the exact payload it tried to submit, so the exact-retry semantics
         // the storage contract depends on are untouched.
-        let (bytes, events) =
-            estimate_batch_size_observed(payload, &mut preparation, &mut progress)
-                .inspect_err(|error| self.publish_preparation_error(error, tick))?;
+        let (bytes, events) = estimate_batch_size_observed(payload, observer, progress)
+            .inspect_err(|error| self.publish_preparation_error(error, tick))?;
         if bytes > self.budget.max_batch_bytes || events > self.budget.max_batch_events {
             warn!(
                 schema = "scriptbots.persistence-preparation.v1",
@@ -24271,7 +24270,7 @@ impl StorageSink {
             });
         }
         let (narrative_bytes, narrative_events) =
-            estimate_narrative_size_observed(payload, &mut preparation, &mut progress)
+            estimate_narrative_size_observed(payload, observer, progress)
                 .inspect_err(|error| self.publish_preparation_error(error, tick))?;
         if narrative_bytes > self.budget.max_narrative_batch_bytes
             || narrative_events > self.budget.max_narrative_batch_events
@@ -24306,8 +24305,8 @@ impl StorageSink {
             &self.inflight_bytes,
             bytes,
             self.budget.max_inflight_bytes,
-            &mut preparation,
-            progress,
+            observer,
+            *progress,
         )
         .inspect_err(|error| self.publish_preparation_error(error, tick))?
         .map_err(|would_be| StorageError::InFlightBytesExhausted {
@@ -24321,8 +24320,8 @@ impl StorageSink {
                 &self.inflight_narrative_bytes,
                 narrative_bytes,
                 self.budget.max_narrative_inflight_bytes,
-                &mut preparation,
-                progress,
+                observer,
+                *progress,
             )
             .inspect_err(|error| self.publish_preparation_error(error, tick))?
             .map_err(|would_be| StorageError::InFlightNarrativeBytesExhausted {
@@ -24334,6 +24333,49 @@ impl StorageSink {
         } else {
             None
         };
+
+        Ok((permit, narrative_permit))
+    }
+
+    fn reserve_journal_payload(
+        &self,
+        payload: &PersistenceBatch,
+    ) -> Result<PersistenceJournalReservation, StorageError> {
+        let tick = payload.summary.tick.0;
+        let mut clock = |_| Instant::now();
+        let mut preparation = PreparationDeadline::new(
+            &mut clock,
+            self.deadlines.preparation,
+            Arc::clone(&self.path),
+            tick,
+        );
+        let mut progress = PreparationProgress::default();
+        let permits = self.reserve_payload_observed(payload, &mut preparation, &mut progress)?;
+        preparation
+            .checkpoint(PreparationStage::Complete, progress)
+            .inspect_err(|error| self.publish_preparation_error(error, tick))?;
+        Ok(PersistenceJournalReservation::new(permits))
+    }
+
+    fn submit_with_receipt_using_clock_for_island<Clock>(
+        &self,
+        payload: &PersistenceBatch,
+        island: IslandId,
+        clock: &mut Clock,
+    ) -> Result<AdmissionReceipt, StorageError>
+    where
+        Clock: FnMut(PreparationStage) -> Instant,
+    {
+        let tick = payload.summary.tick.0;
+        let mut progress = PreparationProgress::default();
+        let mut preparation = PreparationDeadline::new(
+            clock,
+            self.deadlines.preparation,
+            Arc::clone(&self.path),
+            tick,
+        );
+        let (permit, narrative_permit) =
+            self.reserve_payload_observed(payload, &mut preparation, &mut progress)?;
 
         let prepared = PreparedPersistenceBatch::from_batch_observed(
             payload,
@@ -24496,6 +24538,21 @@ impl StorageSink {
 }
 
 impl WorldPersistence for StorageSink {
+    fn commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+        Some(PersistenceCommitAuthority::from_owner(Arc::clone(
+            &self.admission,
+        )))
+    }
+
+    fn reserve_journal_batch(
+        &mut self,
+        payload: &PersistenceBatch,
+    ) -> Result<PersistenceJournalReservation, PersistenceAdmissionError> {
+        self.reserve_journal_payload(payload).map_err(|error| {
+            PersistenceAdmissionError::new(payload.summary.tick.0, error.to_string())
+        })
+    }
+
     fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
         self.submit(payload).map_err(|error| {
             let state = match &error {
@@ -44398,6 +44455,141 @@ mod tests {
             commit_state: FailureCommitState::RolledBack,
         };
         assert!(!should_retry_transaction(&permanent, 1));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker journey binds paused admission, exact science commitment, file readback, and shutdown"
+    )]
+    fn paired_host_persistence_waits_nonblocking_for_the_single_journal_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_runtime::HostBlocker;
+
+        for file_backed in [false, true] {
+            let path = temp_db_path("storage-host-receipt-boundary");
+            let path_string = path.to_string_lossy().to_string();
+            let mut pipeline = if file_backed {
+                StoragePipeline::create_unattributed_file(&path_string)?
+            } else {
+                StoragePipeline::unattributed_memory_with_thresholds(1, 1, 1, 1)?
+            };
+            let session_id = HostSessionId::new(0x5107);
+            let journal = pipeline.journal_port(session_id, StorageJournalOptions::default())?;
+            pipeline.set_deadlines(StorageDeadlines {
+                admission_ack: Duration::from_millis(10),
+                ..StorageDeadlines::default()
+            })?;
+            let (world, persistence) = WorldState::with_persistence(
+                ScriptBotsConfig {
+                    world_width: 64,
+                    world_height: 64,
+                    food_cell_size: 16,
+                    rng_seed: Some(0x5107),
+                    closed: true,
+                    population_minimum: 0,
+                    population_spawn_interval: 0,
+                    persistence_interval: 1,
+                    narrative_interval: 0,
+                    chart_flush_interval: 0,
+                    ..ScriptBotsConfig::default()
+                },
+                Box::new(pipeline.sink()),
+            )?;
+            let mut core = HostCore::with_journal_and_persistence(
+                session_id,
+                world,
+                HostCoreOptions {
+                    initial_playback: PlaybackSnapshot {
+                        paused: false,
+                        speed_multiplier: 1.0,
+                    },
+                    tick_period_nanos: 1,
+                    max_automatic_steps_per_drive: 1,
+                    ..HostCoreOptions::default()
+                },
+                Box::new(journal),
+                persistence,
+            )?;
+            let mut frontend = NullFrontend::new(core.local_port(), 0x5108);
+            frontend.drive_at(&mut core, ManualInstant::from_nanos(0))?;
+            let pause = pipeline.pause_worker_for_test()?;
+            let first = frontend.drive_at(&mut core, ManualInstant::from_nanos(1))?;
+            assert_eq!(first.scientific_steps, 1);
+            assert!(matches!(
+                first.blocker,
+                Some(HostBlocker::PersistencePending { tick: Tick(1), .. })
+            ));
+            assert_eq!(
+                pipeline.sink.tx.len(),
+                1,
+                "the paused worker must receive only JournalAdmit, with no duplicate Persist"
+            );
+            assert!(
+                pipeline.sink.inflight_bytes() > 0,
+                "the exact scientific reservation must remain charged until receipt polling"
+            );
+            assert_eq!(
+                pipeline.analytics_provider().snapshot().committed_tick,
+                None
+            );
+            assert_eq!(
+                core.with_world(WorldState::persistence_boundary_status),
+                scriptbots_core::PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+            );
+            assert!(core.capture_host_checkpoint_v1().is_err());
+            for _ in 0..3 {
+                let waiting = frontend.drive_at(&mut core, ManualInstant::from_nanos(1))?;
+                assert_eq!(waiting.scientific_steps, 0);
+                assert_eq!(waiting.blocker, first.blocker);
+            }
+            pause.release();
+            let flush = pipeline.flush_and_wait()?;
+            assert!(
+                pipeline.sink.inflight_bytes() > 0,
+                "worker commitment alone cannot release an unobserved core reservation"
+            );
+            for attempt in 0..JOURNAL_WORKER_RETRY_LIMIT {
+                let observed = frontend.drive_at(&mut core, ManualInstant::from_nanos(1))?;
+                assert_eq!(observed.scientific_steps, 0);
+                if observed.blocker.is_none() {
+                    break;
+                }
+                assert!(
+                    attempt + 1 < JOURNAL_WORKER_RETRY_LIMIT,
+                    "real journal did not settle its retained scientific batch"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                core.with_world(WorldState::persistence_boundary_status),
+                scriptbots_core::PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
+            );
+            assert_eq!(pipeline.sink.inflight_bytes(), 0);
+            assert_eq!(pipeline.sink.inflight_narrative_bytes(), 0);
+            assert_eq!(flush.committed_tick, Some(1));
+            let batch_id = flush
+                .watermarks
+                .admitted
+                .expect("one admitted science batch");
+            assert_eq!(batch_id.get(), 1);
+            assert_eq!(flush.watermarks.applied, Some(batch_id));
+            if file_backed {
+                assert_eq!(flush.guarantee, PersistenceGuarantee::Durable);
+                assert_eq!(flush.watermarks.durable, Some(batch_id));
+                let reader = StorageReader::open(&path_string)?;
+                assert_eq!(reader.run_ledger_summary()?.tick_count, 1);
+                assert_eq!(reader.persistence_watermarks()?, flush.watermarks);
+                reader.close()?;
+            } else {
+                assert_eq!(flush.guarantee, PersistenceGuarantee::CommittedVolatile);
+                assert_eq!(flush.watermarks.durable, None);
+            }
+            drop(core);
+            let shutdown = pipeline.shutdown()?;
+            assert_eq!(shutdown.watermarks, flush.watermarks);
+        }
+        Ok(())
     }
 
     #[test]

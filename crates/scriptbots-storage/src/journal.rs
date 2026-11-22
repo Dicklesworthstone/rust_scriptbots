@@ -9,8 +9,8 @@ use super::{
 use arc_swap::ArcSwap;
 use crossbeam_channel as xchan;
 use scriptbots_core::{
-    AgentUid, BirthRecord, DeathRecord, ExistingAgentPolicy, MapArtifact, ScriptBotsConfig,
-    SelectionUpdate, Tick, TickCombatSummary,
+    AgentUid, BirthRecord, DeathRecord, ExistingAgentPolicy, MapArtifact,
+    PersistenceCommitAuthority, ScriptBotsConfig, SelectionUpdate, Tick, TickCombatSummary,
 };
 use scriptbots_runtime::{
     AdmissionSequence, ApplicationFailure, ApplicationState, AppliedCommand,
@@ -3553,6 +3553,15 @@ impl Drop for StorageJournalPort {
 }
 
 impl JournalPort for StorageJournalPort {
+    fn persistence_commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+        // JournalAdmit commits the complete persistence payload through the same worker
+        // outbox before emitting its terminal receipt. Share only this pipeline's authority;
+        // another sink, even for the same path or run label, cannot use that receipt.
+        Some(PersistenceCommitAuthority::from_owner(Arc::clone(
+            &self.admission,
+        )))
+    }
+
     fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
         let batch_id = batch.id();
         if let Some(outstanding) = self.outstanding.get(&batch_id) {
@@ -4824,6 +4833,263 @@ mod tests {
             volatile_event_history_capacity: 4,
             ..HostCoreOptions::default()
         }
+    }
+
+    struct ReservedJournalFixture {
+        core: HostCore,
+        frontend: NullFrontend<scriptbots_runtime::LocalHostPort>,
+        worker: xchan::Receiver<StorageCommand>,
+        receipts: xchan::Sender<JournalReceipt>,
+        sink: crate::StorageSink,
+    }
+
+    fn reserved_journal_fixture(budget: crate::PayloadBudget) -> ReservedJournalFixture {
+        let session_id = HostSessionId::new(0x5109);
+        let options = StorageJournalOptions {
+            admission_capacity: 1,
+            ..StorageJournalOptions::default()
+        };
+        let (worker_tx, worker) = xchan::bounded(1);
+        let admission = Arc::new(Mutex::new(AdmissionState { open: true }));
+        let sink = crate::StorageSink {
+            run_id: RunId::new(1),
+            tx: worker_tx.clone(),
+            analytics: crate::AnalyticsSnapshotProvider::empty(),
+            admission: Arc::clone(&admission),
+            path: Arc::from(":memory:"),
+            deadlines: crate::StorageDeadlines {
+                command_enqueue: Duration::from_millis(10),
+                admission_ack: Duration::from_millis(10),
+                ..crate::StorageDeadlines::default()
+            },
+            budget,
+            inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        let world = timeout_test_world();
+        let persistence = world.bind_persistence(Box::new(sink.clone())).unwrap();
+        let shared = Arc::new(JournalSessionShared::new(options.admission_capacity));
+        let (receipts, receipt_rx) = xchan::bounded(options.admission_capacity);
+        let publisher =
+            JournalReaderPublisher::new(session_id, JournalReaderBackend::Memory, options);
+        let mut journal = StorageJournalPort::new(
+            worker_tx,
+            admission,
+            shared,
+            receipt_rx,
+            &publisher,
+            options,
+            ShutdownCommitRequirement::CommittedVolatile,
+        );
+        journal.command_reader = None;
+        let core = HostCore::with_journal_and_persistence(
+            session_id,
+            world,
+            timeout_host_options(),
+            Box::new(journal),
+            persistence,
+        )
+        .unwrap();
+        let frontend = NullFrontend::new(core.local_port(), 0x510a);
+        ReservedJournalFixture {
+            core,
+            frontend,
+            worker,
+            receipts,
+            sink,
+        }
+    }
+
+    #[test]
+    fn paired_journal_full_retries_reuse_one_scientific_reservation() {
+        // This is an admission/receipt protocol fixture using the actual sink and journal
+        // ports. Real memory/file worker commitment is covered by the companion pipeline test.
+        let ReservedJournalFixture {
+            mut core,
+            mut frontend,
+            worker,
+            receipts,
+            sink,
+        } = reserved_journal_fixture(crate::PayloadBudget::default());
+        let (reply, _reply_rx) = xchan::bounded(1);
+        sink.tx.try_send(StorageCommand::Flush { reply }).unwrap();
+        frontend.step().unwrap();
+        let blocked = frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(0))
+            .unwrap();
+        assert!(matches!(
+            blocked.blocker,
+            Some(HostBlocker::JournalFull { .. })
+        ));
+        let retained = core.pending_journal_batch().unwrap();
+        let reserved = sink.inflight_bytes();
+        let narrative_reserved = sink.inflight_narrative_bytes();
+        assert!(reserved > 0);
+        for _ in 0..3 {
+            assert!(matches!(
+                core.retry_retained_journal().unwrap(),
+                Some(JournalAdmission::Full { .. })
+            ));
+            assert_eq!(sink.inflight_bytes(), reserved);
+            assert_eq!(sink.inflight_narrative_bytes(), narrative_reserved);
+            assert!(Arc::ptr_eq(
+                &retained,
+                &core.pending_journal_batch().unwrap()
+            ));
+        }
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(StorageCommand::Flush { .. })
+        ));
+        assert_eq!(
+            core.retry_retained_journal().unwrap(),
+            Some(JournalAdmission::Accepted {
+                batch_id: retained.id()
+            })
+        );
+        let queued = admitted_journal_batch(worker.try_recv().unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&queued, &retained));
+        assert!(matches!(worker.try_recv(), Err(xchan::TryRecvError::Empty)));
+        assert_eq!(sink.inflight_bytes(), reserved);
+        assert_eq!(core.persistence().last_admitted_tick(), None);
+        receipts
+            .try_send(JournalReceipt::new(
+                retained.id(),
+                JournalReceiptState::CommittedVolatile,
+            ))
+            .unwrap();
+        frontend
+            .drive_at(&mut core, ManualInstant::from_nanos(1))
+            .unwrap();
+        assert_eq!(core.persistence().last_admitted_tick(), Some(Tick(1)));
+        assert!(!core.persistence().has_pending_batch());
+        assert_eq!(sink.inflight_bytes(), 0);
+        assert_eq!(sink.inflight_narrative_bytes(), 0);
+    }
+
+    #[test]
+    fn paired_journal_preserves_custom_sink_budget_before_any_worker_dispatch() {
+        for budget in [
+            crate::PayloadBudget {
+                max_batch_bytes: 1,
+                ..crate::PayloadBudget::default()
+            },
+            crate::PayloadBudget {
+                max_batch_events: 0,
+                ..crate::PayloadBudget::default()
+            },
+            crate::PayloadBudget {
+                max_inflight_bytes: 0,
+                ..crate::PayloadBudget::default()
+            },
+        ] {
+            let ReservedJournalFixture {
+                mut core,
+                mut frontend,
+                worker,
+                receipts: _receipts,
+                sink,
+            } = reserved_journal_fixture(budget);
+            let submitted = frontend.step().unwrap();
+            let refused = frontend
+                .drive_at(&mut core, ManualInstant::from_nanos(0))
+                .expect_err("the configured sink budget must refuse before journal dispatch");
+            assert!(
+                refused
+                    .to_string()
+                    .contains("could not reserve journal persistence")
+            );
+            assert!(matches!(worker.try_recv(), Err(xchan::TryRecvError::Empty)));
+            assert_eq!(sink.inflight_bytes(), 0);
+            assert_eq!(sink.inflight_narrative_bytes(), 0);
+            assert_eq!(core.persistence().last_admitted_tick(), None);
+            assert_eq!(
+                core.persistence().fault().unwrap().state(),
+                scriptbots_core::PersistenceAdmissionState::NotAdmitted
+            );
+            let retained = core.pending_journal_batch().unwrap();
+            assert!(std::ptr::eq(
+                core.persistence().pending_batch().unwrap(),
+                retained.persistence().unwrap().as_ref()
+            ));
+            assert!(core.indeterminate_journal_batch().is_none());
+            let status = frontend
+                .command_status(submitted.command_id())
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                status.journal(),
+                JournalState::Failed(failure) if failure.code == "persistence_reservation_failed"
+            ));
+            assert_eq!(core.world_tick(), Tick(1));
+            assert_eq!(
+                core.drive_interest(),
+                scriptbots_runtime::HostDriveInterest::Faulted
+            );
+        }
+    }
+
+    #[test]
+    fn paired_journal_reservation_failure_stays_terminal_after_capacity_recovers() {
+        let budget = crate::PayloadBudget::default();
+        let ReservedJournalFixture {
+            mut core,
+            mut frontend,
+            worker,
+            receipts: _receipts,
+            sink,
+        } = reserved_journal_fixture(budget);
+        // Model another submitter owning the full shared sink budget. Once the host has
+        // published a terminal refusal, freeing that capacity cannot authorize a new write.
+        sink.inflight_bytes
+            .store(budget.max_inflight_bytes, Ordering::Release);
+        let submitted = frontend.step().unwrap();
+        assert!(
+            frontend
+                .drive_at(&mut core, ManualInstant::from_nanos(0))
+                .is_err()
+        );
+        let retained = core.pending_journal_batch().unwrap();
+        assert!(matches!(worker.try_recv(), Err(xchan::TryRecvError::Empty)));
+        sink.inflight_bytes.store(0, Ordering::Release);
+        let retry = core
+            .retry_retained_journal()
+            .expect_err("terminal refusal cannot dispatch");
+        assert!(
+            retry
+                .to_string()
+                .contains("terminally failed journal batch")
+        );
+        assert!(matches!(worker.try_recv(), Err(xchan::TryRecvError::Empty)));
+        assert_eq!(sink.inflight_bytes(), 0);
+        assert_eq!(sink.inflight_narrative_bytes(), 0);
+        assert!(Arc::ptr_eq(
+            &retained,
+            &core.pending_journal_batch().unwrap()
+        ));
+        assert!(std::ptr::eq(
+            core.persistence().pending_batch().unwrap(),
+            retained.persistence().unwrap().as_ref()
+        ));
+        assert_eq!(core.persistence().last_admitted_tick(), None);
+        assert_eq!(
+            core.persistence().fault().unwrap().state(),
+            scriptbots_core::PersistenceAdmissionState::NotAdmitted
+        );
+        assert!(core.indeterminate_journal_batch().is_none());
+        let status = frontend
+            .command_status(submitted.command_id())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            status.journal(),
+            JournalState::Failed(failure) if failure.code == "persistence_reservation_failed"
+        ));
+        assert_eq!(core.world_tick(), Tick(1));
+        assert_eq!(
+            core.drive_interest(),
+            scriptbots_runtime::HostDriveInterest::Faulted
+        );
     }
 
     fn admitted_journal_batch(command: StorageCommand) -> Option<Arc<JournalBatch>> {
