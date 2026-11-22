@@ -460,6 +460,30 @@ function experimentTransport() {
   return { client, prepared, sessionId: client.tracker.sessionId };
 }
 
+test("failed-run retry transport binds the generation and source before HTTP admission", async () => {
+  const original = globalThis.fetch, requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url), ...options });
+    return new Response('{}');
+  };
+  try {
+    const { client, sessionId } = experimentTransport();
+    await client.retryFailedExperiment("cohort.example", { sessionId, expectedGeneration: Number.MAX_SAFE_INTEGER });
+    const request = requests[0];
+    assert.equal(request.method, "POST");
+    assert.equal(request.url.pathname, "/prefix/api/v1/experiments/cohort.example/retry-failed");
+    assert.equal(request.headers["X-ScriptBots-Session"], sessionId);
+    assert.deepEqual(JSON.parse(request.body), { expected_generation: Number.MAX_SAFE_INTEGER });
+    assert.equal(request.credentials, "omit");
+    for (const expectedGeneration of [undefined, -1, 1.5, "7", NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(client.retryFailedExperiment("cohort.example", { sessionId, expectedGeneration }), /exact observed/);
+    }
+    await assert.rejects(client.retryFailedExperiment("cohort.example", { sessionId: "7", expectedGeneration: 9 }));
+    await assert.rejects(client.retryFailedExperiment("../other", { sessionId, expectedGeneration: 9 }));
+    assert.equal(requests.length, 1, "invalid generation, source or path must never reach HTTP");
+  } finally { globalThis.fetch = original; }
+});
+
 test("cohort transport keeps exact u64 seeds, unchanged retry bytes and the negotiated source", async () => {
   const original = globalThis.fetch, requests = [];
   globalThis.fetch = async (url, options) => {

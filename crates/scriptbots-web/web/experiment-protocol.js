@@ -415,14 +415,21 @@ export function validateExperimentStatus(value, context = {}) {
         || previous.created_at_utc !== summary.created_at_utc || generation < previous.generation
         || previous.runs.length !== runs.length) refuse("status identity or generation changed across observations");
     const byId = new Map(previous.runs.map((run) => [run.run_id, run]));
+    // Only the caller's explicit generation-guarded retry can replace observed
+    // failed evidence. Ordinary polling still refuses terminal regressions.
+    const retryAuthorized = context.retryGeneration !== undefined
+      && integer(context.retryGeneration, "retry generation") === previous.generation
+      && generation > previous.generation;
     for (const run of runs) {
       const old = byId.get(run.run_id);
       if (!old || old.variant_id !== run.variant_id || old.seed !== run.seed
           || old.brain_family !== run.brain_family || old.target_ticks !== run.target_ticks) refuse("immutable run matrix changed across observations");
+      const retried = retryAuthorized && old.state === "failed";
       if ((old.state === "running" && run.state === "pending")
-          || (["completed", "failed"].includes(old.state) && old.state !== run.state)) refuse("run lifecycle regressed");
+          || (retried && run.state === "pending")
+          || (["completed", "failed"].includes(old.state) && !retried && old.state !== run.state)) refuse("run lifecycle regressed");
       const terminalKeys = ["state", "total_ticks", "final_digest", "bundle_path", "error_reason"];
-      if ((generation === previous.generation || ["completed", "failed"].includes(old.state))
+      if ((generation === previous.generation || (["completed", "failed"].includes(old.state) && !retried))
           && terminalKeys.some((key) => old[key] !== run[key])) refuse("unchanged or terminal run evidence was replaced");
     }
   }

@@ -60,6 +60,26 @@ function catalog(statuses = []) {
   };
 }
 
+function failedStatus(id = "cohort") {
+  const value = status({ id, state: "completed", generation: 9 });
+  value.status = "failed";
+  value.completed_runs -= 1;
+  value.failed_runs = 1;
+  Object.assign(value.runs[0], { state: "failed", total_ticks: 0, final_digest: null,
+    bundle_path: null, error_reason: "checkpoint publication failed",
+    checkpoint_progress: { state: "observed", tick: 5, checkpoint_digest: DIGEST, source: "published" } });
+  return value;
+}
+
+function retriedStatus() {
+  const value = failedStatus();
+  value.generation += 1;
+  value.status = "running";
+  value.failed_runs = 0;
+  Object.assign(value.runs[0], { state: "running", error_reason: null });
+  return value;
+}
+
 function comparison(observed) {
   return {
     experiment_id: observed.experiment_id, plan_digest: observed.plan_digest,
@@ -74,10 +94,10 @@ function comparison(observed) {
 }
 
 async function harness(page = catalog()) {
-  const calls = { list: [], create: [], status: [], cancel: [], resume: [], compare: [] };
+  const calls = { list: [], create: [], status: [], cancel: [], resume: [], retryFailed: [], compare: [] };
   let clock = 0, sequence = 0;
   const services = {};
-  for (const kind of ["create", "status", "cancel", "resume", "compare"]) {
+  for (const kind of ["create", "status", "cancel", "resume", "retryFailed", "compare"]) {
     services[kind] = (request, signal) => new Promise((resolve, reject) => {
       calls[kind].push({ request, signal, resolve, reject });
     });
@@ -262,6 +282,125 @@ test("cancel and resume only change displayed lifecycle after observed server re
   await resumed;
   assert.equal(h.controller.selected.status, "running");
   assert.equal(h.calls.resume[0].request.experimentId, "cohort");
+});
+
+test("failed-run retry captures one observed generation and retains completed peers", async () => {
+  const h = await harness();
+  const failed = failedStatus();
+  await launch(h, failed);
+  assert.equal(h.controller.canResume, false);
+  assert.equal(h.controller.canRetryFailed, true);
+  const pending = h.controller.retryFailed();
+  assert.deepEqual(h.calls.retryFailed[0].request,
+    { sessionId: SESSION, experimentId: "cohort", expectedGeneration: 9 });
+  assert.equal(h.controller.canRetryFailed, false);
+  assert.equal(await h.controller.retryFailed(), null);
+  assert.equal(h.calls.retryFailed.length, 1);
+  assert.equal(h.controller.selected.status, "failed", "admission is not an observed retry");
+  h.calls.retryFailed[0].resolve(retriedStatus());
+  assert.ok(await pending);
+  assert.equal(h.controller.selected.status, "running");
+  assert.equal(h.controller.selected.generation, 10);
+  assert.deepEqual(h.controller.selected.runs.slice(1), failed.runs.slice(1));
+  assert.equal(h.controller.canRetryFailed, false);
+  assert.equal(h.calls.resume.length, 0, "retry never uses ordinary resume");
+});
+
+test("lost failed-run retry survives an unchanged refresh before its delayed generation arrives", async () => {
+  const h = await harness();
+  await launch(h, failedStatus());
+  const pending = h.controller.retryFailed();
+  h.calls.retryFailed[0].reject(new Error("response lost after admission"));
+  assert.equal(await pending, null);
+  assert.equal(h.controller.canRetryFailed, false);
+  assert.match(h.controller.notice, /refresh status/);
+  assert.equal(await h.controller.retryFailed(), null);
+  assert.equal(h.calls.retryFailed.length, 1);
+  const unchanged = h.controller.refreshStatus(true);
+  h.calls.status.at(-1).resolve(failedStatus());
+  assert.ok(await unchanged);
+  assert.equal(h.controller.canRetryFailed, true);
+  assert.equal(h.controller.failedRetry.generation, 9,
+    "the original POST may still commit after this unchanged observation");
+  const refresh = h.controller.refreshStatus(true);
+  h.calls.status.at(-1).resolve(retriedStatus());
+  assert.ok(await refresh);
+  assert.equal(h.controller.selected.status, "running");
+  assert.equal(h.controller.failedRetry, null);
+  assert.equal(h.calls.retryFailed.length, 1, "observing delayed admission never resubmits work");
+});
+
+test("an unchanged failed-run refresh permits only an explicit reissue of the original generation", async () => {
+  const h = await harness();
+  await launch(h, failedStatus());
+  const first = h.controller.retryFailed();
+  h.calls.retryFailed[0].reject(new Error("response lost while retry was validating"));
+  assert.equal(await first, null);
+  const refresh = h.controller.refreshStatus(true);
+  h.calls.status.at(-1).resolve(failedStatus());
+  assert.ok(await refresh);
+  assert.equal(h.calls.retryFailed.length, 1);
+
+  const reissued = h.controller.retryFailed();
+  assert.deepEqual(h.calls.retryFailed[1].request, h.calls.retryFailed[0].request);
+  assert.equal(h.controller.failedRetry.refreshed, false);
+  assert.equal(h.controller.canRetryFailed, false);
+  assert.equal(await h.controller.retryFailed(), null);
+  h.calls.retryFailed[1].reject(new RemoteOwnerHttpError(409, "original retry already committed"));
+  assert.equal(await reissued, null);
+  assert.equal(h.controller.canRetryFailed, false, "another read is required after reissue");
+
+  const observed = h.controller.refreshStatus(true);
+  h.calls.status.at(-1).resolve(retriedStatus());
+  assert.ok(await observed);
+  assert.equal(h.controller.selected.generation, 10);
+  assert.equal(h.controller.failedRetry, null);
+  assert.equal(h.calls.retryFailed.length, 2);
+});
+
+test("opening another failed experiment clears only the previous selection's retry authority", async () => {
+  const first = failedStatus(), second = failedStatus("other-cohort");
+  const h = await harness(catalog([first, second]));
+  const opening = h.controller.open(first.experiment_id);
+  h.calls.status.at(-1).resolve(first);
+  assert.ok(await opening);
+  const retry = h.controller.retryFailed();
+  h.calls.retryFailed[0].reject(new Error("first experiment retry response lost"));
+  assert.equal(await retry, null);
+  assert.equal(h.controller.failedRetry.experimentId, first.experiment_id);
+
+  const switching = h.controller.open(second.experiment_id);
+  h.calls.status.at(-1).resolve(second);
+  assert.ok(await switching);
+  assert.equal(h.controller.selected.experiment_id, second.experiment_id);
+  assert.equal(h.controller.failedRetry, null);
+  assert.equal(h.controller.canRetryFailed, true);
+  assert.equal(h.calls.retryFailed.length, 1, "selection never starts another attempt");
+});
+
+test("failed-run retry refuses unchanged acknowledgements and terminal peer substitution", async () => {
+  const h = await harness();
+  const failed = failedStatus();
+  await launch(h, failed);
+  const pending = h.controller.retryFailed();
+  h.calls.retryFailed[0].resolve(failed);
+  assert.equal(await pending, null);
+  assert.equal(h.controller.canRetryFailed, false);
+  assert.match(h.controller.notice, /newer retry generation/);
+  const refresh = h.controller.refreshStatus(true);
+  const forged = retriedStatus();
+  forged.runs[1].final_digest = "c".repeat(16);
+  h.calls.status.at(-1).resolve(forged);
+  assert.equal(await refresh, null);
+  assert.deepEqual(h.controller.selected, failed);
+  assert.equal(h.controller.canRetryFailed, false);
+  const unchanged = h.controller.refreshStatus(true);
+  h.calls.status.at(-1).resolve(failed);
+  await unchanged;
+  assert.equal(h.controller.canRetryFailed, true,
+    "a verified unchanged status establishes that the observed generation can be retried");
+  assert.equal(h.controller.failedRetry.generation, failed.generation,
+    "an unchanged observation cannot revoke authority for a delayed retry response");
 });
 
 test("comparisons require complete cohorts and bind the exact selected pair and generation", async () => {

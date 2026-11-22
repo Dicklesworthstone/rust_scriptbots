@@ -30,9 +30,9 @@ function completedVariants(status) {
 
 /** One in-flight operation and one exact uncertain creation request per observed source. */
 export class ExperimentController {
-  constructor({ list, create, status, cancel, resume, compare, onChange = () => {},
+  constructor({ list, create, status, cancel, resume, retryFailed, compare, onChange = () => {},
     id = interventionRequestId, now = () => performance.now() }) {
-    this.services = { list, create, status, cancel, resume, compare };
+    this.services = { list, create, status, cancel, resume, retryFailed, compare };
     this.onChange = onChange;
     this.id = id;
     this.now = now;
@@ -48,6 +48,7 @@ export class ExperimentController {
     this.cursor = null;
     this.selected = null;
     this.creation = null;
+    this.failedRetry = null;
     this.comparison = null;
     this.runPageIndex = 0;
     this.lastCatalogRead = -Infinity;
@@ -63,6 +64,12 @@ export class ExperimentController {
     && this.creation.sessionId === this.source.sessionId; }
   get canCancel() { return this.canOperate && ACTIVE.has(this.selected?.status); }
   get canResume() { return this.canOperate && this.selected !== null && experimentCanResume(this.selected); }
+  get canRetryFailed() { return this.canOperate
+    && (!this.failedRetry || (this.failedRetry.refreshed
+      && this.failedRetry.experimentId === this.selected?.experiment_id
+      && this.failedRetry.generation === this.selected?.generation))
+    && this.selected?.failed_runs > 0
+    && ["stopped", "cancelled", "failed"].includes(this.selected.status); }
   get canCompare() { return this.canOperate && completedVariants(this.selected).size >= 2; }
   get totalRunPages() { return Math.max(1, Math.ceil((this.selected?.runs.length ?? 0) / EXPERIMENT_RUN_PAGE_SIZE)); }
   get visibleRuns() {
@@ -228,12 +235,21 @@ export class ExperimentController {
     const capturedRequest = request ?? (this.creation?.state === "observed"
       && this.creation.experimentId === experimentId ? this.creation.prepared.request : undefined);
     const checked = validateExperimentStatus(value, { experimentId, request: capturedRequest,
-      planDigest: previous?.plan_digest, minimumGeneration: previous?.generation, previousStatus: previous });
+      planDigest: previous?.plan_digest, minimumGeneration: previous?.generation, previousStatus: previous,
+      retryGeneration: this.failedRetry?.experimentId === experimentId ? this.failedRetry.generation : undefined });
     if (this.comparison && (this.comparison.experiment_id !== checked.experiment_id
         || this.comparison.plan_digest !== checked.plan_digest || this.comparison.status_generation !== checked.generation)) {
       this.comparison = null;
     }
     this.selected = copy(checked);
+    if (this.failedRetry) {
+      if (checked.experiment_id !== this.failedRetry.experimentId
+          || checked.generation > this.failedRetry.generation) this.failedRetry = null;
+      // A lost POST may still be validating when this read sees the old status.
+      // Preserve its authority for a later observation; only an explicit reissue
+      // of this same generation is now allowed.
+      else if (checked.generation === this.failedRetry.generation) this.failedRetry.refreshed = true;
+    }
     this.runPageIndex = Math.min(this.runPageIndex, this.totalRunPages - 1);
     this.lastStatusRead = this.now();
     this.notice = checked.status === "completed"
@@ -268,6 +284,23 @@ export class ExperimentController {
     this.notice = "Requesting continuation of this experiment's unfinished runs.";
     return this.run("Resume outcome unconfirmed; refresh status before retrying",
       (signal) => this.services.resume(request, signal), (value) => this.acceptStatus(value, request.experimentId));
+  }
+
+  retryFailed() {
+    if (!this.canRetryFailed) return Promise.resolve(null);
+    const request = { sessionId: this.source.sessionId, experimentId: this.selected.experiment_id,
+      expectedGeneration: this.selected.generation };
+    // Keep this authority after a lost response so an explicit status refresh
+    // can observe the retry, without silently starting another failed attempt.
+    this.failedRetry = { experimentId: request.experimentId, generation: request.expectedGeneration, refreshed: false };
+    this.notice = "Verifying saved continuations and preserving the failed attempt before retrying.";
+    return this.run("Failed-run retry outcome unconfirmed; refresh status before trying again",
+      (signal) => this.services.retryFailed(request, signal), (value) => {
+        if (!Number.isSafeInteger(value?.generation) || value.generation <= request.expectedGeneration) {
+          throw new Error("The host did not observe a newer retry generation");
+        }
+        return this.acceptStatus(value, request.experimentId);
+      });
   }
 
   compare({ baselineVariant, challengerVariant, metric }) {

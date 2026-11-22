@@ -2492,6 +2492,40 @@ for the observed outcome. Resume uses the validated saved owner/journal cuts and
 does not start an unrelated run. Reuse the original create payload and
 `--idempotency-key` after a lost create response.
 
+#### Retrying failed experiment runs
+
+Ordinary resume keeps recorded failures terminal. After inspecting and addressing
+the cause, explicitly retry failed runs from their saved progress:
+
+```bash
+# Local runner: use the identical plan and output directory.
+cargo run -p scriptbots-app --bin scriptbots-app -- experiment \
+  --plan experiment-plan.json --out runs/matched-experiment --retry-failed
+
+# Running server: observe the generation first, then use that exact value.
+cargo run -p scriptbots-app --bin control_cli -- experiment status food-pause-recovery
+cargo run -p scriptbots-app --bin control_cli -- experiment retry-failed food-pause-recovery \
+  --expected-generation 12
+```
+
+The server also exposes `POST /api/v1/experiments/ID/retry-failed` with
+`{"expected_generation":12}`, and MCP `experiment_retry_failed` with
+`{"experiment_id":"food-pause-recovery","expected_generation":12}`. Replace
+the example generation with the value actually returned by status. The browser's
+**Retry failed runs from saved progress** action captures that value automatically.
+After an uncertain response, refresh status before trying again; an older
+generation cannot authorize another attempt after the batch has advanced.
+
+Retry verifies every failed run's executable checkpoint or completed bundle,
+reserves server execution capacity, and reopens all failed runs together.
+Completed companions keep their original results. Missing, corrupt, foreign or
+busy continuation evidence causes refusal; retry never reconstructs progress by
+starting an unrelated tick-zero run. The exact preceding failure status is
+retained under `status.json.retries/generation-<20-digit-generation>.json`.
+History is bounded to 16 retry generations; reaching that limit refuses another
+retry and preserves the evidence. Interrupted publication can recover only when
+the retained failure record, successor status and executable continuations agree.
+
 #### Checkpoints and artifacts from the shell
 
 The same control CLI captures checkpoints and discovers retained artifacts. Use
@@ -2608,7 +2642,7 @@ digest evidence within its window.
 - Default: `127.0.0.1:8090` over HTTP; disable with `SCRIPTBOTS_CONTROL_MCP=disabled`.
 - Override bind address: `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR=127.0.0.1:9090`.
 - Implemented with `fastmcp-rust`; the server shares the same `ControlHandle` as REST.
-- Tools exposed (31):
+- Tools exposed:
   - Configuration: `list_knobs` → array of knob entries; `get_config` → full config snapshot;
     `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`; `apply_patch` → accepts `{ patch: { ... } }`
   - Scenarios: `list_presets` → available scenario presets; `apply_preset` → accepts `{ name }`; `intervene` → scheduled intervention
@@ -2624,12 +2658,25 @@ digest evidence within its window.
     and unfinished runs from validated owner/journal cuts, and recovers verified completed
     bundles saved before their final status write; missing or incompatible cuts are refused).
     The same saved-definition discovery supports status/list/resume by ID after restart.
+    `experiment_retry_failed` explicitly reopens failed runs from verified saved
+    progress and requires the observed `expected_generation`; original failure
+    evidence and completed peers are preserved.
     `experiment_compare` verifies two completed cohorts at their declared endpoint
     and returns the matched-seed contrast, uncertainty and provenance; one-seed
     cohorts explicitly return descriptive results without inferential claims.
   - Checkpoints and artifacts: `checkpoint_create` (captured from the world owner and recorded in the run database
     through the storage worker), `checkpoint_list`, `checkpoint_status`, `artifact_list`, `artifact_get`
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.
+
+REST, WebSocket controls and MCP tools share process-wide admission limits:
+eight expensive query/work requests and sixteen command/status requests. Extra
+work is refused before entering the blocking queue. A disconnected queued
+request is cancelled; a request already running retains its slot until it exits.
+Command admission has separate capacity, and immutable latest-tick publications
+retain their direct read path. MCP HTTP dispatch has its own bounded outer
+admission and returns a JSON-RPC capacity error with the original request ID
+and HTTP 503 when full. These bounds preserve admission capacity; FastMCP's
+same-session mutex and unrelated blocking-pool work can still delay execution.
 
 MCP quickstart:
 - Start the app; verify MCP binds on `127.0.0.1:8090` (override via `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR`).

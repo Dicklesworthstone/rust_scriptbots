@@ -2,6 +2,65 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Bounded API work and failed-study recovery (2026-11-21):**
+[Implemented and independently reviewed; final browser and changed-Rust-format
+DSR checks passed; native qualification blocked — Codex; contributions to `bd-2z0.12.2` and
+`bd-2z0.5.11`, broader acceptance remains open]
+
+- Bound blocking REST, WebSocket control, MCP tool and SSE/NDJSON query work
+  before executor admission. Share eight expensive-work and sixteen command
+  slots process-wide; retain permits through a running caller's disconnect and
+  cancel queued work when its caller disappears. Preserve direct immutable
+  publication reads. MCP dispatch has a separate bounded outer budget and
+  preserves JSON-RPC identity on explicit capacity refusal. These are admission
+  guarantees; the same-session FastMCP mutex can still delay commands.
+- Add explicit failed-run retry to the local runner, control CLI, REST, MCP and
+  browser. Verify every failed run's executable continuation or completed bundle
+  before reopening all failed peers together. Keep completed companions and
+  ordinary resume's monotonic contract unchanged. Reserve server execution
+  capacity before publishing retry status, and require the observed generation
+  at remote boundaries so a lost response cannot authorize a later attempt.
+- Retain exact failed status bytes under `status.json.retries`, with a 16-generation
+  bound. Interrupted retry publication requires the exact retained witness,
+  successor status and executable cuts. Missing, corrupt or foreign sources
+  refuse without silently replaying from tick zero.
+- Keep browser retry authority across an unchanged refresh after a lost response;
+  allow only an explicit reissue against that same generation. Observe delayed
+  admission without resubmitting work, retain completed-peer validation, and
+  clear retry authority when the selected experiment or remote source changes.
+- Add native regressions for worker cancellation/capacity, exact Step retry,
+  nonzero owner/journal continuation, failure-history bounds and interrupted
+  publication, plus actual REST/MCP retry requests against real retained owners.
+  Authored native tests are not evidence of executed passes.
+
+DSR `scriptbots_final_browser/20261121T185316-WCHA0xpE` passed all 258 Node tests
+with zero failures, skips or cancellations, plus syntax checks for all browser
+JavaScript, renderer modules and test modules. The final snapshot includes both
+lost-response timing and experiment-selection regressions; source signatures
+were stable. Browser tests use the repository's existing service/DOM doubles and
+do not substitute for native execution or graphical end-to-end qualification.
+
+The first admission-only source passed pinned formatting/parse checks through
+DSR `scriptbots_final_server_format/20261121T184756-1XrOKvTb` and was committed
+directly to `main` as `e780c8a386d081e00dfeb1944f3fadcaba733b9c`.
+Final five-file Rust formatting/parse checks passed through DSR
+`scriptbots_final_rust_format/20261121T190039-JsuYR54T` (3/3 executed checks,
+stable source). Required whole-workspace `cargo fmt --check` executed through
+DSR `scriptbots_workspace_format/20261121T190325-0PkkcLDp` and failed in eight
+untouched files whose bytes match the original base commit; this does not
+qualify the workspace formatting gate.
+
+DSR `scriptbots_final_production_check/20261121T190240-GmTMgp9N` ran
+`cargo check --locked -p scriptbots-app --lib --no-default-features` with the
+pinned nightly, one Cargo job, zero debuginfo and one compiler thread. Dependency
+compilation reached `asupersync 0.5.0`, whose rustc process received SIGKILL;
+Cargo exited 101 before ScriptBots application typechecking. All 720 frozen
+source files were unchanged afterward. The receipt does not establish why the
+compiler was killed. Production binaries, native regression tests, workspace
+check and strict workspace Clippy remain unexecuted after that shared dependency
+blocker. Full-workspace qualification and the original beads' broader acceptance
+remain open; dependency pins and scientific baselines are unchanged.
+
 **Indexed carcass reward candidates (2026-11-20):**
 [Implemented and independently reviewed; scoped DSR Rust checks passed —
 Codex; contribution to `bd-h33`, broader performance acceptance remains open]

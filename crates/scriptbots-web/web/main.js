@@ -182,6 +182,7 @@ const experiments = new ExperimentController({
   status: (request, signal) => remoteClient.experimentStatus(request.experimentId, { sessionId: request.sessionId, signal }),
   cancel: (request, signal) => remoteClient.cancelExperiment(request.experimentId, { sessionId: request.sessionId, signal }),
   resume: (request, signal) => remoteClient.resumeExperiment(request.experimentId, { sessionId: request.sessionId, signal }),
+  retryFailed: (request, signal) => remoteClient.retryFailedExperiment(request.experimentId, { ...request, signal }),
   compare: (request, signal) => remoteClient.compareExperiment(request.experimentId, { ...request, signal }),
   onChange: (controller) => renderExperimentLab(experimentPanel, controller),
 });
@@ -226,6 +227,7 @@ for (const [id, action] of [
   ["refresh", () => experiments.refreshStatus(true)],
   ["cancel", () => experiments.cancel()],
   ["resume", () => experiments.resume()],
+  ["retry-failed", () => experiments.retryFailed()],
   ["run-previous", () => experiments.previousRuns()],
   ["run-next", () => experiments.nextRuns()],
   ["compare", () => experiments.compare({

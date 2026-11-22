@@ -417,6 +417,45 @@ test("comparison refuses stale provenance, unpaired seeds, incomplete arms and i
   assert.throws(() => validateExperimentComparison(base, {}), /currently observed/);
 });
 
+test("only an explicit observed retry generation can replace failed run evidence", () => {
+  const previous = statusFixture({ state: "failed" });
+  const completed = statusFixture().runs[0];
+  previous.runs[0] = clone(completed);
+  previous.completed_runs = 1;
+  previous.failed_runs -= 1;
+  const resumed = clone(previous);
+  resumed.generation += 1;
+  resumed.status = "running";
+  resumed.failed_runs = 0;
+  for (const run of resumed.runs.filter((row) => row.state === "failed")) {
+    run.state = "running";
+    run.error_reason = null;
+  }
+  const context = { previousStatus: previous, retryGeneration: previous.generation };
+  assert.throws(() => validateExperimentStatus(resumed, { previousStatus: previous }), /lifecycle regressed/);
+  assert.throws(() => validateExperimentStatus(resumed, { ...context, retryGeneration: 8 }), /lifecycle regressed/);
+  assert.throws(() => validateExperimentStatus({ ...resumed, generation: previous.generation }, context), /lifecycle regressed/);
+  assert.equal(validateExperimentStatus(resumed, context).runs[1].state, "running");
+  assert.deepEqual(validateExperimentStatus(resumed, context).runs[0], completed);
+
+  const changedPeer = clone(resumed);
+  changedPeer.runs[0].final_digest = worldDigest("f");
+  assert.throws(() => validateExperimentStatus(changedPeer, context), /terminal run evidence/);
+  const reset = clone(resumed);
+  Object.assign(reset.runs[1], { state: "pending",
+    checkpoint_progress: { state: "unavailable", reason: "not_started" } });
+  assert.throws(() => validateExperimentStatus(reset, context), /lifecycle regressed/);
+  const foreign = clone(resumed);
+  foreign.plan_digest = hash("f");
+  assert.throws(() => validateExperimentStatus(foreign, context), /identity or generation/);
+
+  const failedAgain = clone(previous);
+  failedAgain.generation += 2;
+  failedAgain.runs[1].error_reason = "a different observed failure";
+  assert.throws(() => validateExperimentStatus(failedAgain, { previousStatus: previous }), /terminal run evidence/);
+  assert.equal(validateExperimentStatus(failedAgain, context).runs[1].error_reason, "a different observed failure");
+});
+
 test("two completed arms remain comparable when a separate arm fails", () => {
   const status = statusFixture({ arms: ["control", "treatment", "third"] });
   for (const run of status.runs.filter((row) => row.variant_id === "third")) {

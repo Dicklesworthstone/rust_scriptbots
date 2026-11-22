@@ -218,6 +218,7 @@ export function renderExperimentLab(panel, controller) {
     ["catalog-next", controller.canOperate && !!page?.has_more], ["launch", controller.canLaunch],
     ["retry", controller.canRetry], ["refresh", controller.canOperate && !!selected],
     ["cancel", controller.canCancel], ["resume", controller.canResume], ["compare", controller.canCompare],
+    ["retry-failed", controller.canRetryFailed],
     ["run-previous", !!selected && controller.runPageIndex > 0],
     ["run-next", !!selected && controller.runPageIndex + 1 < controller.totalRunPages],
     ["export", !!selected || !!controller.comparison],

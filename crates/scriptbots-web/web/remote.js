@@ -454,6 +454,15 @@ export class RemoteStreamClient {
       sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, method: "POST", parse: parseExperimentJson });
   }
 
+  async retryFailedExperiment(experimentId, { sessionId, expectedGeneration, signal } = {}) {
+    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) {
+      throw new Error("Failed-run retry requires an exact observed status generation");
+    }
+    const body = JSON.stringify({ expected_generation: expectedGeneration });
+    return this.labJson("/api/v1/experiments/" + experimentIdentifier(experimentId) + "/retry-failed",
+      sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, method: "POST", body, parse: parseExperimentJson });
+  }
+
   /** The server restores complete endpoint evidence and performs its paired analysis. */
   async compareExperiment(experimentId, { sessionId, baseline_variant, challenger_variant, metric, signal } = {}) {
     experimentIdentifier(baseline_variant);
