@@ -453,14 +453,94 @@ test("a synchronous reconnect during consumption retains the new connection's fr
 function experimentTransport() {
   const client = new RemoteStreamClient({ url: "wss://lab.example/prefix/api/ws/stream?discard=yes#fragment", decodeFrame() {} });
   client.state = "connected";
-  client.tracker.acknowledge("18446744073709551610");
+  client.tracker.acknowledge(SESSION);
   const prepared = prepareExperimentRequest({ experiment_id: "cohort.example", seeds: ["9007199254740993", "18446744073709551615"],
     variants: [{ variant_id: "control", brain_family: "mlp" }, { variant_id: "treatment", brain_family: "dwraon" }],
     ticks_per_run: 20, max_concurrency: 1, idempotency_key: "one-exact-cohort" });
   return { client, prepared, sessionId: client.tracker.sessionId };
 }
 
-test("cohort transport keeps exact u64 seeds, unchanged retry bytes and the negotiated source", async () => {
+test("run artifact inventory uses the same host and session, exact seeds and a bounded nonpaginated response", async () => {
+  const original = globalThis.fetch, requests = [];
+  try {
+    const { client, sessionId } = experimentTransport();
+    globalThis.fetch = async (url, options) => {
+      requests.push({ url: new URL(url), ...options });
+      return new Response('{"run":{"seed":18446744073709551615}}');
+    };
+    const result = await client.experimentRunArtifacts("cohort.example", "cohort.example-control-seed18446744073709551615", { sessionId });
+    assert.equal(result.run.seed, "18446744073709551615");
+    assert.equal(requests[0].url.href, "https://lab.example/prefix/api/v1/experiments/cohort.example/runs/cohort.example-control-seed18446744073709551615/artifacts");
+    assert.equal(requests[0].method, "GET");
+    assert.equal(requests[0].headers["X-ScriptBots-Session"], sessionId);
+    assert.equal(requests[0].credentials, "omit");
+    for (const id of ["../other", ".", "run/escape", "x".repeat(129)]) {
+      await assert.rejects(client.experimentRunArtifacts("cohort.example", id, { sessionId }));
+    }
+    await assert.rejects(client.experimentRunArtifacts("cohort.example", "run", { sessionId: "7" }));
+    assert.equal(requests.length, 1);
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(EXPERIMENT_LIMITS.maxRunArtifactResponseBytes + 1)); },
+      cancel() { cancelled = true; },
+    }));
+    await assert.rejects(client.experimentRunArtifacts("cohort.example", "run", { sessionId }), /exceeds/);
+    assert.equal(cancelled, true);
+    let respond;
+    globalThis.fetch = () => new Promise((resolve) => { respond = resolve; });
+    const pending = client.experimentRunArtifacts("cohort.example", "run", { sessionId });
+    client.generation += 1;
+    respond(new Response("{}"));
+    await assert.rejects(pending, /connection changed/);
+  } finally { globalThis.fetch = original; }
+});
+
+test("artifact download refuses moved paths or changed provenance before requesting any file bytes", async () => {
+  const original = globalThis.fetch;
+  const expected = { artifact_id: "experiment-" + "a".repeat(64), filename: "bundle_manifest.json",
+    content_type: "application/json", byte_size: 2, checksum_blake3: "b".repeat(64),
+    checksum_sha256: "c".repeat(64), created_at_utc: "1794456010",
+    relative_path: "experiments/cohort/run/bundle_manifest.json" };
+  try {
+    const { client, sessionId } = experimentTransport();
+    for (const [key, value] of [["relative_path", "experiments/foreign/run/bundle_manifest.json"],
+      ["content_type", "application/octet-stream"], ["created_at_utc", "1794456011"]]) {
+      let calls = 0;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ ...expected, [key]: value }));
+      };
+      await assert.rejects(client.downloadArtifact(expected.artifact_id, { sessionId, expected }), /differs/);
+      assert.equal(calls, 1, "a replaced catalog entry cannot trigger a byte download");
+    }
+  } finally { globalThis.fetch = original; }
+});
+
+test("failed-run retry transport binds the generation and source before HTTP admission", async () => {
+  const original = globalThis.fetch, requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url), ...options });
+    return new Response('{}');
+  };
+  try {
+    const { client, sessionId } = experimentTransport();
+    await client.retryFailedExperiment("cohort.example", { sessionId, expectedGeneration: Number.MAX_SAFE_INTEGER });
+    const request = requests[0];
+    assert.equal(request.method, "POST");
+    assert.equal(request.url.pathname, "/prefix/api/v1/experiments/cohort.example/retry-failed");
+    assert.equal(request.headers["X-ScriptBots-Session"], sessionId);
+    assert.deepEqual(JSON.parse(request.body), { expected_generation: Number.MAX_SAFE_INTEGER });
+    assert.equal(request.credentials, "omit");
+    for (const expectedGeneration of [undefined, -1, 1.5, "7", NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(client.retryFailedExperiment("cohort.example", { sessionId, expectedGeneration }), /exact observed/);
+    }
+    await assert.rejects(client.retryFailedExperiment("cohort.example", { sessionId: "7", expectedGeneration: 9 }));
+    await assert.rejects(client.retryFailedExperiment("../other", { sessionId, expectedGeneration: 9 }));
+    assert.equal(requests.length, 1, "invalid generation, source or path must never reach HTTP");
+  } finally { globalThis.fetch = original; }
+});
+
+test("cohort transport keeps exact u64 seeds, unchanged retry bytes and the full u128 negotiated source", async () => {
   const original = globalThis.fetch, requests = [];
   globalThis.fetch = async (url, options) => {
     requests.push({ url: new URL(url), ...options });
@@ -507,6 +587,31 @@ test("cohort transport keeps exact u64 seeds, unchanged retry bytes and the nego
     await assert.rejects(client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control", challenger_variant: "control", metric: "alive_agents" }));
     await assert.rejects(client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control", challenger_variant: "treatment", metric: "invented" }));
     assert.equal(requests.length, count, "invalid source or payload never reached HTTP");
+  } finally { globalThis.fetch = original; }
+});
+
+test("owner HTTP requests refuse malformed or overflowing sessions before any fetch", async () => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return new Response("{}"); };
+  try {
+    const { client, sessionId } = experimentTransport();
+    assert.equal(sessionId, SESSION);
+    for (const invalid of [undefined, null, 7, "", "-1", "+1", "01", "1.0", "1e2", " 1", "1 ",
+      "340282366920938463463374607431768211456", "9".repeat(40)]) {
+      // Pin the same invalid value on both sides so equality alone cannot stand
+      // in for the declared u128 grammar and range check.
+      client.tracker.sessionId = invalid;
+      await assert.rejects(client.listExperiments({ sessionId: invalid }), /identity/);
+      await assert.rejects(client.listCheckpoints({ sessionId: invalid }), /identity/);
+      await assert.rejects(client.interventionStatus(COMMAND, { sessionId: invalid }), /identity/);
+      await assert.rejects(client.downloadArtifact("artifact-one", { sessionId: invalid }), /identity/);
+    }
+    client.tracker.sessionId = sessionId;
+    for (const cursor of ["18446744073709551616", SESSION]) {
+      await assert.rejects(client.listExperiments({ sessionId, cursor }), /identity/);
+    }
+    assert.equal(calls, 0, "invalid source or a widened u64 cursor cannot reach HTTP");
   } finally { globalThis.fetch = original; }
 });
 

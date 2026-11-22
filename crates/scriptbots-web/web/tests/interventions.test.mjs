@@ -7,7 +7,7 @@ import {
 import { RemoteStreamClient } from "../remote.js";
 
 const COMMAND = "d78bce3980d94a5bb851b15b0f7b0471";
-const SESSION = "18446744073709551610";
+const SESSION = "340282366920938463463374607431768211455";
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const add = (value, delta = 1n) => (BigInt(value) + delta).toString();
 const action = () => ({ kind: "drought", region: { shape: "all" }, ticks: 5, growth_scale: 0.1 });
@@ -92,7 +92,7 @@ test("toolbox actions preserve canonical scalar payloads and reject unsupported 
   ]) assert.throws(() => validateInterventionAction(value));
 });
 
-test("new requests freeze the exact paused source and a detached payload beyond JavaScript integer precision", () => {
+test("new requests freeze the exact u128 paused source and a detached payload beyond JavaScript integer precision", () => {
   const value = { kind: "meteor", region: { shape: "disc", x: 1, y: 2, radius: 3 }, lethality: 0.5, scorch: 0.25 };
   const source = frame({ identity: { controlRevision: "9007199254740993" }, snapshot: { epoch: "9007199254740995" } });
   const frozen = makeInterventionRequest(source, value, "web-intervention-wide");
@@ -112,6 +112,11 @@ test("new requests freeze the exact paused source and a detached payload beyond 
   assert.throws(() => makeInterventionRequest(frame({ playback: { paused: false } }), action(), "valid-id"), /Pause/);
   assert.throws(() => makeInterventionRequest(frame(), action(), "x".repeat(129)));
   assert.throws(() => makeInterventionRequest(frame({ identity: { controlRevision: 7 } }), action(), "valid-id"));
+  for (const sessionId of [Number(SESSION), "01", "-1", "340282366920938463463374607431768211456"]) {
+    assert.throws(() => makeInterventionRequest(frame({ identity: { sessionId } }), action(), "valid-id"), /identities/);
+  }
+  assert.throws(() => makeInterventionRequest(frame({ identity: { controlRevision: "18446744073709551616" } }), action(), "valid-id"), /identities/);
+  assert.throws(() => makeInterventionRequest(frame({ snapshot: { epoch: "18446744073709551616" } }), action(), "valid-id"), /identities/);
 });
 
 test("receipts retain canonical hexadecimal command IDs, exact large boundaries and separate lifecycle axes", () => {
@@ -135,6 +140,14 @@ test("receipts retain canonical hexadecimal command IDs, exact large boundaries 
   assert.throws(() => validateInterventionReceipt(malformed, req));
   malformed.commandId = "18446744073709551615";
   assert.throws(() => validateInterventionReceipt(malformed, req));
+  for (const field of ["epoch", "tick", "publicationRevision", "scientificRevision", "controlRevision", "configRevision"]) {
+    const invalid = structuredClone(applied);
+    invalid.source[field] = "18446744073709551616";
+    assert.throws(() => validateInterventionReceipt(invalid, req), /identities/);
+  }
+  const invalid = structuredClone(applied);
+  invalid.source.sessionId = "340282366920938463463374607431768211456";
+  assert.throws(() => validateInterventionReceipt(invalid, { ...req, sessionId: invalid.source.sessionId }), /identities/);
 });
 
 test("receipt validation rejects impossible admission and journal combinations from the owner protocol", () => {

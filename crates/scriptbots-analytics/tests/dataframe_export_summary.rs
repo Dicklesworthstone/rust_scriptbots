@@ -462,6 +462,46 @@ fn assert_float_identical(actual: f64, expected: f64) {
     }
 }
 
+fn assert_materialized_rolling_summary(
+    reader: &StorageReader,
+    summary: &RunSummaryReport,
+    rolling_window: usize,
+) {
+    let (_, metrics) = load_metric_rows(reader).expect("materialized metric oracle");
+    let metric_names: BTreeSet<_> = metrics.iter().map(|row| row.name.as_str()).collect();
+    let mut expected_metrics = Vec::new();
+    for name in metric_names {
+        let rows: Vec<_> = metrics.iter().filter(|row| row.name == name).collect();
+        let values: Vec<Scalar> = rows.iter().map(|row| Scalar::Float64(row.value)).collect();
+        let series = Series::new(
+            name,
+            Index::from_range(0, i64::try_from(rows.len()).unwrap(), 1),
+            Column::from_values(values).unwrap(),
+        )
+        .unwrap();
+        let rolled = series.rolling(rolling_window, Some(1)).mean().unwrap();
+        for (index, row) in rows.iter().enumerate() {
+            let smoothed_value = match rolled.values().get(index) {
+                Some(Scalar::Float64(value)) => *value,
+                _ => row.value,
+            };
+            expected_metrics.push(RollingMetricRow {
+                metric_name: name.to_owned(),
+                tick: row.tick,
+                raw_value: row.value,
+                smoothed_value,
+            });
+        }
+    }
+    assert_eq!(summary.rolling_metrics.len(), expected_metrics.len());
+    for (actual, expected) in summary.rolling_metrics.iter().zip(&expected_metrics) {
+        assert_eq!(actual.metric_name, expected.metric_name);
+        assert_eq!(actual.tick, expected.tick);
+        assert_float_identical(actual.raw_value, expected.raw_value);
+        assert_float_identical(actual.smoothed_value, expected.smoothed_value);
+    }
+}
+
 /// The former JSONL + whole-table strategy is a deliberately independent,
 /// small-fixture oracle for paging, group order, and floating-point operations.
 #[expect(
@@ -481,7 +521,6 @@ fn assert_summary_matches_materialized(
         rolling_window
     };
     let (_, agents) = load_agent_rows(reader).expect("materialized agent oracle");
-    let (_, metrics) = load_metric_rows(reader).expect("materialized metric oracle");
     let classify = |tendency: f32| {
         if tendency >= 0.7 {
             "Herbivore"
@@ -570,38 +609,7 @@ fn assert_summary_matches_materialized(
         assert_float_identical(actual.mean_energy, expected.mean_energy);
     }
 
-    let metric_names: BTreeSet<_> = metrics.iter().map(|row| row.name.as_str()).collect();
-    let mut expected_metrics = Vec::new();
-    for name in metric_names {
-        let rows: Vec<_> = metrics.iter().filter(|row| row.name == name).collect();
-        let values: Vec<Scalar> = rows.iter().map(|row| Scalar::Float64(row.value)).collect();
-        let series = Series::new(
-            name,
-            Index::from_range(0, i64::try_from(rows.len()).unwrap(), 1),
-            Column::from_values(values).unwrap(),
-        )
-        .unwrap();
-        let rolled = series.rolling(rolling_window, Some(1)).mean().unwrap();
-        for (index, row) in rows.iter().enumerate() {
-            let smoothed_value = match rolled.values().get(index) {
-                Some(Scalar::Float64(value)) => *value,
-                _ => row.value,
-            };
-            expected_metrics.push(RollingMetricRow {
-                metric_name: name.to_owned(),
-                tick: row.tick,
-                raw_value: row.value,
-                smoothed_value,
-            });
-        }
-    }
-    assert_eq!(summary.rolling_metrics.len(), expected_metrics.len());
-    for (actual, expected) in summary.rolling_metrics.iter().zip(&expected_metrics) {
-        assert_eq!(actual.metric_name, expected.metric_name);
-        assert_eq!(actual.tick, expected.tick);
-        assert_float_identical(actual.raw_value, expected.raw_value);
-        assert_float_identical(actual.smoothed_value, expected.smoothed_value);
-    }
+    assert_materialized_rolling_summary(reader, &summary, rolling_window);
     assert_eq!(summary.epoch_size, epoch_size);
     assert_eq!(summary.rolling_window, rolling_window);
     summary
@@ -1025,10 +1033,13 @@ fn empty_summary_has_defaults_and_no_fabricated_observations() {
         .expect("finish empty source");
     let reader = StorageReader::open_finished(&db_path).expect("finished source lease");
     let summary = assert_summary_matches_materialized(&reader, 0, 0);
-    assert_eq!(summary.diet_summaries, []);
-    assert_eq!(summary.brain_summaries, []);
-    assert_eq!(summary.rolling_metrics, []);
-    assert_eq!(summary.founder_lineages, []);
+    assert_eq!(summary.diet_summaries, [] as [EpochDietSummaryRow; 0]);
+    assert_eq!(summary.brain_summaries, [] as [EpochBrainSummaryRow; 0]);
+    assert_eq!(summary.rolling_metrics, [] as [RollingMetricRow; 0]);
+    assert_eq!(
+        summary.founder_lineages,
+        [] as [scriptbots_analytics::FounderLineageAggregateRow; 0]
+    );
     assert!(summary.markdown_table.contains("(no agents recorded)"));
     assert!(summary.markdown_table.contains("| - | 0 | 0 | 0 |"));
 }

@@ -76,6 +76,9 @@ function model(changes = {}) {
     canCancel: false, canResume: false, canCompare: true, canRetry: false,
     page: null, cursor: null, selected, creation: null, comparison: null, notice: "",
     runPageIndex: 0, totalRunPages: 1, visibleRuns: selected.runs,
+    completedRuns: selected.runs.filter((run) => run.state === "completed"), artifactRunId: null,
+    runArtifacts: null, selectedArtifact: null,
+    canReadArtifacts: false, canDownloadBundle: false, canDownloadArtifact: false,
     ...changes,
   };
 }
@@ -90,6 +93,35 @@ function comparison(changes = {}) {
     plan_digest: "plan-abc", status_generation: 3, ...changes,
   };
 }
+
+test("completed run files expose endpoint provenance, original paths and deliberate download controls", () => {
+  const root = panel();
+  const selected = status();
+  const run = selected.runs[0];
+  const artifact = { artifact_id: "experiment-" + "a".repeat(64), filename: "final.checkpoint",
+    relative_path: `experiments/${selected.experiment_id}/${run.run_id}/checkpoints/final.checkpoint`,
+    byte_size: 123, checksum_sha256: "b".repeat(64), checksum_blake3: "c".repeat(64) };
+  const inventory = { experiment_id: selected.experiment_id, plan_digest: selected.plan_digest,
+    status_generation: selected.generation, run, artifacts: [artifact], total_bytes: 123 };
+  const ready = model({ selected, artifactRunId: run.run_id, runArtifacts: inventory, selectedArtifact: artifact,
+    canReadArtifacts: true, canDownloadBundle: true, canDownloadArtifact: true });
+  renderExperimentLab(root, ready);
+  assert.equal(root.at("artifact-run").value, run.run_id);
+  assert.match(root.at("artifact-select").textContent, /checkpoints\/final.checkpoint · 123 bytes/);
+  assert.match(root.at("artifact-summary").textContent, /plan plan-abc · endpoint digest final-baseline-11/);
+  assert.match(root.at("artifact-detail").textContent, /SHA-256 b{64} · BLAKE3 c{64}/);
+  assert.equal(root.at("bundle-download").disabled, false);
+  assert.equal(root.at("artifact-download").disabled, false);
+  renderExperimentLab(root, { ...ready, canOperate: false, canReadArtifacts: false,
+    canDownloadBundle: false, canDownloadArtifact: false });
+  for (const id of ["artifact-run", "artifacts-load", "artifact-select", "artifact-download", "bundle-download"]) {
+    assert.equal(root.at(id).disabled, true, id + " must not switch sources during a download");
+  }
+  assert.equal(root.at("artifact-select").value, artifact.artifact_id);
+  renderExperimentLab(root, model());
+  assert.equal(root.at("bundle-download").disabled, true);
+  assert.equal(root.at("artifact-detail").textContent, "");
+});
 
 test("form retains exact u64 seeds, per-arm overrides, and ordered same-tick interventions", () => {
   const request = readExperimentForm(form({

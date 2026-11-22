@@ -714,6 +714,26 @@ impl TerminalLabGate {
                 format!("ResumeExperiment {experiment_id}"),
                 selected_experiment == Some(experiment_id.as_str()),
             ),
+            (
+                LabWorkflowRequest::RetryFailedExperiment {
+                    experiment_id,
+                    session_id,
+                    expected_generation,
+                },
+                LabAction::RetryFailedExperiment {
+                    experiment_id: observed_id,
+                    session_id: observed_session,
+                    expected_generation: observed_generation,
+                },
+            ) => (
+                local_id.to_owned(),
+                format!("RetryFailedExperiment {experiment_id} generation {expected_generation}"),
+                selected_experiment == Some(experiment_id.as_str())
+                    && experiment_id == observed_id
+                    && *session_id == session
+                    && session_id == observed_session
+                    && expected_generation == observed_generation,
+            ),
             _ => (local_id.to_owned(), "Experiment request".to_owned(), false),
         };
         let permission = {
@@ -1187,6 +1207,8 @@ impl TerminalExperimentLab {
                             | 'D'
                             | 'u'
                             | 'U'
+                            | 'f'
+                            | 'F'
                             | 'n'
                             | 'N'
                             | 's'
@@ -1282,6 +1304,13 @@ impl TerminalExperimentLab {
             K::Char('c' | 'C') if self.workflows.batch.is_some() => LabAction::Compare,
             K::Char('d' | 'D') if self.workflows.batch.is_some() => LabAction::CancelExperiment,
             K::Char('u' | 'U') if self.workflows.batch.is_some() => LabAction::ResumeExperiment,
+            K::Char('f' | 'F') => {
+                let Some(action) = self.workflows.failed_experiment_retry_action() else {
+                    self.workflows.set_notice("Refresh a stopped experiment with observed failed runs before retrying them.");
+                    return true;
+                };
+                action
+            }
             K::Enter | K::Char('b' | 'B' | 'v' | 'V' | 'm' | 'M' | 'c' | 'C' | '[' | ']') => {
                 self.workflows.set_notice("Select an experiment from the catalog and wait for its details before comparing arms.");
                 return true;
@@ -1290,7 +1319,10 @@ impl TerminalExperimentLab {
         };
         if matches!(
             action,
-            LabAction::CancelExperiment | LabAction::ResumeExperiment | LabAction::CreateExperiment
+            LabAction::CancelExperiment
+                | LabAction::ResumeExperiment
+                | LabAction::RetryFailedExperiment { .. }
+                | LabAction::CreateExperiment
         ) {
             self.begin_mutation(action, session);
         } else {
@@ -5175,6 +5207,11 @@ impl<'a> TerminalApp<'a> {
                             K::Enter if self.frankentui.route == ShellRoute::Experiments => {
                                 Some(ShellMessage::PinComparisonBaseline)
                             }
+                            K::Char('c' | 'C')
+                                if self.frankentui.route == ShellRoute::Experiments =>
+                            {
+                                Some(ShellMessage::CompareSelectedExperiments)
+                            }
                             K::Char('[' | ']')
                                 if self.frankentui.route == ShellRoute::Experiments =>
                             {
@@ -5385,6 +5422,7 @@ impl<'a> TerminalApp<'a> {
                             if matches!(&pending.request,
                                 LabWorkflowRequest::CancelExperiment { experiment_id }
                                 | LabWorkflowRequest::ResumeExperiment { experiment_id }
+                                | LabWorkflowRequest::RetryFailedExperiment { experiment_id, .. }
                                 if *experiment_id == batch.summary.experiment_id)
                                 && lab.workflows.batch.as_ref() == Some(&batch) => Ok(batch),
                         Ok(TerminalLabObservation::Created { request_id, session_id, experiment })
@@ -9656,15 +9694,20 @@ impl<'a> TerminalApp<'a> {
         if let Some(agent_uid) = agent_id_opt.map(|agent| agent.uid) {
             snap.focused_agent_uid = Some(agent_uid.get());
             let inspection_deadline = Instant::now() + Duration::from_millis(5);
-            match self.client.port().inspect_agent_before(
-                agent_uid,
-                if self.probe_enabled {
-                    PROBE_MAX_CONTRIBUTORS
-                } else {
-                    0
-                },
-                inspection_deadline,
-            ) {
+            let detail = if self.probe_enabled {
+                self.client.port().inspect_agent_before(
+                    agent_uid,
+                    PROBE_MAX_CONTRIBUTORS,
+                    inspection_deadline,
+                )
+            } else {
+                // A zero-row attribution still computes the sensor explanation.
+                // Use the existing HUD read so the brain pull retains its budget.
+                self.client
+                    .port()
+                    .inspect_agent_for_hud_before(agent_uid, inspection_deadline)
+            };
+            match detail {
                 Ok(Some(detail)) if detail.source.matches_snapshot(&world) => {
                     snap.focused_brain_bound = detail.brain_bound;
                     snap.focused_outputs = Some(detail.outputs);
@@ -21788,6 +21831,26 @@ for case in ('panic', 'subscription', 'renderer'):
                         }
                         Ok(LabWorkflowResponse::Experiment(response))
                     }
+                    LabWorkflowRequest::RetryFailedExperiment {
+                        ref experiment_id,
+                        expected_generation,
+                        ..
+                    } => {
+                        calls.lock().unwrap().push(request.clone());
+                        let mut retained = batch.lock().unwrap();
+                        let observed = retained.as_mut().unwrap();
+                        assert_eq!(&observed.summary.experiment_id, experiment_id);
+                        assert_eq!(observed.generation, expected_generation);
+                        assert!(observed.summary.failed_runs > 0);
+                        observed.generation += 1;
+                        observed.summary.status = "running".into();
+                        observed.summary.failed_runs = 0;
+                        for variant in &mut observed.variants {
+                            variant.running_runs = variant.failed_runs;
+                            variant.failed_runs = 0;
+                        }
+                        Ok(LabWorkflowResponse::Experiment(observed.clone()))
+                    }
                     _ => panic!("unexpected fixture request"),
                 }
             }));
@@ -22023,6 +22086,51 @@ for case in ('panic', 'subscription', 'renderer'):
                 .mutation
                 .is_none()
         );
+
+        // A finished batch with failed runs has no unfinished-run resume path.
+        // Its separate retry waits for the captured-generation intent to be shown.
+        let (failed_generation, completed_peer) = {
+            let mut retained = batch.lock().unwrap();
+            let observed = retained.as_mut().unwrap();
+            observed.generation += 1;
+            observed.summary.status = "failed".into();
+            observed.summary.completed_runs = observed.variants[0].total_runs;
+            observed.summary.failed_runs = observed.variants[1].total_runs;
+            observed.variants[0].completed_runs = observed.variants[0].total_runs;
+            observed.variants[1].failed_runs = observed.variants[1].total_runs;
+            (observed.generation, observed.variants[0].clone())
+        };
+        terminal_lab_key(simulator.model_mut(), K::Char('r'));
+        poll_terminal_lab(simulator.model_mut(), true);
+        let failed_frame = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(failed_frame.contains("F retry failed runs"));
+        simulator_presentation_callback(simulator.model(), 1);
+        terminal_lab_key(simulator.model_mut(), K::Char('f'));
+        poll_terminal_lab(simulator.model_mut(), false);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        let pending = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 40));
+        assert!(pending.contains("RetryFailedExperiment"));
+        assert!(pending.contains(&format!("generation {failed_generation}")));
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            4,
+            "painting is not presentation"
+        );
+        simulator_presentation_callback(simulator.model(), 1);
+        simulator.send(LiveTerminalMessage::Refresh);
+        poll_terminal_lab(simulator.model_mut(), true);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 5);
+        assert!(
+            matches!(&calls[4], LabWorkflowRequest::RetryFailedExperiment {
+            expected_generation, ..
+        } if *expected_generation == failed_generation)
+        );
+        let app = simulator.model().app.borrow();
+        let observed = app.experiment_lab.workflows.batch.as_ref().unwrap();
+        assert_eq!(observed.summary.status, "running");
+        assert_eq!(observed.variants[0], completed_peer);
+        assert_eq!(observed.generation, failed_generation + 1);
     }
 
     #[test]
@@ -23137,7 +23245,11 @@ for case in ('panic', 'subscription', 'renderer'):
                         let row = text
                             .lines()
                             .find(|line| {
-                                line.split_whitespace().find(|cell| *cell != ">")
+                                let row = line.trim_start();
+                                row.strip_prefix('>')
+                                    .unwrap_or(row)
+                                    .split_whitespace()
+                                    .next()
                                     == Some(run.variant_id.as_str())
                             })
                             .expect("real completed variant is visibly rendered");

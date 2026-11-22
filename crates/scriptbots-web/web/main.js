@@ -14,6 +14,7 @@ import { CheckpointLabController, renderCheckpointLab } from "./checkpoint-lab.j
 import { ExperimentController } from "./experiments.js";
 import { readExperimentForm, renderExperimentLab, experimentObservationExport } from "./experiment-view.js";
 import { renderStudyReport } from "./study-report.js";
+import { WorldViewport, WorldDrag, MIN_WORLD_ZOOM, MAX_WORLD_ZOOM } from "./world-view.js";
 
 const {
   init_sim,
@@ -32,6 +33,13 @@ const rendererSelect = document.getElementById("renderer");
 const rendererStatus = document.getElementById("renderer-status");
 const environmentLayer = document.getElementById("environment-layer");
 const environmentStatus = document.getElementById("environment-status");
+const worldViewport = new WorldViewport();
+const worldDrag = new WorldDrag();
+const worldViewStatus = document.getElementById("world-view-status");
+const worldZoomIn = document.getElementById("world-zoom-in");
+const worldZoomOut = document.getElementById("world-zoom-out");
+const worldFit = document.getElementById("world-fit");
+const worldFollow = document.getElementById("world-follow");
 const captureButton = document.getElementById("capture-btn");
 const captureStatus = document.getElementById("capture-status");
 let captureRequest = null;
@@ -168,13 +176,17 @@ const experimentPanel = document.getElementById("experiment-lab");
 const experimentForm = document.getElementById("experiment-form");
 const experimentFormError = document.getElementById("experiment-form-error");
 let experimentExportUrl = null;
+let experimentDownloadUrl = null;
 const experiments = new ExperimentController({
   list: (request, signal) => remoteClient.listExperiments({ ...request, signal }),
   create: (request, signal) => remoteClient.createExperiment(request, { signal }),
   status: (request, signal) => remoteClient.experimentStatus(request.experimentId, { sessionId: request.sessionId, signal }),
   cancel: (request, signal) => remoteClient.cancelExperiment(request.experimentId, { sessionId: request.sessionId, signal }),
   resume: (request, signal) => remoteClient.resumeExperiment(request.experimentId, { sessionId: request.sessionId, signal }),
+  retryFailed: (request, signal) => remoteClient.retryFailedExperiment(request.experimentId, { ...request, signal }),
   compare: (request, signal) => remoteClient.compareExperiment(request.experimentId, { ...request, signal }),
+  artifacts: (request, signal) => remoteClient.experimentRunArtifacts(request.experimentId, request.runId, { ...request, signal }),
+  download: (request, signal) => remoteClient.downloadArtifact(request.artifactId, { ...request, signal }),
   onChange: (controller) => renderExperimentLab(experimentPanel, controller),
 });
 
@@ -210,6 +222,24 @@ experimentForm?.addEventListener("submit", (event) => {
 document.getElementById("experiment-select")?.addEventListener("change", (event) => {
   if (event.target.value) void experimentAction(() => experiments.open(event.target.value));
 });
+document.getElementById("experiment-artifact-run")?.addEventListener("change", (event) => {
+  experiments.selectArtifactRun(event.target.value);
+});
+document.getElementById("experiment-artifact-select")?.addEventListener("change", (event) => {
+  experiments.selectArtifact(event.target.value);
+});
+async function saveExperimentDownload(action) {
+  const result = await action();
+  if (!result) return;
+  if (experimentDownloadUrl) URL.revokeObjectURL(experimentDownloadUrl);
+  experimentDownloadUrl = URL.createObjectURL(result.blob);
+  const anchor = document.createElement("a");
+  anchor.href = experimentDownloadUrl;
+  anchor.download = result.filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
 for (const [id, action] of [
   ["catalog-refresh", () => experiments.refreshCatalog(true)],
   ["catalog-first", () => experiments.firstPage()],
@@ -218,6 +248,10 @@ for (const [id, action] of [
   ["refresh", () => experiments.refreshStatus(true)],
   ["cancel", () => experiments.cancel()],
   ["resume", () => experiments.resume()],
+  ["retry-failed", () => experiments.retryFailed()],
+  ["artifacts-load", () => experiments.loadRunArtifacts()],
+  ["artifact-download", () => saveExperimentDownload(() => experiments.downloadSelectedArtifact())],
+  ["bundle-download", () => saveExperimentDownload(() => experiments.downloadRunBundle())],
   ["run-previous", () => experiments.previousRuns()],
   ["run-next", () => experiments.nextRuns()],
   ["compare", () => experiments.compare({
@@ -340,8 +374,8 @@ function synchronizeCheckpointView(controller) {
     }
     document.getElementById("sim-container").dataset.view = reviewedCheckpoint ? "checkpoint" : "live";
     canvas.setAttribute("aria-label", reviewedCheckpoint
-      ? "Saved checkpoint canvas. Creature inspection is unavailable; use Return to live to inspect the current population."
-      : "Simulation canvas. Click a creature to inspect it; Escape clears selection.");
+      ? "Saved checkpoint canvas. Drag to pan, scroll to zoom, Home fits the world. Return to live to inspect creatures."
+      : "Simulation canvas. Click a creature to inspect; drag to pan; scroll or plus/minus to zoom; arrows pan; Home fits; F follows; Escape clears selection.");
     const metricsHeading = document.getElementById("metrics-heading");
     if (metricsHeading) metricsHeading.textContent = reviewedCheckpoint ? "Saved World Metrics" : "Live Metrics";
     resetPerformanceWindows(reviewedCheckpoint?.frame.snapshot ?? remoteFrame?.snapshot);
@@ -685,18 +719,30 @@ for (const action of ["pause", "step", "resume"]) {
 
 function selectCreature(uid) {
   if (reviewedCheckpoint) return;
+  if (uid === null) cancelWorldDrag();
+  const following = worldViewport.followedUid !== null;
   inspector.select(uid);
   brainInspector.select(uid);
   genomeInspector.select(uid);
-  // Selection is presentation-only, so paused frames also need repainting.
-  lastPaintedFrame = null;
+  if (following) {
+    worldViewport.stopFollowing();
+    if (uid !== null && paintedWorld()?.frame.snapshot.agents.some((agent) => agent.uid === uid)) {
+      worldViewport.follow(uid, paintedWorld().frame.snapshot);
+    }
+  }
+  // Selection and camera revision participate in the paused-frame paint key.
+  // Retain the previous accepted transform until the renderer accepts a repaint.
+  updateWorldNavigation();
 }
 
 document.getElementById("sim-container")?.addEventListener("click", (event) => {
-  if (reviewedCheckpoint || event.target !== canvas || event.button !== 0 || !inspector.frame) return;
+  if (event.target !== canvas || event.button !== 0) return;
+  if (worldDrag.consumeClick()) { event.preventDefault(); return; }
+  const painted = paintedWorld();
+  if (reviewedCheckpoint || !painted || !inspector.frame) return;
   const bounds = canvas.getBoundingClientRect();
-  const uid = pickAgent(inspector.frame.snapshot, event.clientX - bounds.left, event.clientY - bounds.top,
-    { width: bounds.width, height: bounds.height, canvasWidth: canvas.width, canvasHeight: canvas.height });
+  const uid = pickAgent(painted.frame.snapshot, event.clientX - bounds.left, event.clientY - bounds.top,
+    { width: bounds.width, height: bounds.height, canvasWidth: canvas.width, canvasHeight: canvas.height, view: painted.view });
   selectCreature(uid);
   canvas.focus({ preventScroll: true });
 });
@@ -714,6 +760,139 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && (event.target === canvas || inspectorPanel?.contains(event.target))) {
     selectCreature(null);
   }
+});
+
+function paintedWorld() {
+  return lastPaintedFrame?.simulationGeneration === simulationGeneration
+    && lastPaintedFrame.presentationGeneration === presentationGeneration && lastPaintedFrame.view
+    && lastPaintedFrame.viewSource === worldViewport.source
+    && lastPaintedFrame.width === canvas.width && lastPaintedFrame.height === canvas.height
+    ? lastPaintedFrame : null;
+}
+
+function updateWorldNavigation() {
+  const painted = paintedWorld();
+  const selected = painted && !reviewedCheckpoint ? inspector.selectionFor(painted.frame, simulationGeneration) : null;
+  if (worldZoomIn) worldZoomIn.disabled = !painted || worldViewport.view.zoom >= MAX_WORLD_ZOOM;
+  if (worldZoomOut) worldZoomOut.disabled = !painted || worldViewport.view.zoom <= MIN_WORLD_ZOOM;
+  if (worldFit) worldFit.disabled = !painted;
+  if (worldFollow) {
+    worldFollow.disabled = !painted || !!reviewedCheckpoint || (!selected && worldViewport.followedUid === null);
+    worldFollow.textContent = worldViewport.followedUid === null ? "Follow selected" : "Stop following";
+    worldFollow.setAttribute("aria-pressed", String(worldViewport.followedUid !== null));
+  }
+  if (!worldViewStatus) return;
+  let message = "Waiting for a world view.";
+  if (painted) {
+    const { view, frame } = painted;
+    const scale = `${Number(view.zoom.toFixed(2))}×`;
+    message = worldViewport.followedUid !== null ? `${scale} · following creature ${worldViewport.followedUid}.`
+      : `${scale} · center ${(view.centerX * frame.snapshot.world.width).toFixed(1)}, ${(view.centerY * frame.snapshot.world.height).toFixed(1)}. World edges wrap.`;
+    if (view !== worldViewport.view) message += " Updating view…";
+    if (worldViewport.notice) message += " " + worldViewport.notice;
+    Object.assign(worldViewStatus.dataset, { zoom: String(view.zoom), centerX: String(view.centerX), centerY: String(view.centerY),
+      sessionId: frame.identity.sessionId, tick: frame.identity.tick, followedUid: worldViewport.followedUid ?? "" });
+  } else {
+    for (const key of Object.keys(worldViewStatus.dataset)) delete worldViewStatus.dataset[key];
+  }
+  if (worldViewStatus.textContent !== message) worldViewStatus.textContent = message;
+}
+
+function cancelWorldDrag() {
+  const pointerId = worldDrag.active?.pointerId;
+  if (pointerId !== undefined) {
+    worldDrag.cancel(true);
+    if (canvas.hasPointerCapture?.(pointerId)) canvas.releasePointerCapture(pointerId);
+  }
+  delete canvas.dataset.dragging;
+}
+
+function zoomWorld(factor, x = 0.5, y = 0.5, paintedView = worldViewport.view) {
+  if (!paintedWorld()) return;
+  cancelWorldDrag();
+  worldViewport.zoomBy(factor, x, y, paintedView);
+  updateWorldNavigation();
+}
+
+function followSelectedCreature() {
+  const painted = paintedWorld();
+  if (!painted || reviewedCheckpoint) return;
+  cancelWorldDrag();
+  if (worldViewport.followedUid !== null) worldViewport.stopFollowing();
+  else {
+    const selected = inspector.selectionFor(painted.frame, simulationGeneration);
+    if (selected === null) return;
+    worldViewport.follow(selected, painted.frame.snapshot);
+  }
+  updateWorldNavigation();
+}
+
+worldZoomIn?.addEventListener("click", () => zoomWorld(1.5));
+worldZoomOut?.addEventListener("click", () => zoomWorld(1 / 1.5));
+worldFit?.addEventListener("click", () => {
+  if (paintedWorld()) { cancelWorldDrag(); worldViewport.fit(); updateWorldNavigation(); }
+});
+worldFollow?.addEventListener("click", followSelectedCreature);
+
+const worldContainer = document.getElementById("sim-container");
+worldContainer?.addEventListener("wheel", (event) => {
+  const painted = paintedWorld();
+  if (event.target !== canvas || !painted) return;
+  const bounds = canvas.getBoundingClientRect();
+  if (!(bounds.width > 0 && bounds.height > 0)) return;
+  event.preventDefault();
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? bounds.height : 1;
+  const delta = Math.max(-600, Math.min(600, event.deltaY * unit));
+  zoomWorld(Math.exp(-delta * 0.002), (event.clientX - bounds.left) / bounds.width,
+    (event.clientY - bounds.top) / bounds.height, painted.view);
+}, { passive: false });
+worldContainer?.addEventListener("pointerdown", (event) => {
+  const painted = paintedWorld();
+  if (event.target !== canvas || !painted || event.button !== 0 || event.isPrimary === false) return;
+  const bounds = canvas.getBoundingClientRect();
+  if (worldDrag.begin(event.pointerId, event.clientX, event.clientY, painted.view, bounds.width, bounds.height)) {
+    canvas.setPointerCapture(event.pointerId);
+    canvas.focus({ preventScroll: true });
+  }
+});
+worldContainer?.addEventListener("pointermove", (event) => {
+  if (event.target !== canvas || !paintedWorld()) return;
+  const bounds = canvas.getBoundingClientRect();
+  if (!(bounds.width > 0 && bounds.height > 0)) return;
+  if (worldDrag.active && (worldDrag.active.width !== bounds.width || worldDrag.active.height !== bounds.height)) {
+    cancelWorldDrag();
+    return;
+  }
+  const movement = worldDrag.move(event.pointerId, event.clientX, event.clientY, bounds.width, bounds.height);
+  if (!movement) return;
+  event.preventDefault();
+  worldViewport.panFrom(movement.view, movement.deltaX / bounds.width, movement.deltaY / bounds.height);
+  canvas.dataset.dragging = "true";
+  updateWorldNavigation();
+});
+worldContainer?.addEventListener("pointerup", (event) => {
+  if (event.target !== canvas || !worldDrag.end(event.pointerId)) return;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  delete canvas.dataset.dragging;
+});
+for (const kind of ["pointercancel", "lostpointercapture"]) {
+  worldContainer?.addEventListener(kind, (event) => {
+    if (worldDrag.active?.pointerId === event.pointerId) cancelWorldDrag();
+  });
+}
+document.addEventListener("keydown", (event) => {
+  if (event.target !== canvas || event.ctrlKey || event.metaKey || event.altKey || !paintedWorld()) return;
+  const pans = { ArrowLeft: [0.1, 0], ArrowRight: [-0.1, 0], ArrowUp: [0, 0.1], ArrowDown: [0, -0.1] };
+  if (pans[event.key]) {
+    cancelWorldDrag();
+    worldViewport.panFrom(worldViewport.view, ...pans[event.key].map((value) => value * (event.shiftKey ? 2.5 : 1)));
+  } else if (event.key === "+" || event.key === "=") zoomWorld(1.5);
+  else if (event.key === "-") zoomWorld(1 / 1.5);
+  else if (event.key === "Home" || event.key === "0") { cancelWorldDrag(); worldViewport.fit(); }
+  else if (event.key.toLowerCase() === "f") followSelectedCreature();
+  else return;
+  event.preventDefault();
+  updateWorldNavigation();
 });
 
 stepsSlider.addEventListener("input", () => {
@@ -780,6 +959,7 @@ function updateRemoteControls() {
   remoteOverlay.hidden = !remoteMode || !!remoteFrame || !!reviewedCheckpoint;
   renderCheckpointView();
   updateCheckpointControls();
+  updateWorldNavigation();
 }
 
 function updateCheckpointControls() {
@@ -816,17 +996,23 @@ function updateCheckpointControls() {
 
 function renderRecoveryControls() {
   const busy = browserStorePending || checkpointLoadPending;
+  const conflict = browserRecovery?.error?.code === "conflict";
+  const unobserved = browserRecovery?.error?.code === "unobserved";
   if (recoveryEnabled) {
     recoveryEnabled.checked = browserRecovery?.enabled === true;
     recoveryEnabled.disabled = !browserRecovery || remoteMode || !simHandle || activeBrainPreset === "wander" || busy;
   }
   if (recoveryRestoreButton) recoveryRestoreButton.disabled = remoteMode || !wasmInitialized
     || !browserContinuationStore || busy || browserRecovery?.pending === true;
-  if (recoveryRetryButton) recoveryRetryButton.disabled = remoteMode || !browserRecovery?.enabled
-    || !browserRecovery.error || busy || browserRecovery.pending;
+  if (recoveryRetryButton) {
+    recoveryRetryButton.disabled = remoteMode || !browserRecovery?.enabled
+      || !browserRecovery.error || busy || browserRecovery.pending;
+    recoveryRetryButton.textContent = conflict || unobserved ? "Use this world for recovery" : "Retry Recovery";
+  }
   if (!recoveryStatus) return;
   let state = "Recovery is off for this world.";
   if (browserRecovery?.pending) state = browserRecovery.enabled ? "Saving a recovery checkpoint…" : "Cancelling the previous world's recovery write…";
+  else if (conflict || unobserved) state = `Recovery stopped: ${browserRecovery.error.message} Restore the saved recovery world, or choose Use this world for recovery to replace the shared recovery with this world's next checkpoint.`;
   else if (browserRecovery?.error) state = `Recovery stopped: ${browserRecovery.error.message} Use Retry Recovery after resolving the error.`;
   else if (browserRecovery?.enabled) state = browserRecovery.available
     ? "Recovery is on: saving changed owner state at most once every 30 seconds."
@@ -1093,11 +1279,13 @@ async function selectRenderer(preference, fallbackReason = null) {
     nextRenderer.destroy();
     return;
   }
+  cancelWorldDrag();
   renderer?.destroy();
   canvas.replaceWith(nextCanvas);
   canvas = nextCanvas;
   renderer = nextRenderer;
   lastPaintedFrame = null;
+  updateWorldNavigation();
   rendererStatus.dataset.renderer = backend;
   for (const key of Object.keys(rendererStatus.dataset)) {
     if (key !== "renderer") delete rendererStatus.dataset[key];
@@ -1141,28 +1329,50 @@ function observePresentedLiveFrame(frame) {
 
 function drawSnapshot(frame, historical = false) {
   if (!renderer) return false;
+  let view, selectedUid;
   try {
     validateFrameIdentity(frame);
+    const previousSource = worldViewport.source;
+    view = worldViewport.observe(frame, presentationGeneration);
+    if (worldViewport.source !== previousSource) {
+      cancelWorldDrag();
+      // A busy renderer may retain old pixels; they cannot authorize a new owner's camera.
+      updateWorldNavigation();
+    }
+    if (worldDrag.active) {
+      const bounds = canvas.getBoundingClientRect();
+      if (worldDrag.active.width !== bounds.width || worldDrag.active.height !== bounds.height
+          || (lastPaintedFrame && (lastPaintedFrame.width !== canvas.width || lastPaintedFrame.height !== canvas.height))) {
+        cancelWorldDrag();
+      }
+    }
+    selectedUid = historical ? null : inspector.selectionFor(frame, simulationGeneration);
   } catch (error) {
     if (captureRequest) finishCapture(captureRequest, error);
     else showCaptureError(`Frame refused: ${error.message}`);
     return false;
   }
+
   if (lastPaintedFrame?.simulationGeneration === simulationGeneration
       && lastPaintedFrame.presentationGeneration === presentationGeneration
       && lastPaintedFrame.publicationRevision === frame.identity.publicationRevision
       && lastPaintedFrame.sessionId === frame.identity.sessionId
+      && lastPaintedFrame.viewSource === worldViewport.source
+      && lastPaintedFrame.viewRevision === worldViewport.revision
+      && lastPaintedFrame.selectedUid === selectedUid
       && lastPaintedFrame.width === canvas.width && lastPaintedFrame.height === canvas.height
       && (!captureRequest || captureRequest.encoding)) {
     if (!historical) observePresentedLiveFrame(frame);
+    updateWorldNavigation();
     return true;
   }
   try {
     if (renderer.render(frame.snapshot, { environment: frame.environment, identity: frame.identity,
       layer: environmentLayer?.value ?? "combined", generation: presentationGeneration,
-      selectedUid: historical ? null : inspector.selectionFor(frame, simulationGeneration) })) {
+      selectedUid, view })) {
       lastPaintedFrame = { simulationGeneration, presentationGeneration, publicationRevision: frame.identity.publicationRevision,
-        sessionId: frame.identity.sessionId, width: canvas.width, height: canvas.height };
+        sessionId: frame.identity.sessionId, width: canvas.width, height: canvas.height,
+        view, viewSource: worldViewport.source, viewRevision: worldViewport.revision, selectedUid, frame };
       for (const [key, value] of Object.entries(frame.identity)) {
         rendererStatus.dataset[key === "tick" ? "snapshotTick" : key] = value;
       }
@@ -1178,6 +1388,7 @@ function drawSnapshot(frame, historical = false) {
       renderCheckpointView();
       captureAdmittedFrame(frame.identity);
       if (!historical) observePresentedLiveFrame(frame);
+      updateWorldNavigation();
       return true;
     }
   } catch (error) {
@@ -1228,6 +1439,7 @@ function captureAdmittedFrame(frameIdentity) {
       throw new Error("Displayed world changed before capture; try again");
     }
     const identity = { ...frameIdentity };
+    const capturedView = lastPaintedFrame.view;
     const checkpoint = reviewedCheckpoint?.checkpoint;
     const backend = rendererStatus.dataset.renderer;
     const filename = checkpoint
@@ -1262,7 +1474,8 @@ function captureAdmittedFrame(frameIdentity) {
         link.click();
         Object.assign(captureStatus.dataset, identity, { renderer: backend, state: "ready", filename,
           view: checkpoint ? "checkpoint" : "live", checkpointId: checkpoint?.checkpoint_id ?? "",
-          worldDigestV1: checkpoint?.world_digest_v1 ?? "" });
+          worldDigestV1: checkpoint?.world_digest_v1 ?? "", cameraZoom: String(capturedView.zoom),
+          cameraCenterX: String(capturedView.centerX), cameraCenterY: String(capturedView.centerY) });
         captureStatus.textContent = checkpoint
           ? `Saved-world PNG ready — ${checkpoint.checkpoint_id}, tick ${checkpoint.tick}, world digest ${checkpoint.world_digest_v1} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`
           : `PNG ready — tick ${identity.tick}, science revision ${identity.scientificRevision}, publication ${identity.publicationRevision} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`;
@@ -1278,12 +1491,15 @@ function captureAdmittedFrame(frameIdentity) {
 }
 
 window.addEventListener("pagehide", () => {
+  cancelWorldDrag();
   browserRecovery?.setEnabled(false);
   narrative.setEnabled(false);
   checkpointLab.setEnabled(false);
   experiments.setEnabled(false);
   if (experimentExportUrl) URL.revokeObjectURL(experimentExportUrl);
   experimentExportUrl = null;
+  if (experimentDownloadUrl) URL.revokeObjectURL(experimentDownloadUrl);
+  experimentDownloadUrl = null;
   if (labPollTimer !== null) clearInterval(labPollTimer);
   labPollTimer = null;
   if (labDownloadUrl) URL.revokeObjectURL(labDownloadUrl);
@@ -1972,10 +2188,37 @@ recoveryEnabled?.addEventListener("change", () => {
   browserRecovery.setEnabled(recoveryEnabled.checked);
 });
 
-recoveryRetryButton?.addEventListener("click", () => {
-  if (!browserRecovery?.enabled || remoteMode || browserStorePending || checkpointLoadPending || browserRecovery.pending) return;
-  recoveryReadStatus = "";
-  browserRecovery.retry();
+recoveryRetryButton?.addEventListener("click", async () => {
+  if (!browserRecovery?.enabled || !browserRecovery.error || remoteMode || browserStorePending
+      || checkpointLoadPending || browserRecovery.pending) return;
+  if (!["conflict", "unobserved"].includes(browserRecovery.error.code)) {
+    // A quota/abort retry retains its original comparison. It must not silently
+    // authorize replacing a newer checkpoint saved by another tab meanwhile.
+    recoveryReadStatus = "";
+    browserRecovery.retry();
+    return;
+  }
+  const generation = simulationGeneration;
+  const original = simHandle;
+  browserStorePending = true;
+  recoveryReadStatus = "Checking the shared recovery before using this world…";
+  updateCheckpointControls();
+  try {
+    const record = await browserContinuationStore.readRecovery();
+    if (continuationReadIsStale(generation, original)) {
+      recoveryReadStatus = "Recovery replacement cancelled because the active world changed.";
+      return;
+    }
+    recoveryRecord = record ? { tick: record.tick, savedAt: record.savedAt,
+      byteLength: record.blob.size, source: record.source } : null;
+    recoveryReadStatus = "This world will replace the observed recovery at its next save; a further change in another tab will stop the write.";
+    browserRecovery.retry();
+  } catch (error) {
+    recoveryReadStatus = `Recovery refresh failed: ${error.message || error}`;
+  } finally {
+    browserStorePending = false;
+    updateCheckpointControls();
+  }
 });
 
 recoveryRestoreButton?.addEventListener("click", async () => {
@@ -1988,7 +2231,9 @@ recoveryRestoreButton?.addEventListener("click", async () => {
   recoveryReadStatus = "Reading the recovery checkpoint…";
   updateCheckpointControls();
   try {
-    const record = await browserContinuationStore.readRecovery();
+    // Restoring a valid saved world must also work when the browser refuses
+    // writes. Reading here does not authorize automatic replacement of it.
+    const record = await browserContinuationStore.readRecovery({ observe: false });
     if (continuationReadIsStale(generation, original)) {
       recoveryReadStatus = "Recovery restore cancelled because the active world changed.";
       return;

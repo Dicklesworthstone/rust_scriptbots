@@ -13,9 +13,9 @@ use scriptbots_core::{
     AgentUid, AppliedInterventionRecord, BirthOrigin, BirthRecord, BrainInspectionLimits,
     BrainInspectionResponse, ConfigAuditEntry, ControlCommand, DeathCause, DeathRecord,
     DynamicAgentSnapshot, DynamicAgentVisuals, DynamicWorldSnapshot, Generation,
-    HydrologyFlowDirection, PersistenceBatch, ResourceLedgerTick, ScientificStateError,
-    ScriptBotsConfig, SelectionState, SelectionUpdate, SimulationCommand, TerrainKind, Tick,
-    TickCombatSummary, TickEvents, TickSummary, toroidal_delta,
+    HydrologyFlowDirection, PersistenceBatch, PersistenceCommitAuthority, ResourceLedgerTick,
+    ScientificStateError, ScriptBotsConfig, SelectionState, SelectionUpdate, SimulationCommand,
+    TerrainKind, Tick, TickCombatSummary, TickEvents, TickSummary, toroidal_delta,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -3711,6 +3711,17 @@ pub trait JournalPort {
     /// Poll at most `limit` acknowledgements without blocking.
     fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt>;
 
+    /// Owner whose persistence work this journal commits as part of each exact batch.
+    ///
+    /// The default preserves the separate persistence sink. An adapter may opt in only when
+    /// its receipt at [`Self::shutdown_commit_requirement`] proves that the batch's complete
+    /// scientific persistence payload has committed to that same owner. Queue acceptance is
+    /// insufficient. The host also checks the bound sink's opaque authority before using this
+    /// path, and keeps science blocked until the qualifying receipt arrives.
+    fn persistence_commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+        None
+    }
+
     /// Optional detached capability for reconstructing evicted scientific-event records.
     ///
     /// A live-memory reader must never advertise crash durability. File-backed adapters added by
@@ -3791,6 +3802,13 @@ pub enum HostBlocker {
     LifecycleStopped,
     /// A latched scientific fault prevents a later transition.
     ScientificFault,
+    /// An accepted journal owns the exact scientific batch but has not proved commitment.
+    PersistencePending {
+        /// Journal batch whose matching receipt must settle the core persistence boundary.
+        batch_id: JournalBatchId,
+        /// Completed scientific tick retained at the unresolved boundary.
+        tick: Tick,
+    },
 }
 
 /// Exact reason a full scientific-event hot ring cannot evict its front record.

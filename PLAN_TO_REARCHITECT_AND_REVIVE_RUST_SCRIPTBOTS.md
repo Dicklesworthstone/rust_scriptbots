@@ -2,6 +2,337 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Owner responsiveness during persistence (2026-11-22):**
+[Implemented and independently reviewed; native execution qualification pending
+— Codex; scoped contributions to `bd-w1oi` and `bd-kgob`; original acceptance retained]
+
+The storage journal already carries and commits the exact scientific persistence
+batch. A paired sink and journal now settle that obligation through the matching
+terminal receipt, removing the second synchronous submission and its worker wait.
+The owner can continue maintenance and permitted playback controls while science
+waits at an explicit `PersistencePending` boundary. Existing command-authority and
+FIFO rules still apply. File storage requires `Durable`; memory storage requires
+`CommittedVolatile`. Queue acceptance never advances the persistence watermark.
+
+- Bind acknowledgement to the same storage owner, world and exact immutable batch.
+  Custom or unrelated sinks retain their existing admission path.
+- Apply the existing borrowed payload measurement, record limits, preparation
+  deadline and independent scientific/narrative byte reservations before dispatch.
+  Retain the reservations through backpressure and failure; exact retries cannot
+  charge twice, bypass operator limits or re-dispatch a terminal refusal.
+- Preserve partial flushes, ordered shutdown, checkpoint refusal while unresolved,
+  and the completed scientific-fault batch's commitment before driver exit.
+- Add identity, delayed/weaker/foreign receipt, refusal, retry, shutdown and fault
+  regressions, plus a real paused-worker memory/file journey checking one journal
+  write, retained reservations, committed watermarks and persisted readback.
+
+This removes a redundant owner-thread wait; it does not establish flat database
+commit cost or resolve the upstream engine throughput acceptance. DSR native
+qualification and the original long-running storage reproductions remain open.
+
+**Observed communication (2026-11-22):**
+[Currently In Progress — Codex; scoped contribution to `bd-16g.7`]
+
+Align the communication analysis with the exact emitter snapshot consumed by
+sensing, including initial founders and population changes, and preserve truthful
+sample windows across checkpoint continuation and measurement re-enablement. The
+separate multiband protocol and behavioral-emergence acceptance remain open.
+
+**Browser host authority and recovery conflicts (2026-11-22):**
+[Implemented and independently reviewed; Node checks passed, browser execution
+blocked — Codex; scoped contributions to `bd-2z0.12.2`, `bd-2z0.12.3` and
+`bd-ywtv`; original acceptance retained]
+
+- Preserve native 128-bit host session IDs across browser experiment, checkpoint,
+  artifact and intervention workflows, while retaining 64-bit bounds for ticks,
+  epochs and revisions. The full-width fixtures reproduce 95 failures against
+  the original sources; all 270 Node tests pass with commit `d78d8e6`.
+- Compare an explicitly observed recovery token and replace the shared IndexedDB
+  slot in one transaction. Concurrent tabs, stale writers and ABA replacements
+  cannot silently overwrite a newer checkpoint. Abort/quota retries preserve the
+  previous observation; conflicts require an explicit choice to use the current
+  world. Owner changes cancel stale refreshes. Legacy adoption preserves original
+  checkpoint bytes and metadata; readonly restore does not require a write.
+- Upgrade the database to version 2 without replacing its object store or saved
+  worlds, fencing already-loaded version-1 writers that lack conflict checks.
+  Extend unit coverage and the real-IndexedDB two-page browser journey, retaining
+  the latter's explicit WASM owner double and existing deadlines.
+
+The combined DSR Node check passes all 279 tests with no failures or skips.
+Chromium is blocked before page creation by the executor's socket permission;
+no browser assertions ran. Its failed launch log is retained, and the enclosing
+DSR run was stopped during its final aggregate source hash after executor
+instability, so this is not a passing aggregate receipt. Native/WASM execution
+qualification and the broader durable journal/SQLite-image acceptance remain open.
+
+**Native experiment recovery and portable results (2026-11-21):**
+[Implemented and independently reviewed; browser and archive checks passed,
+native execution qualification blocked — Codex; contributions to the native Lab,
+`bd-2z0.5.11`, `bd-2z0.12.2` and `bd-2z0.12.3`; broader acceptance retained]
+
+- Implemented explicit generation-guarded failed-run retry in the shared native
+  Lab, GPUI and Bevy buttons, and the terminal's `F` action. Each action captures
+  its source session, experiment and observed generation; stale clicks cannot
+  substitute a fresh generation. Lost or mismatched replies clear the stale
+  observation and require a read before another explicit attempt. Completed
+  peers and prior failure evidence remain retained. The terminal uses its
+  existing presented-intent gate.
+- Implemented bounded, source-verified artifacts for one completed experiment
+  run through the control service, REST and MCP. The canonical verifier checks
+  the selected plan/run/variant/seed/family/configuration, endpoint evidence and
+  restored final owner without reading companion bundles. The immutable inventory
+  includes all indexed files and the manifest; it preserves the original artifact
+  root and uses existing verified byte downloads. Bounds are 33 files, 16 MiB per
+  file, 32 MiB indexed data plus 16 MiB manifest, and 256 KiB response JSON.
+- Added CLI `experiment run-artifacts` and `experiment download-run --out`.
+  Download all bounded files and verify metadata, both checksums and the complete
+  manifest index before claiming a new output directory. Preserve paths and bytes,
+  refuse existing destinations and retain partial output on write/sync failures.
+  The existing offline verifier then restores the saved final owner and checks
+  the requested endpoint before a success receipt is emitted.
+- Added browser completed-run selection, verified inventory discovery, individual
+  file download and a complete portable ZIP. Source/run/plan checks, explicit
+  transfer bounds, SHA-256 verification and exact manifest-index membership
+  prevent foreign, changed or incomplete results from being exported. A source
+  change or hidden panel aborts the transfer; other cohort progress preserves an
+  already observed completed run's inventory. Original scientific bytes and
+  full-width seed tokens are never reserialized into replacement artifacts.
+
+Native retry source and enum dispatch were independently reviewed; the six Rust
+files were parsed through DSR with the pinned formatter. Existing formatting
+differences in runtime/terminal/render files were retained, rather than claimed
+as a clean whole-workspace format gate. Native test bodies cover stale source and
+generation, lost replies, completed peers and all three native presentations,
+but have not executed successfully. The DSR app baseline check ended with Cargo
+exit 137 during dependency compilation. A separate, smaller runtime test attempt
+reached unchanged `scriptbots-core`, whose rustc process received SIGKILL (Cargo
+exit 101), before `scriptbots-runtime` compiled. Neither attempt establishes why
+the process was killed, and neither qualifies native execution or strict-remote
+acceptance. Dependency pins and scientific baselines are unchanged.
+
+DSR `scriptbots_native_final_format/20261121T223040-t43lR0DC` parsed the final
+six native files and checked formatter output against unchanged baseline deltas
+(2/2 executed checks passed). DSR
+`scriptbots_backend_final_format/20261121T223121-Ja4GHzuZ` passed pinned formatting
+for all three artifact-backend files. Native artifact tests have been authored
+for portable reassembly, corrupt/unfinished/failed companions, foreign-owner
+substitution, cold catalogs, root changes and actual REST/MCP listeners; these
+tests remain unexecuted behind the native compiler blocker described above.
+
+DSR `scriptbots_web_node_2/20261121T223113-A5NNPMrn` passed all 267 Node tests
+with zero skips or failures; changed browser modules also passed syntax checks.
+The frozen suite includes real SHA-256 transfer checks, malformed/incomplete
+inventories, corrupt bytes and metadata, source/visibility cancellation, and
+complete ZIP path/offset/CRC32 checks. DSR
+`scriptbots_zip_interop/20261121T223340-YdE6Bexl` then passed 2/2 independent
+archive checks: Python `zipfile` read the unchanged controller test's actual ZIP,
+verified all four fixture entries and CRCs, and compared the original CSV,
+binary checkpoint-fixture and full-width-seed JSON bytes. These are browser
+controller and archive-format observations, not native checkpoint execution or
+graphical end-to-end qualification. The earlier broad Node glob also picked up
+two Playwright scripts whose required module was unavailable; those did not run.
+
+DSR `scriptbots_cli_final_format/20261121T224020-sIJ8IPYx` passed the final CLI
+source formatting check after independent review corrected the 16-hex scientific
+digest distinction and typed manifest run-ID comparison. CLI regressions cover
+real REST download/reassembly, immutable existing outputs, companion independence,
+socket-level metadata/payload corruption and bounded portable paths; they are
+authored but unexecuted. The final evidence comparison matched all six native
+retry files, three backend files, 34 browser files and the CLI source byte-for-byte
+to their respective DSR snapshots. Workspace check/Clippy and graphical/native
+execution remain unqualified; no broader bead is closed by these scoped results.
+
+**Bounded API work and failed-study recovery (2026-11-21):**
+[Implemented and independently reviewed; final browser and changed-Rust-format
+DSR checks passed; native qualification blocked — Codex; contributions to `bd-2z0.12.2` and
+`bd-2z0.5.11`, broader acceptance remains open]
+
+- Bound blocking REST, WebSocket control, MCP tool and SSE/NDJSON query work
+  before executor admission. Share eight expensive-work and sixteen command
+  slots process-wide; retain permits through a running caller's disconnect and
+  cancel queued work when its caller disappears. Preserve direct immutable
+  publication reads. MCP dispatch has a separate bounded outer budget and
+  preserves JSON-RPC identity on explicit capacity refusal. These are admission
+  guarantees; the same-session FastMCP mutex can still delay commands.
+- Add explicit failed-run retry to the local runner, control CLI, REST, MCP and
+  browser. Verify every failed run's executable continuation or completed bundle
+  before reopening all failed peers together. Keep completed companions and
+  ordinary resume's monotonic contract unchanged. Reserve server execution
+  capacity before publishing retry status, and require the observed generation
+  at remote boundaries so a lost response cannot authorize a later attempt.
+- Retain exact failed status bytes under `status.json.retries`, with a 16-generation
+  bound. Interrupted retry publication requires the exact retained witness,
+  successor status and executable cuts. Missing, corrupt or foreign sources
+  refuse without silently replaying from tick zero.
+- Keep browser retry authority across an unchanged refresh after a lost response;
+  allow only an explicit reissue against that same generation. Observe delayed
+  admission without resubmitting work, retain completed-peer validation, and
+  clear retry authority when the selected experiment or remote source changes.
+- Add native regressions for worker cancellation/capacity, exact Step retry,
+  nonzero owner/journal continuation, failure-history bounds and interrupted
+  publication, plus actual REST/MCP retry requests against real retained owners.
+  Authored native tests are not evidence of executed passes.
+
+DSR `scriptbots_final_browser/20261121T185316-WCHA0xpE` passed all 258 Node tests
+with zero failures, skips or cancellations, plus syntax checks for all browser
+JavaScript, renderer modules and test modules. The final snapshot includes both
+lost-response timing and experiment-selection regressions; source signatures
+were stable. Browser tests use the repository's existing service/DOM doubles and
+do not substitute for native execution or graphical end-to-end qualification.
+
+The first admission-only source passed pinned formatting/parse checks through
+DSR `scriptbots_final_server_format/20261121T184756-1XrOKvTb` and was committed
+directly to `main` as `e780c8a386d081e00dfeb1944f3fadcaba733b9c`.
+Final five-file Rust formatting/parse checks passed through DSR
+`scriptbots_final_rust_format/20261121T190039-JsuYR54T` (3/3 executed checks,
+stable source). Required whole-workspace `cargo fmt --check` executed through
+DSR `scriptbots_workspace_format/20261121T190325-0PkkcLDp` and failed in eight
+untouched files whose bytes match the original base commit; this does not
+qualify the workspace formatting gate.
+
+DSR `scriptbots_final_production_check/20261121T190240-GmTMgp9N` ran
+`cargo check --locked -p scriptbots-app --lib --no-default-features` with the
+pinned nightly, one Cargo job, zero debuginfo and one compiler thread. Dependency
+compilation reached `asupersync 0.5.0`, whose rustc process received SIGKILL;
+Cargo exited 101 before ScriptBots application typechecking. All 720 frozen
+source files were unchanged afterward. The receipt does not establish why the
+compiler was killed. Production binaries, native regression tests, workspace
+check and strict workspace Clippy remain unexecuted after that shared dependency
+blocker. Full-workspace qualification and the original beads' broader acceptance
+remain open; dependency pins and scientific baselines are unchanged.
+
+**Indexed carcass reward candidates (2026-11-20):**
+[Implemented and independently reviewed; scoped DSR Rust checks passed —
+Codex; contribution to `bd-h33`, broader performance acceptance remains open]
+
+- Replace the per-corpse all-population candidate search with a fresh spatial
+  index when its rebuild and bucket traversal can be amortized over eligible
+  corpses. Preserve the ordered full scan for expensive sparse grids, broad
+  radii, mismatched index geometry and refused rebuilds.
+- Keep the original f32 toroidal distance predicate and reward arithmetic.
+  Conservatively pad only the broad phase for rounded boundary and subnormal
+  distance cases, and restore dense recipient order before reducing rewards.
+  Avoid sorting a near-full population by using its original ordered scan.
+- Reuse candidate and recipient buffers across corpses. Defer index rebuilding
+  until a mature, spiked, health-dead corpse can actually distribute rewards;
+  positive-health brain-fault deaths remain ineligible recipients.
+- Add four focused regressions with an independent full-scan oracle. Compare
+  resource rejection bits, reward counters, world digests, RNG state and runtime
+  fields across dense-order permutations, seams, translated positions, capped
+  rewards, subnormal/world-spanning radii and index fallbacks. Explicit witnesses
+  require the optimized path to run and demonstrate the unpadded boundary miss.
+
+DSR `scriptbots_core_corrected_final/20261121T002517-UVjAerMW` passed all five
+checks on the final byte-verified source: targeted pinned formatting; all four
+`carcass_index_*` tests with default features plus `economy-faults`; the same
+four tests without default features plus `economy-faults`; strict library
+Clippy with `economy-faults`; and strict production-default library Clippy
+without that feature. Both Clippy commands used `-D warnings`. Source signatures
+matched before and after execution. Existing unused-variable and fixture warnings
+remain in the scalar test configuration; no warnings were suppressed.
+
+This is scoped package evidence. Full-workspace/all-target qualification,
+whole-world application characterization and same-invocation incumbent/candidate
+performance measurements remain pending. No throughput gain or `bd-h33`
+closure is claimed, and dependency pins, scientific baselines and acceptance
+criteria are unchanged.
+
+**Browser world exploration (2026-11-20):**
+[Implemented; DSR JavaScript regressions passed — Codex;
+scoped input/presentation contribution to `bd-2z0.12.3`]
+
+- Add shared Canvas/WebGPU camera geometry with 1–32× pointer-anchored zoom,
+  drag and keyboard pan, Fit world, and exact-UID Follow selected. Agents,
+  selection rings and environment tiles wrap across both world seams.
+- Anchor picking and gestures to the last admitted frame and its immutable
+  camera. A refused replacement frame cannot let old pixels authorize Follow
+  against a new owner, epoch or world extent. Follow stops when its creature
+  disappears; source replacement resets the view and cancels active gestures.
+- Repaint paused worlds when camera or selection changes without submitting
+  simulation commands, advancing ticks or modifying snapshots. Keep GPU
+  admission bounded to one outstanding frame and reuse environment textures.
+- Add 12 Node camera/renderer regressions and a production DOM/Canvas interaction
+  case covering wheel, drag, keyboard, fit/follow, paused-state command counts,
+  source replacement, refused-frame lifetime and resize cancellation. The DOM
+  case explicitly uses WASM-owner and renderer-admission doubles.
+
+DSR `scriptbots_browser_continue/20261121T000709-kFMgrZOk` passed all 251
+`*.test.mjs` tests with no failures or skips, plus syntax checks for every changed
+JavaScript module and both DOM harnesses. The frozen source signatures matched
+before and after execution. The Node renderer cases exercise host adapters with
+explicit graphics doubles; they do not establish browser pixels or GPU-driver
+behavior. Chromium is unavailable here, so the authored DOM interaction case,
+packaged-WASM journey and real GPU/capability matrix remain unexecuted.
+The original browser acceptance bead remains open.
+
+**Persistence and durable command recovery (2026-11-20):**
+[Source implemented; executable qualification blocked — Codex;
+scoped contributions to `bd-50bg` and `bd-2z0.12.2`]
+
+- [x] Replace the durable authority lookup's three-table join with exact keyed
+  reads, preserving claiming-session binding, canonical receipts, pending states
+  and corruption refusals (`c74942c`).
+- [x] Batch births, deaths and migrations within the existing science transaction;
+  preserve lineage conflict handling and migration replacement order (`7ea282a`).
+- [x] Add real-file receipt regressions and multi-chunk lifecycle equivalence,
+  late-failure rollback and exact-retry coverage. Independent source review and
+  the pinned targeted formatter passed; executable Rust results remain pending.
+- [x] Add transactional V20 indexes matching both transition queries' journal
+  identity, retaining all cross-command corruption checks (`186d305`). Preserve
+  the historical V19 migration and exact schema fingerprints; add populated-file
+  upgrade, retained-row/receipt, index-seek and corruption rollback regressions.
+  Two independent source reviews and pinned DSR formatting passed.
+- [ ] Execute the new receipt, lifecycle and migration regressions. The final
+  DSR attempt ended after 606.255 seconds with Cargo exit 101: `rustc` compiling
+  unchanged `asupersync 0.5.0` received SIGKILL, before any ScriptBots crate or
+  Rust test ran. The frozen authority/lifecycle source stayed unchanged; V20
+  has formatting and source review evidence only. An OOM cause was not verified.
+- [ ] Complete DSR Rust execution and the original live server/throughput probes.
+  Source changes alone do not close these beads or establish a measured speedup.
+
+Final DSR run: `scriptbots-storage-bounded-compile/20261120T210902-TUZCZXD6`.
+The run ended and its package-cache and target-directory locks were released.
+The full workspace, Clippy, real-server latency and throughput acceptance remain
+open. Dependency pins, lockfile, scientific row policy and original criteria
+were not changed to obtain a result.
+
+**Spatial rebuild allocation and bounded live streaming (2026-11-20):**
+[Source implemented and independently reviewed; scoped index checks passed —
+broader acceptance remains open under `bd-h33` and `bd-ac4l`]
+
+- Replace per-rebuild dense spatial bucket allocations with retained contiguous
+  entry, offset and scatter arrays. Preserve exact cell traversal, agent order,
+  toroidal queries and sparse-world behavior across every query surface.
+- Bound WebSocket projections with four process-wide reservations. The actual
+  blocking worker owns its reservation through cancellation or timeout, and
+  successful output retains it until its frames are sent or discarded.
+- Poll projection futures alongside socket traffic so ACKs, controls, status and
+  accepted subscription replacement remain responsive. Discard superseded
+  projections before installing new delivery state; old results cannot advance
+  replacement cursors.
+- Add regressions for allocation reuse and exact query ordering, cancelled and
+  timed-out projection workers, cancellation before admission, retained completed
+  output, and real-socket ACK/control/replacement progress while admission waits.
+
+DSR against byte-identical index source passed all 16 unit tests, all-target
+check, strict all-target Clippy and targeted formatting. Its isolated dependency
+lock matches the production lock, including transitive versions and checksums.
+This validates the index package; whole-world scientific equivalence and measured
+throughput gains still require the broader acceptance probes.
+
+The final streaming source passed targeted DSR formatting. The native
+application library check acquired its dependencies and reached compilation,
+then was killed with exit 137 before any application diagnostic. It provides
+neither a typecheck pass nor a source-failure diagnosis. The four new
+concurrency/socket tests did not execute. Full workspace and live contention
+qualification remain open. UBS is unavailable in this environment, so no scanner
+pass is claimed.
+
+The named native checkpoint retry concerns in `bd-5ygz` were also audited.
+Existing commit `85f580f` already repairs the digest-width guard and shared
+REST/MCP branch identity/conflict handling. Dependency acquisition prevented the
+baseline tests from running; source review alone does not close that bead.
+
 **Between-step lifecycle events and archipelago continuation (2026-11-20):**
 [Source implemented; focused runtime regressions passed — Codex; `bd-uxvp`]
 
@@ -1512,6 +1843,255 @@ both edited JavaScript syntax checks and all 21 existing continuation/remote
 adapter tests. The new real-DOM lifecycle regressions remain unexecuted because
 the managed environment refused Chrome's Unix socket creation before startup.
 
+**Responsive Bevy HUD (2026-11-05):** [Currently In Progress — GentleDuck;
+original `bd-2z0.14.1.18.1`; verify existing `bd-2z0.14.1.18.4`, scopes unchanged]
+
+- [x] Inspect ready and in-progress work, source, original criteria and current
+  native evidence; reserve exact paths and claim the original tasks.
+- [x] Trace existing UI docking, pointer capture, text-change guard and Bevy's
+  pinned scrolling/layout APIs; add no dependency or replacement UI model.
+- [x] Bound panel heights and scroll overflow while retaining all fields/actions.
+- [x] Stack panels in narrow viewports, honor UI scale, retain the software
+  watermark and provide a reversible detail toggle without changing science.
+- [x] Route wheel input through computed visible panel bounds, including padding
+  and buttons; suppress world selection, zoom and drag over either panel.
+- [x] Preserve a clear central world strip in stacked layouts and retain centered
+  follow framing when the information panel spans the window.
+- [x] Exercise real ECS unchanged/changed text, responsive layout, scroll bounds,
+  resize/clamping, hidden panels, device units, narrow follow, nonfinite/foreign input and
+  pointer isolation; require the positive regression to reject a broken consumer.
+- [x] Run source-bound DSR format, required workspace check/strict Clippy and
+  focused/full Bevy library suites without weakening assertions, gates or goldens.
+- [x] Run the crate-wide Bevy suite, including integration and documentation
+  tests, before declaring the original unchanged-text task complete.
+- [x] Retain the actual crate-wide snapshot failure and reopen original
+  `bd-2z0.14.3.9`; trace the later intentional `2de46a55` daylight-palette change.
+- [x] Generate and visually review a separate CPU-semantic golden candidate;
+  retain the recording run's source-moved refusal rather than call it green.
+- [x] Compare old/new image observations, unchanged guard thresholds and shared
+  palette authority; require a stable candidate readback without regeneration.
+- [x] Promote only the reviewed image bytes with the palette justification,
+  then run a clean committed-source crate-wide Bevy comparison before closure.
+- [x] Preserve Jeff's incoming runtime deadline fix byte-for-byte through a
+  reviewed canonical merge; repeat clean-source compiler/lint and runtime tests.
+- [x] Reconcile the later incoming renderer/runtime work and review the combined
+  HUD; keep diagnostics and detail visibility on distinct shortcuts.
+- [x] Correct physical pixel-wheel conversion for scaled UI and camera input;
+  reject foreign-window wheel events and add scale/window assertions.
+- [x] Extend the real host-backed command-feedback regression to observe both
+  compact/full text, actual changed outcomes and unchanged change-detection ticks.
+- [x] Qualify the final combined source and the strengthened real-consumer test,
+  then require the same tests to reject reverted consumers in retained scratch.
+- [x] Review the required commit tool's explicit canonical merge-choice extension
+  separately, including retained wrong-tree, tampering and missing-parent refusals.
+- [x] Retain failed cache relocation and verify all 17,838 original files against
+  their saved SHA256 digests; no missing or mismatched bytes and no cleanup credit.
+- [x] Relocate seven inactive build artifacts (1,234,037,196 bytes) to protected
+  RAM-backed storage; verify every hash and original-path symlink before reuse.
+- [x] Preserve two later completed test executables (849,538,736 bytes) with
+  verified hashes; Cargo may replace original-path links during subsequent builds.
+- [x] Drive the optimized native window through selection, actual resize/scale,
+  panel scroll, toggle and controls; verify owner receipts/identity and images.
+- [ ] Qualify the canonical merge of later storage/analytics source through
+  `fa4e22ff`; preserve its author attribution and run its previously unexecuted regressions.
+- [x] Preserve the later creature card through `7122ef2f`; remove the overlapping
+  wheel handler and duplicate panel components, and wrap the actual card fields.
+- [x] Retain incoming scroll assertions with a real scaled primary window and
+  add a nonsaturating pixel-delta observation; keep one physical-bounds consumer.
+- [x] Extend the real-owner card regression to observe stationary Text/layout
+  change ticks and changed page/injected-failure labels, retaining prior assertions.
+- [x] Require reverted card Text and body-wrap consumers to fail those actual
+  regressions at a source-matched compiled mutant.
+- [x] Retain the failed `64a283d6` qualification: the all-text layout guard caught
+  static captions, and sparse narrative fixtures incorrectly assumed default
+  persistence was enabled. Fix both without relaxing the original assertions.
+- [x] Pass the corrected working-source seven-check DSR probe: Bevy 299+7,
+  narrative integration ten, both complete pipeline tests and storage schema 26.
+- [x] Preserve and review upstream replay/cohort/export contributions through
+  `38345ffb` in a conflict-free canonical merge; retain incoming attribution.
+- [x] Retain the superseded `0237f3d7` run as canceled before release, and apply
+  standard formatting to the incoming source without changing assertions.
+- [x] Correct the incoming const-branch compiler error, extract the unchanged
+  cohort fixture setup and remove an unused provenance clone; the four required
+  compiler/lint/format probes pass without new lint suppressions.
+- [x] Retain clean `5c01922f` compiler/lint and Bevy/runtime successes plus its
+  actual Parquet library/CLI failures; keep partial results separate.
+- [x] Commit actual-footer Parquet readback and the foreign-file negative in
+  `8087d2fa`; retain every strict schema/value/null/EOF comparison.
+- [x] Replace the scanner-flagged panic workaround with a page-source enum that
+  cannot represent the run manifest (`55c305b2`); keep the manifest visitor and
+  all five paged sources' SQL/cursors unchanged.
+- [x] Retain the failed `5c01922f` 19/25 result. Its replay command selected
+  the binary harness and ran zero tests; correct it to the library harness and
+  require observed nonzero replay passes before admitting the release build.
+- [x] Retain clean `55c305b2`'s failed 22/25 result: its actual nine-test replay
+  lane found an obsolete recorded-config refusal, and the release stayed blocked.
+- [x] Preserve upstream `4fb8324c` and restore both analytics merge conflicts;
+  retain borrowed-run selection and the complete shared-database cohort oracle.
+- [x] Distinguish all eight known-world endpoint values in `cb3dccd5` and derive
+  the summary diagnostic bound from its declaration; runner execution is pending.
+- [x] Correct the recorded-config replay contract in `2d99f1f5`; its focused
+  controller/terminal probe actually runs and passes all nine tests.
+- [x] Fix the fixture-only import and extract the unchanged rolling-summary
+  comparison helper. Clean `e09c9d16` passes the required six-check preflight.
+- [x] Preserve the canceled `e09c9d16` full run as incomplete; retain its raw
+  Bevy test output without claiming a complete suite or a new release binary.
+- [x] On explicit user assignment, take over the interrupted shared merge.
+  Preserve the original working patch and index; merge all eight upstream commits
+  through `72a40efb` in `45e97bde`, retaining their original author attribution.
+- [x] Restore the preserved controller resolution immediately after the canonical
+  merge: remove the duplicate replay loop and use the current scientific-input API.
+- [x] Retain actual incoming compilation/format/lint failures. Fix the missing
+  test-only Path import, extract unchanged config/audit publication and schedule
+  assertions, and retain all empty-output checks as equality comparisons.
+- [x] Adjust the missing-input negative for the newly supported interventions:
+  use a real oversized input omitted by bounded history; preserve the owner-state
+  assertions and the separate ordinary-intervention positive oracles.
+- [x] Pass the exact working-source eight-check probe at patch `b51421a7`:
+  required compiler/lint/format checks, runtime 262 passed/six existing ignored,
+  and all eleven controller/terminal replay tests. This is authoring evidence.
+- [x] Retain the expanded scanner's one diagnosed test-executable false positive;
+  make Cargo's compile-time executable authority explicit without suppression.
+- [ ] Qualify the newer monitoring source and corrective patch with required
+  compiler/lint checks, actual server tests, CLI reproduction and the full scanner.
+- [x] Retain the nine-check monitoring authoring result: real CLI reproduction
+  passes all 16 cases and UBS reports zero critical findings over 27 files;
+  required compiler/lint and server tests fail compilation on the new owner's
+  immutable port binding. Correct that binding without changing its assertions.
+- [x] Re-run required compiler/strict lint checks and the complete server module
+  after the port fix; resolve any newly exposed diagnostics before committing.
+- [x] Correct REST array admission on original malformed-request/owner-barrier
+  tests (`bd-qjh2`); pass all 64 server cases and the required compiler/lint
+  checks at exact patch `2033c411`, then commit the reviewed source as `6c8472dc`.
+- [x] Review and preserve upstream browser, live comparison and MCP increments
+  through pinned `2aa22513` in canonical merge `04ea1ada`; restore their plan
+  entries explicitly after the plan-only favor-ours resolution.
+- [x] Execute the actual browser lifecycle suite at clean upstream `0002dada`
+  using existing Playwright/Chromium: four browser cases pass, including 18
+  candidate refusals, three recovery paths and a one-timer observation. Its WASM
+  double qualifies browser lifecycle behavior, not the checkpoint codec.
+- [ ] Qualify the final formatting and explicit outgoing static-header fixture
+  with the combined 32-file Rust/JavaScript scanner and required lint checks.
+- [x] Retain the integrated compiler-pass/strict-Clippy failure: the new inline
+  comparison DTO expands `ShellMessage`'s largest variant to at least 400 bytes,
+  versus 152 for the next variant. Box the optional comparison payload and
+  preserve the same result-value, rendering and refresh assertions.
+- [x] Re-run required checks, eleven focused application regressions and the
+  changed-file scanner before committing the corrective source as `386f0b1a`.
+  The complete application library suite remains mandatory on the clean commit.
+- [x] Retain and diagnose the real comparison-suite failures: its common
+  fixture sets four unregistered knobs and fails before running science.
+  Preserve production knob admission, use the supported reproduction threshold,
+  and assert the short horizon precedes the declared default food-respawn interval.
+- [x] Execute the corrected real comparison cases and retain all final-state,
+  contrast, extinct-cohort, provenance, rejection and nonmutation assertions.
+- [x] Diagnose the broader authoring run (769 passed, ten failed, one existing
+  live-provider ignore): correct escaped-report expectations and the table-row
+  selector without weakening their scientific assertions. Keep the correct
+  dirty-source tournament-publication refusal for clean-source qualification.
+- [x] Wire the existing HUD-only owner read when the terminal probe is off;
+  retain the 5 ms budget and full probe attribution when on. All eleven focused
+  real comparison/report/terminal regressions pass, including unchanged brain
+  cache assertions and the capability golden. Stop parallel diagnostic workloads.
+- [ ] Review and commit the corrective source, then qualify the clean combined
+  revision with all original gates, added API/checkpoint/reproduction checks and
+  one optimized build. Working-source probes cannot substitute for that result.
+- [x] Retain clean `386f0b1a`'s complete application result: 778 passed, one
+  failed, one existing live-provider ignore. The unchanged full-publication
+  guard refused missing compile-time cleanliness/status/diff provenance in my
+  DSR profile. Stop the remaining known-red run; derive the missing inputs from
+  an actually clean checkout before the next full application run.
+- [ ] Preserve and qualify the later browser-only `3eb330f1` contribution:
+  execute the eight IndexedDB adapter tests, actual Chromium lifecycle cases,
+  and the real freshly packaged WASM save/reload/restore journey. Retain abort,
+  corruption, stale-owner and exact-next-tick assertions and evidence classes.
+- [x] Correct the second-pass duplicate-key regression in `bd-qjh2`: check the
+  original body's object shape and deserialize it directly, retaining Serde's
+  duplicate-field refusal. Exercise raw repeated and escaped count keys on both
+  REST aliases under the existing no-admission owner barrier; run required
+  checks, the complete server module and scanner before committing this fix.
+  Exact patch `27190624` passes eight DSR checks, all 67 server tests and a
+  zero-critical scanner result; source committed as `e8d32e50`.
+- [ ] Build the final optimized app with the duplicate-key correction, bind its
+  actual source and binary hashes, and use that binary for the native 1×/2× run.
+- [x] Preserve the later native GPUI Lab and Bevy AgentUid contributions through
+  pinned `e8afd206`; review the application callbacks, worker cancellation,
+  projections, native button regressions and original incoming plan entries.
+  Canonical `6ab144aa` retains all source, one incoming tracker comment and
+  existing local tracker/plan content. Its source remains unqualified.
+- [x] Retain the formatted GPUI preflight's real E0521 selector-lifetime error;
+  the application `gui,bevy_render` strict check passed, but workspace test
+  compilation failed. Correct only the button helper's literal selector lifetime;
+  all native button assertions remain. Corrective patch `9e446803` passes all
+  nine DSR checks: three GPUI component cases, two actual provider cases and
+  zero-critical UBS over five files. Reviewed source is committed as `569f1165`.
+- [ ] Format and qualify the integrated GPUI source, including the actual new
+  provider and native-button tests plus the `gui` application feature, required
+  workspace checks and full Bevy/application suites with observed provenance.
+- [x] Retain the complete clean `569f1165` application result: 781 passed,
+  zero failed and one existing live-provider ignore; the unchanged full-publication
+  tournament barrier passes with actually observed clean/status/diff provenance.
+  The overall 19-check run is incomplete because its separate Bevy fixture failed.
+- [x] Repair the empty-world selected-UID fixture without weakening its exact
+  assertions. Retain the first repair's valid tick-48 seeded-arrival refusal;
+  use the existing injected-arrival API instead. Exact patch `0e15bffc` passes
+  nine DSR checks, including 299 Bevy library and seven integration tests,
+  required compiler/lint/format checks and the changed-file scanner. Reviewed
+  source is committed as `1f144470`; the only later Rust difference from the
+  complete app run is this one line inside the Bevy test module.
+- [ ] Run the complete renderer library suite as well as the new focused cases;
+  the added Lab tabs also interact with existing window and presentation behavior.
+- [ ] Execute matched-seed comparison, columnar/text export and observed-order
+  historical replay regressions against the combined source; leave broader
+  original scientific acceptance open unless its full requirements are observed.
+- [x] Reopen original `bd-2z0.11.8` on the observed Parquet provenance readback
+  regression; preserve strict schema equality and restore actual file-footer
+  metadata in both full-table and bounded streaming readers.
+- [x] Verify the corrected readers against actual files, including a foreign
+  provenance file, multi-page exports, empty schemas and both full CLI pipelines
+  at `55c305b2`; later summary additions have separate pending qualification.
+- [x] Audit `.11.8` against its complete original acceptance; retain unobserved
+  large-run/memory and schema/multi-run requirements on the original item.
+- [ ] Drive and visually inspect the new card's optimized native window at both
+  scales before closing the reopened original HUD/text tasks again.
+- [x] Review/commit source, re-execute the committed source in a fresh solo pass,
+  audit original acceptance and update Beads only on cited observed evidence.
+- [ ] Publish qualified source and prepare a separate tracker snapshot; verify
+  final remote tips, tracked state and released reservations in the session.
+
+Consumer: native users reading selected creatures while retaining world controls.
+This bounded TODO retires at publication. Evidence and audit:
+`/data/tmp/scriptbots-responsive-hud-EpiJWQBq/`.
+
+Original acceptance is observed at clean source `4f0f3db8`: DSR
+`responsive_hud_clean_final/20261105T211747-1654146` passes **13/13**, including
+workspace all-target check, strict workspace/Bevy-app Clippy, formatting,
+**297 Bevy library + seven integration tests**, zero doctests and zero ignored
+Bevy tests. Runtime has **259 passed / six pre-existing ignored** lanes.
+Source-matched reverted consumers fail their intended regressions; no existing
+assertion, budget or lint threshold was relaxed. The separately reviewed golden
+promotion follows intentional daylight palette `2de46a55`, retains unchanged
+image thresholds, and qualifies only the CPU-semantic image. The separate commit
+tool extension admits explicitly reviewed canonical favor-ours merges; default
+unresolved merges, wrong trees and token tampering remain refused.
+
+Optimized native DSR
+`responsive_hud_native_final_4f0f3db8/20261105T220318-1754666` passes **6/6**,
+binary SHA256 `cf5d3a62b39fd469e126bbb1291c11e83c246ceae7bf32dbe4fc065e2547004b`.
+Actual X11 resizes at 1×/2× retain selection, reachable genome/dock content and
+the software notice; the 400×300 logical view wraps the full 64-hex digest.
+Pointer Step advances **1→2** and **3→4**, both applied and journal-durable;
+other paused gestures preserve ticks. The two processes exit normally.
+One paused software frame pair at each scale has zero changed crop pixels,
+24,000/99,000 observed respectively; this establishes neither a flicker cause
+nor temporal/hardware quality. These observations originally closed `.18.1`,
+`.18.4` and `.3.9` on unchanged criteria after fresh solo re-execution. The later
+creature-card integration reopens `.18.1` and `.18.4` until its own source passes
+the same criteria; `.3.9` remains closed. No independent verifier was available.
+Hardware, Metal, broader HUD/terrain, science and performance parents remain
+open. Later integration and publication remain pending below; this native binary
+is explicitly `4f0f3db8`, not the later merged revision.
+
 **Experiment consumers and browser recovery (2026-11-06):** [Source increments
 implemented — original native/browser qualification remains open]
 
@@ -1551,20 +2131,20 @@ wait correction was manually reviewed after the five-file syntax run and was
 not rechecked before the disconnect.
 
 **Browser saved continuations (2026-11-06):** [Implemented in source — browser
-runtime qualification remains blocked]
+runtime qualification pending]
 
-The browser now saves one explicit full-owner continuation in IndexedDB and
+The browser saves one explicit full-owner continuation in IndexedDB and
 discovers its tick/time after reload. Restore validates a bounded Blob before
 installing a paused owner, including recovery from an invalid startup permalink.
 Transactions acknowledge only on completion; abort/quota failures preserve the
 previous record. Reset, permalink and remote transitions invalidate delayed
 restores; a saved tick mismatch rejects and frees the candidate. Blocked database
-opens retain one pending request rather than accumulating retries. DSR passed
-all eight adapter tests using controlled IndexedDB events and the five edited
-JavaScript syntax checks. Actual packaged-WASM reload/next-tick/abort/corruption
-and DOM ownership-race regressions are authored; Chromium remains unavailable,
-so those browser journeys are unexecuted. No Durable receipt or SQLite/journal
-qualification is claimed.
+opens retain one pending request rather than accumulating retries. The original
+author reported eight adapter tests and five JavaScript syntax checks through
+DSR, with Chromium unavailable. GentleDuck preserved this contribution in
+`66ec9237`; fresh adapter, actual DOM ownership-race and freshly packaged WASM
+reload/next-tick/abort/corruption execution is pending below. This contribution
+does not qualify Durable receipts or the SQLite-image/batch-journal architecture.
 
 **MCP comparison increment (2026-11-06):** [Implemented in source — native
 qualification remains blocked]
@@ -1620,16 +2200,17 @@ waits; further requests receive explicit backpressure and disconnected clients
 cancel still-queued control work. This contributes to Phase 5.2 and `bd-ac4l`;
 the original throughput, soak and full DSR acceptance remain open.
 
-**Session verification:** DSR JavaScript syntax checks passed for all three
-edited browser files; the existing remote consumer suite passed 13/13 tests.
-Rust formatting was limited to changed regions and their enclosing constructs,
-with independent source review across the three feature contributions. Both a
-clean-baseline compiler check and a one-job candidate check were terminated by
-SIGKILL while compiling the unchanged `asupersync 0.5.0` dependency, before app
-code was reached. Native tests and Clippy therefore did not run. Playwright's
-Chromium provisioning returned truncated archives, so the DOM lifecycle suite
-also remains unexecuted. No scientific baseline or original Bead acceptance is
-changed by these source contributions.
+**Upstream authoring-session verification:** DSR JavaScript syntax checks passed
+for all three edited browser files; the existing remote consumer suite passed
+13/13 tests. Rust formatting was limited to changed regions and their enclosing
+constructs, with independent source review across the three feature contributions.
+Both a clean-baseline compiler check and a one-job candidate check were terminated
+by SIGKILL while compiling unchanged `asupersync 0.5.0`, before app code was reached.
+Native tests and Clippy therefore did not run in that authoring session.
+Playwright's Chromium provisioning returned truncated archives there, so its DOM
+lifecycle suite also remained unexecuted. The subsequent integration session's
+source-bound results are recorded separately above; no scientific baseline or
+original Bead acceptance is changed by these source contributions.
 
 **Large-run export and scientific evidence (2026-11-05):** [Currently In Progress —
 Codex; source contributions landed, original acceptance remains open]
@@ -1660,7 +2241,10 @@ persistence, with typed refusal for missing/corrupt evidence and explicit skips
 for incomplete windows or unsupported metrics/islands. Statistical thresholds
 and FDR calculations remain unchanged. Added regressions include multi-page
 history, gaps outside the selected window, truncated evidence and a production
-world extinction between default persistence boundaries. The end-to-end fixture's
+world extinction between explicitly configured sparse persistence boundaries.
+The production default disables periodic persistence; the fixture configures a
+13-tick cadence and verifies that final partial batches retain complete inputs.
+The end-to-end fixture's
 planted energy shift and combat null now derive from its actual agents/replay.
 
 Migration note: only narrative-validate moves to schema v2. Its payload adds the
@@ -1670,10 +2254,12 @@ was shortened. Metric-only historical runs with selected events are refused
 rather than certified from noncanonical samples; unrelated report schemas stay
 unchanged.
 
-Independent source reviews are complete; Cargo, formatting, Clippy, UBS and DSR
-execution are unavailable in this session and are not claimed. The new regressions
-are authored, not executed. No original Bead acceptance or scientific baseline
-is changed.
+The original author reported source review without execution. Subsequent fresh
+solo DSR execution by GentleDuck passed the ten narrative integration cases,
+both complete pipeline cases (including actual CLI/Parquet/SQL comparisons),
+and 26 storage-schema cases in `responsive_hud_static_sparse_probe`,
+`20261105T225726-1991874`. Clean committed-source workspace qualification remains
+pending below. No original broad Bead acceptance or scientific baseline changed.
 
 **Bevy owner inspector (2026-11-05):** [Qualified bounded contribution — GentleDuck;
 original `bd-2z0.14.1.18.3` closed, acceptance unchanged; fresh solo verification]

@@ -3796,8 +3796,11 @@ pub struct ExperimentArgs {
         conflicts_with = "example"
     )]
     pub out: Option<PathBuf>,
+    /// Retry failed runs from their verified saved cuts, retaining prior failure evidence.
+    #[arg(long, conflicts_with = "example")]
+    pub retry_failed: bool,
     /// Print an editable matched MLP/DWRAON experiment plan without starting a run.
-    #[arg(long, conflicts_with_all = ["plan", "out"])]
+    #[arg(long, conflicts_with_all = ["plan", "out", "retry_failed"])]
     pub example: bool,
 }
 
@@ -3898,6 +3901,19 @@ fn run_experiment_subcommand(args: &ExperimentArgs) -> Result<()> {
         .context("experiment plan was refused before creating artifacts")?;
     admit_experiment_output(output_dir)?;
     let status_path = output_dir.join("status.json");
+    if args.retry_failed {
+        let observed = runner
+            .status_snapshot(&status_path)
+            .context("cannot observe the experiment generation before retry")?;
+        runner
+            .retry_failed_runs(&status_path, observed.generation)
+            .with_context(|| {
+                format!(
+                    "failed-run retry was refused; inspect retained evidence in {}",
+                    output_dir.display()
+                )
+            })?;
+    }
     let status = runner.execute_batch(&status_path).with_context(|| {
         format!(
             "experiment execution or resume failed; retained artifacts in {} were preserved",

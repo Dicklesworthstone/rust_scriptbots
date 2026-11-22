@@ -1,9 +1,14 @@
 import { EnvironmentRaster } from "./environment.js";
 import { agentRadius, agentUid } from "../inspector.js";
+import { worldProjection, visitWorldCopies } from "../world-view.js";
 
 const ENVIRONMENT_WGSL = /* wgsl */ `
 @group(0) @binding(0) var grid: texture_2d<f32>;
-@group(0) @binding(1) var<uniform> coverage: vec4<f32>;
+struct EnvironmentView {
+  coverage: vec4<f32>,
+  camera: vec4<f32>,
+}
+@group(0) @binding(1) var<uniform> view: EnvironmentView;
 struct VertexOutput {
   @builtin(position) position: vec4<f32>,
   @location(0) uv: vec2<f32>,
@@ -16,11 +21,12 @@ struct VertexOutput {
   return output;
 }
 @fragment fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
-  if (input.uv.x >= coverage.x || input.uv.y >= coverage.y) {
+  let uv = fract((input.uv - vec2<f32>(0.5)) * view.camera.z + view.camera.xy);
+  if (uv.x >= view.coverage.x || uv.y >= view.coverage.y) {
     return vec4<f32>(0.043, 0.066, 0.126, 1.0);
   }
   let size = textureDimensions(grid);
-  let cell = min(vec2<u32>(input.uv / coverage.xy * vec2<f32>(size)), size - vec2<u32>(1u));
+  let cell = min(vec2<u32>(uv / view.coverage.xy * vec2<f32>(size)), size - vec2<u32>(1u));
   return textureLoad(grid, vec2<i32>(cell), 0);
 }
 `;
@@ -206,7 +212,7 @@ export class WebGpuRenderer {
     this.environmentSize = "";
     this.environmentKey = null;
     this.environmentGroup = null;
-    this.environmentUniform = device.createBuffer({ size: 16,
+    this.environmentUniform = device.createBuffer({ size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.disposed = false;
     this.failure = null;
@@ -266,7 +272,9 @@ export class WebGpuRenderer {
     });
     this.agentBuffer?.destroy();
     this.agentBuffer = agentBuffer;
+    const previous = this.agentArray;
     this.agentArray = new Float32Array((AGENT_STRIDE_ALIGNED / FLOAT_BYTES) * capacity);
+    this.agentArray.set(previous);
     this.bindGroup = bindGroup;
     this.agentCapacity = capacity;
   }
@@ -280,6 +288,7 @@ export class WebGpuRenderer {
     // supplies the then-current snapshot after the existing frame completes.
     if (this.#pendingFrame) return false;
 
+    const projection = worldProjection(snapshot.world, this.canvas.width, this.canvas.height, presentation.view);
     const environment = this.environment.update(presentation.environment, presentation.identity,
       snapshot.world, presentation.layer, snapshot.epoch, presentation.generation);
     if (environment && this.environmentKey !== environment.key) {
@@ -301,8 +310,13 @@ export class WebGpuRenderer {
       this.device.queue.writeTexture({ texture: this.environmentTexture }, environment.pixels,
         { bytesPerRow: environment.width * 4, rowsPerImage: environment.height },
         { width: environment.width, height: environment.height });
-      this.device.queue.writeBuffer(this.environmentUniform, 0, new Float32Array([...environment.coverage, 0, 0]));
       this.environmentKey = environment.key;
+    }
+    if (environment) {
+      // A camera move changes sampling, never the retained source texture.
+      this.device.queue.writeBuffer(this.environmentUniform, 0, new Float32Array([
+        ...environment.coverage, 0, 0, projection.centerX, projection.centerY, 1 / projection.zoom, 0,
+      ]));
     }
 
     this.updateViewUniform();
@@ -310,24 +324,26 @@ export class WebGpuRenderer {
     this.ensureAgentCapacity(Math.max(agents.length, 1));
 
     const floatsPerAgent = AGENT_STRIDE_ALIGNED / FLOAT_BYTES;
-    const scaleX = this.canvas.width / snapshot.world.width;
-    const scaleY = this.canvas.height / snapshot.world.height;
-    for (let i = 0; i < agents.length; i += 1) {
-      const base = i * floatsPerAgent;
-      const agent = agents[i];
-      const radius = agentRadius(agent);
-      this.agentArray[base + 0] = agent.position[0] * scaleX;
-      this.agentArray[base + 1] = agent.position[1] * scaleY;
-      this.agentArray[base + 2] = radius;
-      this.agentArray[base + 3] = typeof presentation.selectedUid === "string"
-        && agentUid(agent) === presentation.selectedUid ? 1.0 : 0.0;
-      this.agentArray[base + 4] = agent.color[0];
-      this.agentArray[base + 5] = agent.color[1];
-      this.agentArray[base + 6] = agent.color[2];
-      this.agentArray[base + 7] = agent.boost ? 1.0 : 0.0;
+    let visibleCount = 0;
+    for (const agent of agents) {
+      const radius = agentRadius(agent) * projection.zoom;
+      const selected = typeof presentation.selectedUid === "string" && agentUid(agent) === presentation.selectedUid;
+      visitWorldCopies(agent.position, projection, radius + 5.5, (x, y) => {
+        if (visibleCount >= this.agentCapacity) this.ensureAgentCapacity(visibleCount + 1);
+        const base = visibleCount * floatsPerAgent;
+        this.agentArray[base + 0] = x;
+        this.agentArray[base + 1] = y;
+        this.agentArray[base + 2] = radius;
+        this.agentArray[base + 3] = selected ? 1.0 : 0.0;
+        this.agentArray[base + 4] = agent.color[0];
+        this.agentArray[base + 5] = agent.color[1];
+        this.agentArray[base + 6] = agent.color[2];
+        this.agentArray[base + 7] = agent.boost ? 1.0 : 0.0;
+        visibleCount += 1;
+      });
     }
 
-    const byteLength = agents.length * AGENT_STRIDE_ALIGNED;
+    const byteLength = visibleCount * AGENT_STRIDE_ALIGNED;
     if (byteLength) this.device.queue.writeBuffer(this.agentBuffer, 0, this.agentArray.buffer, 0, byteLength);
 
     const textureView = this.context.getCurrentTexture().createView();
@@ -347,10 +363,10 @@ export class WebGpuRenderer {
       pass.setBindGroup(0, this.environmentGroup);
       pass.draw(3);
     }
-    if (agents.length) {
+    if (visibleCount) {
       pass.setPipeline(this.pipeline);
       pass.setBindGroup(0, this.bindGroup);
-      pass.draw(6, agents.length, 0, 0);
+      pass.draw(6, visibleCount, 0, 0);
     }
     pass.end();
     this.#submitFrame(encoder.finish());

@@ -58,7 +58,16 @@
             height: auto;
             display: block;
             cursor: crosshair;
+            touch-action: none;
         }
+
+        #sim-canvas[data-dragging="true"] { cursor: grabbing; }
+        #world-navigation { border: 1px solid #334155; border-radius: 0.5rem; padding: 0.65rem; }
+        #world-navigation h2 { font-size: 0.95rem; margin-bottom: 0.55rem; }
+        .world-navigation-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+        .world-navigation-actions button { flex: 1 1 45%; padding: 0.45rem 0.4rem; font-size: 0.82rem; }
+        #world-view-status, #world-navigation-help { font-size: 0.78rem; line-height: 1.45; overflow-wrap: anywhere; }
+        #world-navigation-help { color: #94a3b8; margin-bottom: 0; }
 
         #checkpoint-view {
             position: absolute;
@@ -388,7 +397,7 @@
     <div id="mismatch-banner" role="alert" aria-live="polite"></div>
     <main>
         <section id="sim-container">
-            <canvas id="sim-canvas" width="1280" height="720" tabindex="0" aria-label="Simulation canvas. Click a creature to inspect it; Escape clears selection."></canvas>
+            <canvas id="sim-canvas" width="1280" height="720" tabindex="0" aria-label="Simulation canvas. Click a creature to inspect; drag to pan; scroll or plus/minus to zoom; arrows pan; Home fits; F follows; Escape clears selection."></canvas>
             <div id="remote-overlay" role="status" hidden>Waiting for a remote canvas frame…</div>
             <section id="checkpoint-view" aria-label="Saved-world review" hidden>
                 <p id="checkpoint-view-status" role="status" aria-live="polite"></p>
@@ -433,6 +442,17 @@
                     <option value="agents">Agents only</option>
                 </select>
                 <div id="environment-status" role="status" aria-live="polite">Waiting for environment layers…</div>
+                <section id="world-navigation" aria-labelledby="world-navigation-heading">
+                    <h2 id="world-navigation-heading">Explore the world</h2>
+                    <div class="world-navigation-actions">
+                        <button id="world-zoom-out" type="button" disabled>− Zoom out</button>
+                        <button id="world-zoom-in" type="button" disabled>+ Zoom in</button>
+                        <button id="world-fit" type="button" disabled>Fit world</button>
+                        <button id="world-follow" type="button" aria-pressed="false" disabled>Follow selected</button>
+                    </div>
+                    <p id="world-view-status" role="status">Waiting for a world view.</p>
+                    <p id="world-navigation-help">Drag to pan; scroll to zoom. With the canvas focused: arrows pan, +/− zoom, Home fits, F follows selection. Panning stops following.</p>
+                </section>
                 <section id="agent-inspector" aria-labelledby="inspector-heading" data-state="empty">
                     <h2 id="inspector-heading">Creature inspector</h2>
                     <p id="inspector-status" role="status">Click a creature in the world, or enter its stable UID.</p>
@@ -680,11 +700,26 @@
                 <button id="experiment-refresh" type="button" disabled>Refresh selected status</button>
                 <button id="experiment-cancel" type="button" disabled>Cancel unfinished runs</button>
                 <button id="experiment-resume" type="button" disabled>Resume unfinished runs</button>
+                <button id="experiment-retry-failed" type="button" disabled>Retry failed runs from saved progress</button>
+                <p>Retry keeps the original failure evidence and requires a verified saved continuation for every failed run. Completed runs remain unchanged. After an uncertain response, refresh status before retrying.</p>
                 <p>Progress is a saved checkpoint observation. It may lag the running world. Server bundle paths identify host files; they are not browser downloads.</p>
                 <p id="experiment-run-page"></p>
                 <button id="experiment-run-previous" type="button" disabled>Previous run page</button>
                 <button id="experiment-run-next" type="button" disabled>Next run page</button>
                 <ol id="experiment-runs" aria-label="Observed experiment runs"></ol>
+                <h3>Completed run downloads</h3>
+                <label>Completed run
+                    <select id="experiment-artifact-run" disabled><option value="">No completed runs observed</option></select>
+                </label>
+                <button id="experiment-artifacts-load" type="button" disabled>Load verified run files</button>
+                <p id="experiment-artifact-summary" role="status"></p>
+                <label>Run file
+                    <select id="experiment-artifact-select" disabled><option value="">Load a completed run's files</option></select>
+                </label>
+                <p id="experiment-artifact-detail"></p>
+                <button id="experiment-artifact-download" type="button" disabled>Download selected file</button>
+                <button id="experiment-bundle-download" type="button" disabled>Download complete run bundle (.zip)</button>
+                <p>The host verifies the completed run and its saved owner. Downloads check byte counts and SHA-256. The ZIP preserves the original manifest and relative paths; extract it for bundle verification or replay tools. Preparing a download does not replay the experiment.</p>
                 <h3>Paired endpoint comparison</h3>
                 <p>Choose two fully completed arms and one terminal metric. Each distinct matched seed contributes one pair. Results report challenger minus baseline; larger values alone do not imply better fitness.</p>
                 <label>Baseline arm

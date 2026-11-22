@@ -523,9 +523,10 @@ use scriptbots_core::{
     BrainFamilyCodec, BrainGenomeEnvelope, DeathCause, DeathRecord, Generation,
     INTERACTION_EVENTS_OBSERVED_KIND, INTERACTION_EVENTS_PERSISTED_KIND,
     INTERACTION_EVENTS_SAMPLED_OUT_KIND, INTERACTION_EVENTS_TRUNCATED_KIND, PersistedGenome,
-    PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch, PersistenceEventKind,
-    Position, ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayInteractionKind,
-    ReplayRngScope, Tick, WorldPersistence,
+    PersistenceAdmissionError, PersistenceAdmissionState, PersistenceBatch,
+    PersistenceCommitAuthority, PersistenceEventKind, PersistenceJournalReservation, Position,
+    ReplayAgentPhase, ReplayEvent, ReplayEventKind, ReplayInteractionKind, ReplayRngScope, Tick,
+    WorldPersistence,
     ancestry::{AncestryError, AncestryGraph},
     narrative::{
         EVENT_RECORD_SCHEMA_VERSION, EventKind, EventRecord,
@@ -709,9 +710,10 @@ const SCRIPTBOTS_SCHEMA_V16_VERSION: i64 = 16;
 /// Schema version introducing MAP-Elites behavioral archive tables (bd-16g.6.1).
 pub const SCRIPTBOTS_SCHEMA_V17_VERSION: i64 = 17;
 const SCRIPTBOTS_SCHEMA_V18_VERSION: i64 = 18;
+const SCRIPTBOTS_SCHEMA_V19_VERSION: i64 = 19;
 
 /// Current schema version for new `ScriptBots` run databases.
-pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 19;
+pub const SCRIPTBOTS_SCHEMA_VERSION: i64 = 20;
 
 /// Historical schema migration alias for MAP-Elites behavioral archive (bd-16g.6.1).
 pub const SCRIPTBOTS_SCHEMA_V3: &str = SCRIPTBOTS_SCHEMA_V17;
@@ -2357,6 +2359,17 @@ const SCRIPTBOTS_SCHEMA_V19: &str = r#"
     PRAGMA user_version = 19;
 "#;
 
+/// Journal reconstruction checks every transition attached to the archive's full identity,
+/// including misplaced rows from another command. The command-keyed primary keys cannot
+/// narrow that check by journal sequence. Keep the checks intact and index their actual key.
+const SCRIPTBOTS_SCHEMA_V20: &str = r#"
+    CREATE INDEX host_command_application_transitions_run_session_journal_index
+        ON host_command_application_transitions (run_id, host_session_id, journal_sequence);
+    CREATE INDEX host_command_storage_transitions_run_session_journal_index
+        ON host_command_storage_transitions (run_id, host_session_id, journal_sequence);
+    PRAGMA user_version = 20;
+"#;
+
 const SCRIPTBOTS_MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         SCRIPTBOTS_SCHEMA_V6_VERSION,
@@ -2424,9 +2437,14 @@ const SCRIPTBOTS_MIGRATIONS: &[(i64, &str, &str)] = &[
         SCRIPTBOTS_SCHEMA_V18,
     ),
     (
-        SCRIPTBOTS_SCHEMA_VERSION,
+        SCRIPTBOTS_SCHEMA_V19_VERSION,
         "index_island_narrative_identities",
         SCRIPTBOTS_SCHEMA_V19,
+    ),
+    (
+        SCRIPTBOTS_SCHEMA_VERSION,
+        "index_command_transitions_by_journal",
+        SCRIPTBOTS_SCHEMA_V20,
     ),
 ];
 
@@ -2765,6 +2783,9 @@ const AGENT_COLUMNS: &[&str] = &[
 /// Working-set budget for one multi-row scientific INSERT, not the engine's maximum.
 const MAX_SCIENCE_INSERT_BINDINGS: usize = 1_024;
 const DOMAIN_EVENT_INSERT_WIDTH: usize = 10;
+const BIRTH_INSERT_WIDTH: usize = 16;
+const DEATH_INSERT_WIDTH: usize = 19;
+const MIGRATION_INSERT_WIDTH: usize = 10;
 
 /// Number of values bound by [`scriptbots_agent_insert_sql`].
 #[cfg(test)]
@@ -19431,21 +19452,13 @@ impl Storage {
             return Ok(CommandAuthorityLookup::Collision);
         }
 
+        // Resolve each exact identity separately, as in journal admission below. The pinned
+        // engine scans the growing archive for the equivalent LEFT JOIN even when the
+        // command is keyed. This connection is confined to the storage owner and the run's
+        // writer lease, so no other writer can change these bindings between the reads.
         let terminal_rows = self.connection()?.query_with_params(
-            "SELECT command.journal_sequence, archive.payload_version,
-                    archive.payload_digest, length(CAST(archive.payload_json AS BLOB)),
-                    ledger.state
-             FROM host_command_records AS command
-             LEFT JOIN host_journal_archive AS archive
-               ON archive.run_id = command.run_id
-              AND archive.host_session_id = command.host_session_id
-              AND archive.journal_sequence = command.journal_sequence
-             LEFT JOIN host_journal_batch_ledger AS ledger
-               ON ledger.run_id = command.run_id
-              AND ledger.host_session_id = command.host_session_id
-              AND ledger.journal_sequence = command.journal_sequence
-             WHERE command.run_id = ?1 AND command.host_session_id = ?2
-               AND command.command_id = ?3
+            "SELECT journal_sequence FROM host_command_records
+             WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3
              LIMIT 2",
             &[
                 sqlite_run_id(self.run_id),
@@ -19473,13 +19486,57 @@ impl Storage {
         let journal: String = decode(terminal, 0, "host_command_records.journal_sequence")?;
         let journal_sequence =
             decode_journal_u64("host_command_records.journal_sequence", &journal)?;
+        let journal_identity = [
+            sqlite_run_id(self.run_id),
+            encoded_session.as_str().into(),
+            journal.as_str().into(),
+        ];
+        let archive_rows = self.connection()?.query_with_params(
+            "SELECT payload_version, payload_digest, length(CAST(payload_json AS BLOB))
+             FROM host_journal_archive
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+             LIMIT 2",
+            &journal_identity,
+        )?;
+        let archive = match archive_rows.as_slice() {
+            [] => {
+                return Err(StorageError::InvalidData {
+                    context: "host_command_claims.archive_binding",
+                    reason: format!("command {command_id} has no canonical archive"),
+                });
+            }
+            [archive] => archive,
+            rows => {
+                return Ok(CommandAuthorityLookup::Failed(
+                    CommandAuthorityLookupFailure::Ambiguous {
+                        matches: rows.len(),
+                    },
+                ));
+            }
+        };
+        let ledger_rows = self.connection()?.query_with_params(
+            "SELECT state FROM host_journal_batch_ledger
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+             LIMIT 2",
+            &journal_identity,
+        )?;
+        let ledger_state: Option<String> = match ledger_rows.as_slice() {
+            [] => None,
+            [ledger] => decode(ledger, 0, "host_journal_batch_ledger.state")?,
+            rows => {
+                return Ok(CommandAuthorityLookup::Failed(
+                    CommandAuthorityLookupFailure::Ambiguous {
+                        matches: rows.len(),
+                    },
+                ));
+            }
+        };
         let payload_version: Option<i64> =
-            decode(terminal, 1, "host_journal_archive.payload_version")?;
+            decode(archive, 0, "host_journal_archive.payload_version")?;
         let payload_digest: Option<String> =
-            decode(terminal, 2, "host_journal_archive.payload_digest")?;
+            decode(archive, 1, "host_journal_archive.payload_digest")?;
         let payload_bytes: Option<i64> =
-            decode(terminal, 3, "host_journal_archive.payload_json.length")?;
-        let ledger_state: Option<String> = decode(terminal, 4, "host_journal_batch_ledger.state")?;
+            decode(archive, 2, "host_journal_archive.payload_json.length")?;
         let Some(payload_digest) = payload_digest else {
             return Err(StorageError::InvalidData {
                 context: "host_command_claims.archive_binding",
@@ -22132,10 +22189,11 @@ impl Storage {
                 brain_kind, brain_key, herbivore_tendency,
                 generation, position_x, position_y, is_hybrid, origin, island_id
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
-        for row in rows {
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert::<BIRTH_INSERT_WIDTH>(
+            tx,
+            sql,
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.agent_uid.into(),
@@ -22152,8 +22210,13 @@ impl Storage {
                     sqlite_bool(row.is_hybrid),
                     row.origin.as_str().into(),
                     row.island_id.into(),
-                ],
-            )?;
+                ]
+            }),
+        )?;
+        // Birth identities and all their lineage edges share the enclosing science
+        // transaction. Keep the existing ignore-on-conflict edge policy separate
+        // from the strict birth inserts and their exact returned-row counts.
+        for row in rows {
             if let Some(parent_a) = row.parent_a {
                 let rel = if row.parent_b.is_some() {
                     "sexual_parent_a"
@@ -22209,10 +22272,11 @@ impl Storage {
                 spike_attacker, spike_victim, hit_carnivore, hit_herbivore,
                 hit_by_carnivore, hit_by_herbivore, island_id
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)";
-        for row in rows {
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert::<DEATH_INSERT_WIDTH>(
+            tx,
+            sql,
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.agent_uid.into(),
@@ -22232,10 +22296,10 @@ impl Storage {
                     sqlite_bool(row.hit_by_carnivore),
                     sqlite_bool(row.hit_by_herbivore),
                     row.island_id.into(),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            }),
+        )
+        .map(|_| ())
     }
 
     /// Insert narrative rows in the same transaction as every scientific table (`bd-erff`).
@@ -22454,10 +22518,11 @@ impl Storage {
                 run_id, tick, seq, island_id_from, island_id_to,
                 agent_uid, agent_uid_to, rule, key_value, rank
             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
-        for row in rows {
-            tx.execute_with_params(
-                sql,
-                &[
+        Self::execute_bounded_insert::<MIGRATION_INSERT_WIDTH>(
+            tx,
+            sql,
+            rows.iter().map(|row| {
+                [
                     sqlite_run_id(run_id),
                     row.tick.into(),
                     row.seq.into(),
@@ -22468,10 +22533,10 @@ impl Storage {
                     row.rule.as_str().into(),
                     row.key_value.into(),
                     row.rank.into(),
-                ],
-            )?;
-        }
-        Ok(())
+                ]
+            }),
+        )
+        .map(|_| ())
     }
 
     fn insert_archive_space(
@@ -24154,25 +24219,24 @@ impl StorageSink {
         self.submit_with_receipt_using_clock_for_island(payload, IslandId(0), clock)
     }
 
-    fn submit_with_receipt_using_clock_for_island<Clock>(
+    /// Measure borrowed rows and reserve both independent budgets before either admission path.
+    /// The journal keeps these same permits until its receipt settles the core obligation;
+    /// sharing the checks prevents a journal from bypassing operator-specified sink limits.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "scientific and narrative measurement and reservation form one ordered admission policy"
+    )]
+    fn reserve_payload_observed<Observer>(
         &self,
         payload: &PersistenceBatch,
-        island: IslandId,
-        clock: &mut Clock,
-    ) -> Result<AdmissionReceipt, StorageError>
+        observer: &mut Observer,
+        progress: &mut PreparationProgress,
+    ) -> Result<(InFlightPermit, Option<InFlightPermit>), StorageError>
     where
-        Clock: FnMut(PreparationStage) -> Instant,
+        Observer: PreparationObserver,
     {
         let tick = payload.summary.tick.0;
-        let mut progress = PreparationProgress::default();
-        let mut preparation = PreparationDeadline::new(
-            clock,
-            self.deadlines.preparation,
-            Arc::clone(&self.path),
-            tick,
-        );
-
-        // MEASURE BEFORE ALLOCATING. `from_batch` below materializes the entire
+        // MEASURE BEFORE ALLOCATING. `from_batch` materializes the entire
         // batch; if the batch is pathological, the memory is already gone by the
         // time any deadline or admission gate gets a say. So the size is computed
         // from the batch's borrowed shape first — no cloning or serialization —
@@ -24181,9 +24245,8 @@ impl StorageSink {
         // This is a NotAdmitted outcome in the strictest sense: the caller still
         // holds the exact payload it tried to submit, so the exact-retry semantics
         // the storage contract depends on are untouched.
-        let (bytes, events) =
-            estimate_batch_size_observed(payload, &mut preparation, &mut progress)
-                .inspect_err(|error| self.publish_preparation_error(error, tick))?;
+        let (bytes, events) = estimate_batch_size_observed(payload, observer, progress)
+            .inspect_err(|error| self.publish_preparation_error(error, tick))?;
         if bytes > self.budget.max_batch_bytes || events > self.budget.max_batch_events {
             warn!(
                 schema = "scriptbots.persistence-preparation.v1",
@@ -24207,7 +24270,7 @@ impl StorageSink {
             });
         }
         let (narrative_bytes, narrative_events) =
-            estimate_narrative_size_observed(payload, &mut preparation, &mut progress)
+            estimate_narrative_size_observed(payload, observer, progress)
                 .inspect_err(|error| self.publish_preparation_error(error, tick))?;
         if narrative_bytes > self.budget.max_narrative_batch_bytes
             || narrative_events > self.budget.max_narrative_batch_events
@@ -24242,8 +24305,8 @@ impl StorageSink {
             &self.inflight_bytes,
             bytes,
             self.budget.max_inflight_bytes,
-            &mut preparation,
-            progress,
+            observer,
+            *progress,
         )
         .inspect_err(|error| self.publish_preparation_error(error, tick))?
         .map_err(|would_be| StorageError::InFlightBytesExhausted {
@@ -24257,8 +24320,8 @@ impl StorageSink {
                 &self.inflight_narrative_bytes,
                 narrative_bytes,
                 self.budget.max_narrative_inflight_bytes,
-                &mut preparation,
-                progress,
+                observer,
+                *progress,
             )
             .inspect_err(|error| self.publish_preparation_error(error, tick))?
             .map_err(|would_be| StorageError::InFlightNarrativeBytesExhausted {
@@ -24270,6 +24333,49 @@ impl StorageSink {
         } else {
             None
         };
+
+        Ok((permit, narrative_permit))
+    }
+
+    fn reserve_journal_payload(
+        &self,
+        payload: &PersistenceBatch,
+    ) -> Result<PersistenceJournalReservation, StorageError> {
+        let tick = payload.summary.tick.0;
+        let mut clock = |_| Instant::now();
+        let mut preparation = PreparationDeadline::new(
+            &mut clock,
+            self.deadlines.preparation,
+            Arc::clone(&self.path),
+            tick,
+        );
+        let mut progress = PreparationProgress::default();
+        let permits = self.reserve_payload_observed(payload, &mut preparation, &mut progress)?;
+        preparation
+            .checkpoint(PreparationStage::Complete, progress)
+            .inspect_err(|error| self.publish_preparation_error(error, tick))?;
+        Ok(PersistenceJournalReservation::new(permits))
+    }
+
+    fn submit_with_receipt_using_clock_for_island<Clock>(
+        &self,
+        payload: &PersistenceBatch,
+        island: IslandId,
+        clock: &mut Clock,
+    ) -> Result<AdmissionReceipt, StorageError>
+    where
+        Clock: FnMut(PreparationStage) -> Instant,
+    {
+        let tick = payload.summary.tick.0;
+        let mut progress = PreparationProgress::default();
+        let mut preparation = PreparationDeadline::new(
+            clock,
+            self.deadlines.preparation,
+            Arc::clone(&self.path),
+            tick,
+        );
+        let (permit, narrative_permit) =
+            self.reserve_payload_observed(payload, &mut preparation, &mut progress)?;
 
         let prepared = PreparedPersistenceBatch::from_batch_observed(
             payload,
@@ -24432,6 +24538,21 @@ impl StorageSink {
 }
 
 impl WorldPersistence for StorageSink {
+    fn commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+        Some(PersistenceCommitAuthority::from_owner(Arc::clone(
+            &self.admission,
+        )))
+    }
+
+    fn reserve_journal_batch(
+        &mut self,
+        payload: &PersistenceBatch,
+    ) -> Result<PersistenceJournalReservation, PersistenceAdmissionError> {
+        self.reserve_journal_payload(payload).map_err(|error| {
+            PersistenceAdmissionError::new(payload.summary.tick.0, error.to_string())
+        })
+    }
+
     fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
         self.submit(payload).map_err(|error| {
             let state = match &error {
@@ -30508,7 +30629,11 @@ mod tests {
              WHERE run_id = ?1 AND host_session_id = ?2 AND scientific_event_sequence = ?3",
             &identity,
         )?;
-        assert_eq!(metadata.len(), 1, "zero-event boundaries still need metadata");
+        assert_eq!(
+            metadata.len(),
+            1,
+            "zero-event boundaries still need metadata"
+        );
         assert_eq!(
             metadata[0].get_typed::<i64>(0)?,
             i64::try_from(projection.events.len())?
@@ -30527,7 +30652,10 @@ mod tests {
         assert_eq!(rows.len(), projection.events.len());
         for (row, expected) in rows.iter().zip(&projection.events) {
             assert_eq!(row.get_typed::<i64>(0)?, i64::try_from(expected.ordinal)?);
-            assert_eq!(row.get_typed::<String>(1)?, expected.payload.kind().as_str());
+            assert_eq!(
+                row.get_typed::<String>(1)?,
+                expected.payload.kind().as_str()
+            );
             assert_eq!(
                 row.get_typed::<Option<i64>>(2)?,
                 expected
@@ -30631,7 +30759,10 @@ mod tests {
                 &batch,
                 MAX_HOST_JOURNAL_ARCHIVE_BYTES,
             )?;
-            let projection = prepared.domain_events.as_ref().expect("scientific projection");
+            let projection = prepared
+                .domain_events
+                .as_ref()
+                .expect("scientific projection");
             assert!(projection.events.len() >= founders);
             if founders == 0 {
                 assert!(projection.events.is_empty());
@@ -30669,7 +30800,10 @@ mod tests {
                 &batch,
                 MAX_HOST_JOURNAL_ARCHIVE_BYTES,
             )?;
-            let projection = prepared.domain_events.as_ref().expect("scientific projection");
+            let projection = prepared
+                .domain_events
+                .as_ref()
+                .expect("scientific projection");
             assert!(projection.events.len() >= multi_chunk_count);
             let mut invalid = projection.clone();
             let mut overflowing_birth = projection
@@ -30707,13 +30841,7 @@ mod tests {
                     None,
                 )
                 .expect_err("a late conversion or SQL constraint must refuse the whole projection");
-            assert_domain_projection_rollback(
-                &storage,
-                &prepared,
-                batch.id(),
-                failure,
-                case,
-            )?;
+            assert_domain_projection_rollback(&storage, &prepared, batch.id(), failure, case)?;
             storage.complete_host_journal_archive(
                 batch.id(),
                 batch.scientific_event_sequence(),
@@ -30723,6 +30851,256 @@ mod tests {
                 None,
             )?;
             assert_domain_projection_rows(&storage, projection)?;
+            storage.close()?;
+        }
+        Ok(())
+    }
+
+    fn chunked_lifecycle_fixture() -> Result<StorageBuffer, StorageError> {
+        let narrowest = BIRTH_INSERT_WIDTH
+            .min(DEATH_INSERT_WIDTH)
+            .min(MIGRATION_INSERT_WIDTH);
+        // Cross at least two statement boundaries for every changed table.
+        let count = 2 * (MAX_SCIENCE_INSERT_BINDINGS / narrowest) + 1;
+        let mut buffer = StorageBuffer::default();
+        for index in 0..count {
+            let ordinal = i64::try_from(index).expect("bounded fixture ordinal");
+            let coordinate = f64::from(u32::try_from(index).expect("bounded fixture coordinate"));
+            let uid = u64::try_from(index / 2 + 1).expect("bounded fixture identity");
+            let origin = match index % 3 {
+                0 => BirthOrigin::Seeded,
+                1 => BirthOrigin::Born,
+                _ => BirthOrigin::Injected,
+            };
+            let tick = if origin == BirthOrigin::Seeded { 0 } else { 5 };
+            let mut birth = birth_row_from_record(&sample_birth(tick, uid, origin))?;
+            birth.island_id = ordinal % 2;
+            birth.position_x = coordinate + 0.25;
+            birth.position_y = -coordinate - 0.5;
+            birth.brain_key = (index % 2 == 0).then_some(ordinal);
+            if origin == BirthOrigin::Born {
+                birth.parent_a = Some(10_000 + ordinal);
+                birth.parent_b = (index % 2 == 0).then_some(20_000 + ordinal);
+                birth.is_hybrid = birth.parent_b.is_some();
+                birth.generation = 3;
+            }
+            buffer.births.push(birth);
+
+            let mut death = death_row_from_record(&sample_death(12, uid, DeathCause::Starvation))?;
+            death.island_id = ordinal % 2;
+            death.age = ordinal + 2;
+            death.generation = ordinal + 3;
+            death.energy = coordinate + 0.125;
+            death.food_balance_total = -coordinate - 0.75;
+            death.brain_key = (index % 2 != 0).then_some(ordinal);
+            death.was_hybrid = index % 3 == 0;
+            death.spike_attacker = index % 3 == 1;
+            death.spike_victim = index % 3 == 2;
+            death.hit_carnivore = index % 4 == 0;
+            death.hit_herbivore = index % 4 == 1;
+            death.hit_by_carnivore = index % 4 == 2;
+            death.hit_by_herbivore = index % 4 == 3;
+            buffer.deaths.push(death);
+            buffer.migrations.push(MigrationRow {
+                tick: 7,
+                seq: ordinal,
+                island_id_from: ordinal % 2,
+                island_id_to: 3 + ordinal % 2,
+                agent_uid: i64::try_from(uid).expect("bounded fixture identity"),
+                agent_uid_to: 1_000 + ordinal,
+                rule: "fittest".to_owned(),
+                key_value: coordinate + 0.5,
+                rank: ordinal + 1,
+            });
+        }
+        Ok(buffer)
+    }
+
+    type LifecycleTableSnapshot = BTreeMap<&'static str, Vec<Vec<SqliteValue>>>;
+
+    fn lifecycle_table_snapshot(storage: &Storage) -> Result<LifecycleTableSnapshot, StorageError> {
+        let mut tables = BTreeMap::new();
+        for (table, order) in [
+            ("births", "island_id, agent_uid"),
+            ("deaths", "island_id, agent_uid"),
+            (
+                "lineage_edges",
+                "island_id, child_agent_uid, parent_ordinal",
+            ),
+            ("migrations", "tick, seq"),
+        ] {
+            let rows = storage.connection()?.query_with_params(
+                &format!("SELECT * FROM {table} WHERE run_id = ?1 ORDER BY {order}"),
+                &[sqlite_run_id(storage.run_id)],
+            )?;
+            // These independently created runs have different run IDs. Compare every
+            // scientific column, including nullable fields, island IDs and both UIDs.
+            tables.insert(
+                table,
+                rows.into_iter()
+                    .map(|row| row.values()[1..].to_vec())
+                    .collect(),
+            );
+        }
+        Ok(tables)
+    }
+
+    #[test]
+    fn chunked_lifecycle_inserts_match_single_row_execution_and_replacement_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Storage::unattributed_memory()?;
+        let reference = Storage::unattributed_memory()?;
+        let mut buffer = chunked_lifecycle_fixture()?;
+        // A replacement in a later chunk must win just as it does in sequential SQL.
+        let mut replacement = buffer.migrations[0].clone();
+        replacement.agent_uid_to = 42_424;
+        replacement.rule = "random".to_owned();
+        buffer.migrations.push(replacement);
+        Storage::flush_attempt(
+            storage.connection()?,
+            ":memory:",
+            storage.run_id,
+            &StorageBuffer::default(),
+            &[],
+        )
+        .map_err(|failure| failure.source)?;
+        Storage::flush_attempt(
+            storage.connection()?,
+            ":memory:",
+            storage.run_id,
+            &buffer,
+            &[],
+        )
+        .map_err(|failure| failure.source)?;
+
+        let mut transaction = reference.connection()?.transaction()?;
+        for row in &buffer.births {
+            Storage::insert_births(&transaction, reference.run_id, std::slice::from_ref(row))?;
+        }
+        for row in &buffer.deaths {
+            Storage::insert_deaths(&transaction, reference.run_id, std::slice::from_ref(row))?;
+        }
+        for row in &buffer.migrations {
+            Storage::insert_migrations(&transaction, reference.run_id, std::slice::from_ref(row))?;
+        }
+        transaction.commit()?;
+        drop(transaction);
+        let actual = lifecycle_table_snapshot(&storage)?;
+        assert_eq!(actual, lifecycle_table_snapshot(&reference)?);
+        assert_eq!(actual["births"].len(), buffer.births.len());
+        assert_eq!(actual["deaths"].len(), buffer.deaths.len());
+        assert_eq!(actual["migrations"].len(), buffer.migrations.len() - 1);
+        let edges = buffer
+            .births
+            .iter()
+            .map(|row| usize::from(row.parent_a.is_some()) + usize::from(row.parent_b.is_some()))
+            .sum::<usize>();
+        assert!(edges > 0, "the fixture must exercise lineage creation");
+        assert_eq!(actual["lineage_edges"].len(), edges);
+        let replaced = storage.connection()?.query_row(
+            "SELECT island_id_from, island_id_to, agent_uid, agent_uid_to, rule
+             FROM migrations WHERE tick = 7 AND seq = 0",
+        )?;
+        assert_eq!(replaced.get_typed::<i64>(0)?, 0);
+        assert_eq!(replaced.get_typed::<i64>(1)?, 3);
+        assert_eq!(replaced.get_typed::<i64>(2)?, 1);
+        assert_eq!(replaced.get_typed::<i64>(3)?, 42_424);
+        assert_eq!(replaced.get_typed::<String>(4)?, "random");
+        storage.close()?;
+        reference.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn chunked_lifecycle_late_failures_roll_back_all_tables_and_allow_exact_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for case in [
+            "birth_check",
+            "birth_unique",
+            "death_check",
+            "death_unique",
+            "migration_check",
+        ] {
+            let storage = Storage::unattributed_memory()?;
+            let connection = storage.connection()?;
+            let previous = StorageBuffer {
+                births: vec![birth_row_from_record(&sample_birth(
+                    0,
+                    50_000,
+                    BirthOrigin::Seeded,
+                ))?],
+                deaths: vec![death_row_from_record(&sample_death(
+                    2,
+                    50_000,
+                    DeathCause::Starvation,
+                ))?],
+                ..StorageBuffer::default()
+            };
+            Storage::flush_attempt(connection, ":memory:", storage.run_id, &previous, &[])
+                .map_err(|failure| failure.source)?;
+            let before = lifecycle_table_snapshot(&storage)?;
+            let valid = chunked_lifecycle_fixture()?;
+            let mut invalid = chunked_lifecycle_fixture()?;
+            match case {
+                "birth_check" => invalid.births.last_mut().expect("nonempty").spawn_ordinal = -1,
+                "birth_unique" => {
+                    let first = invalid.births[0].clone();
+                    *invalid.births.last_mut().expect("nonempty") = first;
+                }
+                "death_check" => invalid.deaths.last_mut().expect("nonempty").cause.clear(),
+                "death_unique" => {
+                    let first = invalid.deaths[0].clone();
+                    *invalid.deaths.last_mut().expect("nonempty") = first;
+                }
+                "migration_check" => {
+                    let last = invalid.migrations.last_mut().expect("nonempty");
+                    last.island_id_to = last.island_id_from;
+                }
+                _ => unreachable!("fixture case"),
+            }
+            let failure =
+                Storage::flush_attempt(connection, ":memory:", storage.run_id, &invalid, &[])
+                    .expect_err("a late SQL constraint must roll back the complete science batch");
+            assert_eq!(
+                failure.commit_state,
+                FailureCommitState::RolledBack,
+                "{case}"
+            );
+            let expected = if case.ends_with("unique") {
+                "UNIQUE"
+            } else {
+                "CHECK"
+            };
+            assert!(
+                failure.source.to_string().contains(expected),
+                "{case}: {:?}",
+                failure.source
+            );
+            assert_eq!(
+                lifecycle_table_snapshot(&storage)?,
+                before,
+                "{case}: partial batch escaped rollback"
+            );
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA foreign_keys")?
+                    .get_typed::<i64>(0)?,
+                1
+            );
+            Storage::flush_attempt(connection, ":memory:", storage.run_id, &valid, &[])
+                .map_err(|failure| failure.source)?;
+            let after = lifecycle_table_snapshot(&storage)?;
+            assert_eq!(
+                after["births"].len(),
+                valid.births.len() + before["births"].len(),
+                "{case}"
+            );
+            assert_eq!(
+                after["deaths"].len(),
+                valid.deaths.len() + before["deaths"].len(),
+                "{case}"
+            );
+            assert_eq!(after["migrations"].len(), valid.migrations.len(), "{case}");
             storage.close()?;
         }
         Ok(())
@@ -32616,8 +32994,12 @@ mod tests {
                 "partition_genomes_and_narratives_by_island",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V19_VERSION,
                 "index_island_narrative_identities",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "index_command_transitions_by_journal",
             ),
         ];
         assert_eq!(migrations.len(), expected.len());
@@ -32646,6 +33028,337 @@ mod tests {
             "idempotent install duplicated its ledger"
         );
         connection.close()?;
+        Ok(())
+    }
+
+    const COMMAND_TRANSITION_JOURNAL_INDEXES: [(&str, &str, &str); 2] = [
+        (
+            "host_command_application_transitions",
+            "host_command_application_transitions_run_session_journal_index",
+            "command_id, transition_ordinal, boundary_tick, boundary_control_revision,
+             boundary_scientific_revision, boundary_config_revision, application_state,
+             application_postcard_hex, archive_payload_digest",
+        ),
+        (
+            "host_command_storage_transitions",
+            "host_command_storage_transitions_run_session_journal_index",
+            "command_id, transition_ordinal, storage_state, archive_payload_digest",
+        ),
+    ];
+
+    fn command_transition_journal_query(table: &str, columns: &str, scan: bool) -> String {
+        let hint = if scan { " NOT INDEXED" } else { "" };
+        format!(
+            "SELECT {columns} FROM {table}{hint}
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3
+             ORDER BY transition_ordinal ASC"
+        )
+    }
+
+    fn command_transition_rows(
+        connection: &Connection,
+        sql: &str,
+        parameters: &[SqliteValue],
+    ) -> Result<Vec<Vec<SqliteValue>>, FrankenError> {
+        connection
+            .query_with_params(sql, parameters)
+            .map(|rows| rows.into_iter().map(|row| row.values().to_vec()).collect())
+    }
+
+    fn assert_command_transition_index_seek(
+        connection: &Connection,
+        index: &str,
+        sql: &str,
+        parameters: &[SqliteValue],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root_page = connection
+            .query_row_with_params(
+                "SELECT rootpage FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+                &[index.into()],
+            )?
+            .get_typed::<i64>(0)?;
+        let bytecode = connection.query_with_params(&format!("EXPLAIN {sql}"), parameters)?;
+        // The pinned engine exposes addr/opcode/p1/p2/p3/p4/p5/comment. Resolve the
+        // actual index cursor by its root page, then require a key seek on that cursor.
+        // Merely opening an index or reporting a logical plan is not a seek.
+        let mut index_cursors = Vec::new();
+        for instruction in &bytecode {
+            if instruction.get_typed::<String>(1)? == "OpenRead"
+                && instruction.get_typed::<i64>(3)? == root_page
+            {
+                index_cursors.push(instruction.get_typed::<i64>(2)?);
+            }
+        }
+        let mut seeks_index = false;
+        for instruction in &bytecode {
+            if matches!(
+                instruction.get_typed::<String>(1)?.as_str(),
+                "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT" | "NotFound" | "NoConflict"
+            ) && index_cursors.contains(&instruction.get_typed::<i64>(2)?)
+            {
+                seeks_index = true;
+            }
+        }
+        assert!(
+            seeks_index,
+            "journal lookup did not seek {index}: {:?}",
+            bytecode.iter().map(Row::values).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    fn assert_indexed_journal_lookup_rejects_cross_command_rows(
+        storage: &Storage,
+        session: HostSessionId,
+        first: &CommandEnvelope,
+        second: &CommandEnvelope,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let connection = storage.connection()?;
+        let session_text = encode_journal_u64(session.get());
+        let journal: String = connection
+            .query_row_with_params(
+                "SELECT journal_sequence FROM host_command_records
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3",
+                &[
+                    sqlite_run_id(storage.run_id()),
+                    session_text.as_str().into(),
+                    first.command_id.to_string().into(),
+                ],
+            )?
+            .get_typed(0)?;
+        let parameters = [
+            sqlite_run_id(storage.run_id()),
+            session_text.as_str().into(),
+            journal.as_str().into(),
+        ];
+        let request = CommandAuthorityRequest::Status {
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        let original = storage.resolve_command_authority(session, first.command_id, &request)?;
+        assert!(matches!(original, CommandAuthorityLookup::Found(_)));
+        for (table, _, columns) in COMMAND_TRANSITION_JOURNAL_INDEXES {
+            let sql = command_transition_journal_query(table, columns, false);
+            let before = command_transition_rows(connection, &sql, &parameters)?;
+            connection.execute("BEGIN")?;
+            let changed = connection.execute_with_params(
+                &format!(
+                    "UPDATE {table} SET journal_sequence = ?3
+                     WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?4"
+                ),
+                &[
+                    parameters[0].clone(),
+                    parameters[1].clone(),
+                    parameters[2].clone(),
+                    second.command_id.to_string().into(),
+                ],
+            )?;
+            let misplaced = command_transition_rows(connection, &sql, &parameters)?;
+            let result = storage.resolve_command_authority(session, first.command_id, &request);
+            connection.execute("ROLLBACK")?;
+            assert!(changed > 0, "the corruption control must move {table} rows");
+            assert_eq!(misplaced.len(), before.len() + changed);
+            assert!(
+                misplaced
+                    .iter()
+                    .any(|row| row[0] == SqliteValue::from(second.command_id.to_string()))
+            );
+            assert!(
+                matches!(result, Err(StorageError::InvalidData { .. })),
+                "indexed journal reconstruction hid another command's {table} rows: {result:?}"
+            );
+            assert_eq!(
+                command_transition_rows(connection, &sql, &parameters)?,
+                before
+            );
+            assert_eq!(
+                storage.resolve_command_authority(session, first.command_id, &request)?,
+                original
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one populated file upgrade proves exact archive preservation, executed index seeks, and cold receipt reconstruction across runs and sessions"
+    )]
+    fn v20_transition_indexes_preserve_v19_recovery_and_exact_journal_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-v20-command-transition-indexes");
+        let path_text = path.to_string_lossy().into_owned();
+        let runs = [RunId::new(0x2019), RunId::new(0x2020)];
+        let sessions = [HostSessionId::new(0x201), HostSessionId::new(0x202)];
+        let mut observed = Vec::new();
+        for (run_index, run_id) in runs.into_iter().enumerate() {
+            let manifest = unattributed_manifest_at(run_id, 20);
+            let mut pipeline = if run_index == 0 {
+                StoragePipeline::create_new_file_for_run(&path_text, manifest)?
+            } else {
+                StoragePipeline::append_run(&path_text, manifest)?
+            };
+            for session in sessions {
+                let journal = pipeline.journal_port(session, StorageJournalOptions::default())?;
+                let mut owner = HostCore::with_journal(
+                    session,
+                    journal_fault_world_with_interval(1),
+                    journal_fault_host_options(),
+                    Box::new(journal),
+                )?;
+                let mut frontend = NullFrontend::new(owner.local_port(), session.get() ^ 0xfeed);
+                let mut clock = 0;
+                let speeds = [[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]][run_index];
+                for (offset, speed) in speeds.into_iter().enumerate() {
+                    let envelope = CommandEnvelope::new(
+                        CommandId::from_client_sequence(session.get(), u64::try_from(offset + 1)?),
+                        HostCommand::SetSpeed(speed),
+                    );
+                    let receipt = apply_host_checkpoint_command(
+                        &mut frontend,
+                        &mut owner,
+                        &envelope,
+                        &mut clock,
+                    );
+                    observed.push((run_id, session, envelope, receipt));
+                }
+            }
+            pipeline.shutdown()?;
+        }
+
+        let connection = Connection::open(&path_text)?;
+        // Only the additive V20 objects are removed. Requiring the complete V19
+        // fingerprint makes this a real upgrade fixture, including retained archives.
+        connection.execute_batch(
+            "DROP INDEX host_command_application_transitions_run_session_journal_index;
+             DROP INDEX host_command_storage_transitions_run_session_journal_index;
+             DELETE FROM _schema_migrations WHERE version = 20;
+             PRAGMA user_version = 19;",
+        )?;
+        let old_schema = read_schema_objects(&connection)?;
+        assert_eq!(
+            old_schema,
+            canonical_schema_objects_at(SCRIPTBOTS_SCHEMA_V19_VERSION)?
+        );
+        assert_eq!(
+            Storage::validate_supported_existing_scriptbots_schema(&connection)?,
+            SCRIPTBOTS_SCHEMA_V19_VERSION
+        );
+        let mut before = BTreeMap::new();
+        for (table, _, _) in COMMAND_TRANSITION_JOURNAL_INDEXES {
+            before.insert(
+                table,
+                command_transition_rows(
+                    &connection,
+                    &format!(
+                        "SELECT * FROM {table}
+                         ORDER BY run_id, host_session_id, command_id, transition_ordinal"
+                    ),
+                    &[],
+                )?,
+            );
+            assert!(
+                !before[table].is_empty(),
+                "upgrade fixture must contain {table}"
+            );
+        }
+        connection.close()?;
+
+        for run_id in runs {
+            let storage = Storage::recover_existing_run(&path_text, run_id)?;
+            let connection = storage.connection()?;
+            Storage::validate_existing_scriptbots_schema(connection)?;
+            let upgraded_schema = read_schema_objects(connection)?;
+            assert_eq!(upgraded_schema, canonical_schema_objects()?);
+            let added: Vec<_> = upgraded_schema
+                .iter()
+                .filter(|object| !old_schema.contains(object))
+                .collect();
+            assert_eq!(added.len(), COMMAND_TRANSITION_JOURNAL_INDEXES.len());
+            assert!(
+                old_schema
+                    .iter()
+                    .all(|object| upgraded_schema.contains(object))
+            );
+            for (table, index, columns) in COMMAND_TRANSITION_JOURNAL_INDEXES {
+                assert!(
+                    added
+                        .iter()
+                        .any(|object| object.name == index && object.object_type == "index")
+                );
+                assert_eq!(
+                    command_transition_rows(
+                        connection,
+                        &format!(
+                            "SELECT * FROM {table}
+                             ORDER BY run_id, host_session_id, command_id, transition_ordinal"
+                        ),
+                        &[],
+                    )?,
+                    before[table],
+                    "index backfill changed retained {table} evidence"
+                );
+                let indexed = command_transition_journal_query(table, columns, false);
+                let scanned = command_transition_journal_query(table, columns, true);
+                for (expected_run, session, envelope, _) in &observed {
+                    if *expected_run != run_id {
+                        continue;
+                    }
+                    let journal: String = connection
+                        .query_row_with_params(
+                            "SELECT journal_sequence FROM host_command_records
+                             WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3",
+                            &[
+                                sqlite_run_id(*expected_run),
+                                encode_journal_u64(session.get()).into(),
+                                envelope.command_id.to_string().into(),
+                            ],
+                        )?
+                        .get_typed(0)?;
+                    let parameters = [
+                        sqlite_run_id(*expected_run),
+                        encode_journal_u64(session.get()).into(),
+                        journal.into(),
+                    ];
+                    let actual = command_transition_rows(connection, &indexed, &parameters)?;
+                    assert_eq!(
+                        actual,
+                        command_transition_rows(connection, &scanned, &parameters)?
+                    );
+                    assert!(!actual.is_empty(), "journal lookup lost {table} rows");
+                    assert!(actual.iter().all(|row| row[0] == SqliteValue::from(envelope.command_id.to_string())));
+                    assert_command_transition_index_seek(connection, index, &indexed, &parameters)?;
+                }
+            }
+            for (expected_run, session, envelope, receipt) in &observed {
+                if *expected_run != run_id {
+                    continue;
+                }
+                let authority = storage.resolve_command_authority(
+                    HostSessionId::new(session.get() + 100),
+                    envelope.command_id,
+                    &CommandAuthorityRequest::Status {
+                        max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+                    },
+                )?;
+                assert!(
+                    matches!(authority, CommandAuthorityLookup::Found(authority) if authority.status() == receipt),
+                    "V19 recovery must retain the exact original command receipt"
+                );
+            }
+            let session_commands: Vec<_> = observed
+                .iter()
+                .filter(|(expected_run, session, _, _)| {
+                    *expected_run == run_id && *session == sessions[0]
+                })
+                .collect();
+            assert_indexed_journal_lookup_rejects_cross_command_rows(
+                &storage,
+                sessions[0],
+                &session_commands[0].2,
+                &session_commands[1].2,
+            )?;
+            storage.close()?;
+        }
         Ok(())
     }
 
@@ -33918,8 +34631,12 @@ mod tests {
                 "partition_genomes_and_narratives_by_island",
             ),
             (
-                SCRIPTBOTS_SCHEMA_VERSION,
+                SCRIPTBOTS_SCHEMA_V19_VERSION,
                 "index_island_narrative_identities",
+            ),
+            (
+                SCRIPTBOTS_SCHEMA_VERSION,
+                "index_command_transitions_by_journal",
             ),
         ]
         .into_iter()
@@ -34987,7 +35704,9 @@ mod tests {
             connection.execute(&format!("DROP TABLE {table}"))?;
         }
         connection.execute_batch(
-            "DROP TABLE host_command_claims;
+            "DROP INDEX host_command_application_transitions_run_session_journal_index;
+             DROP INDEX host_command_storage_transitions_run_session_journal_index;
+             DROP TABLE host_command_claims;
              DELETE FROM _schema_migrations WHERE version >= 13;
              PRAGMA user_version = 12;",
         )?;
@@ -40520,6 +41239,228 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real file-owner journey compares keyed command authority with the prior join and the independently observed runtime receipts"
+    )]
+    fn durable_authority_keyed_lookup_preserves_exact_joined_receipts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("durable-authority-keyed-lookup");
+        let path_text = path.to_string_lossy().into_owned();
+        let session = HostSessionId::new(0xc09f);
+        let (mut pipeline, mut owner, mut frontend) =
+            host_checkpoint_file_owner(&path_text, session, 4244);
+        let run_id = pipeline.run_id();
+        let mut clock = 0;
+        let mut observed = Vec::new();
+        for sequence in 1..=3 {
+            let envelope = CommandEnvelope::new(
+                CommandId::from_client_sequence(session.get(), sequence),
+                HostCommand::Step,
+            );
+            let receipt =
+                apply_host_checkpoint_command(&mut frontend, &mut owner, &envelope, &mut clock);
+            assert_eq!(owner.world_tick(), Tick(sequence));
+            observed.push((envelope, receipt));
+        }
+        drop(frontend);
+        drop(owner);
+        pipeline.shutdown()?;
+
+        let before = journal_database_snapshot(&path_text);
+        let storage = Storage::recover_existing_run(&path_text, run_id)?;
+        let observer = HostSessionId::new(session.get() + 1);
+        let session_text = encode_journal_u64(session.get());
+        for (envelope, receipt) in observed {
+            // Keep the old query only as an oracle over actual persisted commands. The
+            // production lookup must select the same archive and ledger among distinct cuts.
+            let joined = storage.connection()?.query_with_params(
+                "SELECT command.journal_sequence, archive.payload_version,
+                        archive.payload_digest, length(CAST(archive.payload_json AS BLOB)),
+                        ledger.state
+                 FROM host_command_records AS command
+                 LEFT JOIN host_journal_archive AS archive
+                   ON archive.run_id = command.run_id
+                  AND archive.host_session_id = command.host_session_id
+                  AND archive.journal_sequence = command.journal_sequence
+                 LEFT JOIN host_journal_batch_ledger AS ledger
+                   ON ledger.run_id = command.run_id
+                  AND ledger.host_session_id = command.host_session_id
+                  AND ledger.journal_sequence = command.journal_sequence
+                 WHERE command.run_id = ?1 AND command.host_session_id = ?2
+                   AND command.command_id = ?3
+                 LIMIT 2",
+                &[
+                    sqlite_run_id(run_id),
+                    session_text.as_str().into(),
+                    envelope.command_id.to_string().into(),
+                ],
+            )?;
+            assert_eq!(joined.len(), 1);
+            let journal: String = joined[0].get_typed(0)?;
+            let digest: String = joined[0].get_typed(2)?;
+            let payload_bytes = usize::try_from(joined[0].get_typed::<i64>(3)?)?;
+            assert_eq!(
+                joined[0].get_typed::<i64>(1)?,
+                i64::from(HOST_JOURNAL_ARCHIVE_VERSION)
+            );
+            assert_eq!(joined[0].get_typed::<String>(4)?, "durable");
+            let record = load_finished_command_journal_record(
+                storage.connection()?,
+                run_id,
+                session,
+                decode_journal_u64("test.journal_sequence", &journal)?,
+                envelope.command_id,
+                &digest,
+                payload_bytes,
+                HostJournalState::Durable,
+            )?;
+            assert_eq!(record.lifecycle.envelope(), &envelope);
+            assert_eq!(
+                record.lifecycle.admission_sequence(),
+                receipt.admission_sequence()
+            );
+            assert_eq!(
+                record
+                    .lifecycle
+                    .terminal()
+                    .expect("recorded command has a terminal application")
+                    .application(),
+                receipt.application()
+            );
+            let status_request = CommandAuthorityRequest::Status {
+                max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+            };
+            let exact_submit = CommandAuthorityRequest::Submit {
+                envelope_postcard_hex: encode_command_envelope_postcard_hex(
+                    "test.command_envelope",
+                    &envelope,
+                )?,
+                policy: CommandClaimPolicy::ReserveIfAbsent,
+                max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+            };
+            let envelope_digest = *blake3::hash(&postcard::to_allocvec(&envelope)?).as_bytes();
+            for request in [&status_request, &exact_submit] {
+                let authority =
+                    storage.resolve_command_authority(observer, envelope.command_id, request)?;
+                assert!(
+                    matches!(authority, CommandAuthorityLookup::Found(authority)
+                        if authority.status() == &receipt
+                            && authority.envelope_digest() == envelope_digest),
+                    "cold lookup must retain the original owner's exact receipt and envelope"
+                );
+            }
+        }
+        assert_eq!(
+            storage.resolve_command_authority(
+                observer,
+                CommandId::from_client_sequence(session.get(), 4),
+                &CommandAuthorityRequest::Status {
+                    max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+                },
+            )?,
+            CommandAuthorityLookup::Absent
+        );
+        storage.close()?;
+        assert_eq!(journal_database_snapshot(&path_text), before);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_authority_keyed_lookup_preserves_pending_and_corruption_refusals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (storage, session, envelope, receipt) =
+            recovered_durable_authority_fixture("durable-authority-keyed-refusals")?;
+        let request = CommandAuthorityRequest::Status {
+            max_envelope_bytes: MAX_COMMAND_ENVELOPE_BYTES,
+        };
+        let expected = storage.resolve_command_authority(session, envelope.command_id, &request)?;
+        assert!(
+            matches!(&expected, CommandAuthorityLookup::Found(authority) if authority.status() == &receipt)
+        );
+        let connection = storage.connection()?;
+        let session_text = encode_journal_u64(session.get());
+        let journal: String = connection
+            .query_row_with_params(
+                "SELECT journal_sequence FROM host_command_records
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND command_id = ?3",
+                &[
+                    sqlite_run_id(storage.run_id()),
+                    session_text.as_str().into(),
+                    envelope.command_id.to_string().into(),
+                ],
+            )?
+            .get_typed(0)?;
+        let identity = [
+            sqlite_run_id(storage.run_id()),
+            session_text.as_str().into(),
+            journal.as_str().into(),
+        ];
+        for mutation in [
+            "UPDATE host_journal_batch_ledger SET state = 'admitted'
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            "UPDATE host_journal_batch_ledger SET state = 'applied'
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            "UPDATE host_journal_batch_ledger SET state = 'committed_volatile'
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+            "DELETE FROM host_journal_batch_ledger
+             WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+        ] {
+            connection.execute("PRAGMA foreign_keys = OFF")?;
+            connection.execute("BEGIN")?;
+            let changed = connection.execute_with_params(mutation, &identity)?;
+            let actual = storage.resolve_command_authority(session, envelope.command_id, &request);
+            connection.execute("ROLLBACK")?;
+            connection.execute("PRAGMA foreign_keys = ON")?;
+            assert_eq!(changed, 1, "the negative must change its bound ledger");
+            assert_eq!(
+                actual?,
+                CommandAuthorityLookup::Failed(CommandAuthorityLookupFailure::Pending),
+                "an uncommitted or absent ledger must not become absent command authority"
+            );
+            assert_eq!(
+                storage.resolve_command_authority(session, envelope.command_id, &request)?,
+                expected
+            );
+        }
+        for (mutation, context) in [
+            (
+                "UPDATE host_journal_archive SET payload_version = payload_version + 1
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                "host_command_claims.archive_binding",
+            ),
+            (
+                "UPDATE host_journal_archive
+                 SET payload_digest = '0000000000000000000000000000000000000000000000000000000000000000'
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                "host_journal_archive.payload_digest",
+            ),
+            (
+                "UPDATE host_journal_archive SET payload_json = '{}'
+                 WHERE run_id = ?1 AND host_session_id = ?2 AND journal_sequence = ?3",
+                "host_journal_archive.payload_digest",
+            ),
+        ] {
+            connection.execute("BEGIN")?;
+            let changed = connection.execute_with_params(mutation, &identity)?;
+            let actual = storage.resolve_command_authority(session, envelope.command_id, &request);
+            connection.execute("ROLLBACK")?;
+            assert_eq!(changed, 1, "the negative must change its bound archive");
+            assert!(
+                matches!(actual, Err(StorageError::InvalidData { context: found, .. }) if found == context),
+                "archive corruption must retain its typed refusal at {context}"
+            );
+            assert_eq!(
+                storage.resolve_command_authority(session, envelope.command_id, &request)?,
+                expected,
+                "rollback must recover the exact original authority"
+            );
+        }
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
     fn retained_command_receipt_bypasses_unrelated_durable_lookup()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp_db_path("retained-command-during-authority-lookup");
@@ -43514,6 +44455,141 @@ mod tests {
             commit_state: FailureCommitState::RolledBack,
         };
         assert!(!should_retry_transaction(&permanent, 1));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker journey binds paused admission, exact science commitment, file readback, and shutdown"
+    )]
+    fn paired_host_persistence_waits_nonblocking_for_the_single_journal_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_runtime::HostBlocker;
+
+        for file_backed in [false, true] {
+            let path = temp_db_path("storage-host-receipt-boundary");
+            let path_string = path.to_string_lossy().to_string();
+            let mut pipeline = if file_backed {
+                StoragePipeline::create_unattributed_file(&path_string)?
+            } else {
+                StoragePipeline::unattributed_memory_with_thresholds(1, 1, 1, 1)?
+            };
+            let session_id = HostSessionId::new(0x5107);
+            let journal = pipeline.journal_port(session_id, StorageJournalOptions::default())?;
+            pipeline.set_deadlines(StorageDeadlines {
+                admission_ack: Duration::from_millis(10),
+                ..StorageDeadlines::default()
+            })?;
+            let (world, persistence) = WorldState::with_persistence(
+                ScriptBotsConfig {
+                    world_width: 64,
+                    world_height: 64,
+                    food_cell_size: 16,
+                    rng_seed: Some(0x5107),
+                    closed: true,
+                    population_minimum: 0,
+                    population_spawn_interval: 0,
+                    persistence_interval: 1,
+                    narrative_interval: 0,
+                    chart_flush_interval: 0,
+                    ..ScriptBotsConfig::default()
+                },
+                Box::new(pipeline.sink()),
+            )?;
+            let mut core = HostCore::with_journal_and_persistence(
+                session_id,
+                world,
+                HostCoreOptions {
+                    initial_playback: PlaybackSnapshot {
+                        paused: false,
+                        speed_multiplier: 1.0,
+                    },
+                    tick_period_nanos: 1,
+                    max_automatic_steps_per_drive: 1,
+                    ..HostCoreOptions::default()
+                },
+                Box::new(journal),
+                persistence,
+            )?;
+            let mut frontend = NullFrontend::new(core.local_port(), 0x5108);
+            frontend.drive_at(&mut core, ManualInstant::from_nanos(0))?;
+            let pause = pipeline.pause_worker_for_test()?;
+            let first = frontend.drive_at(&mut core, ManualInstant::from_nanos(1))?;
+            assert_eq!(first.scientific_steps, 1);
+            assert!(matches!(
+                first.blocker,
+                Some(HostBlocker::PersistencePending { tick: Tick(1), .. })
+            ));
+            assert_eq!(
+                pipeline.sink.tx.len(),
+                1,
+                "the paused worker must receive only JournalAdmit, with no duplicate Persist"
+            );
+            assert!(
+                pipeline.sink.inflight_bytes() > 0,
+                "the exact scientific reservation must remain charged until receipt polling"
+            );
+            assert_eq!(
+                pipeline.analytics_provider().snapshot().committed_tick,
+                None
+            );
+            assert_eq!(
+                core.with_world(WorldState::persistence_boundary_status),
+                scriptbots_core::PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+            );
+            assert!(core.capture_host_checkpoint_v1().is_err());
+            for _ in 0..3 {
+                let waiting = frontend.drive_at(&mut core, ManualInstant::from_nanos(1))?;
+                assert_eq!(waiting.scientific_steps, 0);
+                assert_eq!(waiting.blocker, first.blocker);
+            }
+            pause.release();
+            let flush = pipeline.flush_and_wait()?;
+            assert!(
+                pipeline.sink.inflight_bytes() > 0,
+                "worker commitment alone cannot release an unobserved core reservation"
+            );
+            for attempt in 0..JOURNAL_WORKER_RETRY_LIMIT {
+                let observed = frontend.drive_at(&mut core, ManualInstant::from_nanos(1))?;
+                assert_eq!(observed.scientific_steps, 0);
+                if observed.blocker.is_none() {
+                    break;
+                }
+                assert!(
+                    attempt + 1 < JOURNAL_WORKER_RETRY_LIMIT,
+                    "real journal did not settle its retained scientific batch"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                core.with_world(WorldState::persistence_boundary_status),
+                scriptbots_core::PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
+            );
+            assert_eq!(pipeline.sink.inflight_bytes(), 0);
+            assert_eq!(pipeline.sink.inflight_narrative_bytes(), 0);
+            assert_eq!(flush.committed_tick, Some(1));
+            let batch_id = flush
+                .watermarks
+                .admitted
+                .expect("one admitted science batch");
+            assert_eq!(batch_id.get(), 1);
+            assert_eq!(flush.watermarks.applied, Some(batch_id));
+            if file_backed {
+                assert_eq!(flush.guarantee, PersistenceGuarantee::Durable);
+                assert_eq!(flush.watermarks.durable, Some(batch_id));
+                let reader = StorageReader::open(&path_string)?;
+                assert_eq!(reader.run_ledger_summary()?.tick_count, 1);
+                assert_eq!(reader.persistence_watermarks()?, flush.watermarks);
+                reader.close()?;
+            } else {
+                assert_eq!(flush.guarantee, PersistenceGuarantee::CommittedVolatile);
+                assert_eq!(flush.watermarks.durable, None);
+            }
+            drop(core);
+            let shutdown = pipeline.shutdown()?;
+            assert_eq!(shutdown.watermarks, flush.watermarks);
+        }
+        Ok(())
     }
 
     #[test]

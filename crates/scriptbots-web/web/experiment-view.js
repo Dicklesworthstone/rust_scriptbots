@@ -1,4 +1,4 @@
-import { EXPERIMENT_ENDPOINT_METRICS } from "./experiment-protocol.js";
+import { EXPERIMENT_ENDPOINT_METRICS, experimentRunArtifactPath } from "./experiment-protocol.js";
 
 const MAX_SEED = 18446744073709551615n;
 
@@ -218,11 +218,31 @@ export function renderExperimentLab(panel, controller) {
     ["catalog-next", controller.canOperate && !!page?.has_more], ["launch", controller.canLaunch],
     ["retry", controller.canRetry], ["refresh", controller.canOperate && !!selected],
     ["cancel", controller.canCancel], ["resume", controller.canResume], ["compare", controller.canCompare],
+    ["retry-failed", controller.canRetryFailed],
+    ["artifact-run", controller.canOperate && controller.completedRuns.length > 0],
+    ["artifacts-load", controller.canReadArtifacts], ["artifact-select", controller.canDownloadBundle],
+    ["artifact-download", controller.canDownloadArtifact], ["bundle-download", controller.canDownloadBundle],
     ["run-previous", !!selected && controller.runPageIndex > 0],
     ["run-next", !!selected && controller.runPageIndex + 1 < controller.totalRunPages],
     ["export", !!selected || !!controller.comparison],
   ]) disable(panel, id, !allowed);
   renderRuns(panel, controller);
+  choices(panel.querySelector("#experiment-artifact-run"), controller.completedRuns.length
+    ? controller.completedRuns.map((run) => [run.run_id, run.variant_id + " · seed " + run.seed])
+    : [["", "No completed runs observed"]], controller.artifactRunId || "");
+  const inventory = controller.runArtifacts;
+  choices(panel.querySelector("#experiment-artifact-select"), inventory
+    ? inventory.artifacts.map((artifact) => [artifact.artifact_id,
+      experimentRunArtifactPath(artifact, inventory) + " · " + artifact.byte_size + " bytes"])
+    : [["", "Load a completed run's files"]], controller.selectedArtifact?.artifact_id || "");
+  setText(panel, "artifact-summary", inventory
+    ? inventory.artifacts.length + " verified host files · " + inventory.total_bytes + " bytes · plan "
+      + inventory.plan_digest + " · endpoint digest " + inventory.run.final_digest + "."
+    : "Choose a completed run and load its files. Other runs may still be running or failed.");
+  const artifact = controller.selectedArtifact;
+  setText(panel, "artifact-detail", artifact
+    ? experimentRunArtifactPath(artifact, inventory) + " · SHA-256 " + artifact.checksum_sha256
+      + " · BLAKE3 " + artifact.checksum_blake3 + "." : "");
   const cohorts = new Map();
   for (const run of selected?.runs || []) {
     const prior = cohorts.get(run.variant_id);

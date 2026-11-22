@@ -295,6 +295,15 @@ pub struct CommandStatusDto {
     pub scientific_revision: u64,
 }
 
+/// Retry authority for exactly the observed failed experiment generation.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentRetryFailedRequest {
+    /// Generation from the last observed experiment status. A repeated request
+    /// cannot authorize another attempt after the status has advanced.
+    pub expected_generation: u64,
+}
+
 /// Request payload for setting simulation speed multiplier.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SpeedRequest {
@@ -633,6 +642,35 @@ pub struct ExperimentRunRecordDto {
     pub bundle_path: Option<String>,
     pub error_reason: Option<String>,
 }
+
+/// Complete, bounded file inventory for one source-verified completed run.
+///
+/// The status generation identifies the observation, not a mutable page cursor.
+/// Companion runs may still be running or have failed; only this run's exact
+/// plan, final owner and bundle are verified before exposing downloadable files.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ExperimentRunArtifactsDto {
+    pub experiment_id: String,
+    pub plan_digest: String,
+    pub status_generation: u64,
+    pub run: ExperimentRunRecordDto,
+    /// Manifest and all indexed files, with at most 33 entries and no pagination.
+    pub artifacts: Vec<ArtifactMetadataDto>,
+    /// Exact sum of every listed file, including the bundle manifest.
+    pub total_bytes: u64,
+}
+
+/// Maximum encoded inventory size shared by REST, MCP and remote clients.
+pub const MAX_EXPERIMENT_RUN_ARTIFACTS_RESPONSE_BYTES: usize = 256 * 1024;
+/// Complete inventory cardinality, including the bundle manifest.
+pub const MAX_EXPERIMENT_RUN_ARTIFACTS: usize = crate::experiment_runner::MAX_BUNDLE_ARTIFACTS + 1;
+/// Maximum bytes of any one downloadable experiment file.
+pub const MAX_EXPERIMENT_RUN_ARTIFACT_BYTES: u64 =
+    crate::experiment_runner::MAX_BUNDLE_ARTIFACT_BYTES;
+/// Maximum sum of all inventory files, including the separately bounded manifest.
+pub const MAX_EXPERIMENT_RUN_TOTAL_ARTIFACT_BYTES: u64 =
+    crate::experiment_runner::MAX_BUNDLE_TOTAL_ARTIFACT_BYTES
+        + crate::experiment_runner::MAX_STATUS_BYTES;
 
 /// Complete batch status report for an experiment.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -3934,19 +3972,39 @@ impl DataServices {
         status: &crate::experiment_runner::ExperimentBatchStatus,
         root: &Path,
     ) -> Result<(), ControlError> {
+        self.publish_experiment_artifact_records(
+            &status.experiment_id,
+            status
+                .runs
+                .iter()
+                .filter(|run| run.state == crate::experiment_runner::RunState::Completed),
+            root,
+        )
+        .map(|_| ())
+    }
+
+    /// Publish a selected, semantically verified run or the completed batch slice.
+    /// Keep catalog identities immutable and expose no files from a failed slice.
+    fn publish_experiment_artifact_records<'a>(
+        &self,
+        experiment_id: &str,
+        runs: impl IntoIterator<Item = &'a crate::experiment_runner::RunRecord>,
+        root: &Path,
+    ) -> Result<Vec<ArtifactMetadataDto>, ControlError> {
         use crate::experiment_runner::{
             MAX_BUNDLE_ARTIFACT_BYTES, MAX_BUNDLE_ARTIFACTS, MAX_BUNDLE_TOTAL_ARTIFACT_BYTES,
             MAX_STATUS_BYTES, MatchedSeedExperimentRunner, RunState,
         };
         let manifest_limit = usize::try_from(MAX_STATUS_BYTES).expect("manifest limit fits usize");
         let mut staged = BTreeMap::new();
-        for run in status
-            .runs
-            .iter()
-            .filter(|run| run.state == RunState::Completed)
-        {
+        for run in runs {
+            if run.state != RunState::Completed {
+                return Err(ControlError::Conflict(
+                    "only completed experiment runs publish artifacts".to_owned(),
+                ));
+            }
             let relative_bundle = PathBuf::from("experiments")
-                .join(&status.experiment_id)
+                .join(experiment_id)
                 .join(&run.run_id);
             let bundle_dir = root.join(&relative_bundle);
             scriptbots_storage::bundle::verify_run_bundle_bounded(
@@ -3965,7 +4023,7 @@ impl DataServices {
                 serde_json::from_slice(&manifest_bytes)
                     .map_err(|error| ControlError::Serialization(error.to_string()))?;
             if bundle.manifest.run_id != MatchedSeedExperimentRunner::bundle_run_id(&run.run_id)
-                || bundle.manifest.experiment_id.as_deref() != Some(status.experiment_id.as_str())
+                || bundle.manifest.experiment_id.as_deref() != Some(experiment_id)
                 || bundle.manifest.variant_id.as_deref() != Some(run.variant_id.as_str())
                 || bundle.manifest.root_seed != run.seed
                 || bundle.digests.max_tick != run.total_ticks
@@ -4080,10 +4138,10 @@ impl DataServices {
                 ));
             }
         }
-        for (id, observed) in staged {
-            catalog.entry(id).or_insert(observed);
-        }
-        Ok(())
+        Ok(staged
+            .into_iter()
+            .map(|(id, observed)| catalog.entry(id).or_insert(observed).metadata.clone())
+            .collect())
     }
 
     fn reserve_experiment_execution(
@@ -4365,6 +4423,8 @@ impl ControlHandle {
                 "config_patching".into(),
                 "experiments_batch".into(),
                 "experiment_comparisons".into(),
+                "experiment_run_artifacts".into(),
+                "experiment_failed_run_retry".into(),
                 "checkpoints_v1".into(),
                 "checkpoint_branch_catalog_v1".into(),
                 "artifacts_storage".into(),
@@ -4395,8 +4455,10 @@ impl ControlHandle {
                 "/api/v1/experiments".into(),
                 "/api/v1/experiments/{experiment_id}".into(),
                 "/api/v1/experiments/{experiment_id}/compare".into(),
+                "/api/v1/experiments/{experiment_id}/runs/{run_id}/artifacts".into(),
                 "/api/v1/experiments/{experiment_id}/cancel".into(),
                 "/api/v1/experiments/{experiment_id}/resume".into(),
+                "/api/v1/experiments/{experiment_id}/retry-failed".into(),
                 "/api/v1/checkpoints".into(),
                 "/api/v1/checkpoints/{checkpoint_id}".into(),
                 "/api/v1/checkpoints/branches".into(),
@@ -4432,8 +4494,10 @@ impl ControlHandle {
                 "experiment_list".into(),
                 "experiment_status".into(),
                 "experiment_compare".into(),
+                "experiment_run_artifacts".into(),
                 "experiment_cancel".into(),
                 "experiment_resume".into(),
+                "experiment_retry_failed".into(),
                 "checkpoint_create".into(),
                 "checkpoint_list".into(),
                 "checkpoint_status".into(),
@@ -4450,8 +4514,10 @@ impl ControlHandle {
                 "ExperimentBatchStatusDto".into(),
                 "ExperimentSummaryDto".into(),
                 "ExperimentComparisonDto".into(),
+                "ExperimentRunArtifactsDto".into(),
                 "ExperimentComparisonRequest".into(),
                 "ExperimentCreateRequest".into(),
+                "ExperimentRetryFailedRequest".into(),
                 "ExperimentVariantDto".into(),
                 "ScenarioInterventionV1".into(),
                 "CheckpointCreateRequest".into(),
@@ -4718,6 +4784,125 @@ impl ControlHandle {
         job.status_dto(true)
     }
 
+    /// Inspect the exact downloadable files of one completed experiment run.
+    ///
+    /// A single plan-validated status binds the response. Verification reads only
+    /// the selected run, so a running or corrupt companion cannot hide healthy
+    /// results. No status, checkpoint or live world is changed by this operation.
+    pub fn get_experiment_run_artifacts(
+        &self,
+        experiment_id: &str,
+        run_id: &str,
+    ) -> Result<ExperimentRunArtifactsDto, ControlError> {
+        use crate::experiment_runner::{
+            MAX_RUN_COMPONENT_BYTES, RunState, validate_path_component,
+        };
+        for (label, value) in [("experiment_id", experiment_id), ("run_id", run_id)] {
+            if value.len() > MAX_RUN_COMPONENT_BYTES {
+                return Err(ControlError::BadRequest(format!(
+                    "{label} exceeds the {MAX_RUN_COMPONENT_BYTES}-byte experiment identity bound"
+                )));
+            }
+            validate_path_component(label, value)
+                .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        }
+        self.data_services.recover_experiment(experiment_id)?;
+        let (runner, state_file, root) = {
+            let jobs = self
+                .data_services
+                .experiments
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            let job = jobs.get(experiment_id).ok_or_else(|| {
+                ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
+            })?;
+            (
+                Arc::clone(&job.runner),
+                job.state_file.clone(),
+                job.artifact_root.clone(),
+            )
+        };
+        let status = runner
+            .status_snapshot(&state_file)
+            .map_err(|error| experiment_catalog_error(&state_file, error))?;
+        let record = status
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .ok_or_else(|| {
+                ControlError::NotFound(format!(
+                    "run '{run_id}' is not in experiment '{experiment_id}'"
+                ))
+            })?;
+        if record.state != RunState::Completed {
+            return Err(ControlError::Conflict(format!(
+                "run '{run_id}' is {:?}; downloadable results require a completed run",
+                record.state
+            )));
+        }
+        runner
+            .verify_completed_run(&state_file, &status, run_id)
+            .map_err(|error| experiment_catalog_error(&state_file, error))?;
+        // Read the observation cache only: recovering a companion checkpoint is
+        // unrelated to this run's independently verified final bundle.
+        let mut progress = runner
+            .checkpoint_progress_snapshot(&state_file, &status, true)
+            .map_err(|error| experiment_catalog_error(&state_file, error))?;
+        let artifacts = self.data_services.publish_experiment_artifact_records(
+            experiment_id,
+            std::iter::once(record),
+            &root,
+        )?;
+        let total_bytes = artifacts
+            .iter()
+            .try_fold(0_u64, |total, artifact| {
+                total.checked_add(artifact.byte_size)
+            })
+            .filter(|total| *total <= MAX_EXPERIMENT_RUN_TOTAL_ARTIFACT_BYTES)
+            .ok_or_else(|| {
+                ControlError::PayloadTooLarge(
+                    "completed run inventory exceeds its aggregate byte bound".to_owned(),
+                )
+            })?;
+        if artifacts.len() > MAX_EXPERIMENT_RUN_ARTIFACTS {
+            return Err(ControlError::PayloadTooLarge(
+                "completed run inventory exceeds its artifact count bound".to_owned(),
+            ));
+        }
+        let result = ExperimentRunArtifactsDto {
+            experiment_id: status.experiment_id.clone(),
+            plan_digest: status.plan_digest.clone(),
+            status_generation: status.generation,
+            run: ExperimentRunRecordDto {
+                run_id: record.run_id.clone(),
+                variant_id: record.variant_id.clone(),
+                brain_family: record.brain_family.clone(),
+                seed: record.seed,
+                state: "completed".to_owned(),
+                total_ticks: record.total_ticks,
+                target_ticks: runner.max_ticks,
+                checkpoint_progress: progress
+                    .remove(run_id)
+                    .expect("progress covers every validated run"),
+                final_digest: record.final_digest.clone(),
+                bundle_path: record.bundle_path.clone(),
+                error_reason: None,
+            },
+            artifacts,
+            total_bytes,
+        };
+        if serde_json::to_vec_pretty(&result)
+            .map_err(ControlError::serialization)?
+            .len()
+            > MAX_EXPERIMENT_RUN_ARTIFACTS_RESPONSE_BYTES
+        {
+            return Err(ControlError::PayloadTooLarge(
+                "completed run inventory exceeds its encoded response bound".to_owned(),
+            ));
+        }
+        Ok(result)
+    }
+
     /// Compare one declared endpoint across two complete, distinct variant cohorts.
     ///
     /// Bundle restoration and the canonical Lab statistics run on the caller's
@@ -4927,6 +5112,24 @@ impl ControlHandle {
         &self,
         experiment_id: &str,
     ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        self.start_retained_experiment(experiment_id, None)
+    }
+
+    /// Explicitly retry failed runs from verified continuations, retaining their
+    /// original failure evidence. Completed runs are never executed again.
+    pub fn retry_failed_experiment(
+        &self,
+        experiment_id: &str,
+        expected_generation: u64,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
+        self.start_retained_experiment(experiment_id, Some(expected_generation))
+    }
+
+    fn start_retained_experiment(
+        &self,
+        experiment_id: &str,
+        retry_generation: Option<u64>,
+    ) -> Result<ExperimentBatchStatusDto, ControlError> {
         self.data_services.recover_experiment(experiment_id)?;
         let mut lock = self
             .data_services
@@ -4937,6 +5140,15 @@ impl ControlHandle {
             ControlError::NotFound(format!("experiment '{experiment_id}' not found"))
         })?;
         let current = job.status_dto(false)?;
+        let retry_failed = retry_generation.is_some();
+        if let Some(expected) = retry_generation
+            && current.generation != expected
+        {
+            return Err(ControlError::Conflict(format!(
+                "experiment '{experiment_id}' generation changed: expected {expected}, observed {}; refresh status before retrying failed runs",
+                current.generation
+            )));
+        }
         match current.status.as_str() {
             "running" | "pending" => {
                 return Err(ControlError::Conflict(format!(
@@ -4950,7 +5162,12 @@ impl ControlHandle {
             }
             _ => {}
         }
-        if current.completed_runs + current.failed_runs == current.total_runs {
+        if retry_failed && current.failed_runs == 0 {
+            return Err(ControlError::Conflict(format!(
+                "experiment '{experiment_id}' has no failed runs to retry"
+            )));
+        }
+        if !retry_failed && current.completed_runs + current.failed_runs == current.total_runs {
             return Err(ControlError::Conflict(format!(
                 "experiment '{experiment_id}' has no pending runs to resume (status {})",
                 current.status
@@ -4962,7 +5179,10 @@ impl ControlHandle {
         let run_slots = current
             .runs
             .iter()
-            .filter(|run| matches!(run.state.as_str(), "pending" | "running"))
+            .filter(|run| {
+                matches!(run.state.as_str(), "pending" | "running")
+                    || (retry_failed && run.state == "failed")
+            })
             .count()
             .min(job.runner.max_concurrency);
         let grid_cells = job
@@ -4978,6 +5198,19 @@ impl ControlHandle {
             run_slots,
             grid_cells,
         )?;
+        if let Some(expected_generation) = retry_generation {
+            // Reserve the whole execution wave before changing retained status.
+            // A refusal must leave both failure evidence and continuation cuts
+            // intact; the reservation drops if validation or publication fails.
+            job.runner
+                .retry_failed_runs(&job.state_file, expected_generation)
+                .map_err(|error| match error {
+                    error @ crate::experiment_runner::ExperimentRunnerError::StaleStatusGeneration { .. } => {
+                        ControlError::Conflict(error.to_string())
+                    }
+                    error => experiment_catalog_error(&job.state_file, error),
+                })?;
+        }
         job.cancel
             .store(false, std::sync::atomic::Ordering::Release);
         if let Ok(mut error) = job.last_error.lock() {
@@ -6007,9 +6240,11 @@ impl ControlHandle {
                 "checkpoint discovery directory budget exceeded".into(),
             ));
         }
-        if retention.requests.values().any(|request| {
-            !request.acknowledged && request.metadata.checkpoint_id == checkpoint_id
-        }) {
+        if retention
+            .requests
+            .values()
+            .any(|request| !request.acknowledged && request.metadata.checkpoint_id == checkpoint_id)
+        {
             return Err(ControlError::NotFound(
                 "checkpoint completion is pending; retry its original capture request".into(),
             ));
@@ -6161,8 +6396,8 @@ impl ControlHandle {
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         continuity: Option<&scriptbots_core::WorldHostCheckpointV1>,
     ) -> Result<(WorldState, Option<crate::BrainPreset>), ControlError> {
-        let registry = crate::brains::create_brain_registry_for_checkpoint(checkpoint)
-            .map_err(|error| {
+        let registry =
+            crate::brains::create_brain_registry_for_checkpoint(checkpoint).map_err(|error| {
                 ControlError::BadRequest(format!(
                     "checkpoint registry does not match the compiled application adapters: {error}"
                 ))
@@ -8785,6 +9020,230 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn experiment_run_artifacts_download_complete_portable_results_despite_broken_peer() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let runner = comparison_catalog_runner(root.path(), "run-download", vec![7], 0.0);
+        let status_path = runner.output_dir.join("status.json");
+        let completed = runner.execute_batch(&status_path).unwrap();
+        let run = &completed.runs[0];
+        let peer = &completed.runs[1];
+        let peer_path = Path::new(peer.bundle_path.as_ref().unwrap()).join("exports/summary.csv");
+        let peer_before = fs::read(&peer_path).unwrap();
+        fs::write(&peer_path, b"broken companion endpoint\n").unwrap();
+        let status_before = fs::read(&status_path).unwrap();
+        let live_before = host.port.scientific_digest_v1().unwrap();
+
+        // Recover directly from the durable catalog; no global artifact scan or
+        // successful prior status/download request is needed.
+        let inventory = handle
+            .get_experiment_run_artifacts("run-download", &run.run_id)
+            .unwrap();
+        assert_eq!(inventory.experiment_id, completed.experiment_id);
+        assert_eq!(inventory.plan_digest, completed.plan_digest);
+        assert_eq!(inventory.status_generation, completed.generation);
+        assert_eq!(inventory.run.run_id, run.run_id);
+        assert_eq!(inventory.run.variant_id, run.variant_id);
+        assert_eq!(inventory.run.seed, run.seed);
+        assert_eq!(inventory.run.final_digest, run.final_digest);
+        assert_eq!(inventory.run.state, "completed");
+        assert_eq!(inventory.run.total_ticks, runner.max_ticks);
+        assert_eq!(inventory.artifacts.len(), 4);
+        assert_eq!(
+            inventory.total_bytes,
+            inventory
+                .artifacts
+                .iter()
+                .map(|file| file.byte_size)
+                .sum::<u64>()
+        );
+        let portable = tempfile::tempdir().unwrap();
+        let prefix = format!("experiments/run-download/{}/", run.run_id);
+        for artifact in &inventory.artifacts {
+            let relative = artifact.relative_path.strip_prefix(&prefix).unwrap();
+            let (metadata, bytes) = handle.read_artifact_bytes(&artifact.artifact_id).unwrap();
+            assert_eq!(&metadata, artifact);
+            assert_eq!(compute_blake3(&bytes), artifact.checksum_blake3);
+            assert_eq!(compute_sha256(&bytes), artifact.checksum_sha256);
+            let output = portable.path().join(relative);
+            fs::create_dir_all(output.parent().unwrap()).unwrap();
+            fs::write(output, bytes).unwrap();
+        }
+        let verified = crate::experiment_runner::verify_portable_run_bundle(portable.path())
+            .unwrap()
+            .final_state
+            .unwrap();
+        assert_eq!(verified.run_id, run.run_id);
+        assert_eq!(Some(verified.scientific_digest), run.final_digest);
+        assert!(
+            handle
+                .get_experiment_run_artifacts("run-download", &peer.run_id)
+                .is_err()
+        );
+
+        // A cold catalog and a retargeted active root both preserve the selected
+        // bundle's source identity; an unrelated corrupt peer still cannot block it.
+        handle.data_services.artifacts.lock().unwrap().clear();
+        handle.data_services.experiments.lock().unwrap().clear();
+        let recovered = handle
+            .get_experiment_run_artifacts("run-download", &run.run_id)
+            .unwrap();
+        assert_eq!(recovered.artifacts, inventory.artifacts);
+        let second_root = tempfile::tempdir().unwrap();
+        let handle = handle
+            .with_artifacts_dir(second_root.path().to_path_buf())
+            .unwrap();
+        let retained = handle
+            .get_experiment_run_artifacts("run-download", &run.run_id)
+            .unwrap();
+        assert_eq!(retained.artifacts, inventory.artifacts);
+        assert_eq!(fs::read(&status_path).unwrap(), status_before);
+        assert_ne!(fs::read(&peer_path).unwrap(), peer_before);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_before);
+    }
+
+    #[test]
+    fn experiment_run_artifacts_are_immutable_as_unfinished_companions_complete() {
+        use crate::experiment_runner::RunState;
+        let root = tempfile::tempdir().unwrap();
+        let (handle, host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let runner = comparison_catalog_runner(root.path(), "partial-download", vec![7], 0.0);
+        let path = runner.output_dir.join("status.json");
+        let mut status = runner.load_or_create_status(&path).unwrap();
+        let first_id = status.runs[0].run_id.clone();
+        let second_id = status.runs[1].run_id.clone();
+        assert!(matches!(
+            handle.get_experiment_run_artifacts("partial-download", &first_id),
+            Err(ControlError::Conflict(_))
+        ));
+        status.runs[0].state = RunState::Running;
+        runner.save_status(&path, &mut status).unwrap();
+        status.runs[0] = runner.execute_single_run(&runner.variants[0], 7).unwrap();
+        status.completed_runs = 1;
+        runner.save_status(&path, &mut status).unwrap();
+        let live = host.port.scientific_digest_v1().unwrap();
+        let first = handle
+            .get_experiment_run_artifacts("partial-download", &first_id)
+            .unwrap();
+        assert_eq!(first.status_generation, status.generation);
+        assert!(matches!(
+            handle.get_experiment_run_artifacts("partial-download", &second_id),
+            Err(ControlError::Conflict(_))
+        ));
+
+        // A running peer has no saved checkpoint at all. Inventory discovery
+        // must not attempt to recover or verify that unrelated owner.
+        status.runs[1].state = RunState::Running;
+        runner.save_status(&path, &mut status).unwrap();
+        let running = handle
+            .get_experiment_run_artifacts("partial-download", &first_id)
+            .unwrap();
+        assert_eq!(running.artifacts, first.artifacts);
+        assert!(matches!(
+            handle.get_experiment_run_artifacts("partial-download", &second_id),
+            Err(ControlError::Conflict(_))
+        ));
+        status.runs[1] = runner.execute_single_run(&runner.variants[1], 7).unwrap();
+        status.completed_runs = 2;
+        runner.save_status(&path, &mut status).unwrap();
+        let saved_status = fs::read(&path).unwrap();
+        let finished = handle
+            .get_experiment_run_artifacts("partial-download", &first_id)
+            .unwrap();
+        assert!(finished.status_generation > first.status_generation);
+        assert_eq!(finished.artifacts, first.artifacts);
+        assert_eq!(finished.total_bytes, first.total_bytes);
+        assert_eq!(finished.run.final_digest, first.run.final_digest);
+        assert_eq!(fs::read(&path).unwrap(), saved_status);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+    }
+
+    #[test]
+    fn experiment_run_artifacts_refuse_foreign_ids_and_self_consistent_owner_substitution() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let runner = comparison_catalog_runner(root.path(), "identity-download", vec![7], 0.0);
+        let path = runner.output_dir.join("status.json");
+        let completed = runner.execute_batch(&path).unwrap();
+        let run = &completed.runs[0];
+        for invalid in ["", "../outside", &"x".repeat(129)] {
+            assert!(matches!(
+                handle.get_experiment_run_artifacts("identity-download", invalid),
+                Err(ControlError::BadRequest(_))
+            ));
+            assert!(matches!(
+                handle.get_experiment_run_artifacts(invalid, &run.run_id),
+                Err(ControlError::BadRequest(_))
+            ));
+        }
+        for (experiment_id, run_id) in [
+            ("missing", run.run_id.as_str()),
+            ("identity-download", "another-batch-baseline-seed7"),
+        ] {
+            assert!(matches!(
+                handle.get_experiment_run_artifacts(experiment_id, run_id),
+                Err(ControlError::NotFound(_))
+            ));
+        }
+        let good = handle
+            .get_experiment_run_artifacts("identity-download", &run.run_id)
+            .unwrap();
+        let directory = Path::new(run.bundle_path.as_ref().unwrap());
+        let manifest_path = directory.join("bundle_manifest.json");
+        let manifest_before = fs::read(&manifest_path).unwrap();
+        let checkpoint_path = directory.join("checkpoints/final.checkpoint");
+        let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+        let foreign = fs::read(
+            Path::new(completed.runs[1].bundle_path.as_ref().unwrap())
+                .join("checkpoints/final.checkpoint"),
+        )
+        .unwrap();
+        let mut bundle: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&manifest_before).unwrap();
+        let entry = bundle
+            .artifacts
+            .iter_mut()
+            .find(|entry| entry.relative_path == "checkpoints/final.checkpoint")
+            .unwrap();
+        entry.bytes_len = foreign.len() as u64;
+        entry.blake3_hex = compute_blake3(&foreign);
+        fs::write(&checkpoint_path, foreign).unwrap();
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&bundle).unwrap()).unwrap();
+        // Byte integrity alone now succeeds, but the restored owner belongs to
+        // another arm and cannot authorize a download inventory for this run.
+        scriptbots_storage::bundle::verify_run_bundle_bounded(
+            directory,
+            scriptbots_storage::bundle::RunBundleVerificationLimits {
+                max_manifest_bytes: crate::experiment_runner::MAX_STATUS_BYTES,
+                max_artifacts: crate::experiment_runner::MAX_BUNDLE_ARTIFACTS,
+                max_artifact_bytes: crate::experiment_runner::MAX_BUNDLE_ARTIFACT_BYTES,
+                max_total_artifact_bytes: crate::experiment_runner::MAX_BUNDLE_TOTAL_ARTIFACT_BYTES,
+            },
+        )
+        .unwrap();
+        assert!(
+            handle
+                .get_experiment_run_artifacts("identity-download", &run.run_id)
+                .is_err()
+        );
+        fs::write(&checkpoint_path, checkpoint_before).unwrap();
+        fs::write(&manifest_path, manifest_before).unwrap();
+        let restored = handle
+            .get_experiment_run_artifacts("identity-download", &run.run_id)
+            .unwrap();
+        assert_eq!(restored.artifacts, good.artifacts);
+    }
+
+    #[test]
     fn experiment_comparison_uses_verified_matched_endpoints_without_advancing_live_science() {
         let root = tempfile::tempdir().unwrap();
         let (handle, host) = handle();
@@ -9263,6 +9722,183 @@ pub(crate) mod tests {
             services.reserve_experiment_execution("new", 1, 1),
             Err(ControlError::ExperimentShuttingDown)
         ));
+    }
+
+    pub(crate) fn failed_retry_catalog_fixture(
+        handle: ControlHandle,
+        root: &std::path::Path,
+        experiment_id: &str,
+    ) -> (
+        ControlHandle,
+        crate::experiment_runner::ExperimentBatchStatus,
+        [crate::experiment_runner::RunRecord; 2],
+    ) {
+        use crate::experiment_runner::{
+            MatchedSeedCohort, MatchedSeedExperimentRunner, RunState, ScenarioVariant,
+        };
+        use std::sync::atomic::AtomicBool;
+
+        // Match production's canonical source root, including /var aliases on macOS.
+        let root = root.canonicalize().unwrap();
+        let handle = handle.with_artifacts_dir(root.clone()).unwrap();
+        let directory = root.join("experiments").join(experiment_id);
+        let runner = Arc::new(MatchedSeedExperimentRunner::new(
+            experiment_id,
+            MatchedSeedCohort {
+                cohort_id: "cohort".into(),
+                seeds: vec![7, 11],
+            },
+            vec![ScenarioVariant {
+                variant_id: "mlp".into(),
+                brain_family: "mlp".into(),
+                config_overrides: BTreeMap::from([
+                    ("world_width".into(), json!(100)),
+                    ("world_height".into(), json!(100)),
+                    ("food_cell_size".into(), json!(50)),
+                ]),
+                interventions: Vec::new(),
+            }],
+            3,
+            1,
+            directory.clone(),
+        ));
+        // Real completed owners/bundles model a failure publishing one final
+        // status; the successful peer's saved owner must remain unchanged.
+        let completed = [7, 11].map(|seed| {
+            runner
+                .execute_single_run(&runner.variants[0], seed)
+                .unwrap()
+        });
+        let state_file = directory.join("status.json");
+        let mut status = runner.load_or_create_status(&state_file).unwrap();
+        for run in &mut status.runs {
+            run.state = RunState::Running;
+        }
+        runner.save_status(&state_file, &mut status).unwrap();
+        status.runs[0].state = RunState::Failed;
+        status.runs[0].error_reason = Some("completion status publication failed".into());
+        status.runs[1] = completed[1].clone();
+        status.completed_runs = 1;
+        status.failed_runs = 1;
+        runner.save_status(&state_file, &mut status).unwrap();
+        handle.data_services.experiments.lock().unwrap().insert(
+            experiment_id.into(),
+            ExperimentJob {
+                runner,
+                state_file: state_file.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                running: Arc::new(AtomicBool::new(false)),
+                last_error: Arc::new(Mutex::new(None)),
+                created_at_utc: "1".into(),
+                artifact_root: root.to_path_buf(),
+                artifact_generation: Mutex::new(None),
+                worker: None,
+            },
+        );
+        (handle, status, completed)
+    }
+
+    #[test]
+    fn experiment_run_artifacts_preserve_completed_results_in_a_failed_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, host) = handle();
+        let (handle, status, completed) =
+            failed_retry_catalog_fixture(handle, root.path(), "failed-download");
+        let state_file = root.path().join("experiments/failed-download/status.json");
+        let before = fs::read(&state_file).unwrap();
+        let live = host.port.scientific_digest_v1().unwrap();
+        let inventory = handle
+            .get_experiment_run_artifacts("failed-download", &completed[1].run_id)
+            .unwrap();
+        assert_eq!(inventory.run.final_digest, completed[1].final_digest);
+        assert_eq!(inventory.status_generation, status.generation);
+        // Even an intact bundle left by a torn publication does not promote a
+        // failed run to completed evidence. Explicit retry/recovery owns that.
+        assert!(matches!(
+            handle.get_experiment_run_artifacts("failed-download", &completed[0].run_id),
+            Err(ControlError::Conflict(_))
+        ));
+        assert_eq!(fs::read(state_file).unwrap(), before);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+    }
+
+    #[test]
+    fn experiment_failed_retry_reserves_capacity_and_keeps_generation_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let (handle, status, completed) =
+            failed_retry_catalog_fixture(handle, root.path(), "failed-retry");
+        let directory = root.path().join("experiments/failed-retry");
+        let state_file = directory.join("status.json");
+        let generation = status.generation;
+        let before = fs::read(&state_file).unwrap();
+        let cuts = status
+            .runs
+            .iter()
+            .map(|run| {
+                let path = directory.join(format!("{}.checkpoint", run.run_id));
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            handle.resume_experiment("failed-retry"),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            handle.retry_failed_experiment("failed-retry", generation + 1),
+            Err(ControlError::Conflict(message)) if message.contains("generation changed")
+        ));
+        handle.clone().with_experiment_run_capacity(0).unwrap();
+        assert!(matches!(
+            handle.retry_failed_experiment("failed-retry", generation),
+            Err(ControlError::ExperimentCapacity(_))
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), before);
+        for (path, bytes) in &cuts {
+            assert_eq!(&fs::read(path).unwrap(), bytes);
+        }
+        assert!(!directory.join("status.json.retries").exists());
+        handle.clone().with_experiment_run_capacity(1).unwrap();
+        let admitted = handle
+            .retry_failed_experiment("failed-retry", generation)
+            .unwrap();
+        assert!(admitted.generation > generation);
+        assert_eq!(admitted.failed_runs, 0);
+        handle
+            .data_services
+            .experiments
+            .lock()
+            .unwrap()
+            .get_mut("failed-retry")
+            .unwrap()
+            .join_worker()
+            .unwrap();
+        let final_status = handle.get_experiment("failed-retry").unwrap();
+        assert_eq!(final_status.status, "completed", "{final_status:?}");
+        assert_eq!(final_status.completed_runs, 2);
+        for (observed, expected) in final_status.runs.iter().zip(&completed) {
+            assert_eq!(observed.total_ticks, expected.total_ticks);
+            assert_eq!(observed.final_digest, expected.final_digest);
+            assert_eq!(observed.bundle_path, expected.bundle_path);
+        }
+        assert_eq!(fs::read(&cuts[1].0).unwrap(), cuts[1].1);
+        assert_eq!(
+            fs::read(directory.join(format!(
+                "status.json.retries/generation-{generation:020}.json"
+            )))
+            .unwrap(),
+            before
+        );
+        let after = fs::read(&state_file).unwrap();
+        assert!(matches!(
+            handle.retry_failed_experiment("failed-retry", generation),
+            Err(ControlError::Conflict(message)) if message.contains("generation changed")
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), after);
+        let capacity = *handle.data_services.execution_capacity.lock().unwrap();
+        assert_eq!(capacity.reserved_run_slots, 0);
+        assert_eq!(capacity.reserved_batches, 0);
     }
 
     #[test]
@@ -12275,7 +12911,8 @@ pub(crate) mod tests {
                     &handle.read_snapshot().unwrap(),
                     &after_spawn_publication
                 ));
-                // Real config edits have their own revision domain, including a round trip.
+                // Complete recorded config edits remain replayable, including a round trip
+                // after a recorded agent command at the same live boundary.
                 let food_max = current.config.food_max;
                 host.wait_applied(
                     &handle
@@ -12315,6 +12952,47 @@ pub(crate) mod tests {
                 assert_eq!(review.base_tick, fresh.tick);
                 assert_eq!(review.checkpoint_id, fresh.checkpoint_id);
                 assert_eq!(review.snapshot.world.tick, fresh_target);
+
+                // Oversized inputs still apply but are omitted from bounded replay
+                // history. The resulting revision gap must refuse historical review.
+                let omitted = handle
+                    .submit_control_command(ControlCommand::Intervention(Box::new(
+                        scriptbots_core::interventions::InterventionCommand::new(
+                            scriptbots_core::interventions::Intervention::Embargo {
+                                region: scriptbots_core::Region::All,
+                                ticks: 2,
+                            },
+                            scriptbots_core::interventions::InterventionSurface::Script,
+                            "x".repeat(
+                                scriptbots_runtime::MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES + 1,
+                            ),
+                        ),
+                    )))
+                    .unwrap();
+                host.wait_applied(&omitted);
+                host.wait_applied(&handle.step().unwrap());
+                let after_omitted = host.port.scientific_digest_v1().unwrap();
+                let after_omitted_publication = handle.read_snapshot().unwrap();
+                assert!(
+                    after_omitted_publication
+                        .applied_interventions
+                        .iter()
+                        .any(|record| record.kind == "embargo" && !record.expired)
+                );
+                let refusal = handle
+                    .event_canvas(fresh_target)
+                    .err()
+                    .expect("an applied input omitted from history must refuse event review");
+                assert!(
+                    matches!(&refusal, ControlError::BadRequest(message)
+                        if message.contains("scientific revisions")),
+                    "{refusal}"
+                );
+                assert_eq!(host.port.scientific_digest_v1().unwrap(), after_omitted);
+                assert!(Arc::ptr_eq(
+                    &handle.read_snapshot().unwrap(),
+                    &after_omitted_publication
+                ));
             }
             fs::write(
                 directory.join("target-oracle.json"),
@@ -12341,7 +13019,7 @@ pub(crate) mod tests {
                 Err(ControlError::InvalidPatch(_))
             ));
             eprintln!(
-                "event canvas preset {preset:?}: base={} target={target_tick} current={} actual science={}; distinct state, matching projection, source guards and corrupt bytes checked",
+                "event canvas preset {preset:?}: base={} target={target_tick} captured_current={} captured_science={}; distinct state, matching projection, source guards and corrupt bytes checked",
                 checkpoint.tick, current.world.tick, current_digest.overall
             );
         }
@@ -14447,7 +15125,11 @@ pub(crate) mod tests {
                 _ => unreachable!(),
             }
             write_checkpoint_catalog(&directory, &metadata).unwrap();
-            assert!(!directory.join(format!("{}.bin", metadata.checkpoint_id)).exists());
+            assert!(
+                !directory
+                    .join(format!("{}.bin", metadata.checkpoint_id))
+                    .exists()
+            );
             assert!(matches!(
                 handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
                 Err(ControlError::PayloadTooLarge(_))
@@ -14466,7 +15148,10 @@ pub(crate) mod tests {
             handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
             Err(ControlError::PayloadTooLarge(_))
         ));
-        assert_eq!(host.port.scientific_digest_v1().unwrap().overall, saved.world_digest_v1);
+        assert_eq!(
+            host.port.scientific_digest_v1().unwrap().overall,
+            saved.world_digest_v1
+        );
     }
 
     #[test]
@@ -14503,7 +15188,11 @@ pub(crate) mod tests {
             metadata.checksum_blake3 = compute_blake3(&bytes);
             metadata.checksum_sha256 = compute_sha256(&bytes);
             write_checkpoint_catalog(&directory, &metadata).unwrap();
-            fs::write(directory.join(format!("{}.bin", metadata.checkpoint_id)), &bytes).unwrap();
+            fs::write(
+                directory.join(format!("{}.bin", metadata.checkpoint_id)),
+                &bytes,
+            )
+            .unwrap();
             assert!(matches!(
                 handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
                 Err(ControlError::PayloadTooLarge(reason)) if reason.contains("history")
@@ -14581,7 +15270,10 @@ pub(crate) mod tests {
         let (restored, preset) =
             ControlHandle::restore_canvas_world_and_preset(&checkpoint, None).unwrap();
         assert_eq!(preset, None);
-        assert_eq!(restored.world_digest_v1().unwrap(), *checkpoint.source_digest());
+        assert_eq!(
+            restored.world_digest_v1().unwrap(),
+            *checkpoint.source_digest()
+        );
         host.wait_applied(&handle.step().unwrap());
         let live = host.port.scientific_digest_v1().unwrap();
         let publication = handle.read_snapshot().unwrap();

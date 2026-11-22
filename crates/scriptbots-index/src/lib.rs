@@ -53,8 +53,54 @@ pub struct UniformGridIndex {
 
 #[derive(Debug, Clone)]
 enum Buckets {
-    Dense(Vec<Vec<usize>>),
+    Dense(DenseBuckets),
     Sparse(HashMap<(i32, i32), Vec<usize>>),
+}
+
+/// Retained compressed rows: each cell owns one slice of `entries`.
+///
+/// Cells retain the existing row-major numbering; entries within each cell retain
+/// input order. Query traversal can therefore keep its existing accumulation order.
+#[derive(Debug, Clone, Default)]
+struct DenseBuckets {
+    offsets: Vec<usize>,
+    entries: Vec<usize>,
+    write_offsets: Vec<usize>,
+}
+
+impl DenseBuckets {
+    #[allow(clippy::cast_sign_loss)]
+    fn rebuild(&mut self, agent_cells: &[(i32, i32)], cells_x: i32, cell_count: usize) {
+        // The dense-cell limit bounds this addition. Every agent contributes once,
+        // so each count, prefix sum, and write position is bounded by the input length.
+        self.offsets.resize(cell_count + 1, 0);
+        self.offsets.fill(0);
+        for &(cx, cy) in agent_cells {
+            // cell_from_point has already canonicalized both coordinates.
+            let cell = cy as usize * cells_x as usize + cx as usize;
+            self.offsets[cell + 1] += 1;
+        }
+        for cell in 1..=cell_count {
+            self.offsets[cell] += self.offsets[cell - 1];
+        }
+
+        self.write_offsets.resize(cell_count, 0);
+        self.write_offsets
+            .copy_from_slice(&self.offsets[..cell_count]);
+        self.entries.resize(agent_cells.len(), 0);
+        for (agent_idx, &(cx, cy)) in agent_cells.iter().enumerate() {
+            let cell = cy as usize * cells_x as usize + cx as usize;
+            let next = &mut self.write_offsets[cell];
+            self.entries[*next] = agent_idx;
+            *next += 1;
+        }
+    }
+
+    fn get(&self, cell: usize) -> Option<&[usize]> {
+        let start = *self.offsets.get(cell)?;
+        let end = *self.offsets.get(cell + 1)?;
+        self.entries.get(start..end)
+    }
 }
 
 impl Default for Buckets {
@@ -289,22 +335,22 @@ impl NeighborhoodIndex for UniformGridIndex {
         };
 
         if let Some(cell_count) = total_cells.filter(|&c| c <= DENSE_BUCKET_MAX_CELLS) {
-            // Dense path: two-pass build for precise capacity reservations
-            let mut counts: Vec<usize> = vec![0; cell_count];
             for (idx, &(x, y)) in positions.iter().enumerate() {
-                let (cx, cy) = self.cell_from_point(x, y);
-                self.agent_cells[idx] = (cx, cy);
-                let lin = self.linear_index(cx, cy);
-                counts[lin] += 1;
+                self.agent_cells[idx] = self.cell_from_point(x, y);
             }
 
-            let mut dense: Vec<Vec<usize>> = counts.into_iter().map(Vec::with_capacity).collect();
-
-            for (idx, &(cx, cy)) in self.agent_cells.iter().enumerate() {
-                let lin = self.linear_index(cx, cy);
-                dense[lin].push(idx);
+            // Reuse the dense arrays across sensing, sharing, and combat rebuilds.
+            // Only population growth beyond retained capacity allocates again.
+            match &mut self.buckets {
+                Buckets::Dense(dense) => {
+                    dense.rebuild(&self.agent_cells, self.cells_x, cell_count);
+                }
+                Buckets::Sparse(_) => {
+                    let mut dense = DenseBuckets::default();
+                    dense.rebuild(&self.agent_cells, self.cells_x, cell_count);
+                    self.buckets = Buckets::Dense(dense);
+                }
             }
-            self.buckets = Buckets::Dense(dense);
         } else {
             // Sparse path: fallback HashMap to avoid huge allocations
             let mut map: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -655,6 +701,128 @@ mod tests {
             }
         }
         positions
+    }
+
+    #[test]
+    fn dense_bucket_queries_preserve_seam_traversal_and_input_order() {
+        // Across both seams the visitor scans x=3,0, and within each x scans
+        // y=2,0. Multiple entries in a cell must retain their original order:
+        // floating-point sensor accumulation depends on that order.
+        let positions = [
+            (1.0, 1.0),
+            (39.0, 29.0),
+            (2.0, 2.0),
+            (39.0, 1.0),
+            (1.0, 29.0),
+            (2.0, 28.0),
+            (11.0, 1.0),
+            (21.0, 1.0),
+            (39.0, 28.0),
+        ];
+        let index = build_index(10.0, 40.0, 30.0, &positions);
+        let expected_buckets = vec![vec![1, 8], vec![3], vec![4, 5], vec![0, 2]];
+        let mut buckets = Vec::new();
+        index.visit_neighbor_buckets(0, 3.0, &mut |indices| {
+            buckets.push(indices.to_vec());
+        });
+        assert_eq!(buckets, expected_buckets);
+
+        let mut scratch_x = Vec::new();
+        let mut scratch_y = Vec::new();
+        let mut scratch_buckets = Vec::new();
+        index.visit_neighbor_bucket_positions_with_scratch(
+            0,
+            3.0,
+            &mut scratch_x,
+            &mut scratch_y,
+            &mut |xs, ys, indices| {
+                assert_eq!(xs.len(), indices.len());
+                assert_eq!(ys.len(), indices.len());
+                for ((&x, &y), &agent_idx) in xs.iter().zip(ys).zip(indices) {
+                    let expected = positions[agent_idx];
+                    assert_eq!(
+                        (x.to_bits(), y.to_bits()),
+                        (expected.0.to_bits(), expected.1.to_bits())
+                    );
+                }
+                scratch_buckets.push(indices.to_vec());
+            },
+        );
+        assert_eq!(scratch_buckets, expected_buckets);
+
+        let mut neighbors = Vec::new();
+        index.neighbors_within(0, 9.0, &mut |idx, distance| {
+            neighbors.push((idx, distance.into_inner().to_bits()));
+        });
+        assert_eq!(
+            neighbors,
+            vec![
+                (1, 8.0_f32.to_bits()),
+                (3, 4.0_f32.to_bits()),
+                (4, 4.0_f32.to_bits()),
+                (2, 2.0_f32.to_bits()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dense_rebuild_reuses_allocations_and_removes_departed_entries() {
+        fn retained_arrays(index: &UniformGridIndex) -> [(*const usize, usize); 3] {
+            let Buckets::Dense(dense) = &index.buckets else {
+                panic!("fixture must use the dense index");
+            };
+            [
+                (dense.offsets.as_ptr(), dense.offsets.capacity()),
+                (dense.entries.as_ptr(), dense.entries.capacity()),
+                (dense.write_offsets.as_ptr(), dense.write_offsets.capacity()),
+            ]
+        }
+
+        let initial = [
+            (1.0, 1.0),
+            (2.0, 2.0),
+            (39.0, 29.0),
+            (21.0, 18.0),
+            (11.0, 7.0),
+            (12.0, 6.0),
+        ];
+        let moved = [
+            (39.0, 1.0),
+            (1.0, 29.0),
+            (39.0, 1.0),
+            (2.0, 2.0),
+            (11.0, 18.0),
+            (1.0, 29.0),
+        ];
+        let mut index = build_index(10.0, 40.0, 30.0, &initial);
+        let allocations = retained_arrays(&index);
+        for positions in [moved.as_slice(), &moved[..3], &[], initial.as_slice()] {
+            index.rebuild(positions).unwrap();
+            assert_eq!(retained_arrays(&index), allocations);
+
+            if positions.is_empty() {
+                assert!(queried_neighbors(&index, 0, 2500.0).is_empty());
+                assert!(bucket_candidates(&index, 0, 50.0).is_empty());
+                assert!(scratch_bucket_candidates(&index, positions, 0, 50.0).is_empty());
+            }
+            for agent_idx in 0..positions.len() {
+                for radius in [0.0_f32, 3.0, 10.0, 50.0] {
+                    let radius_sq = radius * radius;
+                    let expected =
+                        brute_force_neighbors(positions, agent_idx, 40.0, 30.0, radius_sq);
+                    let actual = queried_neighbors(&index, agent_idx, radius_sq);
+                    assert_neighbor_maps_close("retained rebuild", &expected, &actual);
+                    let candidates = bucket_candidates(&index, agent_idx, radius);
+                    assert_eq!(
+                        candidates,
+                        scratch_bucket_candidates(&index, positions, agent_idx, radius)
+                    );
+                    let filtered =
+                        filter_candidates(&candidates, positions, agent_idx, 40.0, 30.0, radius_sq);
+                    assert_neighbor_maps_close("retained bucket rebuild", &expected, &filtered);
+                }
+            }
+        }
     }
 
     #[test]

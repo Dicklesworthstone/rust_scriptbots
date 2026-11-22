@@ -1,5 +1,7 @@
 // Browser boundaries for the existing matched-seed experiment owner. These
 // checks validate observations; they never run science or recalculate inference.
+import { validateLabArtifact } from "./checkpoint-lab.js";
+
 export const EXPERIMENT_LIMITS = Object.freeze({
   maxVariants: 8,
   maxSeeds: 32,
@@ -15,6 +17,11 @@ export const EXPERIMENT_LIMITS = Object.freeze({
   maxCatalogExperiments: 1024,
   maxInterventions: 64,
   maxInterventionBytes: 4096,
+  maxRunArtifactResponseBytes: 256 * 1024,
+  maxRunArtifacts: 33,
+  maxRunArtifactBytes: 16 * 1024 * 1024,
+  maxRunDataBytes: 32 * 1024 * 1024,
+  maxRunBundleBytes: 48 * 1024 * 1024,
 });
 
 export const EXPERIMENT_ENDPOINT_METRICS = Object.freeze([
@@ -415,14 +422,21 @@ export function validateExperimentStatus(value, context = {}) {
         || previous.created_at_utc !== summary.created_at_utc || generation < previous.generation
         || previous.runs.length !== runs.length) refuse("status identity or generation changed across observations");
     const byId = new Map(previous.runs.map((run) => [run.run_id, run]));
+    // Only the caller's explicit generation-guarded retry can replace observed
+    // failed evidence. Ordinary polling still refuses terminal regressions.
+    const retryAuthorized = context.retryGeneration !== undefined
+      && integer(context.retryGeneration, "retry generation") === previous.generation
+      && generation > previous.generation;
     for (const run of runs) {
       const old = byId.get(run.run_id);
       if (!old || old.variant_id !== run.variant_id || old.seed !== run.seed
           || old.brain_family !== run.brain_family || old.target_ticks !== run.target_ticks) refuse("immutable run matrix changed across observations");
+      const retried = retryAuthorized && old.state === "failed";
       if ((old.state === "running" && run.state === "pending")
-          || (["completed", "failed"].includes(old.state) && old.state !== run.state)) refuse("run lifecycle regressed");
+          || (retried && run.state === "pending")
+          || (["completed", "failed"].includes(old.state) && !retried && old.state !== run.state)) refuse("run lifecycle regressed");
       const terminalKeys = ["state", "total_ticks", "final_digest", "bundle_path", "error_reason"];
-      if ((generation === previous.generation || ["completed", "failed"].includes(old.state))
+      if ((generation === previous.generation || (["completed", "failed"].includes(old.state) && !retried))
           && terminalKeys.some((key) => old[key] !== run[key])) refuse("unchanged or terminal run evidence was replaced");
     }
   }
@@ -432,6 +446,75 @@ export function validateExperimentStatus(value, context = {}) {
 export function experimentCanResume(status) {
   return !!status && ["stopped", "cancelled", "failed"].includes(status.status)
     && status.runs.some((run) => ["pending", "running"].includes(run.state));
+}
+
+/** A bundle path is relative to this one completed run, never supplied as a URL. */
+export function experimentRunArtifactPath(artifact, inventory) {
+  const prefix = `experiments/${inventory.experiment_id}/${inventory.run.run_id}/`;
+  if (typeof artifact.relative_path !== "string" || !artifact.relative_path.startsWith(prefix)) {
+    refuse("artifact belongs to another experiment run");
+  }
+  const relative = artifact.relative_path.slice(prefix.length);
+  if (!relative || relative.length > 1024 || relative.split("/").some((part) =>
+    !/^[A-Za-z0-9_.-]+$/.test(part) || part === "." || part === ".." || part.endsWith(".")
+      || /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(part))) {
+    refuse("bundle contains an unsafe or nonportable relative file path");
+  }
+  return relative;
+}
+
+/** Verify a completed run's inventory while unrelated cohort runs keep progressing. */
+export function validateExperimentRunArtifacts(value, context) {
+  shape(value, ["experiment_id", "plan_digest", "status_generation", "run", "artifacts", "total_bytes"],
+    [], "experiment run artifacts");
+  if (!context?.status || !context?.runId) refuse("artifact inventory requires an observed completed run");
+  const status = validateExperimentStatus(context.status);
+  const expected = status.runs.find((run) => run.run_id === context.runId);
+  if (!expected || expected.state !== "completed") refuse("only completed runs have downloadable bundles");
+  const run = runRecord(value.run, status.experiment_id);
+  const generation = integer(value.status_generation, "artifact status generation");
+  if (value.experiment_id !== status.experiment_id
+      || digest(value.plan_digest, "artifact plan digest") !== status.plan_digest
+      || generation < status.generation) refuse("artifact inventory has a foreign plan or stale generation");
+  for (const key of ["run_id", "variant_id", "brain_family", "seed", "state", "total_ticks", "target_ticks",
+    "final_digest", "bundle_path", "error_reason"]) {
+    if (run[key] !== expected[key]) refuse("artifact inventory replaced the selected completed run");
+  }
+  if (!Array.isArray(value.artifacts) || value.artifacts.length < 4
+      || value.artifacts.length > EXPERIMENT_LIMITS.maxRunArtifacts) refuse("bundle inventory is incomplete or exceeds its file bound");
+  const inventory = { experiment_id: status.experiment_id, plan_digest: status.plan_digest,
+    status_generation: generation, run };
+  const ids = new Set(), paths = new Set();
+  const required = new Set(["bundle_manifest.json", "exports/summary.csv", "evidence/run.json", "checkpoints/final.checkpoint"]);
+  let total = 0, dataBytes = 0, manifests = 0;
+  const artifacts = value.artifacts.map((value) => {
+    shape(value, ["artifact_id", "filename", "content_type", "byte_size", "checksum_blake3", "checksum_sha256",
+      "created_at_utc", "relative_path"], [], "run artifact");
+    validateLabArtifact(value);
+    if (!/^experiment-[0-9a-f]{64}$/.test(value.artifact_id)) refuse("invalid experiment artifact identity");
+    text(value.created_at_utc, "artifact creation time", 128);
+    integer(value.byte_size, "artifact byte count", 0, EXPERIMENT_LIMITS.maxRunArtifactBytes);
+    const path = experimentRunArtifactPath(value, inventory);
+    const folded = path.toLowerCase();
+    if (ids.has(value.artifact_id) || paths.has(folded)
+        || [...paths].some((other) => other.startsWith(folded + "/") || folded.startsWith(other + "/"))) {
+      refuse("bundle inventory duplicates an identity or collides on a file path");
+    }
+    ids.add(value.artifact_id);
+    paths.add(folded);
+    required.delete(path);
+    if (path === "bundle_manifest.json") manifests += 1;
+    else dataBytes += value.byte_size;
+    total += value.byte_size;
+    if (total > EXPERIMENT_LIMITS.maxRunBundleBytes || dataBytes > EXPERIMENT_LIMITS.maxRunDataBytes) {
+      refuse("bundle exceeds its aggregate browser transfer bound");
+    }
+    return { ...value };
+  });
+  if (manifests !== 1 || required.size || integer(value.total_bytes, "bundle byte count", 0, EXPERIMENT_LIMITS.maxRunBundleBytes) !== total) {
+    refuse("bundle inventory lacks required run files or its byte total disagrees");
+  }
+  return freeze({ ...inventory, artifacts, total_bytes: total });
 }
 
 export function validateExperimentComparison(value, context) {

@@ -270,6 +270,11 @@ RUST_LOG=info cargo run -p scriptbots-app
 - In an experiment's detail view, `D` requests cooperative stop and `U` resumes
   unfinished runs. The acknowledgement reports the observed batch status and
   progress; a `cancelling` acknowledgement does not mean the runs have finished.
+  When a stopped batch has failed runs, `F` explicitly retries them from verified
+  saved continuations. The displayed source and generation bind the request;
+  completed results and original failures are retained. An unconfirmed reply
+  requires fresh status before another attempt. This detail-view action is
+  separate from the composer's `F` key for forgetting an unconfirmed creation.
 - Press `N` in Experiments to create a matched-seed study. Choose either a
   brain-family comparison or a single ecological treatment, then set the brain
   families, first seed, number of seed pairs and transitions per run. Ecological
@@ -281,7 +286,7 @@ RUST_LOG=info cargo run -p scriptbots-app
   `S` submits or retries the exact frozen request. An unconfirmed submission
   keeps its original identity and choices; `F` explicitly forgets that local
   retry identity after its worker finishes. An already admitted experiment
-  remains in the catalog. Creation, stop and resume wait until their pending
+  remains in the catalog. Creation, stop, resume and failed-run retry wait until their pending
   identity has actually been displayed. `X` can deny an unpresented request or
   discard a submitted request's result; admitted work continues independently.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
@@ -1212,8 +1217,11 @@ and failed runs. Select baseline and challenger arms to compare verified endpoin
 population, total or mean live-agent energy, mean health, mean or maximum age
 counter, maximum living generation, and total food. Comparisons retain the plan
 digest, source generation, endpoint and available statistical results. Stop and
-resume use the existing runner's observed status. The experiment CLI and API
-remain available for larger scripted designs.
+resume use the existing runner's observed status. **Retry failed runs** appears
+for eligible stopped batches and captures the observed source and generation.
+It retains completed results and prior failure evidence; a lost or mismatched
+reply requires fresh status before another explicit retry. The experiment CLI
+and API remain available for larger scripted designs.
 
 The saved-checkpoint pane can **save the current live world**, list retained
 scientific cuts and reconstruct a selected cut for inspection. A completed save
@@ -1729,6 +1737,15 @@ For an interactive run, ScriptBots parses the control environment and transactio
     A build without `brain-ft` refuses these arms before starting a worker or writing files.
   - `POST /api/v1/experiments/{id}/compare` → compare one canonical endpoint metric
     across two completed variant cohorts using verified bundles and exact matched seeds.
+  - `GET /api/v1/experiments/{id}/runs/{run_id}/artifacts` → discover the manifest
+    and all indexed files for one verified completed run. The response binds its
+    plan, status generation, run identity and final digest, with immutable
+    artifact IDs, relative paths, byte counts and both BLAKE3/SHA-256 checksums.
+    It includes at most 33 files, 16 MiB per file, 32 MiB of indexed data plus the
+    manifest (48 MiB total), and 256 KiB of inventory JSON. Download bytes through
+    `GET /api/v1/artifacts/{artifact_id}/download`. Unfinished or corrupt companion
+    runs do not block a healthy selected run; the selected run itself must pass
+    the canonical bundle and restored-owner checks.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
     `--checkpoint-start`); `GET /api/v1/checkpoints`, `/api/v1/artifacts`
   - Playback aliases (two-axis command status): `POST /api/pause`, `POST /api/resume`,
@@ -2492,6 +2509,83 @@ for the observed outcome. Resume uses the validated saved owner/journal cuts and
 does not start an unrelated run. Reuse the original create payload and
 `--idempotency-key` after a lost create response.
 
+#### Retrying failed experiment runs
+
+Ordinary resume keeps recorded failures terminal. After inspecting and addressing
+the cause, explicitly retry failed runs from their saved progress:
+
+```bash
+# Local runner: use the identical plan and output directory.
+cargo run -p scriptbots-app --bin scriptbots-app -- experiment \
+  --plan experiment-plan.json --out runs/matched-experiment --retry-failed
+
+# Running server: observe the generation first, then use that exact value.
+cargo run -p scriptbots-app --bin control_cli -- experiment status food-pause-recovery
+cargo run -p scriptbots-app --bin control_cli -- experiment retry-failed food-pause-recovery \
+  --expected-generation 12
+```
+
+The server also exposes `POST /api/v1/experiments/ID/retry-failed` with
+`{"expected_generation":12}`, and MCP `experiment_retry_failed` with
+`{"experiment_id":"food-pause-recovery","expected_generation":12}`. Replace
+the example generation with the value actually returned by status. The browser's
+**Retry failed runs from saved progress** action, native GPUI/Bevy **Retry failed
+runs** buttons, and terminal detail-view `F` action capture that value automatically.
+After an uncertain response, refresh status before trying again; an older
+generation cannot authorize another attempt after the batch has advanced.
+
+Retry verifies every failed run's executable checkpoint or completed bundle,
+reserves server execution capacity, and reopens all failed runs together.
+Completed companions keep their original results. Missing, corrupt, foreign or
+busy continuation evidence causes refusal; retry never reconstructs progress by
+starting an unrelated tick-zero run. The exact preceding failure status is
+retained under `status.json.retries/generation-<20-digit-generation>.json`.
+History is bounded to 16 retry generations; reaching that limit refuses another
+retry and preserves the evidence. Interrupted publication can recover only when
+the retained failure record, successor status and executable continuations agree.
+
+#### Download a completed experiment run
+
+A completed run can be downloaded while other runs in the same experiment are
+still active or have failed. Read `experiment status ID`, choose a completed
+`run_id`, then inspect or download its entire portable bundle:
+
+```bash
+cargo run -p scriptbots-app --bin control_cli -- experiment run-artifacts \
+  food-pause-recovery RUN_ID
+cargo run -p scriptbots-app --bin control_cli -- experiment download-run \
+  food-pause-recovery RUN_ID --out runs/downloaded-result
+cargo run -p scriptbots-app --bin scriptbots-app -- \
+  --verify-bundle runs/downloaded-result
+```
+
+Replace `RUN_ID` with the exact identifier returned by status. `run-artifacts`
+prints the verified run, plan digest, observed generation and complete immutable
+file inventory. `download-run` checks every metadata record, response size,
+BLAKE3/SHA-256 checksum and manifest entry before creating the destination. It
+preserves the original bytes and relative paths, then uses the existing offline
+verifier to restore the final owner and compare its scientific result. Success
+prints a JSON receipt with the destination, file/byte counts, manifest digest,
+verified tick and final scientific digest. This verifies the saved endpoint;
+it does not rerun the experiment's complete history.
+
+The destination must be new. Network, inventory, checksum and manifest-index
+failures create no destination directory. Write, sync or final-owner verification
+errors report failure and retain the output for inspection; an existing result
+is never overwritten. Run downloads use the per-run bounds documented above,
+including 33 files and 48 MiB total, and preserve full-width integer seeds.
+
+In the connected browser's **Matched-seed experiments** panel, open a retained
+experiment and use **Completed run downloads**. Choose the completed run, select
+**Load verified run files**, then download an individual file or choose
+**Download complete run bundle (.zip)**. The browser checks the selected source,
+plan, run, file metadata, byte counts and SHA-256. The complete ZIP also checks
+its manifest index and retains all original paths and file bytes. Extract the
+archive before using `--verify-bundle`; no server-local bundle path is required.
+Changing the source or hiding the panel aborts an in-flight download, and no
+partial ZIP is offered. **Export browser observation JSON** remains a separate
+export of observed status and comparisons.
+
 #### Checkpoints and artifacts from the shell
 
 The same control CLI captures checkpoints and discovers retained artifacts. Use
@@ -2608,7 +2702,7 @@ digest evidence within its window.
 - Default: `127.0.0.1:8090` over HTTP; disable with `SCRIPTBOTS_CONTROL_MCP=disabled`.
 - Override bind address: `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR=127.0.0.1:9090`.
 - Implemented with `fastmcp-rust`; the server shares the same `ControlHandle` as REST.
-- Tools exposed (31):
+- Tools exposed:
   - Configuration: `list_knobs` → array of knob entries; `get_config` → full config snapshot;
     `apply_updates` → accepts `{ updates: [{ path, value }, ...] }`; `apply_patch` → accepts `{ patch: { ... } }`
   - Scenarios: `list_presets` → available scenario presets; `apply_preset` → accepts `{ name }`; `intervene` → scheduled intervention
@@ -2624,12 +2718,30 @@ digest evidence within its window.
     and unfinished runs from validated owner/journal cuts, and recovers verified completed
     bundles saved before their final status write; missing or incompatible cuts are refused).
     The same saved-definition discovery supports status/list/resume by ID after restart.
+    `experiment_retry_failed` explicitly reopens failed runs from verified saved
+    progress and requires the observed `expected_generation`; original failure
+    evidence and completed peers are preserved.
     `experiment_compare` verifies two completed cohorts at their declared endpoint
     and returns the matched-seed contrast, uncertainty and provenance; one-seed
     cohorts explicitly return descriptive results without inferential claims.
+    `experiment_run_artifacts` accepts `experiment_id` and a completed `run_id`,
+    independently verifies that run, and returns its complete bounded file
+    inventory. `artifact_get` reads an indexed file's metadata; its artifact ID
+    also works with the REST download route. Other runs need not be completed or
+    healthy, and discovery does not resume or advance any experiment.
   - Checkpoints and artifacts: `checkpoint_create` (captured from the world owner and recorded in the run database
     through the storage worker), `checkpoint_list`, `checkpoint_status`, `artifact_list`, `artifact_get`
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.
+
+REST, WebSocket controls and MCP tools share process-wide admission limits:
+eight expensive query/work requests and sixteen command/status requests. Extra
+work is refused before entering the blocking queue. A disconnected queued
+request is cancelled; a request already running retains its slot until it exits.
+Command admission has separate capacity, and immutable latest-tick publications
+retain their direct read path. MCP HTTP dispatch has its own bounded outer
+admission and returns a JSON-RPC capacity error with the original request ID
+and HTTP 503 when full. These bounds preserve admission capacity; FastMCP's
+same-session mutex and unrelated blocking-pool work can still delay execution.
 
 MCP quickstart:
 - Start the app; verify MCP binds on `127.0.0.1:8090` (override via `SCRIPTBOTS_CONTROL_MCP_HTTP_ADDR`).

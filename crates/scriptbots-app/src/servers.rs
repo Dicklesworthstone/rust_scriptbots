@@ -42,15 +42,16 @@ use crate::control::{
     CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto, ConfigSnapshot, ControlError,
     ControlHandle, DietClassDto, EventEntry, EventKind, ExperimentBatchStatusDto,
     ExperimentComparisonDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
-    ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot,
-    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate,
-    MAX_CHECKPOINT_BRANCH_ID_BYTES, MAX_CHECKPOINT_BRANCH_KEY_BYTES,
-    MAX_CHECKPOINT_BRANCH_NAME_BYTES, MAX_CHECKPOINT_BRANCH_REQUEST_BYTES,
-    MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH, MapApplyAgentPolicy, MapApplyRequestBody,
-    MapGenerateRequestBody, PaginatedArtifactsResponse, PaginatedCheckpointBranchesResponse,
-    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
-    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
-    parse_intervention_command, parse_map_artifact,
+    ExperimentRetryFailedRequest, ExperimentRunArtifactsDto, ExperimentRunRecordDto,
+    ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody,
+    InterventionsPollDto, KnobEntry, KnobUpdate, MAX_CHECKPOINT_BRANCH_ID_BYTES,
+    MAX_CHECKPOINT_BRANCH_KEY_BYTES, MAX_CHECKPOINT_BRANCH_NAME_BYTES,
+    MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH,
+    MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
+    PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse,
+    PaginatedExperimentsResponse, Scoreboard, SelectionModeDto, SelectionSnapshotDto,
+    SelectionStateDto, SimulationStatusDto, SpeedRequest, parse_intervention_command,
+    parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
@@ -93,9 +94,27 @@ const CONTROL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stack for every control-runtime worker and blocking thread (bd-6sgk).
 const CONTROL_RUNTIME_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CONTROL_WORK_REQUESTS: usize = 8;
+const MAX_CONTROL_COMMAND_REQUESTS: usize = 16;
+// One pair of budgets across every REST listener, WebSocket control and MCP
+// tool in this process. Expensive reads cannot consume command admission.
+static CONTROL_WORK_SLOTS: std::sync::LazyLock<ControlWorkSlots> = std::sync::LazyLock::new(|| {
+    ControlWorkSlots::new(MAX_CONTROL_WORK_REQUESTS, MAX_CONTROL_COMMAND_REQUESTS)
+});
+// Synchronous FastMCP dispatch has its own bounded outer work. Tools acquire
+// the shared budget above only when dispatch reaches their actual handler.
+static MCP_DISPATCH_SLOTS: std::sync::LazyLock<ControlWorkSlots> = std::sync::LazyLock::new(|| {
+    ControlWorkSlots::new(MAX_CONTROL_WORK_REQUESTS, MAX_CONTROL_COMMAND_REQUESTS)
+});
 const WS_CONTROL_PROTOCOL_VERSION: u16 = 1;
 const MAX_WS_CONTROL_MESSAGE_BYTES: usize = REMOTE_MAX_REQUEST_BYTES;
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_WS_PROJECTIONS: usize = 4;
+// Shared by every listener in this process. A disconnected caller cannot free a
+// running projection's slot. The worker transfers its permit with successful
+// output, retaining admission until the completed batch is delivered or dropped.
+static WS_PROJECTION_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_WS_PROJECTIONS)));
 const LAB_SESSION_HEADER: &str = "x-scriptbots-session";
 const CHECKPOINT_CANVAS_SCHEMA: &str = "scriptbots.checkpoint-canvas.v1";
 const MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
@@ -1570,7 +1589,7 @@ fn default_step_count() -> u64 {
 
 fn parse_step_count(bytes: &[u8]) -> Result<u64, AppError> {
     let Some(first) = bytes.iter().find(|byte| !byte.is_ascii_whitespace()) else {
-        return Ok(1);
+        return Ok(default_step_count());
     };
     // Serde accepts sequences for structs, so `[]` otherwise becomes the
     // default one-step request. Only an empty body or a JSON object is valid.
@@ -1579,6 +1598,7 @@ fn parse_step_count(bytes: &[u8]) -> Result<u64, AppError> {
             "invalid step request payload: expected a JSON object",
         ));
     }
+    // Decode the original object so duplicate fields cannot collapse in Value.
     let body: StepRequestBody = serde_json::from_slice(bytes)
         .map_err(|error| AppError::bad_request(format!("invalid step request payload: {error}")))?;
     Ok(body.count)
@@ -1705,9 +1725,11 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
         post_v1_experiments,
         get_v1_experiments,
         get_v1_experiment_by_id,
+        get_v1_experiment_run_artifacts,
         post_v1_experiment_compare,
         post_v1_experiment_cancel,
         post_v1_experiment_resume,
+        post_v1_experiment_retry_failed,
         post_v1_checkpoints,
         get_v1_checkpoints,
         get_v1_checkpoint_by_id,
@@ -1763,7 +1785,9 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
             ScenarioInterventionV1,
             ExperimentVariantDto,
             ExperimentCreateRequest,
+            ExperimentRetryFailedRequest,
             ExperimentRunRecordDto,
+            ExperimentRunArtifactsDto,
             ExperimentBatchStatusDto,
             ExperimentComparisonRequest,
             ExperimentComparisonDto,
@@ -1938,22 +1962,71 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Run a waiting or CPU-heavy control operation on the blocking thread pool.
-///
-/// Command admission, database reads and rasterization must not park an async
-/// worker. Bounded reads of immutable host publications run directly so they
-/// remain available when unrelated blocking operations occupy the pool.
-async fn run_control<T, F>(operation: F) -> Result<T, AppError>
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlWorkLane {
+    Work,
+    Command,
+}
+
+struct ControlWorkSlots {
+    work: Arc<tokio::sync::Semaphore>,
+    commands: Arc<tokio::sync::Semaphore>,
+}
+
+impl ControlWorkSlots {
+    fn new(work: usize, commands: usize) -> Self {
+        Self {
+            work: Arc::new(tokio::sync::Semaphore::new(work)),
+            commands: Arc::new(tokio::sync::Semaphore::new(commands)),
+        }
+    }
+
+    fn try_admit(
+        &self,
+        lane: ControlWorkLane,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
+        let (slots, description) = match lane {
+            ControlWorkLane::Work => (&self.work, "query/work"),
+            ControlWorkLane::Command => (&self.commands, "command/status"),
+        };
+        Arc::clone(slots).try_acquire_owned().map_err(|_| {
+            AppError::service_unavailable(format!(
+                "{description} request capacity is exhausted; no operation was started; retry with the same request identity after current work completes"
+            ))
+        })
+    }
+
+    /// Refuse excess work before it can enter Tokio's unbounded blocking queue.
+    /// A cancelled queued job is aborted; a running job retains admission until
+    /// its closure exits, including after the requesting connection disappears.
+    async fn run<T, F>(&self, lane: ControlWorkLane, operation: F) -> Result<T, AppError>
+    where
+        F: FnOnce() -> Result<T, ControlError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = self.try_admit(lane)?;
+        let mut task = AbortOnDrop(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        }));
+        (&mut task.0)
+            .await
+            .map_err(|join_error| {
+                AppError::internal(format!("control operation task failed: {join_error}"))
+            })?
+            .map_err(AppError::from)
+    }
+}
+
+/// Run bounded waiting or CPU-heavy work without parking an async worker.
+/// Lane selection belongs to the statically registered handler, never a client
+/// priority field. Immutable publication fast paths need neither lane.
+async fn run_control<T, F>(lane: ControlWorkLane, operation: F) -> Result<T, AppError>
 where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|join_error| {
-            AppError::internal(format!("control operation task failed: {join_error}"))
-        })?
-        .map_err(AppError::from)
+    CONTROL_WORK_SLOTS.run(lane, operation).await
 }
 
 async fn read_latest_tick_summary(
@@ -1971,7 +2044,7 @@ async fn read_latest_tick_summary(
     }
     // Before the first completed tick, the fallback computes max_age by
     // scanning the published population. Keep that work off async workers.
-    run_control(move || handle.latest_summary()).await
+    run_control(ControlWorkLane::Work, move || handle.latest_summary()).await
 }
 
 #[utoipa::path(
@@ -1981,7 +2054,7 @@ async fn read_latest_tick_summary(
     responses((status = 200, body = [KnobEntry]))
 )]
 async fn get_knobs(State(state): State<ApiState>) -> Result<Json<Vec<KnobEntry>>, AppError> {
-    let mut knobs = run_control(move || state.handle.list_knobs()).await?;
+    let mut knobs = run_control(ControlWorkLane::Work, move || state.handle.list_knobs()).await?;
     knobs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Json(knobs))
 }
@@ -1993,7 +2066,7 @@ async fn get_knobs(State(state): State<ApiState>) -> Result<Json<Vec<KnobEntry>>
     responses((status = 200, body = ConfigSnapshot))
 )]
 async fn get_config(State(state): State<ApiState>) -> Result<Json<ConfigSnapshot>, AppError> {
-    let snapshot = run_control(move || state.handle.snapshot()).await?;
+    let snapshot = run_control(ControlWorkLane::Work, move || state.handle.snapshot()).await?;
     Ok(Json(snapshot))
 }
 
@@ -2023,7 +2096,11 @@ async fn get_latest_tick_summary(
 async fn get_hydrology_snapshot(
     State(state): State<ApiState>,
 ) -> Result<Json<HydrologySnapshot>, AppError> {
-    match run_control(move || state.handle.hydrology_snapshot()).await? {
+    match run_control(ControlWorkLane::Work, move || {
+        state.handle.hydrology_snapshot()
+    })
+    .await?
+    {
         Some(snapshot) => Ok(Json(snapshot)),
         None => Err(AppError::not_found("hydrology state unavailable")),
     }
@@ -2222,12 +2299,12 @@ fn tick_publication_stream(
         // The initial summary can scan the population; keep it, serialization,
         // and protocol validation off the async worker. A slow reader retains
         // only this one prepared publication, never a per-tick outbound queue.
-        let result = tokio::task::spawn_blocking(move || {
+        let result = run_control(ControlWorkLane::Work, move || {
             let result = reader
                 .read_snapshot()
                 .map_err(AppError::from)
                 .and_then(|snapshot| poll_tick_publication(&snapshot, &mut subscription));
-            (subscription, result)
+            Ok((subscription, result))
         })
         .await;
         match result {
@@ -2236,12 +2313,7 @@ fn tick_publication_stream(
                 Some((handle, subscription, interval)),
             )),
             Ok((_, Err(error))) => Some((vec![TickPublicationMessage::error(error)], None)),
-            Err(error) => Some((
-                vec![TickPublicationMessage::error(AppError::internal(format!(
-                    "tick publication task failed: {error}"
-                )))],
-                None,
-            )),
+            Err(error) => Some((vec![TickPublicationMessage::error(error)], None)),
         }
     })
     .flat_map(futures_util::stream::iter)
@@ -2424,11 +2496,11 @@ async fn stream_ticks_sse(
             let last_sent = last_sent.clone();
             let filter = filter.clone();
             async move {
-                tokio::task::spawn_blocking(move || {
-                    poll_tick_summaries_for_sse(&handle, &last_sent, &filter)
+                run_control(ControlWorkLane::Work, move || {
+                    Ok(poll_tick_summaries_for_sse(&handle, &last_sent, &filter))
                 })
                 .await
-                .unwrap_or_default()
+                .unwrap_or_else(|error| vec![TickPublicationMessage::error(error).into_sse()])
             }
         })
         .flat_map(futures_util::stream::iter);
@@ -2452,7 +2524,7 @@ async fn stream_ticks_sse(
 async fn stream_ticks_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> Response {
     ws.max_message_size(MAX_WS_CONTROL_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_CONTROL_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_ws_stream(socket, state))
+        .on_upgrade(move |socket| handle_ws_stream(socket, state, Arc::clone(&WS_PROJECTION_SLOTS)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2565,22 +2637,12 @@ fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
 }
 
 async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsControlReply {
-    struct AbortQueuedControl(tokio::task::JoinHandle<Result<CommandStatusDto, ControlError>>);
-    impl Drop for AbortQueuedControl {
-        fn drop(&mut self) {
-            // A disconnected client must not leave queued blocking work behind.
-            // Work already running may have reached owner admission and cannot
-            // be retracted; its exact request identity remains safe to retry.
-            self.0.abort();
-        }
-    }
-
     let request = match parse_ws_control_message(&text) {
         Ok(request) => request,
         Err(error) => return WsControlReply::error(None, error),
     };
     let request_id = request.request_id.clone();
-    let mut operation = AbortQueuedControl(tokio::task::spawn_blocking(move || {
+    let outcome = run_control(ControlWorkLane::Command, move || {
         use scriptbots_core::ControlCommand;
         let command = match request.command.as_str() {
             "pause" => ControlCommand::Pause,
@@ -2598,11 +2660,8 @@ async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsCont
         // The host owns retry identity and conflicting-payload refusal. A reconnect
         // must not create a second Step after the first receipt was lost.
         handle.submit_command(command, request.request_id.as_deref())
-    }));
-    let outcome = (&mut operation.0)
-        .await
-        .map_err(|error| AppError::internal(format!("WebSocket control task failed: {error}")))
-        .and_then(|result| result.map_err(AppError::from));
+    })
+    .await;
     match outcome {
         Ok(receipt) => WsControlReply {
             protocol_version: WS_CONTROL_PROTOCOL_VERSION,
@@ -2656,6 +2715,13 @@ struct PreparedRemoteFrame {
     delivered_subscription: RemoteSubscription,
 }
 
+/// Capacity covers both active CPU work and completed output awaiting delivery.
+#[derive(Debug)]
+struct AdmittedRemoteProjection<T> {
+    value: T,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// Cancel queued blocking work when its requesting connection closes. Running
 /// work retains its own resource permit until it reaches its bounded completion.
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -2670,8 +2736,9 @@ async fn prepare_remote_frames(
     mut subscription: RemoteSubscription,
     snapshot: Arc<RenderSnapshot>,
     awaiting_channels: Vec<RemoteChannel>,
-) -> Result<Vec<PreparedRemoteFrame>, AppError> {
-    let mut projection = AbortOnDrop(tokio::task::spawn_blocking(move || {
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<AdmittedRemoteProjection<Vec<PreparedRemoteFrame>>, AppError> {
+    run_remote_projection(slots, move || {
         let mut frames = Vec::with_capacity(subscription.channels().len());
         for channel in subscription.channels().to_vec() {
             if awaiting_channels.contains(&channel) {
@@ -2690,17 +2757,50 @@ async fn prepare_remote_frames(
             }
         }
         Ok::<_, RemoteSubscriptionError>(frames)
-    }));
-    tokio::time::timeout(WS_WRITE_TIMEOUT, &mut projection.0)
-        .await
-        .map_err(|_| {
-            AppError::service_unavailable(
-                "remote projection deadline exceeded; reconnect with the last consumed cursors",
-            )
-        })?
-        .map_err(|error| AppError::internal(format!("remote projection task failed: {error}")))?
-        .map_err(remote_subscription_error)
+    })
+    .await
 }
+
+/// Admission and execution share one deadline. Waiting for a slot creates no
+/// blocking task; dropping a queued caller removes its semaphore waiter. Once
+/// execution starts, its owned permit survives caller timeout or disconnect and
+/// follows successful output until its consumer finishes with that output.
+async fn run_remote_projection<T, F>(
+    slots: Arc<tokio::sync::Semaphore>,
+    operation: F,
+) -> Result<AdmittedRemoteProjection<T>, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RemoteSubscriptionError> + Send + 'static,
+{
+    tokio::time::timeout(WS_WRITE_TIMEOUT, async move {
+        let permit = slots
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::service_unavailable("remote projection admission is closed"))?;
+        let mut projection = AbortOnDrop(tokio::task::spawn_blocking(move || {
+            operation().map(|value| AdmittedRemoteProjection {
+                value,
+                _permit: permit,
+            })
+        }));
+        (&mut projection.0)
+            .await
+            .map_err(|error| AppError::internal(format!("remote projection task failed: {error}")))?
+            .map_err(remote_subscription_error)
+    })
+    .await
+    .map_err(|_| {
+        AppError::service_unavailable(
+            "remote projection deadline exceeded; reconnect with the last consumed cursors",
+        )
+    })?
+}
+
+type PendingRemoteProjection = futures_util::future::BoxFuture<
+    'static,
+    Result<AdmittedRemoteProjection<Vec<PreparedRemoteFrame>>, AppError>,
+>;
 
 /// Deterministic backoff given observed work duration. The requested rate is an
 /// upper bound, not a latency promise; eight cheap samples permit gradual recovery.
@@ -2805,7 +2905,11 @@ async fn send_ws_cadence(
     send_ws_message(socket, WsMessage::Text(notice.to_string().into())).await
 }
 
-async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
+async fn handle_ws_stream(
+    mut socket: WebSocket,
+    state: ApiState,
+    projection_slots: Arc<tokio::sync::Semaphore>,
+) {
     static NEXT_CONNECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let connection_id = NEXT_CONNECTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let handle = state.handle.clone();
@@ -2819,6 +2923,7 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
     // command queue, so that wait never prevents returning stream credit.
     let mut pending_control: Option<futures_util::future::BoxFuture<'static, WsControlReply>> =
         None;
+    let mut pending_projection: Option<(tokio::time::Instant, PendingRemoteProjection)> = None;
     let mut cadence = WsStreamCadence::new(Duration::from_millis(50));
     let connected_at = tokio::time::Instant::now();
     debug!(connection_id, "WebSocket connected");
@@ -2832,7 +2937,11 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                 .as_ref()
                 .is_some_and(|window| window.awaiting_channels().len() < stream.channels().len())
         });
-        let dispatch_deadline = schedule.remaining(now, cadence.current, has_credit);
+        let dispatch_deadline = schedule.remaining(
+            now,
+            cadence.current,
+            has_credit && pending_projection.is_none(),
+        );
         tokio::select! {
             reply = async {
                 match pending_control.as_mut() {
@@ -2865,10 +2974,14 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                 // causes at most one bounded empty attempt, never an idle timer.
                 schedule.request();
             }
-            _ = wait_ws_deadline(dispatch_deadline) => {
+            (started, prepared) = async {
+                match pending_projection.as_mut() {
+                    Some((started, operation)) => (*started, operation.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                pending_projection = None;
                 if let Some(stream) = &mut subscription {
-                    let started = tokio::time::Instant::now();
-                    schedule.start(connected_at.elapsed());
                     let window = delivery.as_mut().expect("negotiation installs a delivery window");
                     if window.expired(connected_at.elapsed()) {
                         send_ws_error(&mut socket, None, AppError::service_unavailable(
@@ -2876,19 +2989,10 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                         )).await;
                         break;
                     }
-                    let awaiting_channels = window.awaiting_channels();
-                    if awaiting_channels.len() == stream.channels().len() {
-                        continue;
-                    }
-                    let snapshot = match handle.read_snapshot() {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            send_ws_error(&mut socket, None, AppError::from(error)).await;
-                            break;
-                        }
-                    };
-                    let frames = match prepare_remote_frames(stream.clone(), snapshot, awaiting_channels).await {
-                        Ok(frames) => frames,
+                    // Keep the permit alive for the entire delivery loop, not
+                    // only the worker: a slow socket still retains these bytes.
+                    let AdmittedRemoteProjection { value: frames, _permit } = match prepared {
+                        Ok(batch) => batch,
                         Err(error) => {
                             warn!(connection_id, message = %error.message, "remote stream refused a projection");
                             send_ws_error(&mut socket, None, error).await;
@@ -2928,6 +3032,26 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                     {
                         break;
                     }
+                }
+            }
+            _ = wait_ws_deadline(dispatch_deadline) => {
+                if let Some(stream) = &subscription {
+                    let window = delivery.as_ref().expect("negotiation installs a delivery window");
+                    let awaiting_channels = window.awaiting_channels();
+                    let snapshot = match handle.read_snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            send_ws_error(&mut socket, None, AppError::from(error)).await;
+                            break;
+                        }
+                    };
+                    schedule.start(connected_at.elapsed());
+                    // One bounded batch per connection. Capacity waits and CPU
+                    // work remain in select alongside ACKs, controls and close.
+                    pending_projection = Some((tokio::time::Instant::now(), Box::pin(
+                        prepare_remote_frames(stream.clone(), snapshot, awaiting_channels,
+                            Arc::clone(&projection_slots)),
+                    )));
                 }
             }
             _ = legacy_interval.tick(), if subscription.is_none() => {
@@ -3012,6 +3136,10 @@ async fn handle_ws_stream(mut socket: WebSocket, state: ApiState) {
                                     if !send_ws_message(&mut socket, WsMessage::Text(ack.to_string().into())).await {
                                         break;
                                     }
+                                    // No prepared frame has committed a cursor yet.
+                                    // Discard the previous mask's pending batch;
+                                    // a running worker retains only its own slot.
+                                    pending_projection = None;
                                     debug!(connection_id, channels = ?stream.channels(), "remote subscription accepted");
                                     cadence = WsStreamCadence::new(stream.interval());
                                     schedule = WsStreamSchedule::default();
@@ -3174,7 +3302,10 @@ async fn screenshot_ascii(
 )]
 async fn screenshot_png(State(state): State<ApiState>) -> Result<Response, AppError> {
     // Rasterization is CPU-heavy even though capture reads an immutable publication.
-    let bytes = run_control(move || state.handle.snapshot_png(1024, 576)).await?;
+    let bytes = run_control(ControlWorkLane::Work, move || {
+        state.handle.snapshot_png(1024, 576)
+    })
+    .await?;
     Ok((StatusCode::OK, axum::body::Bytes::from(bytes)).into_response())
 }
 
@@ -3225,11 +3356,11 @@ async fn stream_ticks_ndjson(
             let last_sent = last_sent.clone();
             let filter = filter.clone();
             async move {
-                tokio::task::spawn_blocking(move || {
-                    poll_tick_summaries_for_ndjson(&handle, &last_sent, &filter)
+                run_control(ControlWorkLane::Work, move || {
+                    Ok(poll_tick_summaries_for_ndjson(&handle, &last_sent, &filter))
                 })
                 .await
-                .unwrap_or_default()
+                .unwrap_or_else(|error| vec![TickPublicationMessage::error(error).into_ndjson()])
             }
         })
         .flat_map(futures_util::stream::iter);
@@ -3257,7 +3388,10 @@ async fn get_events_tail(
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(32);
-    let events = run_control(move || state.handle.events_tail(limit)).await?;
+    let events = run_control(ControlWorkLane::Work, move || {
+        state.handle.events_tail(limit)
+    })
+    .await?;
     Ok(Json(events))
 }
 
@@ -3301,7 +3435,10 @@ async fn get_narrative_search(
         limit: params.limit,
         run_id: params.run_id,
     };
-    let hits = run_control(move || state.handle.narrative_search(query)).await?;
+    let hits = run_control(ControlWorkLane::Work, move || {
+        state.handle.narrative_search(query)
+    })
+    .await?;
     Ok(Json(hits))
 }
 
@@ -3337,7 +3474,10 @@ async fn get_narrative_around(
         window: params.window,
         run_id: params.run_id,
     };
-    let hits = run_control(move || state.handle.narrative_around(query)).await?;
+    let hits = run_control(ControlWorkLane::Work, move || {
+        state.handle.narrative_around(query)
+    })
+    .await?;
     Ok(Json(hits))
 }
 
@@ -3356,7 +3496,10 @@ async fn get_scoreboard(
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(10);
-    let board = run_control(move || state.handle.compute_scoreboard(limit)).await?;
+    let board = run_control(ControlWorkLane::Work, move || {
+        state.handle.compute_scoreboard(limit)
+    })
+    .await?;
     Ok(Json(board))
 }
 
@@ -3403,12 +3546,13 @@ async fn get_agents_debug(
     }
 
     let query_for_world = query.clone();
-    let mut agents: Vec<AgentDebugEntryDto> =
-        run_control(move || state.handle.debug_agents(query_for_world))
-            .await?
-            .into_iter()
-            .map(AgentDebugEntryDto::from)
-            .collect();
+    let mut agents: Vec<AgentDebugEntryDto> = run_control(ControlWorkLane::Work, move || {
+        state.handle.debug_agents(query_for_world)
+    })
+    .await?
+    .into_iter()
+    .map(AgentDebugEntryDto::from)
+    .collect();
     // Ensure deterministic ordering and explicit tie-breaks
     match query.sort {
         AgentDebugSort::EnergyDesc => agents.sort_by(|a, b| {
@@ -3487,7 +3631,10 @@ async fn get_agent_inspection(
     axum::extract::Query(params): axum::extract::Query<AgentInspectionParams>,
 ) -> Result<Json<scriptbots_runtime::inspector::AgentInspection>, AppError> {
     let (uid, session_id, epoch) = params.identities()?;
-    let detail = run_control(move || state.handle.inspect_agent(uid, session_id, epoch)).await?;
+    let detail = run_control(ControlWorkLane::Work, move || {
+        state.handle.inspect_agent(uid, session_id, epoch)
+    })
+    .await?;
     detail
         .map(Json)
         .ok_or_else(|| AppError::not_found("creature is no longer present in this host"))
@@ -3514,9 +3661,11 @@ async fn get_brain_activity(
     axum::extract::Query(params): axum::extract::Query<AgentInspectionParams>,
 ) -> Result<Json<scriptbots_runtime::inspector::BrainActivityInspection>, AppError> {
     let (uid, session_id, epoch) = params.identities()?;
-    run_control(move || state.handle.inspect_brain_activity(uid, session_id, epoch))
-        .await
-        .map(Json)
+    run_control(ControlWorkLane::Work, move || {
+        state.handle.inspect_brain_activity(uid, session_id, epoch)
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3564,7 +3713,7 @@ async fn get_genome_inspection(
         epoch: params.epoch,
     };
     let (uid, session_id, epoch) = identities.identities()?;
-    run_control(move || {
+    run_control(ControlWorkLane::Work, move || {
         state.handle.inspect_genome_page(
             uid,
             session_id,
@@ -3600,7 +3749,10 @@ async fn post_selection(
     // 202 is still correct and is now honest rather than incidental: the body
     // says `admitted`, not `applied`, so the status code and the payload agree
     // that this command has been accepted and not yet applied.
-    let status = run_control(move || state.handle.update_selection(update, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.update_selection(update, key.as_deref())
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -3617,7 +3769,10 @@ async fn post_selection(
 async fn get_selection(
     State(state): State<ApiState>,
 ) -> Result<Json<SelectionSnapshotDto>, AppError> {
-    let selection = run_control(move || state.handle.current_selection()).await?;
+    let selection = run_control(ControlWorkLane::Work, move || {
+        state.handle.current_selection()
+    })
+    .await?;
     Ok(Json(selection))
 }
 
@@ -3647,7 +3802,10 @@ async fn get_interventions(
     State(state): State<ApiState>,
     axum::extract::Query(query): axum::extract::Query<InterventionsQuery>,
 ) -> Result<Json<InterventionsPollDto>, AppError> {
-    let poll = run_control(move || state.handle.applied_interventions(query.after_seq)).await?;
+    let poll = run_control(ControlWorkLane::Work, move || {
+        state.handle.applied_interventions(query.after_seq)
+    })
+    .await?;
     Ok(Json(poll))
 }
 
@@ -3669,7 +3827,10 @@ async fn patch_config(
     // though it were current. The old response projected future config: it was
     // built from the REQUESTED values and stamped with the tick at which those
     // values were NOT in effect (bd-k7nq). Read /api/config for applied truth.
-    let status = run_control(move || state.handle.apply_patch(payload.patch)).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.apply_patch(payload.patch)
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -3690,7 +3851,10 @@ async fn apply_updates(
     if payload.updates.is_empty() {
         return Err(AppError::bad_request("updates cannot be empty"));
     }
-    let status = run_control(move || state.handle.apply_updates(&payload.updates)).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.apply_updates(&payload.updates)
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -3703,11 +3867,12 @@ async fn apply_updates(
 async fn get_config_audit(
     State(state): State<ApiState>,
 ) -> Result<Json<Vec<ConfigAuditEntryView>>, AppError> {
-    let mut entries: Vec<ConfigAuditEntryView> = run_control(move || state.handle.audit())
-        .await?
-        .into_iter()
-        .map(ConfigAuditEntryView::from)
-        .collect();
+    let mut entries: Vec<ConfigAuditEntryView> =
+        run_control(ControlWorkLane::Work, move || state.handle.audit())
+            .await?
+            .into_iter()
+            .map(ConfigAuditEntryView::from)
+            .collect();
     entries.sort_by_key(|entry| entry.tick);
     Ok(Json(entries))
 }
@@ -3756,7 +3921,10 @@ async fn apply_preset(
             payload.name
         )));
     };
-    let status = run_control(move || state.handle.apply_patch(kind.patch())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.apply_patch(kind.patch())
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -3771,7 +3939,10 @@ async fn post_control_pause(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.pause(key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.pause(key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3786,7 +3957,10 @@ async fn post_control_resume(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.resume(key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.resume(key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3805,7 +3979,10 @@ async fn post_control_step(
     require_json_content_type(&headers, &bytes)?;
     let count = parse_step_count(&bytes)?;
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.step_count(count, key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3822,7 +3999,10 @@ async fn post_control_speed(
     Json(payload): Json<SpeedRequest>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.set_speed(payload.speed, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.set_speed(payload.speed, key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3835,7 +4015,7 @@ async fn post_control_speed(
 async fn post_control_shutdown(
     State(state): State<ApiState>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
-    let status = run_control(move || state.handle.shutdown()).await?;
+    let status = run_control(ControlWorkLane::Command, move || state.handle.shutdown()).await?;
     Ok(Json(status))
 }
 
@@ -3855,9 +4035,11 @@ async fn get_control_status(
     axum::extract::Path(command_id): axum::extract::Path<String>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let id_for_handle = command_id.clone();
-    let status = run_control(move || state.handle.command_status(&id_for_handle))
-        .await?
-        .ok_or_else(|| AppError::not_found(format!("unknown command id: {command_id}")))?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.command_status(&id_for_handle)
+    })
+    .await?
+    .ok_or_else(|| AppError::not_found(format!("unknown command id: {command_id}")))?;
     Ok(Json(status))
 }
 
@@ -3872,7 +4054,10 @@ async fn post_pause(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.pause(key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.pause(key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -3899,7 +4084,7 @@ async fn post_map_generate(
 
     let generator_config = req.generator_config()?;
 
-    let artifact = run_control(move || {
+    let artifact = run_control(ControlWorkLane::Work, move || {
         let (def_w, def_h, def_cell) = state
             .handle
             .read_snapshot()
@@ -3940,7 +4125,7 @@ async fn post_map_apply(
     let key = idempotency_key(&headers).or(payload.idempotency_key);
     let artifact = parse_map_artifact(&payload.artifact)?;
 
-    let status = run_control(move || {
+    let status = run_control(ControlWorkLane::Work, move || {
         state.handle.apply_map(
             artifact,
             payload.existing_agent_policy.into(),
@@ -3968,7 +4153,10 @@ async fn post_control_intervene(
     let key = idempotency_key(&headers).or(payload.idempotency_key.clone());
     let command = parse_intervention_command(&payload)?;
 
-    let status = run_control(move || state.handle.intervene(command, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.intervene(command, key.as_deref())
+    })
+    .await?;
 
     Ok(Json(status))
 }
@@ -3989,9 +4177,11 @@ async fn post_browser_intervention(
     State(state): State<ApiState>,
     Json(request): Json<scriptbots_runtime::remote::BrowserInterventionRequest>,
 ) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionReceipt>, AppError> {
-    run_control(move || state.handle.browser_intervene(&request))
-        .await
-        .map(Json)
+    run_control(ControlWorkLane::Command, move || {
+        state.handle.browser_intervene(&request)
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4020,7 +4210,7 @@ async fn get_browser_intervention_status(
     axum::extract::Path(command_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<BrowserInterventionStatusQuery>,
 ) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionReceipt>, AppError> {
-    run_control(move || {
+    run_control(ControlWorkLane::Command, move || {
         state
             .handle
             .browser_intervention_status(&command_id, &query.session_id)
@@ -4059,7 +4249,7 @@ async fn get_browser_intervention_history(
     State(state): State<ApiState>,
     axum::extract::Query(query): axum::extract::Query<BrowserInterventionHistoryQuery>,
 ) -> Result<Json<scriptbots_runtime::remote::BrowserInterventionHistory>, AppError> {
-    run_control(move || {
+    run_control(ControlWorkLane::Work, move || {
         state.handle.browser_intervention_history(
             &query.session_id,
             &query.epoch,
@@ -4110,7 +4300,10 @@ async fn post_resume(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.resume(key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.resume(key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4133,7 +4326,10 @@ async fn post_step(
     // polling it learns about that one command. Saying so beats implying the
     // receipt covers all of them.
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.step_count(count, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.step_count(count, key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4150,7 +4346,10 @@ async fn post_speed(
     Json(body): Json<SpeedRequestBody>,
 ) -> Result<Json<CommandStatusDto>, AppError> {
     let key = idempotency_key(&headers);
-    let status = run_control(move || state.handle.set_speed(body.speed, key.as_deref())).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.set_speed(body.speed, key.as_deref())
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4161,7 +4360,7 @@ async fn post_speed(
     responses((status = 200, body = SimulationStatusDto))
 )]
 async fn get_status(State(state): State<ApiState>) -> Result<Json<SimulationStatusDto>, AppError> {
-    let status = run_control(move || state.handle.status()).await?;
+    let status = run_control(ControlWorkLane::Command, move || state.handle.status()).await?;
     Ok(Json(status))
 }
 
@@ -4181,7 +4380,7 @@ pub struct PaginationQueryParams {
     responses((status = 200, body = ApiVersionDto))
 )]
 async fn get_version(State(state): State<ApiState>) -> Result<Json<ApiVersionDto>, AppError> {
-    let version = run_control(move || Ok(state.handle.version())).await?;
+    let version = run_control(ControlWorkLane::Command, move || Ok(state.handle.version())).await?;
     Ok(Json(version))
 }
 
@@ -4192,7 +4391,7 @@ async fn get_version(State(state): State<ApiState>) -> Result<Json<ApiVersionDto
     responses((status = 200, body = ApiVersionDto))
 )]
 async fn get_v1_version(State(state): State<ApiState>) -> Result<Json<ApiVersionDto>, AppError> {
-    let version = run_control(move || Ok(state.handle.version())).await?;
+    let version = run_control(ControlWorkLane::Command, move || Ok(state.handle.version())).await?;
     Ok(Json(version))
 }
 
@@ -4203,7 +4402,7 @@ async fn get_v1_version(State(state): State<ApiState>) -> Result<Json<ApiVersion
     responses((status = 200, body = ApiSchemaDto))
 )]
 async fn get_schema(State(state): State<ApiState>) -> Result<Json<ApiSchemaDto>, AppError> {
-    let schema = run_control(move || Ok(state.handle.schema())).await?;
+    let schema = run_control(ControlWorkLane::Command, move || Ok(state.handle.schema())).await?;
     Ok(Json(schema))
 }
 
@@ -4214,7 +4413,7 @@ async fn get_schema(State(state): State<ApiState>) -> Result<Json<ApiSchemaDto>,
     responses((status = 200, body = ApiSchemaDto))
 )]
 async fn get_v1_schema(State(state): State<ApiState>) -> Result<Json<ApiSchemaDto>, AppError> {
-    let schema = run_control(move || Ok(state.handle.schema())).await?;
+    let schema = run_control(ControlWorkLane::Command, move || Ok(state.handle.schema())).await?;
     Ok(Json(schema))
 }
 
@@ -4236,7 +4435,10 @@ async fn post_v1_experiments(
     if body.idempotency_key.is_none() {
         body.idempotency_key = idempotency_key(&headers);
     }
-    let status = run_control(move || state.handle.create_experiment(body)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.create_experiment(body)
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(status)))
 }
 
@@ -4251,7 +4453,7 @@ async fn get_v1_experiments(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedExperimentsResponse>, AppError> {
-    let res = run_control(move || {
+    let res = run_control(ControlWorkLane::Work, move || {
         state
             .handle
             .list_experiments(params.limit, params.cursor.as_deref())
@@ -4271,8 +4473,42 @@ async fn get_v1_experiment_by_id(
     State(state): State<ApiState>,
     axum::extract::Path(experiment_id): axum::extract::Path<String>,
 ) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.get_experiment(&experiment_id)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.get_experiment(&experiment_id)
+    })
+    .await?;
     Ok(Json(status))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/experiments/{experiment_id}/runs/{run_id}/artifacts",
+    tag = "experiments",
+    params(
+        ("experiment_id" = String, Path, description = "Exact admitted experiment identity"),
+        ("run_id" = String, Path, description = "Completed run belonging to this experiment")
+    ),
+    responses(
+        (status = 200, description = "Source-verified inventory of at most 33 files and 48 MiB, including the manifest; use each artifact ID with the existing download route", body = ExperimentRunArtifactsDto),
+        (status = 400, description = "Invalid experiment or run identity"),
+        (status = 404, description = "Experiment or run not found"),
+        (status = 409, description = "Selected run is incomplete or its published identity changed"),
+        (status = 413, description = "Artifact count, byte total or 256 KiB inventory response bound exceeded"),
+        (status = 500, description = "Saved plan, final owner or artifact evidence failed verification"),
+        (status = 503, description = "Bounded control work capacity is busy")
+    )
+)]
+async fn get_v1_experiment_run_artifacts(
+    State(state): State<ApiState>,
+    axum::extract::Path((experiment_id, run_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<ExperimentRunArtifactsDto>, AppError> {
+    let inventory = run_control(ControlWorkLane::Work, move || {
+        state
+            .handle
+            .get_experiment_run_artifacts(&experiment_id, &run_id)
+    })
+    .await?;
+    Ok(Json(inventory))
 }
 
 /// Compare one measured endpoint across two verified completed variant cohorts.
@@ -4329,7 +4565,7 @@ async fn post_v1_experiment_compare(
             "an experiment comparison request is already waiting or running; retry after it finishes",
         )
     })?;
-    let comparison = run_control(move || {
+    let comparison = run_control(ControlWorkLane::Work, move || {
         let _permit = permit;
         state.handle.compare_experiment_variants(
             &experiment_id,
@@ -4353,7 +4589,10 @@ async fn post_v1_experiment_cancel(
     State(state): State<ApiState>,
     axum::extract::Path(experiment_id): axum::extract::Path<String>,
 ) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.cancel_experiment(&experiment_id)).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.cancel_experiment(&experiment_id)
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4371,7 +4610,58 @@ async fn post_v1_experiment_resume(
     State(state): State<ApiState>,
     axum::extract::Path(experiment_id): axum::extract::Path<String>,
 ) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.resume_experiment(&experiment_id)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.resume_experiment(&experiment_id)
+    })
+    .await?;
+    Ok(Json(status))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/experiments/{experiment_id}/retry-failed",
+    tag = "experiments",
+    params(("experiment_id" = String, Path, description = "Unique experiment identifier")),
+    request_body = ExperimentRetryFailedRequest,
+    responses(
+        (status = 200, description = "Failed runs admitted from verified saved owner cuts; poll status for completion", body = ExperimentBatchStatusDto),
+        (status = 400, description = "Missing or malformed generation guard"),
+        (status = 404, description = "Experiment not found"),
+        (status = 409, description = "Observed generation changed, experiment is running, or retry evidence is unavailable"),
+        (status = 413, description = "Request exceeds the 4 KiB body limit"),
+        (status = 415, description = "Request body must use a JSON content type"),
+        (status = 500, description = "Saved status or owner evidence failed verification"),
+        (status = 503, description = "Execution capacity exhausted; failed runs remain unchanged")
+    )
+)]
+async fn post_v1_experiment_retry_failed(
+    State(state): State<ApiState>,
+    axum::extract::Path(experiment_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Result<Json<ExperimentBatchStatusDto>, AppError> {
+    require_json_content_type(&headers, &bytes)?;
+    if bytes.len() > 4096 {
+        return Err(AppError::payload_too_large(
+            "experiment failed-run retry request exceeds 4096 bytes",
+        ));
+    }
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(AppError::bad_request(
+            "experiment failed-run retry request must be a JSON object with expected_generation",
+        ));
+    }
+    let body: ExperimentRetryFailedRequest = serde_json::from_slice(&bytes).map_err(|error| {
+        AppError::bad_request(format!(
+            "invalid experiment failed-run retry request: {error}"
+        ))
+    })?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state
+            .handle
+            .retry_failed_experiment(&experiment_id, body.expected_generation)
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4398,7 +4688,10 @@ async fn post_v1_checkpoints(
     if body.idempotency_key.is_none() {
         body.idempotency_key = idempotency_key(&headers);
     }
-    let meta = run_control(move || state.handle.create_checkpoint(body)).await?;
+    let meta = run_control(ControlWorkLane::Work, move || {
+        state.handle.create_checkpoint(body)
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(meta)))
 }
 
@@ -4413,7 +4706,7 @@ async fn get_v1_checkpoints(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedCheckpointsResponse>, AppError> {
-    let res = run_control(move || {
+    let res = run_control(ControlWorkLane::Work, move || {
         state
             .handle
             .list_checkpoints(params.limit, params.cursor.as_deref())
@@ -4433,7 +4726,10 @@ async fn get_v1_checkpoint_by_id(
     State(state): State<ApiState>,
     axum::extract::Path(checkpoint_id): axum::extract::Path<String>,
 ) -> Result<Json<CheckpointMetadataDto>, AppError> {
-    let meta = run_control(move || state.handle.get_checkpoint(&checkpoint_id)).await?;
+    let meta = run_control(ControlWorkLane::Work, move || {
+        state.handle.get_checkpoint(&checkpoint_id)
+    })
+    .await?;
     Ok(Json(meta))
 }
 
@@ -4506,8 +4802,8 @@ fn checkpoint_canvas_response(
             "checkpoint canvas does not match its requested owner and saved scientific cut",
         ));
     }
-    let environment = RemoteEnvironmentSnapshot::capture(&snapshot)
-        .map_err(checkpoint_canvas_protocol_error)?;
+    let environment =
+        RemoteEnvironmentSnapshot::capture(&snapshot).map_err(checkpoint_canvas_protocol_error)?;
     let frame = RemoteFrame {
         identity: snapshot.as_ref().into(),
         playback: snapshot.playback,
@@ -4568,8 +4864,7 @@ async fn get_v1_checkpoint_canvas(
     })?;
     let mut reconstruction = AbortOnDrop(tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let response =
-            checkpoint_canvas_response(&state.handle, &checkpoint_id, expected_session)?;
+        let response = checkpoint_canvas_response(&state.handle, &checkpoint_id, expected_session)?;
         let bytes = serde_json::to_vec(&response)
             .map_err(|error| AppError::internal(format!("checkpoint canvas encoding: {error}")))?;
         if bytes.len() > MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES {
@@ -4612,7 +4907,7 @@ async fn get_v1_checkpoint_branches(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedCheckpointBranchesResponse>, AppError> {
-    let page = run_control(move || {
+    let page = run_control(ControlWorkLane::Work, move || {
         state
             .handle
             .list_checkpoint_branches(params.limit, params.cursor.as_deref())
@@ -4671,7 +4966,10 @@ async fn post_v1_checkpoint_branches(
             ));
         }
     }
-    let status = run_control(move || state.handle.create_checkpoint_branch(body)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.create_checkpoint_branch(body)
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(status)))
 }
 
@@ -4689,7 +4987,10 @@ async fn get_v1_checkpoint_branch(
     State(state): State<ApiState>,
     axum::extract::Path(branch_id): axum::extract::Path<String>,
 ) -> Result<Json<CheckpointBranchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.get_checkpoint_branch(&branch_id)).await?;
+    let status = run_control(ControlWorkLane::Work, move || {
+        state.handle.get_checkpoint_branch(&branch_id)
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4714,7 +5015,7 @@ async fn get_v1_checkpoint_branch_artifacts(
     axum::extract::Path(branch_id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedArtifactsResponse>, AppError> {
-    let artifacts = run_control(move || {
+    let artifacts = run_control(ControlWorkLane::Work, move || {
         state.handle.list_checkpoint_branch_artifacts(
             &branch_id,
             params.limit,
@@ -4739,7 +5040,10 @@ async fn post_v1_checkpoint_branch_cancel(
     State(state): State<ApiState>,
     axum::extract::Path(branch_id): axum::extract::Path<String>,
 ) -> Result<Json<CheckpointBranchStatusDto>, AppError> {
-    let status = run_control(move || state.handle.cancel_checkpoint_branch(&branch_id)).await?;
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.cancel_checkpoint_branch(&branch_id)
+    })
+    .await?;
     Ok(Json(status))
 }
 
@@ -4754,7 +5058,7 @@ async fn get_v1_artifacts(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<PaginationQueryParams>,
 ) -> Result<Json<PaginatedArtifactsResponse>, AppError> {
-    let res = run_control(move || {
+    let res = run_control(ControlWorkLane::Work, move || {
         state
             .handle
             .list_artifacts(params.limit, params.cursor.as_deref())
@@ -4774,7 +5078,10 @@ async fn get_v1_artifact_by_id(
     State(state): State<ApiState>,
     axum::extract::Path(artifact_id): axum::extract::Path<String>,
 ) -> Result<Json<ArtifactMetadataDto>, AppError> {
-    let meta = run_control(move || state.handle.get_artifact(&artifact_id)).await?;
+    let meta = run_control(ControlWorkLane::Work, move || {
+        state.handle.get_artifact(&artifact_id)
+    })
+    .await?;
     Ok(Json(meta))
 }
 
@@ -4789,7 +5096,10 @@ async fn get_v1_artifact_download(
     State(state): State<ApiState>,
     axum::extract::Path(artifact_id): axum::extract::Path<String>,
 ) -> Result<Response, AppError> {
-    let (meta, bytes) = run_control(move || state.handle.read_artifact_bytes(&artifact_id)).await?;
+    let (meta, bytes) = run_control(ControlWorkLane::Work, move || {
+        state.handle.read_artifact_bytes(&artifact_id)
+    })
+    .await?;
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, meta.content_type)
@@ -4836,12 +5146,20 @@ fn prepare_rest_server(
             post(post_v1_experiment_compare).layer(DefaultBodyLimit::max(4096)),
         )
         .route(
+            "/api/v1/experiments/{experiment_id}/runs/{run_id}/artifacts",
+            get(get_v1_experiment_run_artifacts),
+        )
+        .route(
             "/api/v1/experiments/{experiment_id}/cancel",
             post(post_v1_experiment_cancel),
         )
         .route(
             "/api/v1/experiments/{experiment_id}/resume",
             post(post_v1_experiment_resume),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/retry-failed",
+            post(post_v1_experiment_retry_failed).layer(DefaultBodyLimit::max(4096)),
         )
         .route(
             "/api/v1/checkpoints",
@@ -5493,6 +5811,30 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
 
     builder = register_tool(
         builder,
+        "experiment_run_artifacts",
+        "Discover every downloadable file for one completed experiment run. Verifies its exact plan, run identity, artifact bytes and restored final owner without inspecting companion run files. Returns at most 33 files and a 256 KiB inventory; use artifact_get for metadata or the REST artifact download route for verified bytes. Does not advance the live world or modify experiment status.",
+        json!({
+            "type": "object",
+            "properties": {
+                "experiment_id": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": crate::experiment_runner::MAX_RUN_COMPONENT_BYTES
+                },
+                "run_id": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": crate::experiment_runner::MAX_RUN_COMPONENT_BYTES,
+                    "description": "Exact completed run ID from this experiment's observed status"
+                }
+            },
+            "required": ["experiment_id", "run_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentRunArtifacts,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
         "experiment_compare",
         "Compare one final-state metric across two completed matched-seed variants. Revalidates every retained bundle and final owner checkpoint. Differences are challenger minus baseline; one seed is descriptive only. Does not advance or modify the live world. Retry a busy result after the active comparison finishes.",
         json!({
@@ -5553,6 +5895,23 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
             "additionalProperties": false
         }),
         ControlToolKind::ExperimentResume,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "experiment_retry_failed",
+        "Explicitly retry failed experiment runs from verified saved owner cuts, retaining failure evidence. Pass the observed status generation; poll experiment_status for completion.",
+        json!({
+            "type": "object",
+            "properties": {
+                "experiment_id": {"type": "string"},
+                "expected_generation": {"type": "integer", "minimum": 0}
+            },
+            "required": ["experiment_id", "expected_generation"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentRetryFailed,
         handle.clone(),
     );
 
@@ -5775,6 +6134,7 @@ fn register_tool(
     kind: ControlToolKind,
     handle: ControlHandle,
 ) -> ServerBuilder {
+    debug_assert_eq!(ControlToolKind::from_name(name), Some(kind));
     builder.tool(ControlTool {
         handle,
         kind,
@@ -5787,6 +6147,8 @@ fn register_tool(
 /// Shared per-process MCP HTTP state: one negotiated session guarded by
 /// `dispatch_request_concurrent`. FastMCP retains the session mutex while a
 /// handler runs because tool annotations do not guarantee mutation safety.
+/// Separate work/command admission preserves capacity, not execution priority
+/// over another request already holding this same session mutex.
 #[derive(Clone)]
 struct McpHttpState {
     server: Arc<Server>,
@@ -5819,21 +6181,31 @@ async fn handle_mcp_http_request(
     State(state): State<McpHttpState>,
     Json(request): Json<JsonRpcRequest>,
 ) -> Response {
+    dispatch_mcp_http_request(state, request, &MCP_DISPATCH_SLOTS).await
+}
+
+async fn dispatch_mcp_http_request(
+    state: McpHttpState,
+    request: JsonRpcRequest,
+    slots: &ControlWorkSlots,
+) -> Response {
     let method = request.method.clone();
     let id = request.id.clone();
+    let lane = mcp_request_work_lane(&request);
     let cx = state.request_cx();
     // FastMCP dispatch and its session mutex are synchronous. Capture the
     // caller's context before moving that work off the HTTP async worker.
-    match tokio::task::spawn_blocking(move || {
-        state.server.dispatch_request_concurrent(
-            &cx,
-            &state.session,
-            request,
-            &state.notification_sender,
-            &state.request_sender,
-        )
-    })
-    .await
+    match slots
+        .run(lane, move || {
+            Ok(state.server.dispatch_request_concurrent(
+                &cx,
+                &state.session,
+                request,
+                &state.notification_sender,
+                &state.request_sender,
+            ))
+        })
+        .await
     {
         Ok(Some(message)) => Json(message).into_response(),
         Ok(None) => {
@@ -5863,7 +6235,26 @@ async fn handle_mcp_http_request(
             }
         }
         Err(error) => {
-            warn!(%error, "MCP HTTP dispatch task failed");
+            warn!(?error, "MCP HTTP dispatch task failed");
+            if error.status == StatusCode::SERVICE_UNAVAILABLE {
+                return if let Some(request_id) = id {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "error": {
+                                "code": -32000,
+                                "message": error.message,
+                                "data": {"kind": "capacity", "retryable": true, "operation_started": false}
+                            }
+                        })),
+                    ).into_response()
+                } else {
+                    // A refused notification was not accepted for dispatch.
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                };
+            }
             if let Some(request_id) = id {
                 Json(json!({
                     "jsonrpc": "2.0",
@@ -5963,7 +6354,21 @@ struct McpCheckpointBranchIdRequest {
     branch_id: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpExperimentRetryFailedRequest {
+    experiment_id: String,
+    expected_generation: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpExperimentRunArtifactsRequest {
+    experiment_id: String,
+    run_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlToolKind {
     ListPresets,
     ApplyPreset,
@@ -5988,9 +6393,11 @@ enum ControlToolKind {
     ExperimentCreate,
     ExperimentList,
     ExperimentStatus,
+    ExperimentRunArtifacts,
     ExperimentCompare,
     ExperimentCancel,
     ExperimentResume,
+    ExperimentRetryFailed,
     CheckpointCreate,
     CheckpointList,
     CheckpointStatus,
@@ -6000,6 +6407,109 @@ enum ControlToolKind {
     CheckpointBranchCancel,
     ArtifactList,
     ArtifactGet,
+}
+
+impl ControlToolKind {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "list_presets" => Self::ListPresets,
+            "apply_preset" => Self::ApplyPreset,
+            "list_knobs" => Self::ListKnobs,
+            "get_config" => Self::GetConfig,
+            "apply_updates" => Self::ApplyUpdates,
+            "apply_patch" => Self::ApplyPatch,
+            "pause" => Self::Pause,
+            "resume" => Self::Resume,
+            "step" => Self::Step,
+            "set_speed" => Self::SetSpeed,
+            "get_status" => Self::GetStatus,
+            "shutdown" => Self::Shutdown,
+            "get_command_status" => Self::GetCommandStatus,
+            "map_generate" => Self::MapGenerate,
+            "map_apply" => Self::MapApply,
+            "intervene" => Self::Intervene,
+            "narrative_search" => Self::NarrativeSearch,
+            "narrative_around" => Self::NarrativeAround,
+            "get_version" => Self::GetVersion,
+            "get_schema" => Self::GetSchema,
+            "experiment_create" => Self::ExperimentCreate,
+            "experiment_list" => Self::ExperimentList,
+            "experiment_status" => Self::ExperimentStatus,
+            "experiment_run_artifacts" => Self::ExperimentRunArtifacts,
+            "experiment_compare" => Self::ExperimentCompare,
+            "experiment_cancel" => Self::ExperimentCancel,
+            "experiment_resume" => Self::ExperimentResume,
+            "experiment_retry_failed" => Self::ExperimentRetryFailed,
+            "checkpoint_create" => Self::CheckpointCreate,
+            "checkpoint_list" => Self::CheckpointList,
+            "checkpoint_status" => Self::CheckpointStatus,
+            "checkpoint_branch_create" => Self::CheckpointBranchCreate,
+            "checkpoint_branch_list" => Self::CheckpointBranchList,
+            "checkpoint_branch_status" => Self::CheckpointBranchStatus,
+            "checkpoint_branch_cancel" => Self::CheckpointBranchCancel,
+            "artifact_list" => Self::ArtifactList,
+            "artifact_get" => Self::ArtifactGet,
+            _ => return None,
+        })
+    }
+
+    const fn work_lane(self) -> ControlWorkLane {
+        match self {
+            Self::ApplyPreset
+            | Self::ApplyUpdates
+            | Self::ApplyPatch
+            | Self::Pause
+            | Self::Resume
+            | Self::Step
+            | Self::SetSpeed
+            | Self::GetStatus
+            | Self::Shutdown
+            | Self::GetCommandStatus
+            | Self::Intervene
+            | Self::GetVersion
+            | Self::GetSchema
+            | Self::ExperimentCancel
+            | Self::CheckpointBranchCancel => ControlWorkLane::Command,
+            Self::ListPresets
+            | Self::ListKnobs
+            | Self::GetConfig
+            | Self::MapGenerate
+            | Self::MapApply
+            | Self::NarrativeSearch
+            | Self::NarrativeAround
+            | Self::ExperimentCreate
+            | Self::ExperimentList
+            | Self::ExperimentStatus
+            | Self::ExperimentRunArtifacts
+            | Self::ExperimentCompare
+            | Self::ExperimentResume
+            | Self::ExperimentRetryFailed
+            | Self::CheckpointCreate
+            | Self::CheckpointList
+            | Self::CheckpointStatus
+            | Self::CheckpointBranchCreate
+            | Self::CheckpointBranchList
+            | Self::CheckpointBranchStatus
+            | Self::ArtifactList
+            | Self::ArtifactGet => ControlWorkLane::Work,
+        }
+    }
+}
+
+fn mcp_request_work_lane(request: &JsonRpcRequest) -> ControlWorkLane {
+    match request.method.as_str() {
+        "initialize" | "notifications/initialized" | "ping" | "tools/list" => {
+            ControlWorkLane::Command
+        }
+        "tools/call" => request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            .and_then(ControlToolKind::from_name)
+            .map_or(ControlWorkLane::Work, ControlToolKind::work_lane),
+        _ => ControlWorkLane::Work,
+    }
 }
 
 impl ToolHandler for ControlTool {
@@ -6017,10 +6527,18 @@ impl ToolHandler for ControlTool {
     }
 
     fn call(&self, _ctx: &fastmcp_rust::McpContext, arguments: Value) -> McpResult<Vec<Content>> {
+        // Includes stdio/direct callers. The dispatch budget is distinct, so
+        // HTTP never recursively acquires the same limited permit. This scope
+        // owns admission through the joined large-stack worker and formatting.
+        let _permit = CONTROL_WORK_SLOTS
+            .try_admit(self.kind.work_lane())
+            .map_err(|error| McpError::new(McpErrorCode::ToolExecutionError, error.message))?;
         if matches!(
             self.kind,
             ControlToolKind::Step
+                | ControlToolKind::ExperimentRunArtifacts
                 | ControlToolKind::ExperimentCompare
+                | ControlToolKind::ExperimentRetryFailed
                 | ControlToolKind::CheckpointBranchCreate
                 | ControlToolKind::CheckpointBranchList
                 | ControlToolKind::CheckpointBranchStatus
@@ -6364,6 +6882,20 @@ impl ToolHandler for ControlTool {
                 let res = run_control_mcp_sync(move || handle.get_experiment(&experiment_id))?;
                 make_tool_result(res)
             }
+            ControlToolKind::ExperimentRunArtifacts => {
+                let request: McpExperimentRunArtifactsRequest =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid experiment_run_artifacts parameters: {error}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let inventory = run_control_mcp_sync(move || {
+                    handle.get_experiment_run_artifacts(&request.experiment_id, &request.run_id)
+                })?;
+                make_tool_result(inventory)
+            }
             ControlToolKind::ExperimentCompare => {
                 let request: McpExperimentComparisonRequest =
                     serde_json::from_value(Value::Object(arguments)).map_err(|error| {
@@ -6406,6 +6938,23 @@ impl ToolHandler for ControlTool {
                 let handle = self.handle.clone();
                 let res = run_control_mcp_sync(move || handle.resume_experiment(&experiment_id))?;
                 make_tool_result(res)
+            }
+            ControlToolKind::ExperimentRetryFailed => {
+                let request: McpExperimentRetryFailedRequest =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid experiment_retry_failed parameters: {error}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let status = run_control_mcp_sync(move || {
+                    handle.retry_failed_experiment(
+                        &request.experiment_id,
+                        request.expected_generation,
+                    )
+                })?;
+                make_tool_result(status)
             }
             ControlToolKind::CheckpointCreate => {
                 let req: CheckpointCreateRequest = serde_json::from_value(Value::Object(arguments))
@@ -6565,15 +7114,21 @@ where
     })
 }
 
-/// MCP twin of [`run_control`]: a contended world mutex parks a blocking-pool
-/// thread instead of the MCP server's async worker (bd-134).
+/// MCP twin of [`run_control`] with the original typed control-error mapping.
 #[allow(dead_code)]
 async fn run_control_mcp<T, F>(operation: F) -> Result<T, McpError>
 where
     F: FnOnce() -> Result<T, ControlError> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
+    let permit = CONTROL_WORK_SLOTS
+        .try_admit(ControlWorkLane::Work)
+        .map_err(|error| McpError::new(McpErrorCode::ToolExecutionError, error.message))?;
+    let mut task = AbortOnDrop(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    }));
+    (&mut task.0)
         .await
         .map_err(|join_error| {
             McpError::new(
@@ -6686,7 +7241,8 @@ mod tests {
         // Assembled at runtime: a source-scanning test that spells out its own
         // needle matches itself and passes forever.
         let openers = [
-            format!("run_control(move || {}.", "state.handle"),
+            format!("run_control({}::Command, move || ", "ControlWorkLane"),
+            format!("run_control({}::Work, move || ", "ControlWorkLane"),
             format!("run_control_mcp_sync(move || {}.", "handle"),
         ];
         let bound_openers: Vec<String> = openers
@@ -6739,6 +7295,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(receipt_forms(&deleted), (false, false));
+
+        for opener in &openers {
+            let wrapped = format!("let status =\n    {opener}pause(None))?;");
+            assert_eq!(receipt_forms(&wrapped), (true, false));
+            let discarded = format!("{opener}pause(None))?;");
+            assert_eq!(receipt_forms(&discarded), (false, true));
+        }
 
         // A genuine discard must fail even when valid production bindings remain.
         for opener in &openers {
@@ -7364,22 +7927,28 @@ mod tests {
         .await
         .expect("real saved source projects through the endpoint");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL], "no-store");
-        let body = axum::body::to_bytes(
-            response.into_body(),
-            MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES,
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES)
+            .await
+            .unwrap();
         let response: CheckpointCanvasResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(response.schema, CHECKPOINT_CANVAS_SCHEMA);
-        assert_eq!(response.source_session_id, handle.session_id().get().to_string());
+        assert_eq!(
+            response.source_session_id,
+            handle.session_id().get().to_string()
+        );
         assert_eq!(response.checkpoint, saved);
         let binary = base64::engine::general_purpose::STANDARD
             .decode(&response.frame_base64)
             .unwrap();
         let frame = scriptbots_runtime::remote::decode_remote_frame(&binary).unwrap();
-        assert_eq!(frame.identity.session_id, u128::from(handle.session_id().get()));
+        assert_eq!(
+            frame.identity.session_id,
+            u128::from(handle.session_id().get())
+        );
         assert_eq!(frame.identity.tick, saved.tick);
         assert!(frame.playback.paused);
         assert_eq!(frame.coalesced_publications, 0);
@@ -7390,7 +7959,10 @@ mod tests {
         assert_eq!(environment.width, expected_environment.width);
         assert_eq!(environment.height, expected_environment.height);
         assert_eq!(environment.source_width, expected_environment.source_width);
-        assert_eq!(environment.source_height, expected_environment.source_height);
+        assert_eq!(
+            environment.source_height,
+            expected_environment.source_height
+        );
         assert_eq!(environment.cell_size, expected_environment.cell_size);
         assert_eq!(
             environment.food_max.to_bits(),
@@ -7477,7 +8049,9 @@ mod tests {
             let refusal = get_v1_checkpoint_canvas(
                 State(state.clone()),
                 axum::extract::Path("missing-checkpoint".into()),
-                axum::extract::Query(CheckpointCanvasQuery { session_id: session }),
+                axum::extract::Query(CheckpointCanvasQuery {
+                    session_id: session,
+                }),
             )
             .await
             .unwrap_err();
@@ -7589,6 +8163,10 @@ mod tests {
             (reqwest::Method::GET, "/api/v1/experiments"),
             (reqwest::Method::GET, "/api/v1/experiments/missing"),
             (reqwest::Method::POST, "/api/v1/experiments/missing/compare"),
+            (
+                reqwest::Method::GET,
+                "/api/v1/experiments/missing/runs/missing/artifacts",
+            ),
             (reqwest::Method::POST, "/api/v1/experiments/missing/cancel"),
             (reqwest::Method::POST, "/api/v1/experiments/missing/resume"),
             (reqwest::Method::POST, "/api/v1/checkpoints"),
@@ -9652,6 +10230,307 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(experiment_failed_retry_http)]
+    async fn experiment_failed_retry_http_and_mcp_preserve_saved_peers_and_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = test_host();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Http {
+                bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            },
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let rest_address = reservation.rest_address().unwrap();
+        let mcp_address = reservation.mcp_http_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let client = reqwest::Client::new();
+        let mcp_url = format!("http://{mcp_address}/mcp");
+        let initialized: Value = client
+            .post(&mcp_url)
+            .json(&json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                    "clientInfo":{"name":"failed-retry-test", "version":"0"}}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(initialized.get("error").is_none(), "{initialized}");
+
+        for (experiment_id, via_mcp) in [("rest-retry", false), ("mcp-retry", true)] {
+            let (handle, failed, completed) = crate::control::tests::failed_retry_catalog_fixture(
+                handle.clone(),
+                root.path(),
+                experiment_id,
+            );
+            let directory = root.path().join("experiments").join(experiment_id);
+            let state_file = directory.join("status.json");
+            let original = std::fs::read(&state_file).unwrap();
+            let peer_cut = directory.join(format!("{}.checkpoint", failed.runs[1].run_id));
+            let peer_bytes = std::fs::read(&peer_cut).unwrap();
+            let status_url = format!("http://{rest_address}/api/v1/experiments/{experiment_id}");
+            let retry_url = format!("{status_url}/retry-failed");
+            let mut unchanged_status = original.clone();
+            for (index, (generation, admit)) in [
+                (failed.generation + 1, false),
+                (failed.generation, true),
+                (failed.generation, false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let request = if via_mcp {
+                    client.post(&mcp_url).json(&json!({
+                        "jsonrpc":"2.0", "id":index + 2, "method":"tools/call",
+                        "params":{"name":"experiment_retry_failed", "arguments":{
+                            "experiment_id":experiment_id, "expected_generation":generation
+                        }}
+                    }))
+                } else {
+                    client
+                        .post(&retry_url)
+                        .json(&json!({"expected_generation":generation}))
+                };
+                let response = request.send().await.unwrap();
+                let code = response.status().as_u16();
+                let body: Value = response.json().await.unwrap();
+                if !admit {
+                    assert_eq!(code, if via_mcp { 200 } else { 409 }, "{body}");
+                    if via_mcp {
+                        assert!(body.get("error").is_none(), "{body}");
+                        assert_eq!(body["result"]["isError"], true, "{body}");
+                    }
+                    assert!(body.to_string().contains("generation changed"), "{body}");
+                    assert_eq!(std::fs::read(&state_file).unwrap(), unchanged_status);
+                    continue;
+                }
+
+                assert_eq!(code, 200, "{body}");
+                let admitted: ExperimentBatchStatusDto = if via_mcp {
+                    assert!(body.get("error").is_none(), "{body}");
+                    assert_ne!(body["result"]["isError"], true, "{body}");
+                    serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap()
+                } else {
+                    serde_json::from_value(body).unwrap()
+                };
+                assert!(admitted.generation > failed.generation);
+                assert_eq!(admitted.failed_runs, 0);
+                assert_eq!(admitted.runs[1].final_digest, completed[1].final_digest);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let final_status = loop {
+                    let observed: ExperimentBatchStatusDto = client
+                        .get(&status_url)
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    if observed.status == "completed" {
+                        break observed;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "{observed:?}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                assert_eq!(final_status.completed_runs, 2);
+                for (observed, expected) in final_status.runs.iter().zip(&completed) {
+                    assert_eq!(observed.total_ticks, expected.total_ticks);
+                    assert_eq!(observed.final_digest, expected.final_digest);
+                    assert_eq!(observed.bundle_path, expected.bundle_path);
+                }
+                assert_eq!(std::fs::read(&peer_cut).unwrap(), peer_bytes);
+                assert_eq!(
+                    std::fs::read(directory.join(format!(
+                        "status.json.retries/generation-{:020}.json",
+                        failed.generation
+                    )))
+                    .unwrap(),
+                    original
+                );
+                unchanged_status = std::fs::read(&state_file).unwrap();
+            }
+            assert_eq!(handle.get_experiment(experiment_id).unwrap().failed_runs, 0);
+        }
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+        server.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(experiment_failed_retry_http)]
+    async fn experiment_failed_retry_http_requires_bounded_guarded_json_before_catalog_access() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = test_host();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/api/v1/experiments/not-created/retry-failed");
+        for body in [
+            "",
+            " ",
+            "null",
+            "[]",
+            "[0]",
+            "{}",
+            r#"{"expected_generation":null}"#,
+            r#"{"expected_generation":"0"}"#,
+            r#"{"expected_generation":-1}"#,
+            r#"{"expected_generation":0.5}"#,
+            r#"{"expected_generation":18446744073709551616}"#,
+            r#"{"expected_generation":0,"force":true}"#,
+            r#"{"expected_generation":0,"expected_generation":1}"#,
+        ] {
+            let refused = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status().as_u16(), 400, "{body}");
+        }
+        let valid = r#"{"expected_generation":0}"#;
+        for (length, expected) in [(4096, 404), (4097, 413)] {
+            let body = format!("{valid}{}", " ".repeat(length - valid.len()));
+            let response = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), expected, "{length}");
+        }
+        let full_width = client
+            .post(&url)
+            .json(&json!({"expected_generation":u64::MAX}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(full_width.status().as_u16(), 404);
+        let wrong_type = client
+            .post(&url)
+            .header("Content-Type", "text/plain")
+            .body(valid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_type.status().as_u16(), 415);
+        let stale_session = client
+            .post(&url)
+            .header(
+                "X-ScriptBots-Session",
+                handle.session_id().get().wrapping_add(1).to_string(),
+            )
+            .json(&json!({"expected_generation":0}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale_session.status().as_u16(), 409);
+        assert!(!root.path().join("experiments").exists());
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+        server.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn experiment_failed_retry_mcp_rejects_missing_or_malformed_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let tool = ControlTool {
+            handle: handle.clone(),
+            kind: ControlToolKind::ExperimentRetryFailed,
+            name: "experiment_retry_failed".into(),
+            description: "Retry failed runs".into(),
+            schema: json!({"type":"object"}),
+        };
+        let runtime = mcp_context_test_runtime();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let ctx = fastmcp_rust::McpContext::new(cx, 1);
+        let mcp = experiment_comparison_mcp(handle.clone()).await;
+        let mut cases = vec![
+            json!(null),
+            json!([]),
+            json!(["missing", 0]),
+            json!(false),
+            json!({}),
+            json!({"experiment_id":"missing"}),
+            json!({"expected_generation":0}),
+            json!({"experiment_id":7,"expected_generation":0}),
+            json!({"experiment_id":"missing","expected_generation":0,"force":true}),
+        ];
+        for generation in [json!(null), json!("0"), json!(-1), json!(0.5), json!(1e100)] {
+            cases.push(json!({"experiment_id":"missing","expected_generation":generation}));
+        }
+        for (index, arguments) in cases.into_iter().enumerate() {
+            let direct = tool
+                .call(&ctx, arguments.clone())
+                .expect_err("strict retry tool input");
+            assert_eq!(
+                direct.code,
+                McpErrorCode::InvalidParams,
+                "{arguments}: {direct}"
+            );
+            assert!(!direct.message.contains("not found"), "{direct}");
+            let response = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc":"2.0", "id":index + 2, "method":"tools/call",
+                    "params":{"name":"experiment_retry_failed", "arguments":arguments}
+                }),
+            )
+            .await;
+            if let Some(error) = response.get("error") {
+                assert_eq!(
+                    error["code"],
+                    i32::from(McpErrorCode::InvalidParams),
+                    "{response}"
+                );
+            } else {
+                // JSON Schema can admit a mathematically integral JSON number
+                // outside u64; the typed handler still refuses it explicitly.
+                assert_eq!(response["result"]["isError"], true, "{response}");
+                assert_eq!(response["result"]["content"][0]["text"], direct.message);
+            }
+        }
+        assert!(!root.path().join("experiments").exists());
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+    }
+
     async fn experiment_comparison_mcp(handle: ControlHandle) -> McpHttpState {
         let state = mcp_http_test_state(handle, ServerBuilder::new("experiment-comparison", "0"));
         let initialized = map_policy_mcp_request(
@@ -9663,6 +10542,207 @@ mod tests {
         .await;
         assert!(initialized.get("error").is_none(), "{initialized}");
         state
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real server verifies REST/MCP inventory parity, downloaded bytes, session fencing and corrupt-source refusal"
+    )]
+    async fn experiment_run_artifacts_http_mcp_download_verified_files_without_companion_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = test_host();
+        let runner = crate::control::tests::comparison_catalog_runner(
+            root.path(),
+            "download-transports",
+            vec![7],
+            0.0,
+        );
+        let status_path = runner.output_dir.join("status.json");
+        let completed = runner.execute_batch(&status_path).unwrap();
+        let run = &completed.runs[0];
+        std::fs::write(
+            Path::new(completed.runs[1].bundle_path.as_ref().unwrap()).join("exports/summary.csv"),
+            b"broken companion\n",
+        )
+        .unwrap();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Http {
+                bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            },
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let rest_address = reservation.rest_address().unwrap();
+        let mcp_address = reservation.mcp_http_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let before = std::fs::read(&status_path).unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let url = format!(
+            "http://{rest_address}/api/v1/experiments/download-transports/runs/{}/artifacts",
+            run.run_id,
+        );
+        let stale = handle.session_id().get().wrapping_add(1).to_string();
+        assert_eq!(
+            client
+                .get(&url)
+                .header(LAB_SESSION_HEADER, stale)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT,
+        );
+        let response = client
+            .get(&url)
+            .header(LAB_SESSION_HEADER, handle.session_id().get().to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let inventory: ExperimentRunArtifactsDto = response.json().await.unwrap();
+        assert_eq!(inventory.run.run_id, run.run_id);
+        assert_eq!(inventory.run.final_digest, run.final_digest);
+        assert_eq!(inventory.plan_digest, completed.plan_digest);
+        assert_eq!(inventory.status_generation, completed.generation);
+        for artifact in &inventory.artifacts {
+            let response = client
+                .get(format!(
+                    "http://{rest_address}/api/v1/artifacts/{}/download",
+                    artifact.artifact_id,
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.bytes().await.unwrap();
+            assert_eq!(bytes.len() as u64, artifact.byte_size);
+            assert_eq!(
+                blake3::hash(&bytes).to_hex().to_string(),
+                artifact.checksum_blake3
+            );
+        }
+        let mcp_url = format!("http://{mcp_address}/mcp");
+        let initialized: Value = client
+            .post(&mcp_url)
+            .json(&json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                    "clientInfo":{"name":"download-test", "version":"0"}}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let request = json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":"experiment_run_artifacts", "arguments":{
+                "experiment_id":"download-transports", "run_id":run.run_id
+            }}
+        });
+        let observed: Value = client
+            .post(&mcp_url)
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(observed.get("error").is_none(), "{observed}");
+        assert_ne!(observed["result"]["isError"], true, "{observed}");
+        let mcp_inventory: ExperimentRunArtifactsDto =
+            serde_json::from_str(observed["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&mcp_inventory).unwrap(),
+            serde_json::to_value(&inventory).unwrap(),
+        );
+        // Recheck the exact source on every discovery, including after a
+        // successful response populated the artifact catalog.
+        std::fs::write(
+            Path::new(run.bundle_path.as_ref().unwrap()).join("exports/summary.csv"),
+            b"changed selected endpoint\n",
+        )
+        .unwrap();
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let refused: Value = client
+            .post(&mcp_url)
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            refused["error"]["code"],
+            i32::from(McpErrorCode::InternalError),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&status_path).unwrap(), before);
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+        server.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn experiment_run_artifacts_mcp_rejects_malformed_arguments_before_catalog_access() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let tool = ControlTool {
+            handle: handle.clone(),
+            kind: ControlToolKind::ExperimentRunArtifacts,
+            name: "experiment_run_artifacts".into(),
+            description: "Download completed results".into(),
+            schema: json!({"type":"object"}),
+        };
+        let runtime = mcp_context_test_runtime();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let ctx = fastmcp_rust::McpContext::new(cx, 1);
+        for arguments in [
+            json!(null),
+            json!([]),
+            json!(false),
+            json!({}),
+            json!({"experiment_id":"saved"}),
+            json!({"experiment_id":7,"run_id":"saved-baseline-seed7"}),
+            json!({"experiment_id":"saved","run_id":7}),
+            json!({"experiment_id":"saved","run_id":"saved-baseline-seed7","unknown":true}),
+            json!({"experiment_id":"../outside","run_id":"saved-baseline-seed7"}),
+            json!({"experiment_id":"saved","run_id":"../outside"}),
+            json!({"experiment_id":"saved","run_id":"x".repeat(129)}),
+        ] {
+            let error = tool.call(&ctx, arguments.clone()).unwrap_err();
+            assert_eq!(
+                error.code,
+                McpErrorCode::InvalidParams,
+                "{arguments}: {error}"
+            );
+            assert!(!error.message.contains("not found"), "{error}");
+        }
+        assert!(!root.path().join("experiments").exists());
     }
 
     #[tokio::test]
@@ -9897,6 +10977,26 @@ mod tests {
             .await
             .expect("MCP response body");
         serde_json::from_slice(&bytes).expect("MCP response JSON")
+    }
+
+    fn assert_mcp_handler_refusal(response: &Value, diagnostic: &str) {
+        // FastMCP 0.10 returns schema errors as JSON-RPC errors, but an
+        // executed handler's business refusal as a marked tool result.
+        let matches = |value: &Value| {
+            value.get("error").is_none()
+                && value["result"]["isError"] == true
+                && value["result"]["content"][0]["text"].as_str() == Some(diagnostic)
+        };
+        assert!(matches(response), "{response}");
+        let mut unmarked = response.clone();
+        unmarked["result"]["isError"] = json!(false);
+        assert!(!matches(&unmarked), "an unmarked refusal is not an error");
+        let mut unrelated = response.clone();
+        unrelated["result"]["content"][0]["text"] = json!("unrelated failure");
+        assert!(
+            !matches(&unrelated),
+            "the refusal must name its actual cause"
+        );
     }
 
     #[tokio::test]
@@ -10976,13 +12076,12 @@ mod tests {
             }),
         )
         .await;
-        assert!(conflict.get("error").is_none(), "{conflict}");
-        assert_eq!(conflict["result"]["isError"], true, "{conflict}");
-        assert!(
-            conflict["result"]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("used for a different command envelope")),
-            "{conflict}"
+        assert_mcp_handler_refusal(
+            &conflict,
+            &format!(
+                "command id {} was already used for a different command envelope",
+                first.command_id
+            ),
         );
 
         let websocket = websocket_receipt(
@@ -11094,7 +12193,11 @@ mod tests {
             json!({"count":2}),
             json!({"cout":2}),
             json!([]),
+            json!([1]),
+            json!([1, 2]),
             json!(null),
+            json!(false),
+            json!("step"),
         ] {
             let body = axum::body::Bytes::from(serde_json::to_vec(&value).unwrap());
             let control = post_control_step(State(state.clone()), headers.clone(), body.clone())
@@ -11105,6 +12208,23 @@ mod tests {
                 .await
                 .expect_err("invalid legacy step must be refused");
             assert_eq!(alias.status, StatusCode::BAD_REQUEST, "{value}");
+        }
+        // A Value fixture would collapse these keys before the request arrived.
+        // Every final count is valid, so only the duplicate-field guard refuses it.
+        for body in [
+            br#"{"count":1,"count":1}"#.as_slice(),
+            br#"{"count":0,"count":1}"#,
+            br#"{"count":1,"\u0063ount":1}"#,
+        ] {
+            let body = axum::body::Bytes::copy_from_slice(body);
+            let control = post_control_step(State(state.clone()), headers.clone(), body.clone())
+                .await
+                .expect_err("duplicate fields must be refused before canonical admission");
+            assert_eq!(control.status, StatusCode::BAD_REQUEST);
+            let alias = post_step(State(state.clone()), headers.clone(), body)
+                .await
+                .expect_err("duplicate fields must be refused before alias admission");
+            assert_eq!(alias.status, StatusCode::BAD_REQUEST);
         }
         let tool = ControlTool {
             handle: handle.clone(),
@@ -11127,23 +12247,29 @@ mod tests {
         )
         .await;
         assert!(initialized.get("error").is_none(), "{initialized}");
-        for (index, arguments) in [
-            json!({"count":0}),
-            json!({"count":-1}),
-            json!({"count":1.5}),
-            json!({"count":"2"}),
-            json!({"count":null}),
-            json!({"count":true}),
-            json!({"count":u64::MAX}),
-            json!({"count":2, "idempotency_key":"refused-step"}),
-            json!({"cout":2}),
-            json!({"idempotency_key":7}),
-            json!({"idempotency_key":" "}),
-            json!({"idempotency_key":"k".repeat(1025)}),
-            json!([]),
-            json!(null),
-            json!(false),
-            json!("step"),
+        for (index, (arguments, handler_diagnostic)) in [
+            (json!({"count":0}), None),
+            (json!({"count":-1}), None),
+            (json!({"count":1.5}), None),
+            (json!({"count":"2"}), None),
+            (json!({"count":null}), None),
+            (json!({"count":true}), None),
+            (json!({"count":u64::MAX}), None),
+            (
+                json!({"count":2, "idempotency_key":"refused-step"}),
+                Some("idempotency keys require count=1; submit individually keyed steps for retryable batches"),
+            ),
+            (json!({"cout":2}), None),
+            (json!({"idempotency_key":7}), None),
+            (
+                json!({"idempotency_key":" "}),
+                Some("idempotency_key must contain 1..=1024 bytes"),
+            ),
+            (json!({"idempotency_key":"k".repeat(1025)}), None),
+            (json!([]), None),
+            (json!(null), None),
+            (json!(false), None),
+            (json!("step"), None),
         ]
         .into_iter()
         .enumerate()
@@ -11159,17 +12285,11 @@ mod tests {
                 }),
             )
             .await;
-            if arguments["idempotency_key"] == "refused-step" || arguments["idempotency_key"] == " "
-            {
-                // These shapes satisfy the schema but fail the tool's semantic
-                // checks; FastMCP reports handler refusals as tool errors.
-                assert!(response.get("error").is_none(), "{arguments}: {response}");
-                assert_eq!(
-                    response["result"]["isError"], true,
-                    "{arguments}: {response}"
-                );
-                assert_eq!(response["result"]["content"][0]["text"], direct.message);
+            if let Some(diagnostic) = handler_diagnostic {
+                assert_eq!(direct.message, diagnostic, "{arguments}");
+                assert_mcp_handler_refusal(&response, diagnostic);
             } else {
+                assert!(response.get("result").is_none(), "{arguments}: {response}");
                 assert_eq!(
                     response["error"]["code"],
                     i32::from(McpErrorCode::InvalidParams),
@@ -11208,6 +12328,31 @@ mod tests {
         .expect("owner receipt");
         host.wait_applied(&receipt);
         assert_eq!(handle.status().unwrap().tick, before.world.tick + 1);
+        let mut expected_tick = before.world.tick + 1;
+        let mut unkeyed = HeaderMap::new();
+        unkeyed.insert("Content-Type", "application/json".parse().unwrap());
+        for body in [b"".as_slice(), b" \n", b"{}"] {
+            let Json(receipt) = post_control_step(
+                State(state.clone()),
+                unkeyed.clone(),
+                axum::body::Bytes::copy_from_slice(body),
+            )
+            .await
+            .expect("canonical default still admits one Step");
+            host.wait_applied(&receipt);
+            expected_tick += 1;
+            assert_eq!(handle.status().unwrap().tick, expected_tick);
+            let Json(receipt) = post_step(
+                State(state.clone()),
+                unkeyed.clone(),
+                axum::body::Bytes::copy_from_slice(body),
+            )
+            .await
+            .expect("alias default still admits one Step");
+            host.wait_applied(&receipt);
+            expected_tick += 1;
+            assert_eq!(handle.status().unwrap().tick, expected_tick);
+        }
     }
 
     /// The MCP roster README documents and that `ControlToolKind` dispatches.
@@ -11221,6 +12366,20 @@ mod tests {
     fn mcp_tool_roster_is_complete() {
         let (control, _receiver) = handle();
         let discovery = control.schema();
+        assert!(
+            control
+                .version()
+                .capabilities
+                .iter()
+                .any(|name| name == "experiment_run_artifacts")
+        );
+        assert!(
+            control
+                .version()
+                .capabilities
+                .iter()
+                .any(|capability| capability == "experiment_failed_run_retry")
+        );
         let server = register_control_tools(
             ServerBuilder::new("scriptbots-control-test", "0.0.0"),
             control,
@@ -11253,9 +12412,11 @@ mod tests {
             "experiment_create",
             "experiment_list",
             "experiment_status",
+            "experiment_run_artifacts",
             "experiment_compare",
             "experiment_cancel",
             "experiment_resume",
+            "experiment_retry_failed",
             "checkpoint_create",
             "checkpoint_list",
             "checkpoint_status",
@@ -11294,6 +12455,48 @@ mod tests {
                 .any(|name| name == "ExperimentComparisonDto")
         );
         let tools = server.tools();
+        let inventory_schema = &tools
+            .iter()
+            .find(|tool| tool.name == "experiment_run_artifacts")
+            .unwrap()
+            .input_schema;
+        assert_eq!(inventory_schema["additionalProperties"], false);
+        assert_eq!(
+            inventory_schema["required"],
+            json!(["experiment_id", "run_id"])
+        );
+        for field in ["experiment_id", "run_id"] {
+            assert_eq!(inventory_schema["properties"][field]["minLength"], 1);
+            assert_eq!(
+                inventory_schema["properties"][field]["maxLength"],
+                crate::experiment_runner::MAX_RUN_COMPONENT_BYTES,
+            );
+        }
+        let inventory_path = "/api/v1/experiments/{experiment_id}/runs/{run_id}/artifacts";
+        assert!(discovery.routes.iter().any(|path| path == inventory_path));
+        assert!(
+            discovery
+                .schemas
+                .iter()
+                .any(|name| name == "ExperimentRunArtifactsDto")
+        );
+        let inventory_request: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"experiment_run_artifacts", "lane":"command", "arguments":{
+                "experiment_id":"saved", "run_id":"saved-baseline-seed7"
+            }}
+        }))
+        .unwrap();
+        assert_eq!(
+            mcp_request_work_lane(&inventory_request),
+            ControlWorkLane::Work
+        );
+        let inventory_openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert_eq!(
+            inventory_openapi["paths"][inventory_path]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ExperimentRunArtifactsDto",
+        );
         let schema = &tools
             .iter()
             .find(|tool| tool.name == "experiment_compare")
@@ -11320,6 +12523,53 @@ mod tests {
                 crate::experiment_runner::MAX_RUN_COMPONENT_BYTES
             );
         }
+        let retry = &tools
+            .iter()
+            .find(|tool| tool.name == "experiment_retry_failed")
+            .unwrap()
+            .input_schema;
+        assert_eq!(retry["additionalProperties"], false);
+        assert_eq!(
+            retry["required"],
+            json!(["experiment_id", "expected_generation"])
+        );
+        assert_eq!(
+            retry["properties"]["expected_generation"]["type"],
+            "integer"
+        );
+        assert_eq!(retry["properties"]["expected_generation"]["minimum"], 0);
+        assert!(
+            discovery
+                .routes
+                .iter()
+                .any(|path| path == "/api/v1/experiments/{experiment_id}/retry-failed")
+        );
+        assert!(
+            discovery
+                .schemas
+                .iter()
+                .any(|name| name == "ExperimentRetryFailedRequest")
+        );
+        let request: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"experiment_retry_failed", "lane":"command", "arguments":{
+                "experiment_id":"saved", "expected_generation":0
+            }}
+        }))
+        .unwrap();
+        assert_eq!(mcp_request_work_lane(&request), ControlWorkLane::Work);
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let operation =
+            &openapi["paths"]["/api/v1/experiments/{experiment_id}/retry-failed"]["post"];
+        assert_eq!(operation["requestBody"]["required"], true);
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ExperimentRetryFailedRequest"
+        );
+        assert_eq!(
+            openapi["components"]["schemas"]["ExperimentRetryFailedRequest"]["required"],
+            json!(["expected_generation"])
+        );
     }
 
     /// Collect the `/api/...` literal that follows each occurrence of `marker`.
@@ -11571,6 +12821,209 @@ mod tests {
         assert!(!poll_seq.gap_detected);
     }
 
+    #[tokio::test]
+    async fn control_work_capacity_stays_owned_after_running_caller_cancellation() {
+        let slots = Arc::new(ControlWorkSlots::new(1, 1));
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = mpsc::channel();
+        let worker_slots = Arc::clone(&slots);
+        let worker = tokio::spawn(async move {
+            worker_slots
+                .run(ControlWorkLane::Work, move || {
+                    entered.send(()).expect("worker started");
+                    let _ = wait.recv();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .expect("worker start deadline")
+            .expect("worker entered");
+        worker.abort();
+        assert!(worker.await.expect_err("caller cancelled").is_cancelled());
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let refused_executed = Arc::clone(&executed);
+        let refusal = slots
+            .run(ControlWorkLane::Work, move || {
+                refused_executed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect_err("running worker must still own the only slot");
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!executed.load(Ordering::SeqCst));
+        assert_eq!(
+            slots.run(ControlWorkLane::Command, || Ok(7)).await.unwrap(),
+            7
+        );
+
+        release.send(()).expect("release running worker");
+        let reclaimed = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&slots.work).acquire_owned(),
+        )
+        .await
+        .expect("worker completion deadline")
+        .expect("slot reclaimed");
+        drop(reclaimed);
+        slots
+            .run(ControlWorkLane::Work, move || {
+                executed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect("completed worker releases capacity");
+    }
+
+    #[test]
+    fn control_work_disconnect_cancels_queued_mutation_before_admission() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("one blocking worker");
+        let (entered, started) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::channel();
+        let occupied = runtime.spawn_blocking(move || {
+            entered.send(()).expect("occupied pool");
+            let _ = wait.recv();
+        });
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pool occupied");
+        let slots = ControlWorkSlots::new(1, 1);
+        let mutated = Arc::new(AtomicBool::new(false));
+        let operation_mutated = Arc::clone(&mutated);
+        let queued = runtime.block_on(async {
+            let mut operation = Box::pin(slots.run(ControlWorkLane::Command, move || {
+                operation_mutated.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+            let blocked = tokio::time::timeout(Duration::from_millis(100), &mut operation).await;
+            let reserved = slots.commands.available_permits();
+            drop(operation);
+            (blocked, reserved)
+        });
+        release.send(()).expect("release unrelated blocking work");
+        runtime.block_on(occupied).expect("occupied worker joined");
+        runtime
+            .block_on(runtime.spawn_blocking(|| ()))
+            .expect("queue drained");
+        assert!(queued.0.is_err(), "fixture must really queue the mutation");
+        assert_eq!(queued.1, 0, "queued work reserves its capacity");
+        assert!(
+            !mutated.load(Ordering::SeqCst),
+            "disconnected queued work must not execute later"
+        );
+        assert_eq!(slots.commands.available_permits(), 1);
+    }
+
+    #[test]
+    fn mcp_work_lane_cannot_be_selected_by_client_priority_fields() {
+        for request in [
+            json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+                "name":"narrative_search", "lane":"command", "arguments":{"priority":"command"}}}),
+            json!({"jsonrpc":"2.0", "id":1, "method":"pause", "params":{"name":"pause"}}),
+            json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"unknown"}}),
+            json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":["pause"]}}),
+        ] {
+            let request = serde_json::from_value(request).expect("JSON-RPC request");
+            assert_eq!(mcp_request_work_lane(&request), ControlWorkLane::Work);
+        }
+        let request = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"pause"}
+        }))
+        .expect("known owner command");
+        assert_eq!(mcp_request_work_lane(&request), ControlWorkLane::Command);
+    }
+
+    #[tokio::test]
+    async fn control_work_pressure_preserves_real_step_retry_and_mcp_refusal_identity() {
+        let (handle, owner) = handle();
+        let before = handle
+            .read_snapshot()
+            .expect("initial publication")
+            .world
+            .tick;
+        let slots = ControlWorkSlots::new(1, 1);
+        let busy_work = slots
+            .try_admit(ControlWorkLane::Work)
+            .expect("occupy work capacity");
+        let state = mcp_http_test_state(handle.clone(), ServerBuilder::new("work-capacity", "0"));
+        let initialize = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                "clientInfo":{"name":"work-capacity", "version":"0"}}
+        }))
+        .expect("initialize request");
+        let response = dispatch_mcp_http_request(state.clone(), initialize, &slots).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let query = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":"refused-query", "method":"tools/call",
+            "params":{"name":"narrative_search", "arguments":{"query":"birth"}}
+        }))
+        .expect("query request");
+        let response = dispatch_mcp_http_request(state.clone(), query, &slots).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .expect("refusal body");
+        let response: Value = serde_json::from_slice(&body).expect("JSON-RPC refusal");
+        assert_eq!(response["id"], "refused-query");
+        assert_eq!(response["error"]["code"], -32000);
+        assert_eq!(response["error"]["data"]["retryable"], true);
+        assert_eq!(response["error"]["data"]["operation_started"], false);
+
+        let first_handle = handle.clone();
+        let first = slots
+            .run(ControlWorkLane::Command, move || {
+                first_handle.step_count(1, Some("capacity-exact-step"))
+            })
+            .await
+            .expect("work pressure leaves command admission available");
+        owner.wait_applied(&first);
+        let retry = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{
+                "name":"step", "arguments":{"count":1, "idempotency_key":"capacity-exact-step"}}
+        }))
+        .expect("exact retry request");
+        let response = dispatch_mcp_http_request(state.clone(), retry, &slots).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .expect("retry body");
+        let response: Value = serde_json::from_slice(&body).expect("MCP response");
+        let retried: CommandStatusDto = serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("command receipt text"),
+        )
+        .expect("canonical receipt");
+        owner.wait_applied(&retried);
+        assert_eq!(retried.command_id, first.command_id);
+        assert_eq!(handle.read_snapshot().unwrap().world.tick, before + 1);
+
+        let busy_commands = slots
+            .try_admit(ControlWorkLane::Command)
+            .expect("occupy command capacity");
+        let notification = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "method":"notifications/initialized"
+        }))
+        .expect("notification");
+        let response = dispatch_mcp_http_request(state, notification, &slots).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            axum::body::to_bytes(response.into_body(), 16_384)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop((busy_work, busy_commands));
+    }
+
     #[test]
     fn published_latest_tick_does_not_wait_for_the_blocking_pool() {
         let mut world = WorldState::new(ScriptBotsConfig {
@@ -11664,7 +13117,9 @@ mod tests {
             // never occupied the pool and cannot discriminate the old handlers.
             let queued = tokio::time::timeout(
                 Duration::from_millis(100),
-                run_control(move || queued_handle.latest_summary()),
+                run_control(ControlWorkLane::Work, move || {
+                    queued_handle.latest_summary()
+                }),
             )
             .await;
             let mut initial_read = tokio::spawn(get_latest_tick_summary(State(initial_state)));
@@ -11942,6 +13397,164 @@ mod tests {
         assert_eq!(owner.handle().status().unwrap().tick, 0);
     }
 
+    #[test]
+    fn websocket_projection_capacity_survives_cancellation_and_timeout_until_worker_exit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for expire in [false, true] {
+                let slots = Arc::new(tokio::sync::Semaphore::new(1));
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let (release, wait) = mpsc::channel();
+                let projection =
+                    tokio::spawn(run_remote_projection(Arc::clone(&slots), move || {
+                        entered.send(()).expect("actual projection worker entered");
+                        wait.recv_timeout(Duration::from_secs(10))
+                            .map_err(|error| RemoteSubscriptionError::Request(error.to_string()))?;
+                        Ok(())
+                    }));
+                started.await.unwrap();
+                let caller_finished = if expire {
+                    projection.await.unwrap().is_err_and(|error| {
+                        error.status == StatusCode::SERVICE_UNAVAILABLE
+                            && error.message.contains("projection deadline exceeded")
+                    })
+                } else {
+                    projection.abort();
+                    projection.await.is_err_and(|error| error.is_cancelled())
+                };
+
+                // The pool has another real thread available. Only the production
+                // admission permit can prevent this successor from entering it.
+                let (successor_entered, mut successor_started) = tokio::sync::oneshot::channel();
+                let successor =
+                    tokio::spawn(run_remote_projection(Arc::clone(&slots), move || {
+                        successor_entered.send(()).unwrap();
+                        Ok(())
+                    }));
+                let entered_early =
+                    tokio::time::timeout(Duration::from_millis(100), &mut successor_started)
+                        .await
+                        .is_ok();
+                let retained_while_running = slots.available_permits();
+
+                // Release actual work before any assertion can unwind the runtime.
+                release.send(()).unwrap();
+                let successor_result = successor.await.unwrap();
+                assert!(
+                    caller_finished,
+                    "caller outcome must match cancellation/timeout"
+                );
+                assert!(
+                    !entered_early,
+                    "cancelled caller released a running worker's slot"
+                );
+                assert_eq!(retained_while_running, 0);
+                successor_result.unwrap();
+                assert_eq!(slots.available_permits(), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn websocket_projection_cancelled_before_admission_never_enters_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let held = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let entered = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&entered);
+            let mut projection =
+                tokio::spawn(run_remote_projection(Arc::clone(&slots), move || {
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                }));
+            let waited = tokio::time::timeout(Duration::from_millis(100), &mut projection)
+                .await
+                .is_err();
+            projection.abort();
+            let cancelled = projection.await.is_err_and(|error| error.is_cancelled());
+            drop(held);
+            run_remote_projection(Arc::clone(&slots), || Ok(()))
+                .await
+                .unwrap();
+            assert!(waited, "exhausted admission must not start projection work");
+            assert!(cancelled);
+            assert!(!entered.load(Ordering::SeqCst));
+            assert_eq!(slots.available_permits(), 1);
+
+            slots.close();
+            let refused = run_remote_projection(Arc::clone(&slots), || Ok(())).await;
+            assert_eq!(refused.unwrap_err().status, StatusCode::SERVICE_UNAVAILABLE);
+        });
+    }
+
+    #[test]
+    fn websocket_completed_projection_retains_capacity_until_its_frames_are_dropped() {
+        let (handle, owner) = handle();
+        let snapshot = handle.read_snapshot().unwrap();
+        let digest = owner.port.scientific_digest_v1().unwrap();
+        let request = RemoteSubscriptionRequest::parse(
+            r#"{"protocol_version":1,"command":"subscribe","channels":["telemetry"],"max_fps":60}"#,
+        )
+        .unwrap();
+        let subscription = RemoteSubscription::new(&request, &snapshot).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let slots = Arc::new(tokio::sync::Semaphore::new(1));
+            let completed = prepare_remote_frames(
+                subscription.clone(),
+                Arc::clone(&snapshot),
+                Vec::new(),
+                Arc::clone(&slots),
+            )
+            .await
+            .unwrap();
+            assert_eq!(completed.value.len(), 1);
+            let expected = completed.value[0].bytes.clone();
+            let encoded = scriptbots_runtime::remote::decode_remote_frame(&expected).unwrap();
+            assert_eq!(
+                encoded.identity,
+                scriptbots_runtime::remote::RemoteFrameIdentity::from(snapshot.as_ref())
+            );
+            assert_eq!(slots.available_permits(), 0);
+
+            // These are complete real encoded frames. A fast producer cannot
+            // replace their admission merely because a slow socket has not
+            // finished sending them yet.
+            let mut successor = tokio::spawn(prepare_remote_frames(
+                subscription,
+                Arc::clone(&snapshot),
+                Vec::new(),
+                Arc::clone(&slots),
+            ));
+            let waited = tokio::time::timeout(Duration::from_millis(100), &mut successor)
+                .await
+                .is_err();
+            drop(completed);
+            let delivered = successor.await.unwrap().unwrap();
+            assert!(
+                waited,
+                "completed output released its admission before delivery/drop"
+            );
+            assert_eq!(delivered.value.len(), 1);
+            assert_eq!(delivered.value[0].bytes, expected);
+            assert_eq!(slots.available_permits(), 0);
+            drop(delivered);
+            assert_eq!(slots.available_permits(), 1);
+        });
+        assert_eq!(owner.port.scientific_digest_v1().unwrap(), digest);
+    }
+
     fn connect_websocket(address: SocketAddr) -> TcpStream {
         let mut socket = TcpStream::connect(address).expect("connect WebSocket client");
         socket
@@ -12073,6 +13686,161 @@ mod tests {
             ack["after_event"] = json!(page.next_after_event().to_string());
         }
         send_websocket_text(socket, &ack.to_string());
+    }
+
+    #[test]
+    fn websocket_pending_projection_keeps_acks_controls_and_replacement_live() {
+        use scriptbots_runtime::remote::{RemoteFrameIdentity, RemoteFramePayload};
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(42),
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let owner = crate::control::tests::TestHost::spawn(world);
+        let handle = owner.handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        // Isolate this listener's actual projection admission from parallel
+        // tests while running the same socket loop, codec and owner boundary.
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut held = None;
+        let listener_slots = Arc::clone(&slots);
+        let app = Router::new()
+            .route(
+                "/api/ws/stream",
+                get(move |ws: WebSocketUpgrade, State(state): State<ApiState>| {
+                    let slots = Arc::clone(&listener_slots);
+                    async move {
+                        ws.max_message_size(MAX_WS_CONTROL_MESSAGE_BYTES)
+                            .max_frame_size(MAX_WS_CONTROL_MESSAGE_BYTES)
+                            .on_upgrade(move |socket| handle_ws_stream(socket, state, slots))
+                    }
+                }),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
+        let mut socket = connect_websocket(address);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            send_websocket_text(
+                &mut socket,
+                r#"{"protocol_version":1,"command":"subscribe","request_id":"before-projection-block","channels":["canvas","telemetry"],"max_fps":60}"#,
+            );
+            assert_eq!(read_remote_json(&mut socket, false)["type"], "subscribed");
+            let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+            assert_eq!(opcode, 2);
+            let canvas = scriptbots_runtime::remote::decode_remote_frame(&bytes).unwrap();
+            assert!(matches!(canvas.payload, RemoteFramePayload::Canvas(_)));
+            let (opcode, bytes) = read_remote_websocket_message(&mut socket);
+            assert_eq!(opcode, 2);
+            let telemetry = scriptbots_runtime::remote::decode_remote_frame(&bytes).unwrap();
+            assert!(matches!(
+                telemetry.payload,
+                RemoteFramePayload::Telemetry(_)
+            ));
+            assert_eq!(canvas.identity, telemetry.identity);
+            // Bytes can reach the client before the server finishes the send
+            // branch and drops its completed-batch permit. Observe that release
+            // instead of assuming socket delivery also completed the branch.
+            let release_deadline = std::time::Instant::now() + WS_WRITE_TIMEOUT;
+            held = Some(loop {
+                match Arc::clone(&slots).try_acquire_owned() {
+                    Ok(permit) => break permit,
+                    Err(error) => {
+                        assert!(
+                            std::time::Instant::now() < release_deadline,
+                            "completed initial batch retained its permit: {error}"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+            // Returning just canvas credit schedules a batch while telemetry
+            // still awaits its ACK. With capacity withheld, that batch must not
+            // block the later ACK or the following real control round trips.
+            acknowledge_remote_frame(&mut socket, &canvas);
+            thread::sleep(Duration::from_millis(100));
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            acknowledge_remote_frame(&mut socket, &telemetry);
+            let step =
+                r#"{"protocol_version":1,"command":"step","request_id":"step-during-projection"}"#;
+            send_websocket_text(&mut socket, step);
+            let reply = read_remote_json(&mut socket, true);
+            assert_eq!(reply["type"], "receipt");
+            assert_eq!(reply["request_id"], "step-during-projection");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while handle.status().unwrap().tick != 1 {
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            send_websocket_text(&mut socket, step);
+            let retry = read_remote_json(&mut socket, true);
+            assert_eq!(
+                retry["receipt"]["command_id"],
+                reply["receipt"]["command_id"]
+            );
+            assert_eq!(handle.status().unwrap().tick, 1);
+            let cut = handle.read_snapshot().unwrap();
+            let digest = owner.port.scientific_digest_v1().unwrap();
+
+            send_websocket_text(
+                &mut socket,
+                r#"{"protocol_version":1,"command":"subscribe","request_id":"replacement-telemetry","channels":["telemetry"],"max_fps":60}"#,
+            );
+            let replacement = read_remote_json(&mut socket, true);
+            assert_eq!(replacement["type"], "subscribed");
+            assert_eq!(replacement["request_id"], "replacement-telemetry");
+            assert_eq!(replacement["channels"], json!(["telemetry"]));
+            // This acknowledgement is impossible unless the socket processed
+            // telemetry's outstanding credit while projection was waiting.
+            drop(held.take());
+            let delivered = read_remote_binary(&mut socket);
+            assert!(
+                matches!(delivered.payload, RemoteFramePayload::Telemetry(_)),
+                "the retired canvas projection must not publish on its replacement"
+            );
+            assert_eq!(delivered.identity, RemoteFrameIdentity::from(cut.as_ref()));
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), digest);
+        }));
+        drop(held);
+        drop(socket);
+        let _ = shutdown.send(());
+        let joined = server.join();
+        if let Err(failure) = result {
+            std::panic::resume_unwind(failure);
+        }
+        joined.unwrap();
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[test]

@@ -9006,6 +9006,65 @@ pub struct StepCompletion {
     pub fault: Option<CompletedStepFault>,
 }
 
+/// Opaque identity shared by a persistence sink and its connection-owning journal.
+///
+/// Clones identify the same owner by allocation identity, never by a path or run label.
+/// Possessing this identity does not prove admission or durability; the caller must still
+/// obtain the journal's qualifying receipt for the exact retained batch before acknowledging it.
+#[derive(Clone)]
+pub struct PersistenceCommitAuthority {
+    owner: Arc<dyn Send + Sync>,
+}
+
+impl PersistenceCommitAuthority {
+    /// Bind an authority to one shared owner allocation for its entire lifetime.
+    #[must_use]
+    pub fn from_owner<T: Send + Sync + 'static>(owner: Arc<T>) -> Self {
+        Self { owner }
+    }
+
+    fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
+    }
+}
+
+impl fmt::Debug for PersistenceCommitAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistenceCommitAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque resource reservation retained until an exact journal batch is acknowledged.
+pub struct PersistenceJournalReservation {
+    _guard: Box<dyn Send>,
+}
+
+impl PersistenceJournalReservation {
+    /// Keep an owner's byte permits or other bounded admission resources alive.
+    #[must_use]
+    pub fn new<T: Send + 'static>(guard: T) -> Self {
+        Self {
+            _guard: Box::new(guard),
+        }
+    }
+
+    /// A reservation for an explicitly opted-in sink with no additional resources to charge.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(())
+    }
+}
+
+impl fmt::Debug for PersistenceJournalReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistenceJournalReservation")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Persistence sink invoked after each tick.
 pub trait WorldPersistence: Send {
     /// Admit a completed tick without silently discarding an unacknowledged batch.
@@ -9015,6 +9074,27 @@ pub trait WorldPersistence: Send {
     /// retry through stable identity and exact-payload deduplication. A changed payload is never
     /// a valid retry for the same completed tick.
     fn on_tick(&mut self, payload: &PersistenceBatch) -> Result<(), PersistenceAdmissionError>;
+
+    /// Optional identity of the owner whose journal may acknowledge this sink's exact work.
+    ///
+    /// The default keeps admission entirely on [`Self::on_tick`]. A sink may opt in only when
+    /// a matching journal receipt proves the same persistence obligation without another write.
+    fn commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+        None
+    }
+
+    /// Validate and reserve the exact batch before a matching journal may enqueue it.
+    ///
+    /// This may perform bounded borrowed measurements, but must not materialize another full
+    /// payload, issue database I/O, or wait for worker progress. A refusal proves non-admission.
+    /// The session calls this only for an opted-in authority and retains the returned guard
+    /// across backpressure, receipt delays, and terminal failures.
+    fn reserve_journal_batch(
+        &mut self,
+        _payload: &PersistenceBatch,
+    ) -> Result<PersistenceJournalReservation, PersistenceAdmissionError> {
+        Ok(PersistenceJournalReservation::empty())
+    }
 }
 
 /// Payload-free state of the world's current persistence boundary.
@@ -9030,7 +9110,7 @@ pub enum PersistenceBoundaryStatus {
         /// Tick of the current boundary.
         tick: Tick,
     },
-    /// The external sink acknowledged the immutable batch for this tick.
+    /// The external sink or its matching committed journal acknowledged the immutable batch.
     Sealed {
         /// Tick of the current boundary.
         tick: Tick,
@@ -9049,6 +9129,7 @@ struct PersistenceSessionToken {
 struct PendingPersistenceAdmission {
     batch: Arc<PersistenceBatch>,
     error: Option<PersistenceAdmissionError>,
+    journal_reservation: Option<PersistenceJournalReservation>,
 }
 
 /// External owner of persistence admission state for exactly one [`WorldState`].
@@ -9134,6 +9215,27 @@ pub enum PersistenceSessionError {
     /// The sink did not acknowledge the exact retained batch.
     #[error(transparent)]
     Admission(#[from] PersistenceAdmissionError),
+    /// A journal receipt came from a different owner than this session's bound sink.
+    #[error("persistence receipt authority does not match the bound sink")]
+    CommitAuthorityMismatch,
+    /// A receipt did not refer to the exact retained immutable batch allocation.
+    #[error("persistence receipt for tick {tick} does not match the retained batch allocation")]
+    ReceiptBatchMismatch {
+        /// Tick carried by the attempted acknowledgement.
+        tick: Tick,
+    },
+    /// A journal cannot acknowledge work whose sink admission resources were never reserved.
+    #[error("persistence batch for tick {tick} has no journal admission reservation")]
+    MissingJournalReservation {
+        /// Tick whose reservation is unavailable.
+        tick: Tick,
+    },
+    /// Reserved journal work cannot also be sent through the synchronous sink.
+    #[error("persistence batch for tick {tick} is reserved for a matching journal receipt")]
+    JournalReceiptRequired {
+        /// Tick whose journal owns the admission obligation.
+        tick: Tick,
+    },
 }
 
 /// What the caller knows about a completed batch after admission failed.
@@ -28868,6 +28970,17 @@ impl WorldState {
         let indicator_scale = self.config.carcass_indicator_scale.max(0.0);
         let width = validated_world_unit_f32(self.config.world_width);
         let height = validated_world_unit_f32(self.config.world_height);
+        // The index's bucket geometry is f64, but membership below deliberately
+        // retains the original f32 subtraction, wrap and squared-distance path.
+        // Include its roundoff at the world scale in the broad phase so a point
+        // rounded onto the inclusive boundary cannot disappear across a cell edge.
+        // World extents are positive integral f32 values, so this margin also
+        // dominates squared-distance underflow for subnormal radii.
+        let extent = width.max(height);
+        let candidate_radius = radius + 4.0 * f32::EPSILON * extent;
+        let mut indexed = None;
+        let mut candidate_indices = Vec::new();
+        let mut neighbor_indices = Vec::new();
 
         for (dense_idx, agent_id) in dead {
             let Some(victim_runtime) = self.runtime.get(*agent_id) else {
@@ -28890,18 +29003,99 @@ impl WorldState {
                 continue;
             }
 
-            let mut neighbor_indices = Vec::new();
+            // Delay all index work until an actual reward-producing corpse is
+            // encountered. Rebuild here from these exact positions: combat may
+            // have returned early, and this stage can also be invoked directly.
+            let use_index = *indexed.get_or_insert_with(|| {
+                if !candidate_radius.is_finite() || candidate_radius >= extent * 0.5 {
+                    // Every axis spans all cells; an ordered full scan avoids
+                    // collecting and sorting the entire population per corpse.
+                    return false;
+                }
+                let cell_size = validated_world_unit_f32(self.config.food_cell_size);
+                if self.index.cell_size.to_bits() != cell_size.to_bits() {
+                    // Use config-derived geometry only for the matching index.
+                    return false;
+                }
+                let Ok(population) = u32::try_from(agent_count) else {
+                    return false;
+                };
+                let eligible_corpses = dead
+                    .iter()
+                    .filter(|&&(index, id)| {
+                        index < agent_count
+                            && healths[index] <= 0.0
+                            && ages[index] > 0
+                            && self.runtime.get(id).is_some_and(|runtime| runtime.spiked)
+                    })
+                    .count();
+                let Ok(corpses) = u32::try_from(eligible_corpses) else {
+                    return false;
+                };
+                let cells_x =
+                    f64::from(self.config.world_width.div_ceil(self.config.food_cell_size));
+                let cells_y = f64::from(
+                    self.config
+                        .world_height
+                        .div_ceil(self.config.food_cell_size),
+                );
+                // Query traversal visits empty cells too. Two extra edge cells
+                // cover inclusive interval endpoints and toroidal wrapping.
+                // Reject structurally expensive grids before building them;
+                // only eligible corpses can amortize this stage's rebuild.
+                let span = (2.0 * f64::from(candidate_radius) / f64::from(cell_size)).ceil() + 2.0;
+                let bucket_visits = span.min(cells_x) * span.min(cells_y);
+                let population = f64::from(population);
+                let corpses = f64::from(corpses);
+                let indexed_work = population + cells_x * cells_y + corpses * bucket_visits;
+                if indexed_work >= population * corpses {
+                    return false;
+                }
+                self.work_position_pairs.clear();
+                self.work_position_pairs.reserve(positions.len());
+                for position in &positions {
+                    self.work_position_pairs.push((position.x, position.y));
+                }
+                // A refused rebuild must not omit rewards or query stale buckets.
+                // The original full scan remains the authority in that case.
+                self.index.rebuild(&self.work_position_pairs).is_ok()
+            });
+            if use_index {
+                candidate_indices.clear();
+                self.index
+                    .visit_neighbor_buckets(victim_index, candidate_radius, &mut |indices| {
+                        candidate_indices.extend_from_slice(indices);
+                    });
+                // Reward counters are ordered f32 reductions, so preserve the
+                // old dense-order scan rather than the index's cell traversal.
+                let sort_levels = candidate_indices
+                    .len()
+                    .checked_ilog2()
+                    .and_then(|levels| usize::try_from(levels + 1).ok())
+                    .unwrap_or(0);
+                if candidate_indices.len().saturating_mul(sort_levels) >= agent_count {
+                    // Sorting a nearly full population can cost more than its
+                    // original ordered scan, even when bucket traversal is cheap.
+                    candidate_indices.clear();
+                    candidate_indices.extend(0..agent_count);
+                } else {
+                    candidate_indices.sort_unstable();
+                    candidate_indices.dedup();
+                }
+            } else if candidate_indices.is_empty() {
+                candidate_indices.extend(0..agent_count);
+            }
+            neighbor_indices.clear();
             #[cfg(feature = "simd_wide")]
             {
                 use wide::f32x4;
-                let (handle_chunks, remainder) = handles.as_chunks::<4>();
-                for (chunk_i, chunk) in handle_chunks.iter().enumerate() {
-                    let base = chunk_i * 4;
-                    let ids = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                let (candidate_chunks, remainder) = candidate_indices.as_chunks::<4>();
+                for chunk in candidate_chunks {
+                    let ids = chunk.map(|index| handles[index]);
                     let mut x_delta_arr = [0.0_f32; 4];
                     let mut y_delta_arr = [0.0_f32; 4];
                     for lane in 0..4 {
-                        let idx = base + lane;
+                        let idx = chunk[lane];
                         x_delta_arr[lane] = toroidal_delta(positions[idx].x, victim_pos.x, width);
                         y_delta_arr[lane] = toroidal_delta(positions[idx].y, victim_pos.y, height);
                     }
@@ -28910,7 +29104,7 @@ impl WorldState {
                     let dist2_v = x_delta_v * x_delta_v + y_delta_v * y_delta_v;
                     let dist2 = dist2_v.to_array();
                     for lane in 0..4 {
-                        let idx = base + lane;
+                        let idx = chunk[lane];
                         if ids[lane] == *agent_id || dying[idx] {
                             continue;
                         }
@@ -28922,10 +29116,8 @@ impl WorldState {
                         }
                     }
                 }
-                let base = handles.len() - remainder.len();
-                for (o, neighbor_id) in remainder.iter().enumerate() {
-                    let idx = base + o;
-                    if *neighbor_id == *agent_id || dying[idx] {
+                for &idx in remainder {
+                    if handles[idx] == *agent_id || dying[idx] {
                         continue;
                     }
                     if healths.get(idx).copied().unwrap_or(0.0) <= 0.0 {
@@ -28939,8 +29131,8 @@ impl WorldState {
                 }
             }
             #[cfg(not(feature = "simd_wide"))]
-            for (idx, neighbor_id) in handles.iter().enumerate() {
-                if *neighbor_id == *agent_id || dying[idx] {
+            for &idx in &candidate_indices {
+                if handles[idx] == *agent_id || dying[idx] {
                     continue;
                 }
                 if healths.get(idx).copied().unwrap_or(0.0) <= 0.0 {
@@ -28957,7 +29149,7 @@ impl WorldState {
             }
             let norm = carcass_neighbor_normalizer(neighbor_indices.len(), exponent);
 
-            for idx in neighbor_indices {
+            for &idx in &neighbor_indices {
                 if let Some(runtime_neighbor) = self.runtime.get(handles[idx]) {
                     let herb = clamp01(runtime_neighbor.herbivore_tendency);
                     let carnivore_factor = (1.0 - herb) * (1.0 - herb);
@@ -34158,6 +34350,7 @@ impl PersistenceAdmissionSession {
         self.pending = Some(PendingPersistenceAdmission {
             batch: Arc::clone(batch),
             error: None,
+            journal_reservation: None,
         });
         world.persistence_boundary = PersistenceBoundaryStatus::Pending { tick };
     }
@@ -34306,6 +34499,9 @@ impl PersistenceAdmissionSession {
                 boundary: world.persistence_boundary,
             });
         }
+        if pending.journal_reservation.is_some() {
+            return Err(PersistenceSessionError::JournalReceiptRequired { tick });
+        }
 
         match self.sink.on_tick(pending.batch.as_ref()) {
             Ok(()) => {
@@ -34321,6 +34517,98 @@ impl PersistenceAdmissionSession {
         }
     }
 
+    /// Whether a journal belongs to the exact owner of this session's sink.
+    #[must_use]
+    pub fn accepts_commit_authority(&self, authority: &PersistenceCommitAuthority) -> bool {
+        self.sink
+            .commit_authority()
+            .is_some_and(|bound| bound.same_owner(authority))
+    }
+
+    /// Reserve sink admission resources once before the matching journal is first offered work.
+    ///
+    /// Exact retries reuse the original guard. No acknowledgement cursor or world boundary
+    /// advances here, and a failed reservation retains the exact batch with its typed refusal.
+    pub fn reserve_pending_for_journal(
+        &mut self,
+        world: &WorldState,
+        batch: &Arc<PersistenceBatch>,
+        authority: &PersistenceCommitAuthority,
+    ) -> Result<(), PersistenceSessionError> {
+        let tick = self.validate_journal_batch(world, batch, authority)?;
+        let pending = self
+            .pending
+            .as_mut()
+            .ok_or(PersistenceSessionError::MissingPendingBatch { tick })?;
+        if pending.journal_reservation.is_some() {
+            return Ok(());
+        }
+        match self.sink.reserve_journal_batch(batch.as_ref()) {
+            Ok(reservation) => {
+                pending.journal_reservation = Some(reservation);
+                pending.error = None;
+                Ok(())
+            }
+            Err(error) => {
+                pending.error = Some(error.clone());
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Seal an exact retained batch after its matching journal proves commitment.
+    ///
+    /// This performs no sink I/O. The host must call it only after the journal's required
+    /// commitment has been observed, never on queue admission. Owner identity, world binding,
+    /// the pending boundary, and allocation identity are all checked before any state changes.
+    /// Equal contents in a different allocation cannot acknowledge the session's work.
+    pub fn acknowledge_committed(
+        &mut self,
+        world: &mut WorldState,
+        batch: &Arc<PersistenceBatch>,
+        authority: &PersistenceCommitAuthority,
+    ) -> Result<(), PersistenceSessionError> {
+        let tick = self.validate_journal_batch(world, batch, authority)?;
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.journal_reservation.is_none())
+        {
+            return Err(PersistenceSessionError::MissingJournalReservation { tick });
+        }
+        self.last_admitted_tick = Some(tick);
+        self.pending = None;
+        world.persistence_boundary = PersistenceBoundaryStatus::Sealed { tick };
+        Ok(())
+    }
+
+    fn validate_journal_batch(
+        &self,
+        world: &WorldState,
+        batch: &Arc<PersistenceBatch>,
+        authority: &PersistenceCommitAuthority,
+    ) -> Result<Tick, PersistenceSessionError> {
+        if !self.accepts_commit_authority(authority) {
+            return Err(PersistenceSessionError::CommitAuthorityMismatch);
+        }
+        self.ensure_binding(world)?;
+        let tick = batch.summary.tick;
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or(PersistenceSessionError::MissingPendingBatch { tick })?;
+        if !Arc::ptr_eq(&pending.batch, batch) {
+            return Err(PersistenceSessionError::ReceiptBatchMismatch { tick });
+        }
+        if world.persistence_boundary != (PersistenceBoundaryStatus::Pending { tick }) {
+            return Err(PersistenceSessionError::BoundaryMismatch {
+                pending_tick: tick,
+                boundary: world.persistence_boundary,
+            });
+        }
+        Ok(tick)
+    }
+
     /// Retry the exact retained batch, or report that this session has no staged work.
     pub fn retry_pending(
         &mut self,
@@ -34331,11 +34619,12 @@ impl PersistenceAdmissionSession {
 
     /// Project the final partial cadence tail without performing downstream I/O.
     ///
-    /// The returned [`Arc`] is the exact allocation owned by this admission
-    /// session. A host may embed a clone in its own immutable journal envelope,
-    /// retain that envelope under backpressure, and call [`Self::admit_pending`]
-    /// only after the outer journal accepts the same work. An already-staged
-    /// retry returns the original allocation.
+    /// The returned [`Arc`] is the exact allocation owned by this admission session. A host
+    /// may embed a clone in its immutable journal envelope and retain it under backpressure.
+    /// An independent sink uses [`Self::admit_pending`] after journal admission. A matching
+    /// journal owner instead calls [`Self::reserve_pending_for_journal`] before admission
+    /// and [`Self::acknowledge_committed`] only after its required commitment receipt.
+    /// An already-staged retry returns the original allocation.
     pub fn stage_final_batch(
         &mut self,
         world: &mut WorldState,
@@ -34380,7 +34669,7 @@ impl PersistenceAdmissionSession {
         self.pending.is_some()
     }
 
-    /// Most recent tick synchronously acknowledged by the owned sink.
+    /// Most recent tick acknowledged by the owned sink or its matching committed journal.
     #[must_use]
     pub const fn last_admitted_tick(&self) -> Option<Tick> {
         self.last_admitted_tick
@@ -48109,6 +48398,98 @@ mod tests {
         }
     }
 
+    struct JournalOnlyPersistence(PersistenceCommitAuthority);
+
+    impl WorldPersistence for JournalOnlyPersistence {
+        fn on_tick(&mut self, _: &PersistenceBatch) -> Result<(), PersistenceAdmissionError> {
+            panic!("a committed journal batch must not be submitted a second time")
+        }
+
+        fn commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn committed_journal_receipt_requires_owner_world_and_exact_pending_allocation() {
+        let config = ScriptBotsConfig {
+            persistence_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            rng_seed: Some(0xA11D_5EED),
+            ..ScriptBotsConfig::default()
+        };
+        let owner = Arc::new(());
+        let authority = PersistenceCommitAuthority::from_owner(Arc::clone(&owner));
+        let (mut world, mut session) =
+            world_with_session(config.clone(), JournalOnlyPersistence(authority.clone()));
+        let completion = session.step_outcome(&mut world).expect("staged tick");
+        let batch = ready_batch_arc(&completion.outcome.persistence);
+        let digest = world
+            .world_digest_v1_inner(false)
+            .expect("diagnostic pending scientific state");
+        let foreign_authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+        assert_eq!(
+            session.acknowledge_committed(&mut world, &batch, &foreign_authority),
+            Err(PersistenceSessionError::CommitAuthorityMismatch)
+        );
+        let (mut foreign_world, _) = world_with_session(config, NullPersistence);
+        assert_eq!(
+            session.acknowledge_committed(&mut foreign_world, &batch, &authority),
+            Err(PersistenceSessionError::WrongWorld)
+        );
+        let equal_contents = Arc::new(batch.as_ref().clone());
+        assert_eq!(
+            session.acknowledge_committed(&mut world, &equal_contents, &authority),
+            Err(PersistenceSessionError::ReceiptBatchMismatch { tick: Tick(1) })
+        );
+        assert_same_staged_batch(&session, &batch);
+        assert_eq!(session.last_admitted_tick(), None);
+        assert_eq!(
+            world.persistence_boundary_status(),
+            PersistenceBoundaryStatus::Pending { tick: Tick(1) }
+        );
+        assert!(session.step_outcome(&mut world).is_err());
+        assert_eq!(world.world_digest_v1_inner(false).unwrap(), digest);
+
+        // Independently wrapping a clone of the same owner is valid; equal data in a new
+        // owner allocation above was not. No synchronous sink call is needed in either case.
+        let same_owner = PersistenceCommitAuthority::from_owner(owner);
+        assert_eq!(
+            session.acknowledge_committed(&mut world, &batch, &same_owner),
+            Err(PersistenceSessionError::MissingJournalReservation { tick: Tick(1) })
+        );
+        session
+            .reserve_pending_for_journal(&world, &batch, &same_owner)
+            .expect("reserve the exact pending batch");
+        session
+            .reserve_pending_for_journal(&world, &batch, &same_owner)
+            .expect("an exact journal retry reuses its reservation");
+        assert_eq!(
+            session.admit_pending(&mut world),
+            Err(PersistenceSessionError::JournalReceiptRequired { tick: Tick(1) })
+        );
+        session
+            .acknowledge_committed(&mut world, &batch, &same_owner)
+            .expect("matching committed journal receipt");
+        assert!(!session.has_pending_batch());
+        assert_eq!(session.last_admitted_tick(), Some(Tick(1)));
+        assert_eq!(
+            world.persistence_boundary_status(),
+            PersistenceBoundaryStatus::Sealed { tick: Tick(1) }
+        );
+        assert_eq!(world.world_digest_v1().unwrap(), digest);
+        assert_eq!(
+            session.acknowledge_committed(&mut world, &batch, &authority),
+            Err(PersistenceSessionError::MissingPendingBatch { tick: Tick(1) })
+        );
+        session
+            .step_outcome(&mut world)
+            .expect("next science boundary");
+        assert_eq!(world.tick(), Tick(2));
+    }
+
     #[test]
     fn prepared_persistence_is_inert_until_the_exact_batch_is_admitted() {
         let logs = Arc::new(Mutex::new(Vec::new()));
@@ -52564,6 +52945,457 @@ mod tests {
             (world.carcass_reproduction_bonus - 2.0).abs() < 1e-6,
             "carcass reproduction totals should track distributed amount"
         );
+    }
+
+    // Independent all-population oracle for the indexed broad phase. It never
+    // asks the production index for candidates, and retains the original dense
+    // recipient and caller-supplied corpse order for the f32 reward reductions.
+    fn full_scan_carcass_reward_reference(
+        world: &mut WorldState,
+        dead: &[(usize, AgentId)],
+    ) -> ResourceAmounts {
+        let config = world.config.clone();
+        let radius_squared =
+            config.carcass_distribution_radius * config.carcass_distribution_radius;
+        let mut rejected = ResourceAmounts::default();
+        if config.carcass_distribution_radius <= 0.0
+            || (config.carcass_health_reward <= 0.0 && config.carcass_reproduction_reward <= 0.0)
+        {
+            return rejected;
+        }
+        let handles: Vec<_> = world.agents.iter_handles().collect();
+        let rows: Vec<_> = handles
+            .iter()
+            .map(|&id| world.agents.snapshot(id).expect("reference agent"))
+            .collect();
+        let dying: BTreeSet<_> = dead.iter().map(|&(_, id)| id).collect();
+        // Health, energy, reproduction progress and indicator intensity.
+        let mut additions = vec![[0.0_f32; 4]; handles.len()];
+        for &(victim_index, victim_id) in dead {
+            let victim = &rows[victim_index];
+            if !world.runtime[victim_id].spiked || victim.health > 0.0 {
+                continue;
+            }
+            let maturity = carcass_maturity_multiplier(victim.age, config.carcass_maturity_age);
+            if maturity <= 0.0 {
+                continue;
+            }
+            let neighbors: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| {
+                    if dying.contains(&handles[index]) || row.health <= 0.0 {
+                        return None;
+                    }
+                    let dx = toroidal_delta(
+                        row.position.x,
+                        victim.position.x,
+                        validated_world_unit_f32(config.world_width),
+                    );
+                    let dy = toroidal_delta(
+                        row.position.y,
+                        victim.position.y,
+                        validated_world_unit_f32(config.world_height),
+                    );
+                    (dx * dx + dy * dy <= radius_squared).then_some(index)
+                })
+                .collect();
+            let normalization = carcass_neighbor_normalizer(
+                neighbors.len(),
+                config.carcass_neighbor_exponent.max(1.0),
+            );
+            for index in neighbors {
+                let herbivore = clamp01(world.runtime[handles[index]].herbivore_tendency);
+                let carnivore = (1.0 - herbivore) * (1.0 - herbivore);
+                if carnivore <= f32::EPSILON {
+                    continue;
+                }
+                let gain = config.carcass_health_reward * carnivore * maturity / normalization;
+                if gain > 0.0 {
+                    additions[index][0] += gain;
+                    additions[index][1] += gain * config.carcass_energy_share_rate.max(0.0);
+                    additions[index][3] += gain * config.carcass_indicator_scale.max(0.0);
+                    world.carcass_health_distributed += gain;
+                }
+                let progress =
+                    config.carcass_reproduction_reward * carnivore * maturity / normalization;
+                if progress > 0.0 {
+                    additions[index][2] += progress;
+                    world.carcass_reproduction_bonus += progress;
+                    if config.carcass_health_reward <= 0.0 {
+                        additions[index][3] += config.carcass_indicator_scale.max(0.0);
+                    }
+                }
+            }
+        }
+        for (index, (&id, added)) in handles.iter().zip(&additions).enumerate() {
+            if added[0] > 0.0 {
+                let health = &mut world.agents.columns_mut().health_mut()[index];
+                let old = *health;
+                *health = (*health + added[0]).min(2.0);
+                rejected.health += f64::from((added[0] - (*health - old)).max(0.0));
+            }
+            let runtime = world.runtime.get_mut(id).expect("reference runtime");
+            if added[1] > 0.0 {
+                let old = runtime.energy;
+                runtime.energy = (runtime.energy + added[1]).min(2.0);
+                rejected.energy += f64::from((added[1] - (runtime.energy - old)).max(0.0));
+                runtime.food_delta += added[1];
+            }
+            if added[2] > 0.0 {
+                runtime.reproduction_counter += added[2];
+            }
+            if added[3] > 0.0 {
+                runtime.indicator.intensity = (runtime.indicator.intensity + added[3]).min(100.0);
+                runtime.indicator.color = [1.0; 3];
+            }
+        }
+        rejected
+    }
+
+    fn carcass_index_comparison_world(
+        radius: f32,
+        width: u32,
+        height: u32,
+        cell_size: u32,
+        agent_count: usize,
+    ) -> (WorldState, Vec<(usize, AgentId)>) {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: width,
+            world_height: height,
+            food_cell_size: cell_size,
+            initial_food: 0.0,
+            food_respawn_interval: 0,
+            population_minimum: 0,
+            carcass_distribution_radius: radius,
+            carcass_health_reward: 0.7,
+            carcass_reproduction_reward: 1.3,
+            carcass_neighbor_exponent: 1.25,
+            carcass_maturity_age: 7,
+            carcass_energy_share_rate: 0.37,
+            carcass_indicator_scale: 3.7,
+            rng_seed: Some(0x0ca4_ca55),
+            ..ScriptBotsConfig::default()
+        })
+        .expect("carcass comparison world");
+        let mut handles: Vec<_> = (0..agent_count)
+            .map(|_| world.spawn_agent(AgentData::default()))
+            .collect();
+        // Removal is deliberately stable in production. Use the existing
+        // restore/reorder boundary to exercise a noncanonical dense permutation.
+        handles.swap(5, agent_count - 1);
+        world.agents.reorder(&handles);
+        assert!(world.agent_uid(handles[5]) > world.agent_uid(handles[6]));
+
+        // Populate a deliberately stale index, then move every agent. The
+        // carcass stage must rebuild from its own positions rather than trust it.
+        world
+            .index
+            .rebuild(&vec![(0.0, 0.0); handles.len()])
+            .expect("stale fixture index");
+        let mut dead = Vec::new();
+        for (index, &id) in handles.iter().enumerate() {
+            let is_dying = index.is_multiple_of(11) || index == 5;
+            let mut x = ((index as u32 * 37) % width) as f32;
+            let mut y = ((index as u32 * 71) % height) as f32;
+            if index.is_multiple_of(7) {
+                x += 2.0 * validated_world_unit_f32(width);
+            }
+            if index.is_multiple_of(13) {
+                y -= validated_world_unit_f32(height);
+            }
+            let columns = world.agents.columns_mut();
+            columns.positions_mut()[index] = Position::new(x, y);
+            columns.ages_mut()[index] = (index as u32 * 7) % 19;
+            columns.health_mut()[index] = if is_dying && index != 5 {
+                0.0
+            } else {
+                [0.1, 1.0, 1.95, 2.0][index % 4]
+            };
+            let runtime = world.runtime.get_mut(id).expect("fixture runtime");
+            runtime.spiked = !index.is_multiple_of(3);
+            runtime.herbivore_tendency = [0.0, 0.2, 0.6, 0.9, 1.0][index % 5];
+            runtime.energy = [0.2, 1.3, 1.99, 2.0][index % 4];
+            runtime.food_delta = [-0.25, 0.0, 0.75][index % 3];
+            runtime.reproduction_counter = index as f32 * 0.3;
+            runtime.indicator.intensity = [0.0, 98.0, 100.0][index % 3];
+            runtime.indicator.color = [0.25, 0.5, 0.75];
+            if is_dying {
+                dead.push((index, id));
+            }
+        }
+        dead.sort_by_key(|&(_, id)| world.agent_uid(id));
+        world.carcass_health_distributed = 1.25;
+        world.carcass_reproduction_bonus = 0.375;
+        (world, dead)
+    }
+
+    #[test]
+    fn carcass_index_matches_full_scan_rewards_and_ledger_bits() {
+        for (width, height, cell_size, radius) in [
+            (210, 200, 10, 0.0),
+            (210, 200, 10, f32::from_bits(1)),
+            (210, 200, 10, 10.0),
+            (210, 200, 10, 37.0),
+            (210, 200, 10, 204.0),
+            (210, 200, 10, f32::MAX),
+            (16_777_216, 65_536, 65_536, 100.0),
+        ] {
+            for index_mode in 0..3 {
+                let (mut indexed, dead) =
+                    carcass_index_comparison_world(radius, width, height, cell_size, 512);
+                let (mut reference, reference_dead) =
+                    carcass_index_comparison_world(radius, width, height, cell_size, 512);
+                match index_mode {
+                    1 => {
+                        indexed.index = UniformGridIndex::new(
+                            if width > 1_000_000 { 16.0 } else { 0.1 },
+                            validated_world_unit_f32(width),
+                            validated_world_unit_f32(height),
+                        );
+                    }
+                    2 => indexed.index.cell_size = 0.0,
+                    _ => {}
+                }
+                let before_rng = indexed.random_streams_checkpoint();
+                let expected = full_scan_carcass_reward_reference(&mut reference, &reference_dead);
+                let actual = indexed.distribute_carcass_rewards(&dead);
+                assert_eq!(
+                    [actual.food, actual.energy, actual.health].map(f64::to_bits),
+                    [expected.food, expected.energy, expected.health].map(f64::to_bits),
+                    "ledger mismatch: radius={radius}, width={width}, mode={index_mode}"
+                );
+                assert_eq!(indexed.random_streams_checkpoint(), before_rng);
+                assert_eq!(
+                    indexed.world_digest_v1().expect("indexed digest"),
+                    reference.world_digest_v1().expect("reference digest"),
+                    "scientific mismatch: radius={radius}, width={width}, mode={index_mode}"
+                );
+                assert_eq!(
+                    [
+                        indexed.carcass_health_distributed,
+                        indexed.carcass_reproduction_bonus,
+                    ]
+                    .map(f32::to_bits),
+                    [
+                        reference.carcass_health_distributed,
+                        reference.carcass_reproduction_bonus,
+                    ]
+                    .map(f32::to_bits)
+                );
+                for (actual_id, expected_id) in indexed
+                    .agents
+                    .iter_handles()
+                    .zip(reference.agents.iter_handles())
+                {
+                    let actual_runtime = &indexed.runtime[actual_id];
+                    let expected_runtime = &reference.runtime[expected_id];
+                    assert_eq!(
+                        [
+                            actual_runtime.energy,
+                            actual_runtime.food_delta,
+                            actual_runtime.reproduction_counter,
+                            actual_runtime.indicator.intensity,
+                        ]
+                        .map(f32::to_bits),
+                        [
+                            expected_runtime.energy,
+                            expected_runtime.food_delta,
+                            expected_runtime.reproduction_counter,
+                            expected_runtime.indicator.intensity,
+                        ]
+                        .map(f32::to_bits)
+                    );
+                    assert_eq!(
+                        actual_runtime.indicator.color.map(f32::to_bits),
+                        expected_runtime.indicator.color.map(f32::to_bits)
+                    );
+                }
+                if radius == 37.0 {
+                    assert!(indexed.carcass_health_distributed > 1.25);
+                    assert!(actual.health > 0.0);
+                    assert!(actual.energy > 0.0);
+                    if index_mode == 0 {
+                        assert_eq!(
+                            indexed.work_position_pairs.len(),
+                            indexed.agent_count(),
+                            "the differential oracle must execute the admitted indexed path"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn carcass_index_keeps_rounded_boundary_and_underflow_recipients() {
+        for (radius, corpse_x, neighbor_x) in [
+            (f32::from_bits(10.0_f32.to_bits() - 1), 0.000_000_5, 10.0),
+            (f32::from_bits(1), 0.0, 1.0e-23),
+        ] {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                world_width: 200,
+                world_height: 200,
+                food_cell_size: 10,
+                population_minimum: 0,
+                carcass_distribution_radius: radius,
+                carcass_health_reward: 0.0,
+                carcass_reproduction_reward: 1.0,
+                carcass_neighbor_exponent: 1.0,
+                carcass_maturity_age: 1,
+                rng_seed: Some(41),
+                ..ScriptBotsConfig::default()
+            })
+            .expect("rounding world");
+            let corpse = world.spawn_agent(AgentData {
+                position: Position::new(corpse_x, 0.0),
+                age: 1,
+                health: 0.0,
+                ..AgentData::default()
+            });
+            let neighbor = world.spawn_agent(AgentData {
+                position: Position::new(neighbor_x, 0.0),
+                ..AgentData::default()
+            });
+            // Enough real eligible corpses amortize the index build. Keep the
+            // recipient in a full SIMD chunk and all extra live agents far away.
+            let mut dead = vec![(0, corpse)];
+            for _ in 0..9 {
+                let other = world.spawn_agent(AgentData {
+                    position: Position::new(corpse_x, 0.0),
+                    age: 1,
+                    health: 0.0,
+                    ..AgentData::default()
+                });
+                world.runtime.get_mut(other).expect("other corpse").spiked = true;
+                dead.push((world.agents.index_of(other).expect("corpse index"), other));
+            }
+            for _ in 0..256 {
+                world.spawn_agent(AgentData {
+                    position: Position::new(100.0, 100.0),
+                    ..AgentData::default()
+                });
+            }
+            world.runtime.get_mut(corpse).expect("corpse").spiked = true;
+            let recipient = world.runtime.get_mut(neighbor).expect("recipient");
+            recipient.herbivore_tendency = 0.0;
+            recipient.reproduction_counter = 4.0;
+            let dx = toroidal_delta(neighbor_x, corpse_x, 200.0);
+            assert!(dx * dx <= radius * radius);
+            assert!(f64::from(neighbor_x) - f64::from(corpse_x) > f64::from(radius));
+
+            if radius > 1.0 {
+                let positions: Vec<_> = world
+                    .agents
+                    .columns()
+                    .positions()
+                    .iter()
+                    .map(|position| (position.x, position.y))
+                    .collect();
+                world.index.rebuild(&positions).expect("unpadded index");
+                let mut unpadded = Vec::new();
+                world
+                    .index
+                    .visit_neighbor_buckets(0, radius, &mut |indices| {
+                        unpadded.extend_from_slice(indices);
+                    });
+                assert!(
+                    !unpadded.contains(&1),
+                    "the witness must fail without conservative broad-phase padding"
+                );
+            } else {
+                assert_eq!((radius * radius).to_bits(), 0);
+                assert_eq!((dx * dx).to_bits(), 0);
+            }
+            let _ = world.distribute_carcass_rewards(&dead);
+            assert_eq!(
+                world.work_position_pairs.len(),
+                world.agent_count(),
+                "roundoff witness must execute the indexed path"
+            );
+            assert_eq!(
+                world.runtime[neighbor].reproduction_counter.to_bits(),
+                14.0_f32.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn carcass_index_avoids_empty_grid_work_and_counts_eligible_corpses() {
+        for (radius, width, height, cell_size, population, one_eligible) in [
+            (50.0, 160, 120, 1, 16, false),
+            (37.0, 210, 200, 10, 512, true),
+        ] {
+            let (mut indexed, mut dead) =
+                carcass_index_comparison_world(radius, width, height, cell_size, population);
+            let (mut reference, mut reference_dead) =
+                carcass_index_comparison_world(radius, width, height, cell_size, population);
+            for (world, corpses) in [
+                (&mut indexed, &mut dead),
+                (&mut reference, &mut reference_dead),
+            ] {
+                if one_eligible {
+                    let &(_, eligible) = corpses
+                        .iter()
+                        .find(|&&(index, id)| {
+                            world.agents.columns().health()[index] <= 0.0
+                                && world.agents.columns().ages()[index] > 0
+                                && world.runtime[id].spiked
+                        })
+                        .expect("one mature spiked corpse");
+                    for &(_, id) in corpses.iter() {
+                        world.runtime.get_mut(id).expect("corpse").spiked = id == eligible;
+                    }
+                    assert!(corpses.len() > 20);
+                } else {
+                    world.agents.columns_mut().health_mut().fill(1.0);
+                    for runtime in world.runtime.values_mut() {
+                        runtime.spiked = false;
+                    }
+                    corpses.clear();
+                    let handles: Vec<_> = world.agents.iter_handles().take(6).collect();
+                    for (index, id) in handles.into_iter().enumerate() {
+                        world.agents.columns_mut().health_mut()[index] = 0.0;
+                        world.agents.columns_mut().ages_mut()[index] = 1;
+                        world.runtime.get_mut(id).expect("corpse").spiked = true;
+                        corpses.push((index, id));
+                    }
+                    assert_eq!(corpses.len(), 6);
+                }
+                world.work_position_pairs = vec![(1234.0, 5678.0)];
+            }
+            let expected = full_scan_carcass_reward_reference(&mut reference, &reference_dead);
+            let actual = indexed.distribute_carcass_rewards(&dead);
+            assert_eq!(
+                indexed.work_position_pairs,
+                [(1234.0, 5678.0)],
+                "sparse broad queries and one eligible corpse must retain the full scan"
+            );
+            assert_eq!(
+                [actual.food, actual.energy, actual.health].map(f64::to_bits),
+                [expected.food, expected.energy, expected.health].map(f64::to_bits)
+            );
+            assert_eq!(
+                indexed.world_digest_v1().expect("fallback digest"),
+                reference.world_digest_v1().expect("reference digest")
+            );
+        }
+    }
+
+    #[test]
+    fn carcass_index_does_not_rebuild_for_ineligible_deaths() {
+        let (mut world, dead) = carcass_index_comparison_world(37.0, 210, 200, 10, 128);
+        for &(_, id) in &dead {
+            world.runtime.get_mut(id).expect("corpse").spiked = false;
+        }
+        world.work_position_pairs = vec![(1234.0, 5678.0)];
+        let before = world.world_digest_v1().expect("before digest");
+        assert_eq!(
+            world.distribute_carcass_rewards(&dead),
+            ResourceAmounts::default()
+        );
+        assert_eq!(world.work_position_pairs, [(1234.0, 5678.0)]);
+        assert_eq!(world.world_digest_v1().expect("after digest"), before);
     }
 
     #[test]

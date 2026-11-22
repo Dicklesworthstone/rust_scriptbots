@@ -1,5 +1,6 @@
 // Presentation-owned creature selection. Every scientific value comes from an
 // owner observation; picking, refreshes and highlighting never submit commands.
+import { worldProjection, visitWorldCopies } from "./world-view.js";
 
 export function exactIdentity(value, bits = 64) {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)
@@ -18,24 +19,25 @@ export function agentRadius(agent) {
 }
 
 /** Pick in CSS pixels using the same projection/radius as both renderers. */
-export function pickAgent(snapshot, x, y, { width, height, canvasWidth, canvasHeight }) {
+export function pickAgent(snapshot, x, y, { width, height, canvasWidth, canvasHeight, view }) {
   if (!snapshot || !(width > 0 && height > 0 && canvasWidth > 0 && canvasHeight > 0)
       || !Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > width || y > height) return null;
   const scale = Math.max(width / canvasWidth, height / canvasHeight);
+  const projection = worldProjection(snapshot.world, width, height, view);
   let picked = null;
   let nearest = Infinity;
   for (const agent of snapshot.agents) {
     const uid = agentUid(agent);
     if (uid === null) continue;
-    const dx = x - agent.position[0] / snapshot.world.width * width;
-    const dy = y - agent.position[1] / snapshot.world.height * height;
-    const distance = dx * dx + dy * dy;
-    const radius = Math.max(8, (agentRadius(agent) + 5) * scale);
-    if (distance <= radius * radius && (distance < nearest
-        || (distance === nearest && (picked === null || BigInt(uid) < BigInt(picked))))) {
-      nearest = distance;
-      picked = uid;
-    }
+    const radius = Math.max(8, (agentRadius(agent) * projection.zoom + 5) * scale);
+    visitWorldCopies(agent.position, projection, radius, (px, py) => {
+      const distance = (x - px) ** 2 + (y - py) ** 2;
+      if (distance <= radius * radius && (distance < nearest
+          || (distance === nearest && (picked === null || BigInt(uid) < BigInt(picked))))) {
+        nearest = distance;
+        picked = uid;
+      }
+    });
   }
   return picked;
 }

@@ -3969,7 +3969,8 @@ mod tests {
         assert!(!exp_frame.contains("Significant advantage"));
 
         let mut observed_experiments = harness.model().science.experiments.data().unwrap().clone();
-        observed_experiments.comparison_summary = Some(observed_comparison_fixture(0.38, 0.16));
+        observed_experiments.comparison_summary =
+            Some(observed_comparison_fixture(0.38, 0.16));
         harness.dispatch(ShellMessage::SetExperimentsData(ScreenDataState::Data(
             observed_experiments,
         )));

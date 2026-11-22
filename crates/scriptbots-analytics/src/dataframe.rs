@@ -400,7 +400,9 @@ pub fn read_parquet_batch(path: &Path) -> Result<RecordBatch, DataFrameError> {
     let mut reader = builder.build()?;
     let mut batches = Vec::new();
     for batch_res in reader.by_ref() {
-        batches.push(batch_res?);
+        // Parquet deliberately strips schema metadata from decoded batches.
+        // Restore only the schema read from this artifact's footer.
+        batches.push(batch_res?.with_schema(schema.clone())?);
     }
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
@@ -1718,6 +1720,19 @@ mod tests {
         write_batch_to_parquet(&run_pq, &run_batch).unwrap();
         let run_pq_read = read_parquet_batch(&run_pq).unwrap();
         verify_record_batches(&run_batch, &run_pq_read).unwrap();
+
+        let mut foreign = run_batch.clone();
+        foreign.schema_metadata_mut().insert(
+            "provenance.run_id".to_owned(),
+            "different-persisted-run".to_owned(),
+        );
+        let foreign_pq = dir.path().join("foreign.parquet");
+        write_batch_to_parquet(&foreign_pq, &foreign).unwrap();
+        let foreign_read = read_parquet_batch(&foreign_pq).unwrap();
+        assert!(
+            verify_record_batches(&run_batch, &foreign_read).is_err(),
+            "read-back must preserve and reject foreign file provenance"
+        );
 
         let run_arr = dir.path().join("run.arrow");
         write_batch_to_arrow(&run_arr, &run_batch).unwrap();

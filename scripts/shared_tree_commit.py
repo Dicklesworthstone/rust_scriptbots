@@ -22,8 +22,12 @@ pre-commit plugin rejects commits that did not come through this protocol.
 
 For a conflict-free merge, review with ``--merge-parent COMMIT`` and name every
 path changed from HEAD by the merge. The frozen tree must exactly match Git's
-clean merge result. Conflicted merges and unrelated in-progress operations
-remain unsupported; ordinary reviews still create single-parent commits.
+clean merge result. For an already-integrated incoming parent whose textual
+conflicts should retain HEAD, explicitly add ``--merge-favor ours``; the frozen
+tree must then match Git's canonical merge with that choice, and review also
+prints the full incoming-parent-to-result diff. Unresolved merges and unrelated
+in-progress operations remain unsupported; ordinary reviews still create
+single-parent commits.
 """
 
 from __future__ import annotations
@@ -358,14 +362,23 @@ def identity_payload(manifest: dict[str, object]) -> dict[str, object]:
     # merge mode is explicitly requested, including during hook validation.
     if "merge_parent" in manifest:
         payload["merge_parent"] = manifest["merge_parent"]
+    if "merge_favor" in manifest:
+        payload["merge_favor"] = manifest["merge_favor"]
     return payload
 
 
-def canonical_merge_tree(repo: Repo, base: str, parent: str) -> str:
+def canonical_merge_tree(
+    repo: Repo, base: str, parent: str, *, favor: str | None = None,
+) -> str:
     resolved = git_text(repo, ["rev-parse", "--verify", f"{parent}^{{commit}}"])
     if resolved != parent or parent == base:
         fail("merge parent must be a distinct pinned commit")
-    result = git(repo, ["merge-tree", "--write-tree", base, parent], check=False)
+    arguments = ["merge-tree", "--write-tree"]
+    if favor is not None:
+        if favor != "ours":
+            fail("unsupported merge conflict choice")
+        arguments.append("-Xours")
+    result = git(repo, [*arguments, base, parent], check=False)
     if result.returncode != 0:
         detail = (result.stdout + result.stderr).decode("utf-8", "replace").strip()
         fail(f"only conflict-free merges can be reviewed:\n{detail}")
@@ -373,12 +386,21 @@ def canonical_merge_tree(repo: Repo, base: str, parent: str) -> str:
 
 
 def validate_merge_tree(repo: Repo, manifest: dict[str, object]) -> None:
+    favor: str | None = None
+    if "merge_favor" in manifest and (
+        manifest["merge_favor"] != "ours" or "merge_parent" not in manifest
+    ):
+        fail("merge_favor requires a merge_parent and the explicit choice 'ours'")
+    if "merge_favor" in manifest:
+        favor = "ours"
     if "merge_parent" not in manifest:
         return
     parent = manifest["merge_parent"]
     if not isinstance(parent, str):
         fail("review manifest merge_parent has the wrong type")
-    expected = canonical_merge_tree(repo, str(manifest["base"]), parent)
+    expected = canonical_merge_tree(
+        repo, str(manifest["base"]), parent, favor=favor,
+    )
     if manifest["tree"] != expected:
         fail("reviewed tree must equal the complete conflict-free merge result")
 
@@ -550,6 +572,10 @@ def review_candidate(args: argparse.Namespace) -> int:
     repo = discover_repo()
     agent = require_agent()
     reject_in_progress_git_operation(repo)
+    if args.merge_favor is not None and not args.merge_parent:
+        fail("--merge-favor requires --merge-parent", 64)
+    if args.merge_parent == "":
+        fail("--merge-parent must not be empty", 64)
     paths = normalize_paths(repo, args.paths)
     # bd-mdoc: canonicalize so trailing whitespace, CRLF/CR line endings, and
     # leading/trailing blank lines are normalized to the form git actually
@@ -611,6 +637,8 @@ def review_candidate(args: argparse.Namespace) -> int:
     }
     if merge_parent is not None:
         manifest["merge_parent"] = merge_parent
+        if args.merge_favor is not None:
+            manifest["merge_favor"] = args.merge_favor
         validate_merge_tree(repo, manifest)
     token = token_for(manifest)
     manifest["token"] = token
@@ -627,6 +655,8 @@ def review_candidate(args: argparse.Namespace) -> int:
     print(f"  base:    {base}")
     if merge_parent is not None:
         print(f"  merge:   {merge_parent}")
+    if args.merge_favor is not None:
+        print(f"  favor:   {args.merge_favor} at conflicts; retain other incoming changes")
     print(f"  tree:    {tree}")
     print(f"  message: {message}")
     print("  paths:")
@@ -644,6 +674,18 @@ def review_candidate(args: argparse.Namespace) -> int:
         sys.stdout.buffer.write(b"\n")
     sys.stdout.buffer.flush()
     print("===== END EXACT REVIEW DIFF =====")
+    if args.merge_favor is not None:
+        # The candidate may preserve an already-integrated HEAD at conflicts.
+        # Also expose every difference from the incoming parent for review.
+        incoming_diff = git(repo, [
+            "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--full-index",
+            merge_parent, tree, "--",
+        ]).stdout
+        print("\n===== BEGIN UPSTREAM-TO-RESULT DIFF =====")
+        sys.stdout.flush()
+        sys.stdout.buffer.write(incoming_diff)
+        sys.stdout.buffer.flush()
+        print("===== END UPSTREAM-TO-RESULT DIFF =====")
     print(f"\nREVIEW TOKEN: {token}")
     print("After reviewing every hunk, commit exactly this frozen tree with:")
     print(
@@ -890,14 +932,19 @@ def self_test() -> int:
         return result
 
     def reviewed_token(
-        paths: str | Sequence[str], message: str, *, merge_parent: str | None = None
+        paths: str | Sequence[str], message: str, *, merge_parent: str | None = None,
+        merge_favor: str | None = None,
     ) -> str:
         arguments = ["review", "-m", message]
         if merge_parent is not None:
             arguments.extend(["--merge-parent", merge_parent])
+        if merge_favor is not None:
+            arguments.extend(["--merge-favor", merge_favor])
         arguments.extend(["--", *([paths] if isinstance(paths, str) else paths)])
         result = protocol(arguments)
         output = result.stdout.decode("utf-8", "replace")
+        if merge_favor is not None and "BEGIN UPSTREAM-TO-RESULT DIFF" not in output:
+            fail("self-test: explicit conflict choice omitted the incoming comparison")
         match = re.search(r"^REVIEW TOKEN: ([0-9a-f]{64})$", output, re.MULTILINE)
         if not match:
             fail(f"self-test could not parse review token:\n{output}")
@@ -1100,7 +1147,8 @@ def self_test() -> int:
     print("  ok: pending merge blocks normal commits and refuses replacement metadata")
 
     fixture_write(peer, "c.txt", "C-peer-conflict\n")
-    fixture_git(peer, ["add", "c.txt"])
+    fixture_write(peer, "d.txt", "D-nonconflicting-peer-update\n")
+    fixture_git(peer, ["add", "c.txt", "d.txt"])
     fixture_git(peer, ["commit", "-m", "peer conflicts with local C"])
     fixture_git(fixture, ["fetch", str(peer), "main"])
     conflicting_parent = fixture_git(fixture, ["rev-parse", "FETCH_HEAD"]).stdout.decode().strip()
@@ -1113,6 +1161,58 @@ def self_test() -> int:
     if fixture_git(fixture, ["rev-parse", "HEAD"]).stdout.decode().strip() != merged or merge_head.exists():
         fail("self-test: conflict refusal disturbed HEAD or created active merge state")
     print("  ok: conflicted history is rejected without changing HEAD or active Git state")
+
+    for parent_arguments in ([], ["--merge-parent", ""]):
+        no_parent = protocol(
+            ["review", "--merge-favor", "ours", *parent_arguments,
+             "-m", "missing parent", "--", "d.txt"], expect_ok=False,
+        )
+        if b"--merge-favor requires --merge-parent" not in no_parent.stderr:
+            fail("self-test: conflict choice without a nonempty parent was not refused")
+    empty_parent = protocol(
+        ["review", "--merge-parent", "", "-m", "empty parent", "--", "d.txt"],
+        expect_ok=False,
+    )
+    if b"--merge-parent must not be empty" not in empty_parent.stderr:
+        fail("self-test: an explicit empty parent silently became a normal commit")
+    fixture_write(fixture, "d.txt", "D-not-the-peer-update\n")
+    wrong_resolution = protocol(
+        ["review", "--merge-parent", conflicting_parent, "--merge-favor", "ours",
+         "-m", "wrong resolution", "--", "d.txt"], expect_ok=False,
+    )
+    if b"complete conflict-free merge result" not in wrong_resolution.stderr:
+        fail("self-test: explicit conflict choice accepted a noncanonical tree")
+
+    fixture_write(fixture, "d.txt", "D-nonconflicting-peer-update\n")
+    before_favor = fixture_git(fixture, ["rev-parse", "HEAD"]).stdout.decode().strip()
+    token_favor = reviewed_token(
+        "d.txt", "test: explicit canonical conflict choice",
+        merge_parent=conflicting_parent, merge_favor="ours",
+    )
+    favor_path, favor_manifest = load_manifest(repo, token_favor)
+    saved_favor = favor_path.read_bytes()
+    changed_favor = dict(favor_manifest)
+    changed_favor.pop("merge_favor")
+    favor_path.write_text(json.dumps(changed_favor), encoding="utf-8")
+    unbound_favor = protocol(["commit", "--review", token_favor], expect_ok=False)
+    favor_path.write_bytes(saved_favor)
+    if b"token does not match" not in unbound_favor.stderr:
+        fail("self-test: changing the conflict choice did not invalidate its token")
+    protocol(["commit", "--review", token_favor])
+    favored = fixture_git(fixture, ["rev-parse", "HEAD"]).stdout.decode().strip()
+    if (
+        fixture_git(fixture, ["rev-list", "--parents", "-n", "1", "HEAD"])
+        .stdout.decode().split() != [favored, before_favor, conflicting_parent]
+        or fixture_git(fixture, ["show", "HEAD:c.txt"]).stdout != b"C-advanced-before-merge\n"
+        or fixture_git(fixture, ["show", "HEAD:d.txt"]).stdout != b"D-nonconflicting-peer-update\n"
+        or fixture_git(fixture, ["diff", "--cached", "--name-only", "-z"]).stdout != b"b.txt\0"
+        or (fixture / "c.txt").read_bytes() != b"C-next-unreviewed-edit\n"
+        or (fixture / ".git" / "hook-seen").read_bytes() != b"d.txt\0"
+        or merge_head.exists()
+    ):
+        fail("self-test: explicit choice lost peer updates, exact parents, hooks, or local edits")
+    print("  ok: explicit canonical conflict choice preserves incoming updates and private approval")
+    print("  ok: missing parent, noncanonical tree, and conflict-choice tampering are refused")
     print(f"merge peer fixture retained at {peer}")
 
     print("self-test: all shared-tree commit invariants passed")
@@ -1132,6 +1232,10 @@ def parser() -> argparse.ArgumentParser:
     review.add_argument(
         "--merge-parent",
         help="pin a second parent and require Git's exact conflict-free merge tree",
+    )
+    review.add_argument(
+        "--merge-favor", choices=("ours",),
+        help="explicitly choose HEAD at conflicts; bind Git's complete merge result and print the incoming comparison",
     )
     review.add_argument(
         "--lock-timeout",

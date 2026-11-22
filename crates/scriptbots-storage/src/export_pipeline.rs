@@ -1551,34 +1551,37 @@ pub fn export_provenance(
 
 #[derive(Clone, Copy)]
 enum ExportPageSource {
-    Table(ExportTable),
+    Agent,
+    Lineage,
+    Event,
+    Metric,
     BirthParents,
 }
 
 impl ExportPageSource {
     fn query(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            Self::Table(ExportTable::Agent) => (
+            Self::Agent => (
                 "SELECT run_id, tick, agent_uid, generation, age, position_x, position_y,
                         velocity_x, velocity_y, heading, health, energy, herbivore_tendency,
                         brain_binding FROM agents WHERE run_id = ?1",
                 "tick ASC, agent_uid ASC",
                 " AND (tick > ?2 OR (tick = ?2 AND agent_uid > ?3))",
             ),
-            Self::Table(ExportTable::Lineage) => (
+            Self::Lineage => (
                 "SELECT run_id, child_agent_uid, parent_agent_uid, parent_ordinal,
                         relationship, birth_tick FROM lineage_edges WHERE run_id = ?1",
                 "birth_tick ASC, child_agent_uid ASC, parent_ordinal ASC",
                 " AND (birth_tick > ?2 OR (birth_tick = ?2 AND child_agent_uid > ?3)
                         OR (birth_tick = ?2 AND child_agent_uid = ?3 AND parent_ordinal > ?4))",
             ),
-            Self::Table(ExportTable::Event) => (
+            Self::Event => (
                 "SELECT run_id, tick, seq, scope, event_type, payload
                  FROM replay_events WHERE run_id = ?1",
                 "tick ASC, seq ASC",
                 " AND (tick > ?2 OR (tick = ?2 AND seq > ?3))",
             ),
-            Self::Table(ExportTable::Metric) => (
+            Self::Metric => (
                 "SELECT run_id, tick, name, value FROM metrics WHERE run_id = ?1",
                 "tick ASC, name ASC",
                 " AND (tick > ?2 OR (tick = ?2 AND name > ?3))",
@@ -1589,22 +1592,21 @@ impl ExportPageSource {
                 "tick ASC, agent_uid ASC",
                 " AND (tick > ?2 OR (tick = ?2 AND agent_uid > ?3))",
             ),
-            Self::Table(ExportTable::Run) => unreachable!("run export has exactly one row"),
         }
     }
 
     fn cursor(self, row: &Row) -> Result<Vec<SqliteValue>, StorageError> {
         match self {
-            Self::Table(ExportTable::Agent | ExportTable::Event) => Ok(vec![
+            Self::Agent | Self::Event => Ok(vec![
                 decode_column::<i64>(row, 1, "export.cursor.tick")?.into(),
                 decode_column::<i64>(row, 2, "export.cursor.ordinal")?.into(),
             ]),
-            Self::Table(ExportTable::Lineage) => Ok(vec![
+            Self::Lineage => Ok(vec![
                 decode_column::<i64>(row, 5, "export.cursor.birth_tick")?.into(),
                 decode_column::<i64>(row, 1, "export.cursor.child_uid")?.into(),
                 decode_column::<i64>(row, 3, "export.cursor.parent_ordinal")?.into(),
             ]),
-            Self::Table(ExportTable::Metric) => Ok(vec![
+            Self::Metric => Ok(vec![
                 decode_column::<i64>(row, 1, "export.cursor.tick")?.into(),
                 decode_column::<String>(row, 2, "export.cursor.name")?.into(),
             ]),
@@ -1612,34 +1614,32 @@ impl ExportPageSource {
                 decode_column::<i64>(row, 4, "export.cursor.birth_tick")?.into(),
                 decode_column::<i64>(row, 1, "export.cursor.child_uid")?.into(),
             ]),
-            Self::Table(ExportTable::Run) => unreachable!("run export has no page cursor"),
         }
     }
 
     fn decode(self, rows: &[Row]) -> Result<ExportTablePage, StorageError> {
         match self {
-            Self::Table(ExportTable::Agent) => rows
+            Self::Agent => rows
                 .iter()
                 .map(agent_export_row)
                 .collect::<Result<Vec<_>, _>>()
                 .map(ExportTablePage::Agent),
-            Self::Table(ExportTable::Lineage) => rows
+            Self::Lineage => rows
                 .iter()
                 .map(lineage_export_row)
                 .collect::<Result<Vec<_>, _>>()
                 .map(ExportTablePage::Lineage),
-            Self::Table(ExportTable::Event) => rows
+            Self::Event => rows
                 .iter()
                 .map(event_export_row)
                 .collect::<Result<Vec<_>, _>>()
                 .map(ExportTablePage::Event),
-            Self::Table(ExportTable::Metric) => rows
+            Self::Metric => rows
                 .iter()
                 .map(metric_export_row)
                 .collect::<Result<Vec<_>, _>>()
                 .map(ExportTablePage::Metric),
             Self::BirthParents => birth_parent_export_rows(rows).map(ExportTablePage::Lineage),
-            Self::Table(ExportTable::Run) => unreachable!("run export uses the manifest"),
         }
     }
 }
@@ -1702,11 +1702,17 @@ fn visit_export_pages_validated<E: From<StorageError>>(
     table: ExportTable,
     visit: &mut impl FnMut(ExportTablePage) -> Result<(), E>,
 ) -> Result<(), E> {
-    if table == ExportTable::Run {
-        return visit(ExportTablePage::Run(reader.load_run_export_row()?));
-    }
-    let populated = visit_export_source(reader, ExportPageSource::Table(table), visit)?;
-    if table == ExportTable::Lineage && !populated {
+    let source = match table {
+        ExportTable::Run => {
+            return visit(ExportTablePage::Run(reader.load_run_export_row()?));
+        }
+        ExportTable::Agent => ExportPageSource::Agent,
+        ExportTable::Lineage => ExportPageSource::Lineage,
+        ExportTable::Event => ExportPageSource::Event,
+        ExportTable::Metric => ExportPageSource::Metric,
+    };
+    let populated = visit_export_source(reader, source, visit)?;
+    if matches!(source, ExportPageSource::Lineage) && !populated {
         visit_export_source(reader, ExportPageSource::BirthParents, visit)?;
     }
     Ok(())

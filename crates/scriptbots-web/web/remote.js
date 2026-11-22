@@ -444,6 +444,11 @@ export class RemoteStreamClient {
       sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, parse: parseExperimentJson });
   }
 
+  async experimentRunArtifacts(experimentId, runId, { sessionId, signal } = {}) {
+    return this.labJson(`/api/v1/experiments/${experimentIdentifier(experimentId)}/runs/${experimentIdentifier(runId)}/artifacts`,
+      sessionId, EXPERIMENT_LIMITS.maxRunArtifactResponseBytes, { signal, parse: parseExperimentJson });
+  }
+
   async cancelExperiment(experimentId, { sessionId, signal } = {}) {
     return this.labJson("/api/v1/experiments/" + experimentIdentifier(experimentId) + "/cancel",
       sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, method: "POST", parse: parseExperimentJson });
@@ -452,6 +457,15 @@ export class RemoteStreamClient {
   async resumeExperiment(experimentId, { sessionId, signal } = {}) {
     return this.labJson("/api/v1/experiments/" + experimentIdentifier(experimentId) + "/resume",
       sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, method: "POST", parse: parseExperimentJson });
+  }
+
+  async retryFailedExperiment(experimentId, { sessionId, expectedGeneration, signal } = {}) {
+    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) {
+      throw new Error("Failed-run retry requires an exact observed status generation");
+    }
+    const body = JSON.stringify({ expected_generation: expectedGeneration });
+    return this.labJson("/api/v1/experiments/" + experimentIdentifier(experimentId) + "/retry-failed",
+      sessionId, EXPERIMENT_LIMITS.maxResponseBytes, { signal, method: "POST", body, parse: parseExperimentJson });
   }
 
   /** The server restores complete endpoint evidence and performs its paired analysis. */
@@ -558,7 +572,9 @@ export class RemoteStreamClient {
     }
     if (metadata.artifact_id !== artifactId || (expected && (
       (expected.artifact_id ?? expected.checkpoint_id) !== artifactId
-      || ["byte_size", "checksum_blake3", "checksum_sha256"].some((key) => metadata[key] !== expected[key])))) {
+      || ["byte_size", "checksum_blake3", "checksum_sha256"].some((key) => metadata[key] !== expected[key])
+      || ["filename", "relative_path", "content_type", "created_at_utc"].some((key) =>
+        Object.hasOwn(expected, key) && metadata[key] !== expected[key])))) {
       throw new Error("Artifact catalog entry differs from the selected saved source");
     }
     const url = this.apiUrl(`/api/v1/artifacts/${artifactId}/download`, sessionId);
@@ -568,7 +584,7 @@ export class RemoteStreamClient {
   }
 
   apiUrl(path, sessionId, query = {}) {
-    decimal(sessionId);
+    decimal(sessionId, 128);
     if (this.state !== "connected" || this.tracker.sessionId !== sessionId) {
       throw new Error("Connect to the observed world’s host before reading or submitting an intervention");
     }
