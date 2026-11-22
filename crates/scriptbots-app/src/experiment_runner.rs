@@ -1883,6 +1883,38 @@ impl MatchedSeedExperimentRunner {
         Ok(())
     }
 
+    /// Verify one completed run without reading any companion run's files.
+    ///
+    /// The full status still has to match the admitted plan. Its selected member
+    /// then passes the same artifact, evidence, configuration and restored-owner
+    /// checks as a complete batch, even while other runs are unfinished or broken.
+    pub(crate) fn verify_completed_run(
+        &self,
+        state_file: &Path,
+        status: &ExperimentBatchStatus,
+        run_id: &str,
+    ) -> Result<(), ExperimentRunnerError> {
+        let plan = self.validated_plan()?;
+        self.validate_status(state_file, status, &plan)?;
+        let record = status
+            .runs
+            .iter()
+            .find(|record| record.run_id == run_id)
+            .ok_or_else(|| ExperimentRunnerError::InvalidStatus {
+                path: state_file.to_path_buf(),
+                reason: format!("run `{run_id}` does not belong to this experiment"),
+            })?;
+        if record.state != RunState::Completed {
+            return Err(ExperimentRunnerError::InvalidStatus {
+                path: state_file.to_path_buf(),
+                reason: format!("run `{run_id}` is not completed"),
+            });
+        }
+        let (variant, family) = &plan.variants[&record.variant_id];
+        self.verify_completed_bundle(record, variant, *family, &plan.digest)?;
+        Ok(())
+    }
+
     /// Restore both complete variant cohorts from one plan-validated status.
     ///
     /// Every call rechecks the bounded bundle bytes, run/plan/family/config

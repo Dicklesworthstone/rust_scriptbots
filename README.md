@@ -270,6 +270,11 @@ RUST_LOG=info cargo run -p scriptbots-app
 - In an experiment's detail view, `D` requests cooperative stop and `U` resumes
   unfinished runs. The acknowledgement reports the observed batch status and
   progress; a `cancelling` acknowledgement does not mean the runs have finished.
+  When a stopped batch has failed runs, `F` explicitly retries them from verified
+  saved continuations. The displayed source and generation bind the request;
+  completed results and original failures are retained. An unconfirmed reply
+  requires fresh status before another attempt. This detail-view action is
+  separate from the composer's `F` key for forgetting an unconfirmed creation.
 - Press `N` in Experiments to create a matched-seed study. Choose either a
   brain-family comparison or a single ecological treatment, then set the brain
   families, first seed, number of seed pairs and transitions per run. Ecological
@@ -281,7 +286,7 @@ RUST_LOG=info cargo run -p scriptbots-app
   `S` submits or retries the exact frozen request. An unconfirmed submission
   keeps its original identity and choices; `F` explicitly forgets that local
   retry identity after its worker finishes. An already admitted experiment
-  remains in the catalog. Creation, stop and resume wait until their pending
+  remains in the catalog. Creation, stop, resume and failed-run retry wait until their pending
   identity has actually been displayed. `X` can deny an unpresented request or
   discard a submitted request's result; admitted work continues independently.
 - In Replay (`7`), press `K` to save a checkpoint and use Up/Down to select a
@@ -1212,8 +1217,11 @@ and failed runs. Select baseline and challenger arms to compare verified endpoin
 population, total or mean live-agent energy, mean health, mean or maximum age
 counter, maximum living generation, and total food. Comparisons retain the plan
 digest, source generation, endpoint and available statistical results. Stop and
-resume use the existing runner's observed status. The experiment CLI and API
-remain available for larger scripted designs.
+resume use the existing runner's observed status. **Retry failed runs** appears
+for eligible stopped batches and captures the observed source and generation.
+It retains completed results and prior failure evidence; a lost or mismatched
+reply requires fresh status before another explicit retry. The experiment CLI
+and API remain available for larger scripted designs.
 
 The saved-checkpoint pane can **save the current live world**, list retained
 scientific cuts and reconstruct a selected cut for inspection. A completed save
@@ -1729,6 +1737,15 @@ For an interactive run, ScriptBots parses the control environment and transactio
     A build without `brain-ft` refuses these arms before starting a worker or writing files.
   - `POST /api/v1/experiments/{id}/compare` → compare one canonical endpoint metric
     across two completed variant cohorts using verified bundles and exact matched seeds.
+  - `GET /api/v1/experiments/{id}/runs/{run_id}/artifacts` → discover the manifest
+    and all indexed files for one verified completed run. The response binds its
+    plan, status generation, run identity and final digest, with immutable
+    artifact IDs, relative paths, byte counts and both BLAKE3/SHA-256 checksums.
+    It includes at most 33 files, 16 MiB per file, 32 MiB of indexed data plus the
+    manifest (48 MiB total), and 256 KiB of inventory JSON. Download bytes through
+    `GET /api/v1/artifacts/{artifact_id}/download`. Unfinished or corrupt companion
+    runs do not block a healthy selected run; the selected run itself must pass
+    the canonical bundle and restored-owner checks.
   - `POST /api/v1/checkpoints` → capture a `WorldCheckpointV1` and record it in the run database (usable by
     `--checkpoint-start`); `GET /api/v1/checkpoints`, `/api/v1/artifacts`
   - Playback aliases (two-axis command status): `POST /api/pause`, `POST /api/resume`,
@@ -2512,7 +2529,8 @@ The server also exposes `POST /api/v1/experiments/ID/retry-failed` with
 `{"expected_generation":12}`, and MCP `experiment_retry_failed` with
 `{"experiment_id":"food-pause-recovery","expected_generation":12}`. Replace
 the example generation with the value actually returned by status. The browser's
-**Retry failed runs from saved progress** action captures that value automatically.
+**Retry failed runs from saved progress** action, native GPUI/Bevy **Retry failed
+runs** buttons, and terminal detail-view `F` action capture that value automatically.
 After an uncertain response, refresh status before trying again; an older
 generation cannot authorize another attempt after the batch has advanced.
 
@@ -2664,6 +2682,11 @@ digest evidence within its window.
     `experiment_compare` verifies two completed cohorts at their declared endpoint
     and returns the matched-seed contrast, uncertainty and provenance; one-seed
     cohorts explicitly return descriptive results without inferential claims.
+    `experiment_run_artifacts` accepts `experiment_id` and a completed `run_id`,
+    independently verifies that run, and returns its complete bounded file
+    inventory. `artifact_get` reads an indexed file's metadata; its artifact ID
+    also works with the REST download route. Other runs need not be completed or
+    healthy, and discovery does not resume or advance any experiment.
   - Checkpoints and artifacts: `checkpoint_create` (captured from the world owner and recorded in the run database
     through the storage worker), `checkpoint_list`, `checkpoint_status`, `artifact_list`, `artifact_get`
 Notes: Only HTTP transport is supported here; stdio/SSE are not used.

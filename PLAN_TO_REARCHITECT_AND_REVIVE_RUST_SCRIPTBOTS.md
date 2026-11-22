@@ -13,8 +13,13 @@
   observation and require a read before another explicit attempt. Completed
   peers and prior failure evidence remain retained. The terminal uses its
   existing presented-intent gate.
-- Expose bounded, verified artifacts for one completed experiment run without
-  requiring unrelated cohort runs to finish or remain healthy.
+- Implemented bounded, source-verified artifacts for one completed experiment
+  run through the control service, REST and MCP. The canonical verifier checks
+  the selected plan/run/variant/seed/family/configuration, endpoint evidence and
+  restored final owner without reading companion bundles. The immutable inventory
+  includes all indexed files and the manifest; it preserves the original artifact
+  root and uses existing verified byte downloads. Bounds are 33 files, 16 MiB per
+  file, 32 MiB indexed data plus 16 MiB manifest, and 256 KiB response JSON.
 - Deliver those results through the control CLI and browser, preserving bundle
   paths and checking downloaded bytes against the observed artifact identities.
 - Validate the actual changed paths through DSR and report native execution
@@ -31,6 +36,15 @@ reached unchanged `scriptbots-core`, whose rustc process received SIGKILL (Cargo
 exit 101), before `scriptbots-runtime` compiled. Neither attempt establishes why
 the process was killed, and neither qualifies native execution or strict-remote
 acceptance. Dependency pins and scientific baselines are unchanged.
+
+DSR `scriptbots_native_final_format/20261121T223040-t43lR0DC` parsed the final
+six native files and checked formatter output against unchanged baseline deltas
+(2/2 executed checks passed). DSR
+`scriptbots_backend_final_format/20261121T223121-Ja4GHzuZ` passed pinned formatting
+for all three artifact-backend files. Native artifact tests have been authored
+for portable reassembly, corrupt/unfinished/failed companions, foreign-owner
+substitution, cold catalogs, root changes and actual REST/MCP listeners; these
+tests remain unexecuted behind the native compiler blocker described above.
 
 **Bounded API work and failed-study recovery (2026-11-21):**
 [Implemented and independently reviewed; final browser and changed-Rust-format

@@ -42,15 +42,16 @@ use crate::control::{
     CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto, ConfigSnapshot, ControlError,
     ControlHandle, DietClassDto, EventEntry, EventKind, ExperimentBatchStatusDto,
     ExperimentComparisonDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
-    ExperimentRetryFailedRequest, ExperimentRunRecordDto, ExperimentSummaryDto,
-    ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody, InterventionsPollDto, KnobEntry,
-    KnobUpdate, MAX_CHECKPOINT_BRANCH_ID_BYTES, MAX_CHECKPOINT_BRANCH_KEY_BYTES,
-    MAX_CHECKPOINT_BRANCH_NAME_BYTES, MAX_CHECKPOINT_BRANCH_REQUEST_BYTES,
-    MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH, MapApplyAgentPolicy, MapApplyRequestBody,
-    MapGenerateRequestBody, PaginatedArtifactsResponse, PaginatedCheckpointBranchesResponse,
-    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, Scoreboard, SelectionModeDto,
-    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
-    parse_intervention_command, parse_map_artifact,
+    ExperimentRetryFailedRequest, ExperimentRunArtifactsDto, ExperimentRunRecordDto,
+    ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody,
+    InterventionsPollDto, KnobEntry, KnobUpdate, MAX_CHECKPOINT_BRANCH_ID_BYTES,
+    MAX_CHECKPOINT_BRANCH_KEY_BYTES, MAX_CHECKPOINT_BRANCH_NAME_BYTES,
+    MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH,
+    MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
+    PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse,
+    PaginatedExperimentsResponse, Scoreboard, SelectionModeDto, SelectionSnapshotDto,
+    SelectionStateDto, SimulationStatusDto, SpeedRequest, parse_intervention_command,
+    parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
@@ -1724,6 +1725,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
         post_v1_experiments,
         get_v1_experiments,
         get_v1_experiment_by_id,
+        get_v1_experiment_run_artifacts,
         post_v1_experiment_compare,
         post_v1_experiment_cancel,
         post_v1_experiment_resume,
@@ -1785,6 +1787,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
             ExperimentCreateRequest,
             ExperimentRetryFailedRequest,
             ExperimentRunRecordDto,
+            ExperimentRunArtifactsDto,
             ExperimentBatchStatusDto,
             ExperimentComparisonRequest,
             ExperimentComparisonDto,
@@ -4477,6 +4480,37 @@ async fn get_v1_experiment_by_id(
     Ok(Json(status))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/experiments/{experiment_id}/runs/{run_id}/artifacts",
+    tag = "experiments",
+    params(
+        ("experiment_id" = String, Path, description = "Exact admitted experiment identity"),
+        ("run_id" = String, Path, description = "Completed run belonging to this experiment")
+    ),
+    responses(
+        (status = 200, description = "Source-verified inventory of at most 33 files and 48 MiB, including the manifest; use each artifact ID with the existing download route", body = ExperimentRunArtifactsDto),
+        (status = 400, description = "Invalid experiment or run identity"),
+        (status = 404, description = "Experiment or run not found"),
+        (status = 409, description = "Selected run is incomplete or its published identity changed"),
+        (status = 413, description = "Artifact count, byte total or 256 KiB inventory response bound exceeded"),
+        (status = 500, description = "Saved plan, final owner or artifact evidence failed verification"),
+        (status = 503, description = "Bounded control work capacity is busy")
+    )
+)]
+async fn get_v1_experiment_run_artifacts(
+    State(state): State<ApiState>,
+    axum::extract::Path((experiment_id, run_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<ExperimentRunArtifactsDto>, AppError> {
+    let inventory = run_control(ControlWorkLane::Work, move || {
+        state
+            .handle
+            .get_experiment_run_artifacts(&experiment_id, &run_id)
+    })
+    .await?;
+    Ok(Json(inventory))
+}
+
 /// Compare one measured endpoint across two verified completed variant cohorts.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -5110,6 +5144,10 @@ fn prepare_rest_server(
         .route(
             "/api/v1/experiments/{experiment_id}/compare",
             post(post_v1_experiment_compare).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/experiments/{experiment_id}/runs/{run_id}/artifacts",
+            get(get_v1_experiment_run_artifacts),
         )
         .route(
             "/api/v1/experiments/{experiment_id}/cancel",
@@ -5773,6 +5811,30 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
 
     builder = register_tool(
         builder,
+        "experiment_run_artifacts",
+        "Discover every downloadable file for one completed experiment run. Verifies its exact plan, run identity, artifact bytes and restored final owner without inspecting companion run files. Returns at most 33 files and a 256 KiB inventory; use artifact_get for metadata or the REST artifact download route for verified bytes. Does not advance the live world or modify experiment status.",
+        json!({
+            "type": "object",
+            "properties": {
+                "experiment_id": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": crate::experiment_runner::MAX_RUN_COMPONENT_BYTES
+                },
+                "run_id": {
+                    "type": "string", "minLength": 1,
+                    "maxLength": crate::experiment_runner::MAX_RUN_COMPONENT_BYTES,
+                    "description": "Exact completed run ID from this experiment's observed status"
+                }
+            },
+            "required": ["experiment_id", "run_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::ExperimentRunArtifacts,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
         "experiment_compare",
         "Compare one final-state metric across two completed matched-seed variants. Revalidates every retained bundle and final owner checkpoint. Differences are challenger minus baseline; one seed is descriptive only. Does not advance or modify the live world. Retry a busy result after the active comparison finishes.",
         json!({
@@ -6299,6 +6361,13 @@ struct McpExperimentRetryFailedRequest {
     expected_generation: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpExperimentRunArtifactsRequest {
+    experiment_id: String,
+    run_id: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlToolKind {
     ListPresets,
@@ -6324,6 +6393,7 @@ enum ControlToolKind {
     ExperimentCreate,
     ExperimentList,
     ExperimentStatus,
+    ExperimentRunArtifacts,
     ExperimentCompare,
     ExperimentCancel,
     ExperimentResume,
@@ -6365,6 +6435,7 @@ impl ControlToolKind {
             "experiment_create" => Self::ExperimentCreate,
             "experiment_list" => Self::ExperimentList,
             "experiment_status" => Self::ExperimentStatus,
+            "experiment_run_artifacts" => Self::ExperimentRunArtifacts,
             "experiment_compare" => Self::ExperimentCompare,
             "experiment_cancel" => Self::ExperimentCancel,
             "experiment_resume" => Self::ExperimentResume,
@@ -6409,6 +6480,7 @@ impl ControlToolKind {
             | Self::ExperimentCreate
             | Self::ExperimentList
             | Self::ExperimentStatus
+            | Self::ExperimentRunArtifacts
             | Self::ExperimentCompare
             | Self::ExperimentResume
             | Self::ExperimentRetryFailed
@@ -6464,6 +6536,7 @@ impl ToolHandler for ControlTool {
         if matches!(
             self.kind,
             ControlToolKind::Step
+                | ControlToolKind::ExperimentRunArtifacts
                 | ControlToolKind::ExperimentCompare
                 | ControlToolKind::ExperimentRetryFailed
                 | ControlToolKind::CheckpointBranchCreate
@@ -6808,6 +6881,20 @@ impl ToolHandler for ControlTool {
                 let handle = self.handle.clone();
                 let res = run_control_mcp_sync(move || handle.get_experiment(&experiment_id))?;
                 make_tool_result(res)
+            }
+            ControlToolKind::ExperimentRunArtifacts => {
+                let request: McpExperimentRunArtifactsRequest =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(
+                            McpErrorCode::InvalidParams,
+                            format!("invalid experiment_run_artifacts parameters: {error}"),
+                        )
+                    })?;
+                let handle = self.handle.clone();
+                let inventory = run_control_mcp_sync(move || {
+                    handle.get_experiment_run_artifacts(&request.experiment_id, &request.run_id)
+                })?;
+                make_tool_result(inventory)
             }
             ControlToolKind::ExperimentCompare => {
                 let request: McpExperimentComparisonRequest =
@@ -8076,6 +8163,10 @@ mod tests {
             (reqwest::Method::GET, "/api/v1/experiments"),
             (reqwest::Method::GET, "/api/v1/experiments/missing"),
             (reqwest::Method::POST, "/api/v1/experiments/missing/compare"),
+            (
+                reqwest::Method::GET,
+                "/api/v1/experiments/missing/runs/missing/artifacts",
+            ),
             (reqwest::Method::POST, "/api/v1/experiments/missing/cancel"),
             (reqwest::Method::POST, "/api/v1/experiments/missing/resume"),
             (reqwest::Method::POST, "/api/v1/checkpoints"),
@@ -10453,6 +10544,207 @@ mod tests {
         state
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real server verifies REST/MCP inventory parity, downloaded bytes, session fencing and corrupt-source refusal"
+    )]
+    async fn experiment_run_artifacts_http_mcp_download_verified_files_without_companion_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = test_host();
+        let runner = crate::control::tests::comparison_catalog_runner(
+            root.path(),
+            "download-transports",
+            vec![7],
+            0.0,
+        );
+        let status_path = runner.output_dir.join("status.json");
+        let completed = runner.execute_batch(&status_path).unwrap();
+        let run = &completed.runs[0];
+        std::fs::write(
+            Path::new(completed.runs[1].bundle_path.as_ref().unwrap()).join("exports/summary.csv"),
+            b"broken companion\n",
+        )
+        .unwrap();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Http {
+                bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            },
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let rest_address = reservation.rest_address().unwrap();
+        let mcp_address = reservation.mcp_http_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server
+            .control_handle()
+            .unwrap()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let before = std::fs::read(&status_path).unwrap();
+        let live = handle.read_snapshot().unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let url = format!(
+            "http://{rest_address}/api/v1/experiments/download-transports/runs/{}/artifacts",
+            run.run_id,
+        );
+        let stale = handle.session_id().get().wrapping_add(1).to_string();
+        assert_eq!(
+            client
+                .get(&url)
+                .header(LAB_SESSION_HEADER, stale)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT,
+        );
+        let response = client
+            .get(&url)
+            .header(LAB_SESSION_HEADER, handle.session_id().get().to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let inventory: ExperimentRunArtifactsDto = response.json().await.unwrap();
+        assert_eq!(inventory.run.run_id, run.run_id);
+        assert_eq!(inventory.run.final_digest, run.final_digest);
+        assert_eq!(inventory.plan_digest, completed.plan_digest);
+        assert_eq!(inventory.status_generation, completed.generation);
+        for artifact in &inventory.artifacts {
+            let response = client
+                .get(format!(
+                    "http://{rest_address}/api/v1/artifacts/{}/download",
+                    artifact.artifact_id,
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.bytes().await.unwrap();
+            assert_eq!(bytes.len() as u64, artifact.byte_size);
+            assert_eq!(
+                blake3::hash(&bytes).to_hex().to_string(),
+                artifact.checksum_blake3
+            );
+        }
+        let mcp_url = format!("http://{mcp_address}/mcp");
+        let initialized: Value = client
+            .post(&mcp_url)
+            .json(&json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{"protocolVersion":"2024-11-05", "capabilities":{},
+                    "clientInfo":{"name":"download-test", "version":"0"}}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let request = json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":"experiment_run_artifacts", "arguments":{
+                "experiment_id":"download-transports", "run_id":run.run_id
+            }}
+        });
+        let observed: Value = client
+            .post(&mcp_url)
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(observed.get("error").is_none(), "{observed}");
+        assert_ne!(observed["result"]["isError"], true, "{observed}");
+        let mcp_inventory: ExperimentRunArtifactsDto =
+            serde_json::from_str(observed["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&mcp_inventory).unwrap(),
+            serde_json::to_value(&inventory).unwrap(),
+        );
+        // Recheck the exact source on every discovery, including after a
+        // successful response populated the artifact catalog.
+        std::fs::write(
+            Path::new(run.bundle_path.as_ref().unwrap()).join("exports/summary.csv"),
+            b"changed selected endpoint\n",
+        )
+        .unwrap();
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let refused: Value = client
+            .post(&mcp_url)
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            refused["error"]["code"],
+            i32::from(McpErrorCode::InternalError),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&status_path).unwrap(), before);
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, live.world);
+        assert_eq!(after.revisions, live.revisions);
+        assert_eq!(after.last_applied_command, live.last_applied_command);
+        server.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn experiment_run_artifacts_mcp_rejects_malformed_arguments_before_catalog_access() {
+        let root = tempfile::tempdir().unwrap();
+        let (handle, _host) = handle();
+        let handle = handle
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let tool = ControlTool {
+            handle: handle.clone(),
+            kind: ControlToolKind::ExperimentRunArtifacts,
+            name: "experiment_run_artifacts".into(),
+            description: "Download completed results".into(),
+            schema: json!({"type":"object"}),
+        };
+        let runtime = mcp_context_test_runtime();
+        let cx = runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let ctx = fastmcp_rust::McpContext::new(cx, 1);
+        for arguments in [
+            json!(null),
+            json!([]),
+            json!(false),
+            json!({}),
+            json!({"experiment_id":"saved"}),
+            json!({"experiment_id":7,"run_id":"saved-baseline-seed7"}),
+            json!({"experiment_id":"saved","run_id":7}),
+            json!({"experiment_id":"saved","run_id":"saved-baseline-seed7","unknown":true}),
+            json!({"experiment_id":"../outside","run_id":"saved-baseline-seed7"}),
+            json!({"experiment_id":"saved","run_id":"../outside"}),
+            json!({"experiment_id":"saved","run_id":"x".repeat(129)}),
+        ] {
+            let error = tool.call(&ctx, arguments.clone()).unwrap_err();
+            assert_eq!(
+                error.code,
+                McpErrorCode::InvalidParams,
+                "{arguments}: {error}"
+            );
+            assert!(!error.message.contains("not found"), "{error}");
+        }
+        assert!(!root.path().join("experiments").exists());
+    }
+
     #[tokio::test]
     #[serial(experiment_comparison_http)]
     async fn mcp_experiment_comparison_matches_rest_and_reverifies_saved_evidence() {
@@ -12079,6 +12371,13 @@ mod tests {
                 .version()
                 .capabilities
                 .iter()
+                .any(|name| name == "experiment_run_artifacts")
+        );
+        assert!(
+            control
+                .version()
+                .capabilities
+                .iter()
                 .any(|capability| capability == "experiment_failed_run_retry")
         );
         let server = register_control_tools(
@@ -12113,6 +12412,7 @@ mod tests {
             "experiment_create",
             "experiment_list",
             "experiment_status",
+            "experiment_run_artifacts",
             "experiment_compare",
             "experiment_cancel",
             "experiment_resume",
@@ -12155,6 +12455,48 @@ mod tests {
                 .any(|name| name == "ExperimentComparisonDto")
         );
         let tools = server.tools();
+        let inventory_schema = &tools
+            .iter()
+            .find(|tool| tool.name == "experiment_run_artifacts")
+            .unwrap()
+            .input_schema;
+        assert_eq!(inventory_schema["additionalProperties"], false);
+        assert_eq!(
+            inventory_schema["required"],
+            json!(["experiment_id", "run_id"])
+        );
+        for field in ["experiment_id", "run_id"] {
+            assert_eq!(inventory_schema["properties"][field]["minLength"], 1);
+            assert_eq!(
+                inventory_schema["properties"][field]["maxLength"],
+                crate::experiment_runner::MAX_RUN_COMPONENT_BYTES,
+            );
+        }
+        let inventory_path = "/api/v1/experiments/{experiment_id}/runs/{run_id}/artifacts";
+        assert!(discovery.routes.iter().any(|path| path == inventory_path));
+        assert!(
+            discovery
+                .schemas
+                .iter()
+                .any(|name| name == "ExperimentRunArtifactsDto")
+        );
+        let inventory_request: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"experiment_run_artifacts", "lane":"command", "arguments":{
+                "experiment_id":"saved", "run_id":"saved-baseline-seed7"
+            }}
+        }))
+        .unwrap();
+        assert_eq!(
+            mcp_request_work_lane(&inventory_request),
+            ControlWorkLane::Work
+        );
+        let inventory_openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert_eq!(
+            inventory_openapi["paths"][inventory_path]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/ExperimentRunArtifactsDto",
+        );
         let schema = &tools
             .iter()
             .find(|tool| tool.name == "experiment_compare")
