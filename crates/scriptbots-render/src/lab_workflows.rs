@@ -1333,6 +1333,19 @@ impl SimulationView {
                             cx,
                         )),
                 );
+            if let Some(action) = state.failed_experiment_retry_action() {
+                panel = panel
+                    .child(self.lab_button(
+                        "lab-retry-failed-experiment".into(),
+                        "Retry failed runs".into(),
+                        action,
+                        true,
+                        cx,
+                    ))
+                    .child(div().text_xs().child(
+                        "Retry failed runs from their saved continuations and resume unfinished runs. Completed results and prior failure evidence are retained.",
+                    ));
+            }
             if let Some(error) = &batch.error_reason {
                 panel = panel.child(div().text_xs().child(error.clone()));
             }
@@ -2700,6 +2713,133 @@ mod tests {
             plan_digest: "recorded-plan".into(),
             status_generation: 9,
         }
+    }
+
+    #[test]
+    fn gpui_failed_run_retry_submits_the_displayed_generation_and_keeps_completed_peers() {
+        let host = TestHost::new(
+            WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                population_minimum: 0,
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let source = host.snapshot().session_id;
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut failed = batch(2);
+        failed.summary.status = "failed".into();
+        failed.summary.completed_runs = 1;
+        failed.summary.failed_runs = 1;
+        failed.variants[1].completed_runs = 0;
+        failed.variants[1].failed_runs = 1;
+        let completed_peer = failed.variants[0].clone();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let retained = Mutex::new(failed);
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| panic!("failed-run retry cannot command the live owner")),
+        );
+        session.lab_submit = Some(Arc::new(move |request| {
+            let mut observed = retained.lock().unwrap();
+            Ok(match request {
+                LabWorkflowRequest::ListExperiments { .. } => {
+                    LabWorkflowResponse::Experiments(LabExperimentPage {
+                        items: vec![observed.summary.clone()],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                        reserved_run_slots: 0,
+                        max_run_slots: 1,
+                    })
+                }
+                LabWorkflowRequest::GetExperiment { .. } => {
+                    LabWorkflowResponse::Experiment(observed.clone())
+                }
+                request @ LabWorkflowRequest::RetryFailedExperiment {
+                    session_id,
+                    expected_generation,
+                    ..
+                } => {
+                    assert_eq!(session_id, source);
+                    assert_eq!(expected_generation, observed.generation);
+                    recorded.lock().unwrap().push(request);
+                    observed.generation += 1;
+                    observed.summary.status = "running".into();
+                    observed.summary.failed_runs = 0;
+                    observed.variants[1].failed_runs = 0;
+                    observed.variants[1].running_runs = 1;
+                    LabWorkflowResponse::Experiment(observed.clone())
+                }
+                other => panic!("unexpected retry fixture request: {other:?}"),
+            })
+        }));
+        let context = gpui::TestAppContext::single();
+        let windows = context
+            .update(|app| Arc::new(session).install(app))
+            .unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(1_100.0), px(1_800.0)));
+        let draw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
+            draw(lab);
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("visible retry workflow control");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        let wait = |lab: &mut gpui::VisualTestContext, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(lab);
+                if context.update(|app| ready(&hud.read(app).lab_workflows)) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "failed-run retry response deadline"
+                );
+                std::thread::yield_now();
+            }
+        };
+        click(&mut lab, "dashboard-tab-experiments");
+        wait(&mut lab, &|state| {
+            state.experiments.is_some() && !state.is_busy()
+        });
+        click(&mut lab, "lab-experiment-0");
+        wait(&mut lab, &|state| {
+            state.failed_experiment_retry_action().is_some()
+        });
+        click(&mut lab, "lab-retry-failed-experiment");
+        wait(&mut lab, &|state| {
+            state
+                .batch
+                .as_ref()
+                .is_some_and(|batch| batch.generation == 10)
+                && !state.is_busy()
+        });
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        context.update(|app| {
+            let state = &hud.read(app).lab_workflows;
+            assert_eq!(state.batch.as_ref().unwrap().variants[0], completed_peer);
+            assert!(state.failed_experiment_retry_action().is_none());
+        });
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-retry-failed-experiment").is_none());
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
 
     #[test]

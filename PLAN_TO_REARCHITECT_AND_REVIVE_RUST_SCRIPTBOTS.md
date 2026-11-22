@@ -2,6 +2,36 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Native experiment recovery and portable results (2026-11-21):**
+[Currently In Progress — Codex; functional contributions to the native Lab,
+`bd-2z0.5.11`, `bd-2z0.12.2` and `bd-2z0.12.3`; broader acceptance retained]
+
+- Implemented explicit generation-guarded failed-run retry in the shared native
+  Lab, GPUI and Bevy buttons, and the terminal's `F` action. Each action captures
+  its source session, experiment and observed generation; stale clicks cannot
+  substitute a fresh generation. Lost or mismatched replies clear the stale
+  observation and require a read before another explicit attempt. Completed
+  peers and prior failure evidence remain retained. The terminal uses its
+  existing presented-intent gate.
+- Expose bounded, verified artifacts for one completed experiment run without
+  requiring unrelated cohort runs to finish or remain healthy.
+- Deliver those results through the control CLI and browser, preserving bundle
+  paths and checking downloaded bytes against the observed artifact identities.
+- Validate the actual changed paths through DSR and report native execution
+  separately from source review, formatting and browser tests.
+
+Native retry source and enum dispatch were independently reviewed; the six Rust
+files were parsed through DSR with the pinned formatter. Existing formatting
+differences in runtime/terminal/render files were retained, rather than claimed
+as a clean whole-workspace format gate. Native test bodies cover stale source and
+generation, lost replies, completed peers and all three native presentations,
+but have not executed successfully. The DSR app baseline check ended with Cargo
+exit 137 during dependency compilation. A separate, smaller runtime test attempt
+reached unchanged `scriptbots-core`, whose rustc process received SIGKILL (Cargo
+exit 101), before `scriptbots-runtime` compiled. Neither attempt establishes why
+the process was killed, and neither qualifies native execution or strict-remote
+acceptance. Dependency pins and scientific baselines are unchanged.
+
 **Bounded API work and failed-study recovery (2026-11-21):**
 [Implemented and independently reviewed; final browser and changed-Rust-format
 DSR checks passed; native qualification blocked — Codex; contributions to `bd-2z0.12.2` and

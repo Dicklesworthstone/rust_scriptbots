@@ -623,6 +623,15 @@ pub enum LabWorkflowRequest {
         /// Stable experiment identity.
         experiment_id: String,
     },
+    /// Explicitly retry failed runs from the observed retained generation.
+    RetryFailedExperiment {
+        /// Stable experiment identity.
+        experiment_id: String,
+        /// Application source on which the failed status was observed.
+        session_id: HostSessionId,
+        /// Exact failed status observed before the user requested another attempt.
+        expected_generation: u64,
+    },
     /// Compare verified observations from two distinct arms.
     Compare {
         /// Stable experiment identity.
@@ -1278,6 +1287,15 @@ pub enum LabAction {
     CancelExperiment,
     /// Request validated resume of the selected batch.
     ResumeExperiment,
+    /// Retry failed runs from the exact status shown when this action was offered.
+    RetryFailedExperiment {
+        /// Selected retained experiment identity.
+        experiment_id: String,
+        /// Application source shown when the action was offered.
+        session_id: HostSessionId,
+        /// Observed failed generation; never refreshed implicitly during submission.
+        expected_generation: u64,
+    },
     /// Move to another checkpoint catalog page.
     CheckpointsPage(Option<String>),
     /// Select a retained cut.
@@ -2487,6 +2505,58 @@ impl LabWorkflows {
         }
     }
 
+    /// Explicit retry intent bound to the selected failed status and source.
+    ///
+    /// A pending request or missing fresh status cannot offer another retry. Both
+    /// graphical and terminal frontends use this same eligibility decision.
+    #[must_use]
+    pub fn failed_experiment_retry_action(&self) -> Option<LabAction> {
+        if self.panel != LabPanel::Experiments
+            || self.composing_experiment
+            || self.submit.is_none()
+            || self.is_busy()
+        {
+            return None;
+        }
+        let session_id = self.session?;
+        let batch = self.batch.as_ref()?;
+        if self.selected_experiment.as_ref() != Some(&batch.summary.experiment_id)
+            || !batch_is_bounded(batch)
+            || batch.summary.failed_runs == 0
+            || !matches!(
+                batch.summary.status.as_str(),
+                "failed" | "cancelled" | "stopped"
+            )
+        {
+            return None;
+        }
+        Some(LabAction::RetryFailedExperiment {
+            experiment_id: batch.summary.experiment_id.clone(),
+            session_id,
+            expected_generation: batch.generation,
+        })
+    }
+
+    fn clear_failed_retry_observation(&mut self, request: &LabWorkflowRequest) {
+        if let LabWorkflowRequest::RetryFailedExperiment {
+            experiment_id,
+            session_id,
+            expected_generation,
+        } = request
+            && self.session == Some(*session_id)
+            && self.batch.as_ref().is_some_and(|batch| {
+                batch.summary.experiment_id == *experiment_id
+                    && batch.generation == *expected_generation
+            })
+        {
+            // The runner may have admitted this retry before the reply was lost.
+            // Only a fresh read can offer another explicit generation-bound attempt.
+            self.batch = None;
+            self.comparison = None;
+            self.last_refresh = None;
+        }
+    }
+
     /// Selected metadata from a verified catalog page or the latest save receipt.
     #[must_use]
     pub fn selected_checkpoint_metadata(&self) -> Option<&LabCheckpoint> {
@@ -2554,6 +2624,7 @@ impl LabWorkflows {
             || job.context != self.context
             || self.session != Some(job.session)
         {
+            self.clear_failed_retry_observation(&job.request);
             self.experiment_creation_unconfirmed(
                 &job.request,
                 "Creation finished after its selection or source changed; its receipt was discarded.",
@@ -2590,6 +2661,17 @@ impl LabWorkflows {
         let response = match result {
             Ok(response) => response,
             Err(error) => {
+                if matches!(
+                    &job.request,
+                    LabWorkflowRequest::RetryFailedExperiment { .. }
+                ) {
+                    self.clear_failed_retry_observation(&job.request);
+                    self.set_notice(format!(
+                        "Failed-run retry outcome is unconfirmed: {}. Refresh status before another explicit retry.",
+                        bounded_message(&error),
+                    ));
+                    return None;
+                }
                 if matches!(&job.request, LabWorkflowRequest::ExperimentCapabilities) {
                     self.experiment_capabilities = None;
                 }
@@ -2642,6 +2724,36 @@ impl LabWorkflows {
             ) if self.selected_experiment.as_ref() == Some(experiment_id)
                 && batch.summary.experiment_id == *experiment_id
                 && batch_is_bounded(&batch) =>
+            {
+                self.accept_batch(batch);
+                true
+            }
+            (
+                LabWorkflowRequest::RetryFailedExperiment {
+                    experiment_id,
+                    session_id,
+                    expected_generation,
+                },
+                LabWorkflowResponse::Experiment(batch),
+            ) if self.session == Some(*session_id)
+                && self.selected_experiment.as_ref() == Some(experiment_id)
+                && batch.summary.experiment_id == *experiment_id
+                && batch.generation > *expected_generation
+                && batch_is_bounded(&batch)
+                && self.batch.as_ref().is_some_and(|previous| {
+                    previous.generation == *expected_generation
+                        && previous.plan_digest == batch.plan_digest
+                        && previous.summary.total_runs == batch.summary.total_runs
+                        && previous.variants.len() == batch.variants.len()
+                        && previous.variants.iter().all(|before| {
+                            batch.variants.iter().any(|after| {
+                                before.variant_id == after.variant_id
+                                    && before.brain_family == after.brain_family
+                                    && before.total_runs == after.total_runs
+                                    && before.completed_runs <= after.completed_runs
+                            })
+                        })
+                }) =>
             {
                 self.accept_batch(batch);
                 true
@@ -2792,6 +2904,9 @@ impl LabWorkflows {
     }
 
     fn finish_response(&mut self, request: &LabWorkflowRequest, accepted: bool) {
+        if !accepted {
+            self.clear_failed_retry_observation(request);
+        }
         if !accepted && matches!(request, LabWorkflowRequest::ExperimentCapabilities) {
             self.experiment_capabilities = None;
         }
@@ -3387,6 +3502,25 @@ impl LabWorkflows {
                     self.start(request);
                 }
             }
+            action @ LabAction::RetryFailedExperiment { .. } => {
+                if self.failed_experiment_retry_action().as_ref() != Some(&action) {
+                    self.set_notice("Refresh the selected failed experiment before retrying; its source or observed generation changed, or a request is still pending.");
+                    return;
+                }
+                if let LabAction::RetryFailedExperiment {
+                    experiment_id,
+                    session_id,
+                    expected_generation,
+                } = action
+                {
+                    self.comparison = None;
+                    self.start(LabWorkflowRequest::RetryFailedExperiment {
+                        experiment_id,
+                        session_id,
+                        expected_generation,
+                    });
+                }
+            }
             LabAction::ReviewCheckpoint => {
                 if let Some(row) = self.selected_checkpoint_metadata() {
                     self.start(LabWorkflowRequest::ReviewCheckpoint {
@@ -3812,6 +3946,203 @@ mod tests {
             plan_digest: "recorded-plan".into(),
             status_generation: 9,
         }
+    }
+
+    fn failed_batch() -> LabExperiment {
+        let mut failed = batch(2);
+        failed.summary.status = "failed".into();
+        failed.summary.completed_runs = 1;
+        failed.summary.failed_runs = 1;
+        failed.variants[1].completed_runs = 0;
+        failed.variants[1].failed_runs = 1;
+        failed.error_reason = Some("retained run failure".into());
+        failed
+    }
+
+    #[test]
+    fn failed_run_retry_requires_observed_source_generation_and_preserves_completed_arms() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let mut state = LabWorkflows {
+            submit: Some(Arc::new(move |request| {
+                recorded.lock().unwrap().push(request);
+                let mut response = failed_batch();
+                response.summary.status = "running".into();
+                response.summary.failed_runs = 0;
+                response.variants[1].failed_runs = 0;
+                response.variants[1].running_runs = 1;
+                response.generation += 1;
+                Ok(LabWorkflowResponse::Experiment(response))
+            })),
+            ..LabWorkflows::default()
+        };
+        let session = HostSessionId::new(1);
+        state.synchronize(session, LabPanel::Experiments);
+        state.selected_experiment = Some("actual-batch".into());
+        state.batch = Some(failed_batch());
+        let action = state.failed_experiment_retry_action().unwrap();
+        state.batch.as_mut().unwrap().generation += 1;
+        state.dispatch(action.clone());
+        assert!(
+            !state.is_busy(),
+            "a stale rendered action cannot refresh its generation"
+        );
+        state.batch.as_mut().unwrap().generation -= 1;
+        state.synchronize(HostSessionId::new(2), LabPanel::Experiments);
+        state.selected_experiment = Some("actual-batch".into());
+        state.batch = Some(failed_batch());
+        state.dispatch(action.clone());
+        assert!(
+            !state.is_busy(),
+            "matching IDs and generations on another source are insufficient"
+        );
+        state.synchronize(session, LabPanel::Experiments);
+        state.selected_experiment = Some("actual-batch".into());
+        state.batch = Some(failed_batch());
+        for status in ["running", "pending", "cancelling", "completed", "unknown"] {
+            state.batch.as_mut().unwrap().summary.status = status.into();
+            assert!(state.failed_experiment_retry_action().is_none());
+            state.dispatch(action.clone());
+            assert!(!state.is_busy());
+        }
+        state.batch = Some(failed_batch());
+        state.comparison = Some(comparison("arm-01"));
+        state.dispatch(action.clone());
+        assert!(state.is_busy());
+        assert!(state.failed_experiment_retry_action().is_none());
+        state.dispatch(action);
+        drain_worker(&mut state);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![LabWorkflowRequest::RetryFailedExperiment {
+                experiment_id: "actual-batch".into(),
+                session_id: session,
+                expected_generation: 9,
+            }]
+        );
+        let observed = state.batch.as_ref().unwrap();
+        assert_eq!(observed.generation, 10);
+        assert_eq!(observed.variants[0], failed_batch().variants[0]);
+        assert_eq!(observed.summary.completed_runs, 1);
+        assert!(
+            state.comparison.is_none(),
+            "old-generation inference is not a retry receipt"
+        );
+        assert!(state.failed_experiment_retry_action().is_none());
+    }
+
+    #[test]
+    fn failed_run_retry_lost_reply_requires_status_read_before_another_attempt() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let mut state = LabWorkflows {
+            submit: Some(Arc::new(move |request| {
+                recorded.lock().unwrap().push(request.clone());
+                match request {
+                    LabWorkflowRequest::RetryFailedExperiment {
+                        expected_generation: 9,
+                        ..
+                    } => Err("reply lost after retry admission".into()),
+                    LabWorkflowRequest::GetExperiment { .. } => {
+                        // The admitted attempt can fail before the next status read.
+                        let mut observed = failed_batch();
+                        observed.generation = 12;
+                        Ok(LabWorkflowResponse::Experiment(observed))
+                    }
+                    _ => panic!("only an explicit retry and a status read are permitted"),
+                }
+            })),
+            ..LabWorkflows::default()
+        };
+        state.synchronize(HostSessionId::new(1), LabPanel::Experiments);
+        state.selected_experiment = Some("actual-batch".into());
+        state.batch = Some(failed_batch());
+        let original = state.failed_experiment_retry_action().unwrap();
+        state.dispatch(original.clone());
+        drain_worker(&mut state);
+        assert!(state.batch.is_none());
+        assert!(state.notice.as_deref().unwrap().contains("unconfirmed"));
+        state.dispatch(original.clone());
+        assert!(
+            !state.is_busy(),
+            "a missing response must not authorize another write"
+        );
+        state.maybe_refresh();
+        drain_worker(&mut state);
+        assert_eq!(state.batch.as_ref().unwrap().generation, 12);
+        state.dispatch(original);
+        assert!(
+            !state.is_busy(),
+            "a delayed click retains its old generation"
+        );
+        assert!(matches!(
+            state.failed_experiment_retry_action(),
+            Some(LabAction::RetryFailedExperiment {
+                expected_generation: 12,
+                ..
+            })
+        ));
+        let calls = requests.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(calls[1], LabWorkflowRequest::GetExperiment { .. }));
+    }
+
+    #[test]
+    fn failed_run_retry_refuses_stale_or_changed_receipts_and_dropped_results() {
+        let session = HostSessionId::new(1);
+        let request = LabWorkflowRequest::RetryFailedExperiment {
+            experiment_id: "actual-batch".into(),
+            session_id: session,
+            expected_generation: 9,
+        };
+        for defect in ["generation", "plan", "identity", "completed peer", "family"] {
+            let mut state = LabWorkflows {
+                submit: Some(Arc::new(|_| panic!("fixture only delivers observations"))),
+                ..LabWorkflows::default()
+            };
+            state.synchronize(session, LabPanel::Experiments);
+            state.selected_experiment = Some("actual-batch".into());
+            state.batch = Some(failed_batch());
+            let mut response = failed_batch();
+            response.generation += 1;
+            match defect {
+                "generation" => response.generation = 9,
+                "plan" => response.plan_digest = "different-plan".into(),
+                "identity" => response.summary.experiment_id = "other-batch".into(),
+                "completed peer" => {
+                    response.summary.completed_runs = 0;
+                    response.variants[0].completed_runs = 0;
+                }
+                "family" => response.variants[0].brain_family = "different-family".into(),
+                _ => unreachable!(),
+            }
+            deliver(
+                &mut state,
+                request.clone(),
+                LabWorkflowResponse::Experiment(response),
+            );
+            assert!(state.batch.is_none(), "{defect} cannot confirm a retry");
+            assert!(state.failed_experiment_retry_action().is_none());
+        }
+        let mut state = LabWorkflows::default();
+        state.synchronize(session, LabPanel::Experiments);
+        state.selected_experiment = Some("actual-batch".into());
+        state.batch = Some(failed_batch());
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        state.job = Some(LabJob {
+            request,
+            generation: state.generation,
+            context: state.context,
+            session,
+            result,
+        });
+        state.invalidate();
+        send.send(Err("discarded after admission".into())).unwrap();
+        state.poll();
+        assert!(
+            state.batch.is_none(),
+            "discarding a retry also requires a fresh status read"
+        );
     }
 
     fn deliver(

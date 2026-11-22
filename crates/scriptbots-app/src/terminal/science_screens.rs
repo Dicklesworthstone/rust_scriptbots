@@ -830,6 +830,9 @@ pub(super) fn render_live_experiments_screen(
     } else if let Some(batch) = &workflows.batch {
         lines.push("A catalog · B baseline · V challenger · M or [/] metric · C compare · X discard pending result".into());
         lines.push("N new experiment · D cancel batch · U resume retained batch".into());
+        if workflows.failed_experiment_retry_action().is_some() {
+            lines.push("F retry failed runs from saved continuations; completed results and prior failures are retained".into());
+        }
         lines.push(format!(
             "Experiment {}: {}",
             batch.summary.experiment_id, batch.summary.status

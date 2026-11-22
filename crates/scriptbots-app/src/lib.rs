@@ -4119,162 +4119,188 @@ pub mod renderer {
             LabWorkflowRequest, LabWorkflowResponse,
         };
         Arc::new(move |request| {
-            let result =
-                match request {
-                    LabWorkflowRequest::BranchCapabilities => native_lab_branch_capabilities()
-                        .map(LabWorkflowResponse::BranchCapabilities),
-                    LabWorkflowRequest::CreateCheckpointBranch {
-                        request_id,
-                        session_id,
-                        draft,
-                    } => create_lab_checkpoint_branch(&control, request_id, session_id, draft),
-                    LabWorkflowRequest::ListCheckpointBranches { cursor } => control
-                        .list_checkpoint_branches(Some(LAB_PAGE_SIZE), cursor.as_deref())
-                        .map(|page| {
-                            LabWorkflowResponse::CheckpointBranches(
-                                scriptbots_runtime::lab_workflows::LabCheckpointBranchPage {
-                                    items: page
-                                        .items
-                                        .into_iter()
-                                        .map(project_lab_checkpoint_branch)
-                                        .collect(),
-                                    total: page.total,
-                                    offset: page.offset,
-                                    next_cursor: page.next_cursor,
-                                },
-                            )
-                        }),
-                    LabWorkflowRequest::GetCheckpointBranch { branch_id } => control
-                        .get_checkpoint_branch(&branch_id)
-                        .map(project_lab_checkpoint_branch)
-                        .map(LabWorkflowResponse::CheckpointBranch),
-                    LabWorkflowRequest::CancelCheckpointBranch { branch_id } => control
-                        .cancel_checkpoint_branch(&branch_id)
-                        .map(project_lab_checkpoint_branch)
-                        .map(LabWorkflowResponse::CheckpointBranch),
-                    LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
-                        read_lab_checkpoint_branch_report(&control, &branch_id).map(|report| {
-                            LabWorkflowResponse::CheckpointBranchReport(Box::new(report))
-                        })
-                    }
-                    LabWorkflowRequest::ExperimentCapabilities => {
-                        Ok(LabWorkflowResponse::ExperimentCapabilities(
-                            native_lab_experiment_capabilities(),
-                        ))
-                    }
-                    LabWorkflowRequest::CreateExperiment {
-                        request_id,
-                        session_id,
-                        draft,
-                    } => create_lab_experiment(&control, request_id, session_id, draft),
-                    LabWorkflowRequest::ListExperiments { cursor } => {
-                        control
-                            .list_experiments(Some(LAB_PAGE_SIZE), cursor.as_deref())
-                            .map(|page| {
-                                LabWorkflowResponse::Experiments(LabExperimentPage {
-                        items: page.items.into_iter().map(|row| {
-                            scriptbots_runtime::lab_workflows::LabExperimentSummary {
-                                experiment_id: row.experiment_id,
-                                status: row.status,
-                                total_runs: row.total_runs,
-                                completed_runs: row.completed_runs,
-                                failed_runs: row.failed_runs,
-                            }
-                        }).collect(),
-                        total: page.total,
-                        offset: page.offset,
-                        next_cursor: page.next_cursor,
-                        reserved_run_slots: page.execution_capacity.reserved_run_slots,
-                        max_run_slots: page.execution_capacity.max_run_slots,
-                    })
-                            })
-                    }
-                    LabWorkflowRequest::GetExperiment { experiment_id } => control
-                        .get_experiment(&experiment_id)
-                        .and_then(project_lab_experiment)
-                        .map(LabWorkflowResponse::Experiment),
-                    LabWorkflowRequest::CancelExperiment { experiment_id } => control
-                        .cancel_experiment(&experiment_id)
-                        .and_then(project_lab_experiment)
-                        .map(LabWorkflowResponse::Experiment),
-                    LabWorkflowRequest::ResumeExperiment { experiment_id } => control
-                        .resume_experiment(&experiment_id)
-                        .and_then(project_lab_experiment)
-                        .map(LabWorkflowResponse::Experiment),
-                    LabWorkflowRequest::Compare {
-                        experiment_id,
-                        baseline_variant,
-                        challenger_variant,
-                        metric,
-                    } => control
-                        .compare_experiment_variants(
-                            &experiment_id,
-                            &baseline_variant,
-                            &challenger_variant,
-                            metric.key(),
-                        )
-                        .and_then(|comparison| {
-                            if comparison.metric != metric.key() {
-                                return Err(crate::control::ControlError::Conflict(
-                                    "comparison service returned a different scientific endpoint"
-                                        .into(),
-                                ));
-                            }
-                            Ok(LabWorkflowResponse::Comparison(LabComparison {
-                                experiment_id: comparison.experiment_id,
-                                baseline_variant: comparison.baseline_variant,
-                                challenger_variant: comparison.challenger_variant,
-                                metric,
-                                endpoint_tick: comparison.endpoint_tick,
-                                matched_seeds: comparison.matched_seeds,
-                                mean_difference: comparison.mean_difference,
-                                ci_95: comparison.ci_95,
-                                standardized_effect: comparison.standardized_effect,
-                                p_value: comparison.p_value,
-                                adjusted_p_value: comparison.adjusted_p_value,
-                                descriptive_only: comparison.descriptive_only,
-                                underpowered_reason: comparison.underpowered_reason,
-                                undefined_effect_reason: comparison.undefined_effect_reason,
-                                plan_digest: comparison.plan_digest,
-                                status_generation: comparison.status_generation,
-                            }))
-                        }),
-                    LabWorkflowRequest::ListCheckpoints { cursor } => control
-                        .list_checkpoints(Some(LAB_PAGE_SIZE), cursor.as_deref())
-                        .map(|page| {
-                            LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+            let result = match request {
+                LabWorkflowRequest::BranchCapabilities => {
+                    native_lab_branch_capabilities().map(LabWorkflowResponse::BranchCapabilities)
+                }
+                LabWorkflowRequest::CreateCheckpointBranch {
+                    request_id,
+                    session_id,
+                    draft,
+                } => create_lab_checkpoint_branch(&control, request_id, session_id, draft),
+                LabWorkflowRequest::ListCheckpointBranches { cursor } => control
+                    .list_checkpoint_branches(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                    .map(|page| {
+                        LabWorkflowResponse::CheckpointBranches(
+                            scriptbots_runtime::lab_workflows::LabCheckpointBranchPage {
                                 items: page
                                     .items
                                     .into_iter()
-                                    .map(|checkpoint| LabCheckpoint {
-                                        checkpoint_id: checkpoint.checkpoint_id,
-                                        tick: checkpoint.tick,
-                                        agent_count: checkpoint.agent_count,
-                                        byte_size: checkpoint.byte_size,
-                                        world_digest: checkpoint.world_digest_v1,
-                                    })
+                                    .map(project_lab_checkpoint_branch)
                                     .collect(),
                                 total: page.total,
                                 offset: page.offset,
                                 next_cursor: page.next_cursor,
-                                retained_bytes: page.retention.file_bytes,
-                                max_bytes: page.retention.max_bytes,
-                            })
-                        }),
-                    LabWorkflowRequest::CreateCheckpoint {
-                        request_id,
-                        session_id,
-                    } => create_lab_checkpoint(&control, request_id, session_id),
-                    LabWorkflowRequest::ReviewCheckpoint { checkpoint_id } => control
-                        .checkpoint_canvas(&checkpoint_id)
-                        .map(|snapshot| LabWorkflowResponse::CheckpointFrame {
-                            checkpoint_id,
-                            snapshot,
-                        }),
-                    LabWorkflowRequest::ReviewEvent { event } => review_lab_event(&control, event),
-                };
+                            },
+                        )
+                    }),
+                LabWorkflowRequest::GetCheckpointBranch { branch_id } => control
+                    .get_checkpoint_branch(&branch_id)
+                    .map(project_lab_checkpoint_branch)
+                    .map(LabWorkflowResponse::CheckpointBranch),
+                LabWorkflowRequest::CancelCheckpointBranch { branch_id } => control
+                    .cancel_checkpoint_branch(&branch_id)
+                    .map(project_lab_checkpoint_branch)
+                    .map(LabWorkflowResponse::CheckpointBranch),
+                LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
+                    read_lab_checkpoint_branch_report(&control, &branch_id)
+                        .map(|report| LabWorkflowResponse::CheckpointBranchReport(Box::new(report)))
+                }
+                LabWorkflowRequest::ExperimentCapabilities => {
+                    Ok(LabWorkflowResponse::ExperimentCapabilities(
+                        native_lab_experiment_capabilities(),
+                    ))
+                }
+                LabWorkflowRequest::CreateExperiment {
+                    request_id,
+                    session_id,
+                    draft,
+                } => create_lab_experiment(&control, request_id, session_id, draft),
+                LabWorkflowRequest::ListExperiments { cursor } => control
+                    .list_experiments(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                    .map(|page| {
+                        LabWorkflowResponse::Experiments(LabExperimentPage {
+                            items: page
+                                .items
+                                .into_iter()
+                                .map(|row| {
+                                    scriptbots_runtime::lab_workflows::LabExperimentSummary {
+                                        experiment_id: row.experiment_id,
+                                        status: row.status,
+                                        total_runs: row.total_runs,
+                                        completed_runs: row.completed_runs,
+                                        failed_runs: row.failed_runs,
+                                    }
+                                })
+                                .collect(),
+                            total: page.total,
+                            offset: page.offset,
+                            next_cursor: page.next_cursor,
+                            reserved_run_slots: page.execution_capacity.reserved_run_slots,
+                            max_run_slots: page.execution_capacity.max_run_slots,
+                        })
+                    }),
+                LabWorkflowRequest::GetExperiment { experiment_id } => control
+                    .get_experiment(&experiment_id)
+                    .and_then(project_lab_experiment)
+                    .map(LabWorkflowResponse::Experiment),
+                LabWorkflowRequest::CancelExperiment { experiment_id } => control
+                    .cancel_experiment(&experiment_id)
+                    .and_then(project_lab_experiment)
+                    .map(LabWorkflowResponse::Experiment),
+                LabWorkflowRequest::ResumeExperiment { experiment_id } => control
+                    .resume_experiment(&experiment_id)
+                    .and_then(project_lab_experiment)
+                    .map(LabWorkflowResponse::Experiment),
+                LabWorkflowRequest::RetryFailedExperiment {
+                    experiment_id,
+                    session_id,
+                    expected_generation,
+                } => {
+                    retry_lab_experiment(&control, &experiment_id, session_id, expected_generation)
+                }
+                LabWorkflowRequest::Compare {
+                    experiment_id,
+                    baseline_variant,
+                    challenger_variant,
+                    metric,
+                } => control
+                    .compare_experiment_variants(
+                        &experiment_id,
+                        &baseline_variant,
+                        &challenger_variant,
+                        metric.key(),
+                    )
+                    .and_then(|comparison| {
+                        if comparison.metric != metric.key() {
+                            return Err(crate::control::ControlError::Conflict(
+                                "comparison service returned a different scientific endpoint"
+                                    .into(),
+                            ));
+                        }
+                        Ok(LabWorkflowResponse::Comparison(LabComparison {
+                            experiment_id: comparison.experiment_id,
+                            baseline_variant: comparison.baseline_variant,
+                            challenger_variant: comparison.challenger_variant,
+                            metric,
+                            endpoint_tick: comparison.endpoint_tick,
+                            matched_seeds: comparison.matched_seeds,
+                            mean_difference: comparison.mean_difference,
+                            ci_95: comparison.ci_95,
+                            standardized_effect: comparison.standardized_effect,
+                            p_value: comparison.p_value,
+                            adjusted_p_value: comparison.adjusted_p_value,
+                            descriptive_only: comparison.descriptive_only,
+                            underpowered_reason: comparison.underpowered_reason,
+                            undefined_effect_reason: comparison.undefined_effect_reason,
+                            plan_digest: comparison.plan_digest,
+                            status_generation: comparison.status_generation,
+                        }))
+                    }),
+                LabWorkflowRequest::ListCheckpoints { cursor } => control
+                    .list_checkpoints(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                    .map(|page| {
+                        LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                            items: page
+                                .items
+                                .into_iter()
+                                .map(|checkpoint| LabCheckpoint {
+                                    checkpoint_id: checkpoint.checkpoint_id,
+                                    tick: checkpoint.tick,
+                                    agent_count: checkpoint.agent_count,
+                                    byte_size: checkpoint.byte_size,
+                                    world_digest: checkpoint.world_digest_v1,
+                                })
+                                .collect(),
+                            total: page.total,
+                            offset: page.offset,
+                            next_cursor: page.next_cursor,
+                            retained_bytes: page.retention.file_bytes,
+                            max_bytes: page.retention.max_bytes,
+                        })
+                    }),
+                LabWorkflowRequest::CreateCheckpoint {
+                    request_id,
+                    session_id,
+                } => create_lab_checkpoint(&control, request_id, session_id),
+                LabWorkflowRequest::ReviewCheckpoint { checkpoint_id } => control
+                    .checkpoint_canvas(&checkpoint_id)
+                    .map(|snapshot| LabWorkflowResponse::CheckpointFrame {
+                        checkpoint_id,
+                        snapshot,
+                    }),
+                LabWorkflowRequest::ReviewEvent { event } => review_lab_event(&control, event),
+            };
             result.map_err(|error| error.to_string())
         })
+    }
+
+    fn retry_lab_experiment(
+        control: &crate::control::ControlHandle,
+        experiment_id: &str,
+        session_id: scriptbots_runtime::HostSessionId,
+        expected_generation: u64,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabWorkflowResponse, crate::control::ControlError>
+    {
+        if control.read_snapshot()?.session_id != session_id {
+            return Err(crate::control::ControlError::Conflict(
+                "native failed-run retry belongs to a different owner session".into(),
+            ));
+        }
+        control
+            .retry_failed_experiment(experiment_id, expected_generation)
+            .and_then(project_lab_experiment)
+            .map(scriptbots_runtime::lab_workflows::LabWorkflowResponse::Experiment)
     }
 
     fn retained_lab_event(
@@ -5060,6 +5086,112 @@ pub mod renderer {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             None
+        }
+
+        #[test]
+        fn native_lab_failed_run_retry_uses_real_generation_guard_and_retains_completed_results() {
+            use crate::experiment_runner::RunState;
+            use scriptbots_runtime::lab_workflows::{
+                LabWorkflowRequest as Request, LabWorkflowResponse as Response,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                population_minimum: 0,
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.path().to_path_buf())
+                .unwrap();
+            let runner = crate::control::tests::comparison_catalog_runner(
+                root.path(),
+                "native-failed-retry",
+                vec![7],
+                0.0,
+            );
+            let completed = [0, 1].map(|index| {
+                runner
+                    .execute_single_run(&runner.variants[index], 7)
+                    .unwrap()
+            });
+            let directory = runner.output_dir.clone();
+            let state_file = directory.join("status.json");
+            let mut failed = runner.load_or_create_status(&state_file).unwrap();
+            for run in &mut failed.runs {
+                run.state = RunState::Running;
+            }
+            runner.save_status(&state_file, &mut failed).unwrap();
+            // Model an interrupted terminal-status publication with real owner
+            // continuations and a successful peer retained in the same batch.
+            failed.runs[0].state = RunState::Failed;
+            failed.runs[0].error_reason = Some("completion status publication failed".into());
+            failed.runs[1] = completed[1].clone();
+            failed.completed_runs = 1;
+            failed.failed_runs = 1;
+            runner.save_status(&state_file, &mut failed).unwrap();
+            let source = handle.read_snapshot().unwrap().session_id;
+            let before = host.port.scientific_digest_v1().unwrap();
+            let original_status = std::fs::read(&state_file).unwrap();
+            let peer_path = directory.join(format!("{}.checkpoint", completed[1].run_id));
+            let completed_peer = std::fs::read(&peer_path).unwrap();
+            let provider = lab_workflow_submit(handle.clone());
+            let request = |session_id, expected_generation| Request::RetryFailedExperiment {
+                experiment_id: "native-failed-retry".into(),
+                session_id,
+                expected_generation,
+            };
+            let foreign = scriptbots_runtime::HostSessionId::new(source.get().wrapping_add(1));
+            assert!(
+                provider(request(foreign, failed.generation))
+                    .unwrap_err()
+                    .contains("owner session")
+            );
+            assert!(
+                provider(request(source, failed.generation + 1))
+                    .unwrap_err()
+                    .contains("generation changed")
+            );
+            assert_eq!(std::fs::read(&state_file).unwrap(), original_status);
+            let Response::Experiment(admitted) =
+                provider(request(source, failed.generation)).unwrap()
+            else {
+                panic!("retry must return an observed experiment status");
+            };
+            assert!(admitted.generation > failed.generation);
+            assert!(admitted.summary.completed_runs >= 1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let observed = loop {
+                let Response::Experiment(observed) = provider(Request::GetExperiment {
+                    experiment_id: "native-failed-retry".into(),
+                })
+                .unwrap() else {
+                    panic!("expected retained experiment status");
+                };
+                if observed.summary.status == "completed" {
+                    break observed;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "native retry did not complete: {observed:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            assert_eq!(observed.summary.completed_runs, 2);
+            assert_eq!(observed.summary.failed_runs, 0);
+            assert_eq!(observed.plan_digest, admitted.plan_digest);
+            assert_eq!(std::fs::read(peer_path).unwrap(), completed_peer);
+            let retained = handle.get_experiment("native-failed-retry").unwrap();
+            assert_eq!(retained.runs[1].final_digest, completed[1].final_digest);
+            assert!(directory.join("status.json.retries").is_dir());
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         }
 
         #[test]

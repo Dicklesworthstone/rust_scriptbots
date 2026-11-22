@@ -1439,6 +1439,12 @@ fn experiment_rows(
                 "running" | "pending" | "cancelling"
             ) && summary.completed_runs + summary.failed_runs < summary.total_runs,
         ));
+        if let Some(action) = model.failed_experiment_retry_action() {
+            rows.push(PanelRow::workflow("Retry failed runs", action, true));
+            rows.push(PanelRow::text(
+                "Saved continuations resume; completed results and prior failure evidence are retained.",
+            ));
+        }
         for variant in batch
             .variants
             .iter()
@@ -2832,6 +2838,72 @@ mod tests {
             .collect(),
             error_reason: None,
         }
+    }
+
+    #[test]
+    fn failed_run_retry_row_captures_generation_and_rejects_a_stale_click() {
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Experiments,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        presentation.receive_live(live_frame(12), &mut state, &mut motion);
+        presentation.source_changed = false;
+        let session = presentation.source.unwrap();
+        let (send, calls) = std::sync::mpsc::channel();
+        let mut model = consumer(Some(Arc::new(move |request| {
+            send.send(request).unwrap();
+            Err("fixture reply was lost".into())
+        })));
+        model.synchronize(session, LabPanel::Experiments);
+        let mut failed = created_experiment("failed-batch", &LabExperimentDraft::default());
+        failed.summary.status = "failed".into();
+        failed.summary.completed_runs = failed.variants[0].total_runs;
+        failed.summary.failed_runs = failed.variants[1].total_runs;
+        failed.variants[1].completed_runs = 0;
+        failed.variants[1].failed_runs = failed.variants[1].total_runs;
+        model.selected_experiment = Some("failed-batch".into());
+        model.batch = Some(failed);
+        let rows = panel_rows(&model, &presentation);
+        let row = rows
+            .iter()
+            .find(|row| row.text == "Retry failed runs")
+            .unwrap();
+        assert!(row.enabled);
+        let Some(PanelAction::Workflow(action)) = &row.action else {
+            panic!("retry must use the shared application worker");
+        };
+        assert!(matches!(action, LabAction::RetryFailedExperiment {
+            session_id, expected_generation: 1, ..
+        } if *session_id == session));
+        model.batch.as_mut().unwrap().generation = 2;
+        model.dispatch(action.clone());
+        assert!(!model.is_busy());
+        assert!(calls.try_recv().is_err());
+        let action = model.failed_experiment_retry_action().unwrap();
+        model.dispatch(action);
+        assert!(matches!(
+            calls
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            LabWorkflowRequest::RetryFailedExperiment {
+                expected_generation: 2,
+                ..
+            }
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while model.is_busy() {
+            model.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(model.batch.is_none());
+        assert!(
+            panel_rows(&model, &presentation)
+                .iter()
+                .all(|row| row.text != "Retry failed runs")
+        );
     }
 
     #[test]
