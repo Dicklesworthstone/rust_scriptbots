@@ -453,7 +453,7 @@ test("a synchronous reconnect during consumption retains the new connection's fr
 function experimentTransport() {
   const client = new RemoteStreamClient({ url: "wss://lab.example/prefix/api/ws/stream?discard=yes#fragment", decodeFrame() {} });
   client.state = "connected";
-  client.tracker.acknowledge("18446744073709551610");
+  client.tracker.acknowledge(SESSION);
   const prepared = prepareExperimentRequest({ experiment_id: "cohort.example", seeds: ["9007199254740993", "18446744073709551615"],
     variants: [{ variant_id: "control", brain_family: "mlp" }, { variant_id: "treatment", brain_family: "dwraon" }],
     ticks_per_run: 20, max_concurrency: 1, idempotency_key: "one-exact-cohort" });
@@ -540,7 +540,7 @@ test("failed-run retry transport binds the generation and source before HTTP adm
   } finally { globalThis.fetch = original; }
 });
 
-test("cohort transport keeps exact u64 seeds, unchanged retry bytes and the negotiated source", async () => {
+test("cohort transport keeps exact u64 seeds, unchanged retry bytes and the full u128 negotiated source", async () => {
   const original = globalThis.fetch, requests = [];
   globalThis.fetch = async (url, options) => {
     requests.push({ url: new URL(url), ...options });
@@ -587,6 +587,31 @@ test("cohort transport keeps exact u64 seeds, unchanged retry bytes and the nego
     await assert.rejects(client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control", challenger_variant: "control", metric: "alive_agents" }));
     await assert.rejects(client.compareExperiment("cohort.example", { sessionId, baseline_variant: "control", challenger_variant: "treatment", metric: "invented" }));
     assert.equal(requests.length, count, "invalid source or payload never reached HTTP");
+  } finally { globalThis.fetch = original; }
+});
+
+test("owner HTTP requests refuse malformed or overflowing sessions before any fetch", async () => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return new Response("{}"); };
+  try {
+    const { client, sessionId } = experimentTransport();
+    assert.equal(sessionId, SESSION);
+    for (const invalid of [undefined, null, 7, "", "-1", "+1", "01", "1.0", "1e2", " 1", "1 ",
+      "340282366920938463463374607431768211456", "9".repeat(40)]) {
+      // Pin the same invalid value on both sides so equality alone cannot stand
+      // in for the declared u128 grammar and range check.
+      client.tracker.sessionId = invalid;
+      await assert.rejects(client.listExperiments({ sessionId: invalid }), /identity/);
+      await assert.rejects(client.listCheckpoints({ sessionId: invalid }), /identity/);
+      await assert.rejects(client.interventionStatus(COMMAND, { sessionId: invalid }), /identity/);
+      await assert.rejects(client.downloadArtifact("artifact-one", { sessionId: invalid }), /identity/);
+    }
+    client.tracker.sessionId = sessionId;
+    for (const cursor of ["18446744073709551616", SESSION]) {
+      await assert.rejects(client.listExperiments({ sessionId, cursor }), /identity/);
+    }
+    assert.equal(calls, 0, "invalid source or a widened u64 cursor cannot reach HTTP");
   } finally { globalThis.fetch = original; }
 });
 

@@ -60,14 +60,14 @@ function sameCheckpoint(left, right) {
 export function validateCheckpointCanvas(value, { sessionId, checkpoint }) {
   validateLabCheckpoint(checkpoint);
   validateLabCheckpoint(value?.checkpoint);
-  exactIdentity(sessionId);
+  exactIdentity(sessionId, 128);
   if (value?.schema !== "scriptbots.checkpoint-canvas.v1"
       || value.sourceSessionId !== sessionId || !sameCheckpoint(value.checkpoint, checkpoint)) {
     throw new Error("The saved-world preview does not match the selected checkpoint and host");
   }
   const frame = value.frame, identity = frame?.identity, snapshot = frame?.snapshot;
   for (const field of ["sessionId", "publicationRevision", "scientificRevision",
-    "controlRevision", "configRevision", "tick"]) exactIdentity(identity?.[field]);
+    "controlRevision", "configRevision", "tick"]) exactIdentity(identity?.[field], field === "sessionId" ? 128 : 64);
   if (frame?.schema !== "scriptbots.browser-frame.v1" || identity.sessionId !== sessionId
       || identity.tick !== String(checkpoint.tick) || snapshot?.tick !== checkpoint.tick
       || snapshot.summary?.agentCount !== checkpoint.agent_count || !Array.isArray(snapshot.agents)
@@ -268,7 +268,7 @@ export class CheckpointLabController {
   }
 
   observe(frame, sourceToken) {
-    const sessionId = exactIdentity(frame?.identity?.sessionId);
+    const sessionId = exactIdentity(frame?.identity?.sessionId, 128);
     const epoch = exactIdentity(frame?.snapshot?.epoch ?? "0");
     exactIdentity(frame?.identity?.tick);
     if (sourceToken === null || sourceToken === undefined) throw new Error("The Lab requires an explicit remote source identity");

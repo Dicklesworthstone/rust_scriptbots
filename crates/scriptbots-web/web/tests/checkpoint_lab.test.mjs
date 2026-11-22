@@ -9,7 +9,7 @@ import {
 import { RemoteOwnerHttpError, RemoteStreamClient } from "../remote.js";
 import { MAX_STUDY_REPORT_BYTES } from "../study-report.js";
 
-const SESSION = "18446744073709551610";
+const SESSION = "340282366920938463463374607431768211455";
 const DIGEST = "a".repeat(64);
 const WORLD_DIGEST = "a".repeat(16);
 const SOURCE = "wss://lab.example/nested/api/ws/stream";
@@ -109,6 +109,11 @@ test("saved canvas binds the exact host, metadata and reconstructed scientific c
   for (const change of [
     (value) => { value.sourceSessionId = "7"; },
     (value) => { value.frame.identity.sessionId = Number(SESSION); },
+    (value) => { value.frame.identity.sessionId = "340282366920938463463374607431768211456"; },
+    (value) => { value.frame.identity.publicationRevision = "18446744073709551616"; },
+    (value) => { value.frame.identity.scientificRevision = "18446744073709551616"; },
+    (value) => { value.frame.identity.controlRevision = "18446744073709551616"; },
+    (value) => { value.frame.identity.configRevision = "18446744073709551616"; },
     (value) => { value.frame.identity.tick = "101"; },
     (value) => { value.frame.snapshot.tick = 101; },
     (value) => { value.frame.snapshot.summary.agentCount = 11; },
@@ -124,6 +129,22 @@ test("saved canvas binds the exact host, metadata and reconstructed scientific c
     change(value);
     assert.throws(() => validateCheckpointCanvas(value, request));
   }
+});
+
+test("checkpoint observations refuse out-of-range sessions without widening epoch or tick", async () => {
+  const h = await harness();
+  assert.equal(h.controller.source.sessionId, SESSION);
+  for (const sessionId of [Number(SESSION), "01", "-1", "340282366920938463463374607431768211456"]) {
+    assert.throws(() => h.controller.observe(frame(sessionId), SOURCE), /identities/);
+    assert.equal(h.controller.source.sessionId, SESSION);
+  }
+  for (const field of ["epoch", "tick"]) {
+    const invalid = frame();
+    (field === "epoch" ? invalid.snapshot : invalid.identity)[field] = "18446744073709551616";
+    assert.throws(() => h.controller.observe(invalid, SOURCE), /identities/);
+    assert.equal(h.controller.source.sessionId, SESSION);
+  }
+  assert.equal(h.reads.length, 1, "invalid observations cannot schedule checkpoint reads");
 });
 
 test("explicit saved-world review is immutable and read-only until return to live", async () => {

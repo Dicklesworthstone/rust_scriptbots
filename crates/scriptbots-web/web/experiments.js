@@ -198,7 +198,7 @@ export class ExperimentController {
   }
 
   observe(frame, sourceToken) {
-    const sessionId = exactIdentity(frame?.identity?.sessionId);
+    const sessionId = exactIdentity(frame?.identity?.sessionId, 128);
     if (sourceToken === null || sourceToken === undefined) throw new Error("Experiments require an explicit remote source identity");
     if (!this.source || this.source.sessionId !== sessionId || this.source.token !== sourceToken) {
       const replaced = this.source !== null;

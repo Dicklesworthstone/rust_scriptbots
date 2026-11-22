@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { ExperimentController, EXPERIMENT_RUN_PAGE_SIZE } from "../experiments.js";
 import { RemoteOwnerHttpError } from "../remote.js";
 
-const SESSION = "18446744073709551610";
+const SESSION = "340282366920938463463374607431768211455";
 const SOURCE = "wss://lab.example/prefix/ws";
 const PLAN = "a".repeat(64);
 const DIGEST = "b".repeat(64);
@@ -124,6 +124,16 @@ async function launch(h, observed = status(), input = request()) {
 }
 
 const pair = { baselineVariant: "control", challengerVariant: "treatment", metric: "alive_agents" };
+
+test("experiment observations preserve u128 sessions and refuse malformed replacements", async () => {
+  const h = await harness();
+  assert.equal(h.controller.source.sessionId, SESSION);
+  for (const sessionId of [Number(SESSION), "01", "-1", "340282366920938463463374607431768211456"]) {
+    assert.throws(() => h.controller.observe({ identity: { sessionId } }, SOURCE), /identities/);
+    assert.equal(h.controller.source.sessionId, SESSION);
+  }
+  assert.equal(h.calls.list.length, 1, "invalid replacement sources cannot schedule owner reads");
+});
 
 // Transfer fixtures use real SHA-256 bytes and a mutually consistent manifest
 // index. They do not claim to be native checkpoints or scientific replay proof.

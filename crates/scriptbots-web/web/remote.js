@@ -584,7 +584,7 @@ export class RemoteStreamClient {
   }
 
   apiUrl(path, sessionId, query = {}) {
-    decimal(sessionId);
+    decimal(sessionId, 128);
     if (this.state !== "connected" || this.tracker.sessionId !== sessionId) {
       throw new Error("Connect to the observed world’s host before reading or submitting an intervention");
     }

@@ -52,14 +52,14 @@ export function makeInterventionRequest(frame, action, requestId = interventionR
   const intervention = structuredClone(action);
   if (intervention.region) Object.freeze(intervention.region);
   Object.freeze(intervention);
-  return Object.freeze({ requestId, sessionId: exactIdentity(frame.identity.sessionId),
+  return Object.freeze({ requestId, sessionId: exactIdentity(frame.identity.sessionId, 128),
     epoch: exactIdentity(frame.snapshot.epoch), expectedControlRevision: exactIdentity(frame.identity.controlRevision), intervention });
 }
 
 function validateSource(source, request, { sameEpoch = true } = {}) {
   if (!source || source.sessionId !== request.sessionId || (sameEpoch && source.epoch !== request.epoch)
       || typeof source.paused !== "boolean") throw new Error("Intervention response belongs to another owner or epoch");
-  exactIdentity(source.sessionId);
+  exactIdentity(source.sessionId, 128);
   for (const key of SOURCE_FIELDS) exactIdentity(source[key]);
   if (BigInt(source.epoch) < BigInt(request.epoch)) throw new Error("Intervention source epoch regressed");
   if (request.identity && ["tick", "publicationRevision", "scientificRevision", "controlRevision", "configRevision"]
