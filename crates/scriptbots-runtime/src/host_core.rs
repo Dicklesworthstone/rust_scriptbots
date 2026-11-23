@@ -4716,22 +4716,22 @@ impl HostCore {
                 if code == "scheduled_config_application" || code == "scheduled_config_resolution")
             && self.failed_journal_batches.is_empty()
         {
-            return if self.retained_journal.is_some() {
+            return if self.retained_journal.is_some() && !self.journal_full_retry_needed() {
                 HostDriveInterest::WakeOnly
             } else {
                 HostDriveInterest::Draining
             };
         }
         if matches!(&self.latched_fault, Some(HostFault::Scientific { .. }))
-            && !self.inflight_journal.is_empty()
+            && (!self.inflight_journal.is_empty() || self.journal_full_retry_needed())
             && self.failed_journal_batches.is_empty()
         {
             // A scientific fault does not cancel journal work already admitted by this owner.
             // This includes the fault's event/command audit when persistence is disabled, an
             // independent sink has already sealed the core batch, and earlier inflight work.
-            // Drain every admitted obligation to this journal's terminal commitment without
-            // allowing more science. Non-admission still requires the explicit retry path;
-            // a journal/protocol failure restores the ordinary terminal fault exit.
+            // Drain every obligation to this journal's terminal commitment without more
+            // science. A retained Full batch still needs admission on the driver's maintenance
+            // cadence; a journal/protocol failure restores the ordinary terminal fault exit.
             return HostDriveInterest::Draining;
         }
         if self.health.fault().is_some() {
@@ -4780,6 +4780,17 @@ impl HostCore {
     #[must_use]
     pub fn pending_journal_batch(&self) -> Option<Arc<JournalBatch>> {
         self.retained_journal.as_ref().map(Arc::clone)
+    }
+
+    /// Full work remains retryable even when the published health carries a scientific fault.
+    pub(crate) fn journal_full_retry_needed(&self) -> bool {
+        self.failed_journal_batches.is_empty()
+            && matches!(&self.latched_fault, None | Some(HostFault::Scientific { .. }))
+            && matches!(
+                self.retained_blocker,
+                Some(HostBlocker::JournalFull { batch_id, .. })
+                    if self.retained_journal.as_ref().is_some_and(|batch| batch.id() == batch_id)
+            )
     }
 
     /// Exact command whose owner boundary did not return normally.
@@ -7006,6 +7017,259 @@ fn completed_fault_record(fault: &CompletedStepFault) -> ScientificBoundaryFault
 fn protocol_violation(message: impl Into<String>) -> HostAccessError {
     HostAccessError::ProtocolViolation {
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fault_retry_fixture {
+    use super::*;
+    use scriptbots_core::{BrainSpawnError, ScriptBotsConfig};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Outcome {
+        Durable,
+        Failed,
+        Closed,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct State {
+        attempts: Vec<(u64, Arc<JournalBatch>)>,
+        receipts: VecDeque<JournalReceipt>,
+        polls: usize,
+        sink_calls: Arc<Mutex<usize>>,
+    }
+
+    struct Sink {
+        authority: PersistenceCommitAuthority,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl scriptbots_core::WorldPersistence for Sink {
+        fn on_tick(
+            &mut self,
+            _: &PersistenceBatch,
+        ) -> Result<(), scriptbots_core::PersistenceAdmissionError> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        fn commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+            Some(self.authority.clone())
+        }
+    }
+
+    struct Journal {
+        state: Rc<RefCell<State>>,
+        authority: PersistenceCommitAuthority,
+        now: Box<dyn Fn() -> u64>,
+        full_remaining: usize,
+        outcome: Outcome,
+    }
+
+    impl JournalPort for Journal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            let mut state = self.state.borrow_mut();
+            state.attempts.push(((self.now)(), Arc::clone(batch)));
+            let fault = batch
+                .scientific()
+                .is_some_and(|science| science.fault().is_some());
+            if fault && self.full_remaining > 0 {
+                self.full_remaining -= 1;
+                return JournalAdmission::Full {
+                    batch_id: batch.id(),
+                    capacity: 1,
+                };
+            }
+            if fault && self.outcome == Outcome::Closed {
+                return JournalAdmission::Closed {
+                    batch_id: batch.id(),
+                };
+            }
+            if fault {
+                // A weaker receipt must not let a durable owner exit before its real result.
+                state.receipts.push_back(JournalReceipt::new(
+                    batch.id(),
+                    JournalReceiptState::CommittedVolatile,
+                ));
+            }
+            let terminal = if fault && self.outcome == Outcome::Failed {
+                JournalReceiptState::Failed(JournalFailure {
+                    code: "fault_retry_storage_failure".to_owned(),
+                    message: "the completed fault could not commit".to_owned(),
+                })
+            } else {
+                JournalReceiptState::Durable
+            };
+            state
+                .receipts
+                .push_back(JournalReceipt::new(batch.id(), terminal));
+            JournalAdmission::Accepted {
+                batch_id: batch.id(),
+            }
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            let mut state = self.state.borrow_mut();
+            state.polls += 1;
+            assert!(
+                state.polls < 256,
+                "driver failed to finish the bounded journal script"
+            );
+            // Separate weak and terminal acknowledgements across actual owner boundaries.
+            let count = limit.min(1).min(state.receipts.len());
+            state.receipts.drain(..count).collect()
+        }
+
+        fn command_authority_mode(&self) -> CommandAuthorityMode {
+            CommandAuthorityMode::ProcessLocal
+        }
+
+        fn persistence_commit_authority(&self) -> Option<PersistenceCommitAuthority> {
+            Some(self.authority.clone())
+        }
+    }
+
+    pub(crate) fn host(
+        interval: u32,
+        outcome: Outcome,
+        now: Box<dyn Fn() -> u64>,
+    ) -> (HostCore, Rc<RefCell<State>>) {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            rng_seed: Some(0x5eed_cafe),
+            persistence_interval: interval,
+            population_minimum: 1,
+            population_spawn_interval: 0,
+            closed: false,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .brain_registry_mut()
+            .unwrap()
+            .register("test.driver-fault", |_rng| {
+                Err(BrainSpawnError::new(
+                    "test.driver-fault",
+                    std::io::Error::other("deliberate completed population failure"),
+                ))
+            });
+        let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+        let state = Rc::new(RefCell::new(State::default()));
+        let persistence = world
+            .bind_persistence(Box::new(Sink {
+                authority: authority.clone(),
+                calls: Arc::clone(&state.borrow().sink_calls),
+            }))
+            .unwrap();
+        let core = HostCore::with_journal_and_persistence(
+            HostSessionId::new(0x517e),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    ..PlaybackSnapshot::default()
+                },
+                ..HostCoreOptions::default()
+            },
+            Box::new(Journal {
+                state: Rc::clone(&state),
+                authority,
+                now,
+                full_remaining: 2,
+                outcome,
+            }),
+            persistence,
+        )
+        .unwrap();
+        (core, state)
+    }
+
+    pub(crate) fn assert_finished(
+        core: &HostCore,
+        state: &State,
+        interval: u32,
+        outcome: Outcome,
+        maintenance: u64,
+    ) {
+        let attempts = state
+            .attempts
+            .iter()
+            .filter(|(_, batch)| batch.scientific().is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts.len(),
+            3,
+            "Full must retry through the actual driver"
+        );
+        for pair in attempts.windows(2) {
+            assert!(Arc::ptr_eq(&pair[0].1, &pair[1].1));
+            assert!(
+                pair[1].0 - pair[0].0 >= maintenance,
+                "retry ran before maintenance"
+            );
+        }
+        let batch = &attempts[0].1;
+        assert!(batch.scientific().unwrap().fault().is_some());
+        assert_eq!(batch.persistence().is_some(), interval != 0);
+        assert_eq!(
+            core.world_tick(),
+            Tick(1),
+            "fault must prevent later science"
+        );
+        assert_eq!(*state.sink_calls.lock().unwrap(), 0);
+        assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+        assert_eq!(
+            core.persistence.last_admitted_tick(),
+            (interval != 0 && outcome == Outcome::Durable).then_some(Tick(1))
+        );
+        if outcome == Outcome::Durable {
+            assert!(matches!(
+                core.health(),
+                HostHealth::Faulted(HostFault::Scientific { code, .. }) if code == "brain_spawn"
+            ));
+            assert!(!core.persistence.has_pending_batch());
+            let mut port = core.local_port();
+            for id in 1..=3 {
+                let status = port.command_status(CommandId::new(id)).unwrap().unwrap();
+                assert_eq!(status.journal(), &JournalState::Durable);
+                if id == 2 {
+                    assert!(matches!(
+                        status.application(),
+                        ApplicationState::Failed(failure) if failure.code == "science_blocked"
+                    ));
+                } else {
+                    assert!(matches!(
+                        status.application(),
+                        ApplicationState::Applied(applied) if applied.tick == Tick(1)
+                    ));
+                }
+            }
+        } else {
+            let expected = if outcome == Outcome::Closed {
+                "journal_closed"
+            } else {
+                "fault_retry_storage_failure"
+            };
+            assert!(matches!(
+                core.health(),
+                HostHealth::Faulted(HostFault::Journal { failure, .. }) if failure.code == expected
+            ));
+            assert_eq!(core.persistence.has_pending_batch(), interval != 0);
+            if interval != 0 {
+                assert!(std::ptr::eq(
+                    core.persistence.pending_batch().unwrap(),
+                    batch.persistence().unwrap().as_ref()
+                ));
+            }
+            if outcome == Outcome::Closed {
+                assert!(Arc::ptr_eq(batch, &core.pending_journal_batch().unwrap()));
+                assert!(!core.journal_full_retry_needed());
+            }
+        }
     }
 }
 
@@ -13823,9 +14087,9 @@ mod tests {
                 assert!(batch.scientific().unwrap().fault().is_some());
                 assert!(batch.persistence().is_some());
                 if initially_full {
-                    // Preserve the existing explicit retry contract for non-admission. Once
-                    // accepted, this exact obligation must be drained before returning Faulted.
-                    assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+                    // The owner must stay live while its driver retries this exact allocation.
+                    // The production-driver regressions exercise that retry without manual rescue.
+                    assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
                     state.borrow_mut().full = false;
                     assert_eq!(
                         core.retry_retained_journal().unwrap(),

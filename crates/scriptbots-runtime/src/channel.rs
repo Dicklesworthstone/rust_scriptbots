@@ -35,7 +35,7 @@
 use crate::{
     BrainProjection, BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId,
     CommandStatus, EventCatchUp, EventCatchUpLocator, EventCursor, EventHub, EventPoll,
-    FixedDeadlineHost, HostAccessError, HostBlocker, HostCheckpointError, HostCheckpointV1,
+    FixedDeadlineHost, HostAccessError, HostCheckpointError, HostCheckpointV1,
     HostDriveInterest, HostEvent, HostPort, HostSessionId, LocalHostPort, ManualInstant,
     NativeDriveTrigger, NativeScheduleError, ProtocolEventSequence, RenderSnapshot, SnapshotHub,
     SnapshotRevision, WorldCheckpointCut, WorldDigestCut,
@@ -1833,11 +1833,8 @@ impl ChannelHostDriver {
         Ok(())
     }
 
-    const fn journal_retry_needed(&self) -> bool {
-        matches!(
-            self.host.core().health().blocker(),
-            Some(HostBlocker::JournalFull { .. })
-        )
+    fn journal_retry_needed(&self) -> bool {
+        self.host.core().journal_full_retry_needed()
     }
 
     fn update_journal_retry_deadline(&mut self, now: ManualInstant) -> Result<(), HostAccessError> {
@@ -2009,7 +2006,7 @@ impl ChannelHostDriver {
     /// and return exact accounting.
     ///
     /// Quiescent hosts park without a periodic timer. Retained
-    /// [`HostBlocker::JournalFull`] work is retried at the configured maintenance
+    /// [`crate::HostBlocker::JournalFull`] work is retried at the configured maintenance
     /// cadence, even though the runtime-neutral host requests an external wake.
     /// A full client disconnect converts into
     /// one ordered shutdown rather than abandoning the world. An error leaves
@@ -2097,7 +2094,7 @@ mod tests {
     use super::*;
     use crate::{
         ApplicationState, CommandAuthorityLookup, CommandAuthorityMode, CommandAuthorityReader,
-        CommandClaimPolicy, HostCommand, HostCore, HostCoreOptions, HostLifecycle,
+        CommandClaimPolicy, HostBlocker, HostCommand, HostCore, HostCoreOptions, HostLifecycle,
         JournalAdmission, JournalBatch, JournalPort, JournalReceipt, PlaybackSnapshot,
         RejectionReason, ShutdownCommitRequirement, VolatileJournal,
     };
@@ -2131,6 +2128,52 @@ mod tests {
             submit_deadline: Duration::from_millis(500),
             maintenance_period: Duration::from_millis(2),
             ..ChannelHostOptions::default()
+        }
+    }
+
+    #[test]
+    fn completed_fault_full_batches_finish_through_the_channel_run_loop() {
+        use crate::host_core::fault_retry_fixture::{self, Outcome};
+
+        const MAINTENANCE: u64 = 1_000;
+        for interval in [0, 1, 7] {
+            for outcome in [Outcome::Durable, Outcome::Failed, Outcome::Closed] {
+                let clock = Rc::new(Cell::new(0_u64));
+                let observed = Rc::clone(&clock);
+                let (core, state) =
+                    fault_retry_fixture::host(interval, outcome, Box::new(move || observed.get()));
+                let (mut driver, port) = ChannelHostDriver::new(
+                    FixedDeadlineHost::new(core),
+                    ChannelHostOptions {
+                        maintenance_period: Duration::from_nanos(MAINTENANCE),
+                        ..fast_options()
+                    },
+                )
+                .unwrap();
+                let admissions = [
+                    queue_command(&port, 1, HostCommand::Step),
+                    queue_command(&port, 2, HostCommand::Step),
+                    queue_command(&port, 3, HostCommand::Pause),
+                ];
+                let result = driver
+                    .run(|| {
+                        let now = clock.get() + MAINTENANCE;
+                        clock.set(now);
+                        ManualInstant::from_nanos(now)
+                    })
+                    .unwrap();
+                assert_eq!(result.outcome, ChannelRunOutcome::Faulted);
+                for admission in admissions {
+                    assert!(admission.try_recv().unwrap().is_ok());
+                }
+                fault_retry_fixture::assert_finished(
+                    driver.host().core(),
+                    &state.borrow(),
+                    interval,
+                    outcome,
+                    MAINTENANCE,
+                );
+            }
         }
     }
 

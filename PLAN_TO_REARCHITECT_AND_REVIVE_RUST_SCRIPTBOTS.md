@@ -2,6 +2,25 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Completed-fault journal admission through real drivers (2026-11-23):**
+[Implemented and independently source-reviewed — Codex; native execution unavailable]
+
+Keep a completed scientific fault draining while its exact retained journal batch
+is Full, and retry admission through the channel and native maintenance paths.
+Consult retained batch identity rather than the fault-masked health blocker, poll
+receipts before retry, and pace automatic retries independently of same-instant
+maintenance. Preserve the existing terminal behavior for Closed, failed receipts
+and protocol faults, and retain the preceding partial-batch and admitted-drain fixes.
+Two authored production-driver regressions cover 18 combinations of persistence
+cadence (disabled, every tick, and a partial interval) and durable success, failed
+receipt or Closed admission. They check exact allocation reuse, retry spacing,
+weaker receipts, command evidence and no additional scientific ticks.
+
+This is a scoped persistent-run reliability contribution to `bd-w1oi` and `bd-kgob`.
+The executor is unavailable: no native build, test, Clippy or formatting result is
+claimed. A permanently Full adapter remains pending under the existing contract;
+this adds no fault-drain timeout and does not close long-running storage acceptance.
+
 **Storage cleanup ownership under pressure (2026-11-23):**
 [Implemented and independently source-reviewed — Codex; native execution unavailable]
 

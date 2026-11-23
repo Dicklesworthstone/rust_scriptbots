@@ -823,6 +823,7 @@ mod asupersync_runner {
         controller_state: ControllerState,
         receiver_closed: bool,
         maintenance_deadline: Option<ManualInstant>,
+        fault_journal_retry_at: Option<ManualInstant>,
         terminal: Option<NativeRunOutcome>,
         panic_message: Option<String>,
         host_admission_failure: Option<HostAccessError>,
@@ -862,6 +863,7 @@ mod asupersync_runner {
                     controller_state: ControllerState::Connected,
                     receiver_closed: false,
                     maintenance_deadline: None,
+                    fault_journal_retry_at: None,
                     terminal: None,
                     panic_message: None,
                     host_admission_failure: None,
@@ -1390,6 +1392,7 @@ mod asupersync_runner {
             trigger: NativeDriveTrigger,
         ) -> Result<NativeDriveReceipt, NativeRunError> {
             let receipt = self.host.drive_at(now, trigger)?;
+            self.retry_faulted_journal_if_due(now)?;
             self.metrics.drive_calls = self.metrics.drive_calls.saturating_add(1);
             self.metrics.scheduled_deadlines_elapsed = self
                 .metrics
@@ -1404,6 +1407,41 @@ mod asupersync_runner {
                 .automatic_steps_skipped
                 .saturating_add(receipt.host.automatic_steps_skipped);
             Ok(receipt)
+        }
+
+        fn retry_faulted_journal_if_due(
+            &mut self,
+            now: ManualInstant,
+        ) -> Result<(), NativeRunError> {
+            if !matches!(
+                self.host.core().health().fault(),
+                Some(HostFault::Scientific { .. })
+            ) || !self.host.core().journal_full_retry_needed()
+            {
+                self.fault_journal_retry_at = None;
+                return Ok(());
+            }
+            if self
+                .fault_journal_retry_at
+                .is_some_and(|deadline| now >= deadline)
+            {
+                // The preceding drive polls receipts before retrying the exact retained batch.
+                // Same-instant maintenance and ordinary ingress cannot accelerate these retries.
+                self.host
+                    .retry_retained_journal()
+                    .map_err(NativeScheduleError::from)?;
+                self.fault_journal_retry_at = None;
+            }
+            if self.host.core().journal_full_retry_needed()
+                && self.fault_journal_retry_at.is_none()
+            {
+                self.fault_journal_retry_at = Some(advance_absolute_deadline(
+                    None,
+                    now,
+                    self.options.maintenance_period_nanos,
+                ));
+            }
+            Ok(())
         }
 
         fn should_cancel(&self, cx: &Cx) -> bool {
@@ -1906,6 +1944,97 @@ mod tests {
         Mutex,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[cfg(all(feature = "native-asupersync", not(target_arch = "wasm32")))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one virtual-time run proves retry pacing, commitment and terminal failures"
+    )]
+    fn completed_fault_full_batches_finish_through_the_native_run_loop() {
+        use crate::host_core::fault_retry_fixture::{self, Outcome};
+
+        const MAINTENANCE: u64 = 100;
+        for interval in [0, 1, 7] {
+            for outcome in [Outcome::Durable, Outcome::Failed, Outcome::Closed] {
+                let (core, state) = fault_retry_fixture::host(
+                    interval,
+                    outcome,
+                    Box::new(|| asupersync::Cx::current().unwrap().now().as_nanos()),
+                );
+                let (mut runner, control) = NativeRunner::new(
+                    FixedDeadlineHost::new(core),
+                    NativeRunnerOptions {
+                        maintenance_period_nanos: MAINTENANCE,
+                        max_same_instant_drives: 32,
+                        ..NativeRunnerOptions::default()
+                    },
+                )
+                .unwrap();
+                for (id, command) in [
+                    (1, HostCommand::Step),
+                    (2, HostCommand::Step),
+                    (3, HostCommand::Pause),
+                ] {
+                    control
+                        .try_submit(CommandEnvelope::new(CommandId::new(id), command))
+                        .unwrap();
+                }
+                let clock = Arc::new(VirtualClock::starting_at(Time::ZERO));
+                let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+                let runtime = RuntimeBuilder::current_thread()
+                    .with_timer_driver(timer.clone())
+                    .enable_platform_reactor(false)
+                    .build()
+                    .unwrap();
+                let finished = Arc::new(AtomicBool::new(false));
+                let done = Arc::clone(&finished);
+                let lifecycle = control.clone();
+                let advancer = std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    let mut generation = 0;
+                    let mut next = 0_u64;
+                    let mut failed = false;
+                    while !done.load(Ordering::Acquire) {
+                        if std::time::Instant::now() >= deadline {
+                            failed = true;
+                            let _ = lifecycle.cancel();
+                        }
+                        let observed = lifecycle.owner_wait_generation();
+                        if observed > generation && timer.pending_count() > 0 {
+                            // Hold virtual time fixed throughout each actual owner drive, including
+                            // every same-instant pump. Advance only a newly registered timer wait.
+                            generation = observed;
+                            next += if failed { 60_000_000_000 } else { MAINTENANCE };
+                            clock.advance_to(Time::from_nanos(next));
+                            let _ = timer.process_timers();
+                        }
+                        std::thread::yield_now();
+                    }
+                    failed
+                });
+                let result = runner.run_on_runtime(&runtime);
+                finished.store(true, Ordering::Release);
+                assert!(
+                    !advancer.join().unwrap(),
+                    "fault retry driver failed to make progress"
+                );
+                assert!(matches!(result, Err(NativeRunError::HostFault { .. })));
+                assert_eq!(
+                    runner.metrics().journal_wakes,
+                    0,
+                    "no manual retry rescue"
+                );
+                fault_retry_fixture::assert_finished(
+                    runner.host().core(),
+                    &state.borrow(),
+                    interval,
+                    outcome,
+                    MAINTENANCE,
+                );
+            }
+        }
+    }
 
     #[derive(Debug, Clone, Copy, Default)]
     enum ReceiptMode {
