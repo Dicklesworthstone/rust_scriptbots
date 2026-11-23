@@ -12,7 +12,7 @@ use std::process::Command;
 
 use scriptbots_analytics::{
     AnalyticsError, NARRATIVE_RECONSTRUCT_SCHEMA_VERSION, NARRATIVE_TIMELINE_SCHEMA_VERSION,
-    REPORT_SCHEMA_VERSION, ReaderCtx, Registry, ReportParams,
+    REPLAY_TIMELINE_SCHEMA_VERSION, REPORT_SCHEMA_VERSION, ReaderCtx, Registry, ReportParams,
 };
 use scriptbots_core::narrative::{EventKind, EventRecord, NarrativeInputRecordV1, SubjectRef};
 use scriptbots_core::{
@@ -292,7 +292,7 @@ fn replay_timeline_handles_empty_stream_and_limit_param() {
     let out = registry
         .run("replay-timeline", &cx, &ReportParams::default())
         .expect("timeline");
-    assert_eq!(out.schema_version, REPORT_SCHEMA_VERSION);
+    assert_eq!(out.schema_version, REPLAY_TIMELINE_SCHEMA_VERSION);
     assert_eq!(out.row_count, 0);
     assert_eq!(out.machine["events"].as_array().map(Vec::len), Some(0));
     assert!(
@@ -303,12 +303,13 @@ fn replay_timeline_handles_empty_stream_and_limit_param() {
     assert_eq!(
         serde_json::to_value(&out).expect("serialize timeline envelope"),
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "report": "replay-timeline",
             "db_path": path,
             "latest_tick": 3,
             "row_count": 0,
             "machine": {
+                "run_id": cx.reader.run_id().to_string(),
                 "event_counts": [],
                 "events": [],
                 "truncated_to": null
@@ -354,6 +355,7 @@ fn replay_timeline_orders_serializes_and_limits_replay_events() {
         json!([["brain_outputs", 1], ["rng_sample", 1]])
     );
     assert_eq!(out.machine["events"][0]["tick"], 1);
+    assert_eq!(out.machine["events"][0]["island_id"], 0);
     assert_eq!(out.machine["events"][0]["seq"], 0);
     assert_eq!(
         out.machine["events"][0]["event"],
@@ -380,6 +382,7 @@ fn replay_timeline_orders_serializes_and_limits_replay_events() {
         })
     );
     assert_eq!(out.machine["events"][1]["tick"], 3);
+    assert_eq!(out.machine["events"][1]["island_id"], 0);
     assert_eq!(
         out.machine["events"][1]["event"],
         json!({
@@ -405,6 +408,83 @@ fn replay_timeline_orders_serializes_and_limits_replay_events() {
         "a bounded timeline page must retain the newest event, not the oldest prefix"
     );
     assert_eq!(limited.machine["truncated_to"], 1);
+}
+
+#[test]
+fn replay_timeline_preserves_colliding_island_identities_in_bounded_pages() {
+    use scriptbots_core::rng_domains::IslandId;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir
+        .path()
+        .join("island-replay.sqlite")
+        .display()
+        .to_string();
+    let mut storage = Storage::create_unattributed_file(&path).expect("create island run");
+    for tick in [1, 2] {
+        let mut island_batch = batch(tick, 1, 1.0);
+        island_batch.replay_events.push(ReplayEvent {
+            agent_uid: Some(AgentUid(7)),
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::BrainOutputs {
+                outputs: vec![0.25],
+            },
+        });
+        // Both worlds deliberately emit identical tick/sequence/agent/payload
+        // values. Only their retained island identity can distinguish them.
+        storage
+            .persist_barrier(&[(IslandId(7), &island_batch), (IslandId(0), &island_batch)])
+            .expect("persist the actual multi-island barrier");
+    }
+    storage.flush().expect("flush island run");
+    storage.close().expect("close island run");
+
+    let cx = ReaderCtx::open(&path).expect("cold reader");
+    let registry = Registry::builtin();
+    let report = registry
+        .run("replay-timeline", &cx, &ReportParams::default())
+        .expect("complete island timeline");
+    let keys = |output: &scriptbots_analytics::ReportOutput| {
+        output.machine["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["tick"].as_u64().unwrap(),
+                    row["island_id"].as_u64().unwrap(),
+                    row["seq"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(report.schema_version, REPLAY_TIMELINE_SCHEMA_VERSION);
+    assert_eq!(report.machine["run_id"], cx.reader.run_id().to_string());
+    assert_eq!(keys(&report), [(1, 0, 0), (1, 7, 0), (2, 0, 0), (2, 7, 0)]);
+    assert_eq!(
+        report.machine["event_counts"],
+        json!([["brain_outputs", 4]])
+    );
+    assert!(report.human_md.contains("| tick | island | seq | event |"));
+    assert!(report.human_md.contains("| 2 | 7 | 0 |"));
+    for limit in [0, 1, 3] {
+        let limited = registry
+            .run(
+                "replay-timeline",
+                &cx,
+                &ReportParams::from_pairs([format!("limit={limit}")]).unwrap(),
+            )
+            .expect("bounded island timeline");
+        let expected = keys(&report);
+        assert_eq!(keys(&limited), expected[expected.len() - limit..]);
+        assert_eq!(
+            limited.machine["event_counts"],
+            report.machine["event_counts"]
+        );
+        assert_eq!(limited.machine["truncated_to"], limit);
+    }
 }
 
 #[test]

@@ -113,8 +113,14 @@ pub const REPORT_SCHEMA_VERSION: u32 = 1;
 ///
 /// V2 preserves complete narrative identities and records, identifies the selected
 /// run, and explicitly scopes kind counts to the returned page. The original
-/// replay-record shape remains available as the `replay-timeline` report at v1.
+/// low-level replay stream remains available as the `replay-timeline` report.
 pub const NARRATIVE_TIMELINE_SCHEMA_VERSION: u32 = 2;
+
+/// Low-level replay timeline with explicit island-scoped event identities.
+///
+/// V2 adds the source island to every event. Tick, sequence and agent UID can
+/// overlap across islands, so v1's unscoped rows cannot identify these events.
+pub const REPLAY_TIMELINE_SCHEMA_VERSION: u32 = 2;
 
 /// Narrative reconstruction with authenticated tick-boundary policy transitions.
 ///
@@ -3798,6 +3804,7 @@ struct ReplayTimeline;
 
 #[derive(Debug, Serialize)]
 struct TimelineMachine {
+    run_id: String,
     event_counts: Vec<(String, u64)>,
     events: Vec<TimelineRow>,
     truncated_to: Option<usize>,
@@ -3806,6 +3813,7 @@ struct TimelineMachine {
 #[derive(Debug, Serialize)]
 struct TimelineRow {
     tick: u64,
+    island_id: u32,
     seq: u64,
     event: serde_json::Value,
 }
@@ -3831,6 +3839,7 @@ impl Report for ReplayTimeline {
 
         let render_started = Instant::now();
         let machine = TimelineMachine {
+            run_id: cx.reader.run_id().to_string(),
             event_counts: counts
                 .iter()
                 .map(|c| (c.event_type.clone(), c.count))
@@ -3840,6 +3849,7 @@ impl Report for ReplayTimeline {
                 .map(|e| {
                     Ok(TimelineRow {
                         tick: e.tick,
+                        island_id: e.island_id.0,
                         seq: e.seq,
                         event: serde_json::to_value(&e.event)?,
                     })
@@ -3851,28 +3861,34 @@ impl Report for ReplayTimeline {
         let mut md = String::new();
         let _ = writeln!(
             md,
-            "# Replay timeline (latest bounded replay-event page, v1)\n"
+            "# Replay timeline (latest bounded replay-event page, v2)\n"
         );
+        let _ = writeln!(md, "Run: `{}`\n", machine.run_id);
         if machine.events.is_empty() {
             let _ = writeln!(md, "_No replay events persisted in this run._");
         } else {
-            let _ = writeln!(md, "| tick | seq | event |");
-            let _ = writeln!(md, "|---|---|---|");
+            let _ = writeln!(md, "| tick | island | seq | event |");
+            let _ = writeln!(md, "|---|---|---|---|");
             for row in &machine.events {
-                let _ = writeln!(md, "| {} | {} | `{}` |", row.tick, row.seq, row.event);
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {} | `{}` |",
+                    row.tick, row.island_id, row.seq, row.event
+                );
             }
             if let Some(t) = machine.truncated_to {
                 let _ = writeln!(md, "\n_…showing {t} of {total} events (bounded SQL page)._");
             }
         }
 
-        let output = base_output(
+        let mut output = base_output(
             self.name(),
             cx,
             machine.events.len(),
             serde_json::to_value(&machine)?,
             md,
         )?;
+        output.schema_version = REPLAY_TIMELINE_SCHEMA_VERSION;
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
     }

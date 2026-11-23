@@ -21,6 +21,21 @@ the exact candidate. Native compilation/tests are still blocked in cold
 dependency acquisition; no runtime pass or broader continuation acceptance is
 claimed.
 
+**Island-scoped replay readback and export (2026-11-23):**
+[Currently In Progress — Codex; scoped contributions to `bd-16g.5` and
+`bd-2z0.11.9`; original native, scientific and scaling acceptance retained]
+
+Preserve the stored island identity in every replay row and order rows by
+tick, island and sequence. Database-backed bundles explicitly tag the richer
+event artifact as `scriptbots.replay-events.v2`; the V1 bundle container is
+unchanged and unscoped event artifacts are refused. Replay timeline report V2
+includes the selected run and each event's island in both JSON and human output.
+The ordinary single-world replay path refuses foreign island metadata or rows
+before prefix filtering can hide them. Authored regressions cover overlapping
+island-local identities, bounded pages, cold readback, and hash-valid provenance
+forgery. Native DSR qualification remains in progress; source changes do not
+establish complete archipelago or replay acceptance.
+
 **Completed-fault journal admission through real drivers (2026-11-23):**
 [Implemented and independently source-reviewed — Codex; native execution unavailable]
 

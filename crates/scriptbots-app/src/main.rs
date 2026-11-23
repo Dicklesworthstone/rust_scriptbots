@@ -28,6 +28,7 @@ use scriptbots_app::{
 use scriptbots_bevy::{BevyRendererContext, render_png_offscreen as render_bevy_png};
 #[cfg(test)]
 use scriptbots_brain::{AssemblyBrain, DwraonBrain, MlpBrain};
+use scriptbots_core::rng_domains::IslandId;
 use scriptbots_core::sense_fixed::SenseProvider;
 use scriptbots_core::{
     LEGACY_RENDER_ENV_NAMES, MapArtifact, NeuroflowActivationKind, NullPersistence,
@@ -5556,8 +5557,12 @@ fn run_replay_cli(
              a recording from an earlier release requires that release)"
         )
     })?;
+    require_single_world_replay(&storage)
+        .context("recorded database is not a single-world replay source")?;
     let recorded_max_tick = storage.max_tick()?.unwrap_or(0);
     let mut persisted_events = storage.load_replay_events()?;
+    require_single_world_replay_events(&persisted_events)
+        .context("recorded replay stream contains another island's evidence")?;
     canonicalize_replay_event_order(&mut persisted_events)
         .context("recorded replay stream contains an invalid or duplicate identity")?;
     let recorded_batch_ticks = storage.summary_ticks()?;
@@ -5763,7 +5768,11 @@ fn run_replay_cli(
         let compare_display = compare_path.display().to_string();
         let other = StorageReader::open(&compare_display)
             .with_context(|| format!("failed to open comparison database {compare_display}"))?;
+        require_single_world_replay(&other)
+            .context("comparison database is not a single-world replay source")?;
         let mut other_events = other.load_replay_events()?;
+        require_single_world_replay_events(&other_events)
+            .context("comparison replay stream contains another island's evidence")?;
         canonicalize_replay_event_order(&mut other_events)
             .context("comparison replay stream contains an invalid or duplicate identity")?;
         other.close()?;
@@ -5879,6 +5888,14 @@ struct ReplayRun {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 enum ReplayIdentityError {
     #[error(
+        "single-world replay requires island 0, but event at tick {tick}, sequence {seq} belongs to {island_id}; archipelago replay must preserve migration barriers"
+    )]
+    UnsupportedIsland {
+        island_id: IslandId,
+        tick: u64,
+        seq: u64,
+    },
+    #[error(
         "ordinary replay event at enclosing tick {tick} uses sequence {seq}, entering the reserved narrative namespace beginning at {reserved_from}"
     )]
     OrdinarySequenceReserved {
@@ -5925,14 +5942,42 @@ enum ReplayIdentityError {
         event: String,
     },
     #[error(
-        "duplicate replay identity at tick {tick}, sequence {seq}: first={first}; duplicate={duplicate}"
+        "duplicate replay identity on {island_id} at tick {tick}, sequence {seq}: first={first}; duplicate={duplicate}"
     )]
     Duplicate {
+        island_id: IslandId,
         tick: u64,
         seq: u64,
         first: String,
         duplicate: String,
     },
+}
+
+fn require_single_world_replay(reader: &StorageReader) -> Result<()> {
+    if let Some(island) = reader
+        .archipelago_islands()?
+        .into_iter()
+        .find(|island| island.island_id != 0)
+    {
+        bail!(
+            "single-world replay requires island 0, but the run records island {}; archipelago replay must preserve migration barriers",
+            island.island_id
+        );
+    }
+    Ok(())
+}
+
+fn require_single_world_replay_events(
+    events: &[PersistedReplayEvent],
+) -> std::result::Result<(), ReplayIdentityError> {
+    if let Some(event) = events.iter().find(|event| event.island_id != IslandId(0)) {
+        return Err(ReplayIdentityError::UnsupportedIsland {
+            island_id: event.island_id,
+            tick: event.tick,
+            seq: event.seq,
+        });
+    }
+    Ok(())
 }
 
 fn replay_event_identity(
@@ -6071,12 +6116,13 @@ fn canonicalize_replay_event_order(
     }
 
     // Stable ordering keeps duplicate diagnostics deterministic.
-    events.sort_by_key(|entry| (entry.tick, entry.seq));
-    if let Some(pair) = events
-        .windows(2)
-        .find(|pair| (pair[0].tick, pair[0].seq) == (pair[1].tick, pair[1].seq))
-    {
+    events.sort_by_key(|entry| (entry.tick, entry.island_id, entry.seq));
+    if let Some(pair) = events.windows(2).find(|pair| {
+        (pair[0].tick, pair[0].island_id, pair[0].seq)
+            == (pair[1].tick, pair[1].island_id, pair[1].seq)
+    }) {
         return Err(ReplayIdentityError::Duplicate {
+            island_id: pair[0].island_id,
             tick: pair[0].tick,
             seq: pair[0].seq,
             first: format_replay_event(&pair[0].event),
@@ -6162,7 +6208,12 @@ fn run_headless_simulation(
             let fallback_seq = u64::try_from(fallback_seq)
                 .context("replay enumeration exceeds the u64 identity domain")?;
             let (tick, seq) = replay_event_identity(record.tick, fallback_seq, &event)?;
-            events.push(PersistedReplayEvent { tick, seq, event });
+            events.push(PersistedReplayEvent {
+                island_id: IslandId(0),
+                tick,
+                seq,
+                event,
+            });
         }
     }
     canonicalize_replay_event_order(&mut events)?;
@@ -6522,7 +6573,12 @@ fn run_headless_simulation_from_checkpoint(
             let fallback_seq = u64::try_from(fallback_seq)
                 .context("replay enumeration exceeds the u64 identity domain")?;
             let (tick, seq) = replay_event_identity(record.tick, fallback_seq, &event)?;
-            events.push(PersistedReplayEvent { tick, seq, event });
+            events.push(PersistedReplayEvent {
+                island_id: IslandId(0),
+                tick,
+                seq,
+                event,
+            });
         }
     }
     canonicalize_replay_event_order(&mut events)?;
@@ -6946,6 +7002,7 @@ struct Divergence {
 #[derive(Debug)]
 enum DivergenceKind {
     TickMismatch,
+    IslandMismatch,
     SequenceMismatch,
     EventMismatch,
     MissingActual,
@@ -6963,6 +7020,13 @@ fn diff_event_stream(
                 if left.tick != right.tick {
                     return Some(Divergence {
                         kind: DivergenceKind::TickMismatch,
+                        expected: Some(left.clone()),
+                        actual: Some(right.clone()),
+                    });
+                }
+                if left.island_id != right.island_id {
+                    return Some(Divergence {
+                        kind: DivergenceKind::IslandMismatch,
                         expected: Some(left.clone()),
                         actual: Some(right.clone()),
                     });
@@ -7036,6 +7100,16 @@ fn report_divergence(left_label: &str, right_label: &str, divergence: Divergence
                     "{marker} Tick mismatch: {left_label} tick {} vs {right_label} tick {}",
                     exp.tick.red(),
                     act.tick.red()
+                );
+            }
+        }
+        DivergenceKind::IslandMismatch => {
+            if let (Some(exp), Some(act)) = (&divergence.expected, &divergence.actual) {
+                println!(
+                    "{marker} Island mismatch at tick {}: {left_label} {} vs {right_label} {}",
+                    exp.tick.red(),
+                    exp.island_id,
+                    act.island_id
                 );
             }
         }
@@ -9556,6 +9630,7 @@ activation = "Sigmoid"
     fn canonical_replay_order_places_narrative_before_interactions() {
         let tick = scriptbots_core::Tick(7);
         let ordinary = PersistedReplayEvent {
+            island_id: IslandId(0),
             tick: tick.0,
             seq: 0,
             event: scriptbots_core::ReplayEvent {
@@ -9585,6 +9660,7 @@ activation = "Sigmoid"
         )
         .expect("canonical narrative record");
         let narrative = PersistedReplayEvent {
+            island_id: IslandId(0),
             tick: tick.0,
             seq: NARRATIVE_INPUT_REPLAY_SEQ,
             event: scriptbots_core::ReplayEvent {
@@ -9598,6 +9674,7 @@ activation = "Sigmoid"
             },
         };
         let interaction = PersistedReplayEvent {
+            island_id: IslandId(0),
             tick: tick.0,
             seq: INTERACTION_REPLAY_SEQ_BASE,
             event: scriptbots_core::ReplayEvent {
@@ -9631,6 +9708,110 @@ activation = "Sigmoid"
     }
 
     #[test]
+    fn replay_identity_preserves_islands_and_single_world_replay_refuses_them() {
+        let event = |island_id, seq| PersistedReplayEvent {
+            island_id: IslandId(island_id),
+            tick: 7,
+            seq,
+            event: scriptbots_core::ReplayEvent {
+                agent_uid: Some(scriptbots_core::AgentUid(9)),
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
+                kind: ReplayEventKind::BrainOutputs {
+                    outputs: vec![0.25],
+                },
+            },
+        };
+        let mut events = vec![event(2, 0), event(0, 2), event(1, 0), event(0, 0)];
+        canonicalize_replay_event_order(&mut events)
+            .expect("overlapping local event identities belong to distinct islands");
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.tick, e.island_id.0, e.seq))
+                .collect::<Vec<_>>(),
+            [(7, 0, 0), (7, 0, 2), (7, 1, 0), (7, 2, 0)]
+        );
+        require_single_world_replay_events(&events[..2]).expect("default island remains valid");
+        require_single_world_replay_events(&[]).expect("empty default stream remains valid");
+        assert_eq!(
+            require_single_world_replay_events(&events).unwrap_err(),
+            ReplayIdentityError::UnsupportedIsland {
+                island_id: IslandId(1),
+                tick: 7,
+                seq: 0,
+            }
+        );
+        let difference = diff_event_stream(&[event(0, 0)], &[event(1, 0)])
+            .expect("equal payloads from different islands cannot compare equal");
+        assert!(matches!(difference.kind, DivergenceKind::IslandMismatch));
+        assert!(diff_event_stream(&events, &events).is_none());
+        let mut duplicates = vec![event(1, 0), event(1, 0)];
+        assert!(matches!(
+            canonicalize_replay_event_order(&mut duplicates),
+            Err(ReplayIdentityError::Duplicate {
+                island_id: IslandId(1),
+                tick: 7,
+                seq: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn run_replay_cli_refuses_archipelago_metadata_even_without_replay_rows() {
+        use scriptbots_runtime::{Archipelago, ArchipelagoConfig, IslandSpec, Topology};
+        use std::num::NonZeroU64;
+
+        let directory = tempdir().expect("temporary archipelago source");
+        let path = directory.path().join("archipelago-replay.sqlite");
+        let path_string = path.display().to_string();
+        let config = ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            closed: true,
+            population_minimum: 0,
+            ..ScriptBotsConfig::default()
+        };
+        let archipelago = Archipelago::new(ArchipelagoConfig {
+            islands: vec![
+                IslandSpec::new(IslandId(0), "zero", config.clone()),
+                IslandSpec::new(IslandId(4), "four", config.clone()),
+            ],
+            topology: Topology::Ring,
+            barrier_interval: NonZeroU64::new(1).unwrap(),
+            master_seed: 42,
+            host_options: HostCoreOptions::default(),
+            migration: None,
+        })
+        .expect("actual archipelago owner");
+        let mut storage = scriptbots_storage::Storage::create_unattributed_file(&path_string)
+            .expect("create recorded archipelago");
+        storage
+            .persist_islands(&archipelago.islands().cloned().collect::<Vec<_>>())
+            .expect("record actual configured islands");
+        storage.close().expect("close source");
+        let before = fs::read(&path).expect("original source bytes");
+        for checkpoint_start in [false, true] {
+            for tick_limit in [0, 10] {
+                let mut cli = default_cli();
+                cli.replay_db = Some(path.clone());
+                cli.tick_limit = Some(tick_limit);
+                cli.checkpoint_start = checkpoint_start;
+                let error = run_replay_cli(&cli, &config, FounderRecipe::Spread, &[]).expect_err(
+                    "single-world replay must refuse before an empty prefix hides islands",
+                );
+                let message = format!("{error:#}");
+                assert!(message.contains("island 4"), "{message}");
+                assert!(message.contains("migration barriers"), "{message}");
+            }
+        }
+        assert_eq!(fs::read(&path).expect("source after refusal"), before);
+    }
+
+    #[test]
     fn canonical_replay_order_rejects_duplicate_narrative_identities_and_aliases() {
         let tick = scriptbots_core::Tick(7);
         let event = |config_revision| {
@@ -9651,6 +9832,7 @@ activation = "Sigmoid"
             )
             .expect("canonical narrative record");
             PersistedReplayEvent {
+                island_id: IslandId(0),
                 tick: tick.0,
                 seq: NARRATIVE_INPUT_REPLAY_SEQ,
                 event: scriptbots_core::ReplayEvent {

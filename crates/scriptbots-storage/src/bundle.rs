@@ -10,6 +10,13 @@ use thiserror::Error;
 /// Schema version tag for portable run bundles.
 pub const RUN_BUNDLE_SCHEMA_VERSION: &str = "scriptbots.run-bundle.v1";
 
+/// Replay artifact format with mandatory island identity on every event.
+///
+/// The bundle container is unchanged. Its event artifact explicitly versions the
+/// richer row schema so an old unscoped export cannot be mistaken for complete
+/// archipelago evidence, including when its byte digest is valid.
+pub const RUN_BUNDLE_REPLAY_EVENTS_FORMAT: &str = "scriptbots.replay-events.v2";
+
 fn hash_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
@@ -344,7 +351,7 @@ pub fn create_run_bundle(
         stage_artifact(
             output_bundle_dir,
             "events.json",
-            "events",
+            RUN_BUNDLE_REPLAY_EVENTS_FORMAT,
             events_json.as_bytes(),
         )?,
         stage_artifact(
@@ -538,7 +545,7 @@ fn verify_database_projection(
 ) -> Result<(), BundleError> {
     for (path, kind) in [
         ("run.db", "database"),
-        ("events.json", "events"),
+        ("events.json", RUN_BUNDLE_REPLAY_EVENTS_FORMAT),
         ("checkpoints.json", "checkpoints"),
     ] {
         if !bundle

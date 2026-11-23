@@ -9,9 +9,9 @@ pub mod bundle;
 pub mod export_pipeline;
 
 pub use bundle::{
-    BundleError, RUN_BUNDLE_SCHEMA_VERSION, RunBundleArtifactEntry, RunBundleDigests, RunBundleV1,
-    RunBundleVerificationResult, create_run_bundle, create_run_bundle_from_artifacts,
-    verify_run_bundle,
+    BundleError, RUN_BUNDLE_REPLAY_EVENTS_FORMAT, RUN_BUNDLE_SCHEMA_VERSION,
+    RunBundleArtifactEntry, RunBundleDigests, RunBundleV1, RunBundleVerificationResult,
+    create_run_bundle, create_run_bundle_from_artifacts, verify_run_bundle,
 };
 
 pub use export_pipeline::{
@@ -7774,7 +7774,12 @@ pub fn trace_locus<C: BrainFamilyCodec>(
 pub struct PersistedReplayEvent {
     /// Simulation tick of the event.
     pub tick: u64,
-    /// Sequence within the tick.
+    /// Island that emitted the event. Agent identities are local to this island.
+    ///
+    /// This comes from the persisted row, not from the agent UID or payload. It is
+    /// required on decode because an omitted island cannot be inferred safely.
+    pub island_id: IslandId,
+    /// Sequence within this island's tick.
     pub seq: u64,
     /// Complete decoded replay event.
     pub event: ReplayEvent,
@@ -12655,22 +12660,14 @@ impl StorageReader {
             .transpose()
     }
 
-    /// Load replay events in deterministic tick/sequence order.
+    /// Load replay events in deterministic tick/island/sequence order.
     pub fn load_replay_events(&self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
         let rows = self
             .connection()?
             .query_with_params(REPLAY_EVENT_SELECT_ASCENDING, &[sqlite_run_id(self.run_id)])?;
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let replay_row = replay_event_row_from_query_row(&row)?;
-            let event = replay_event_from_row(&replay_row)?;
-            events.push(PersistedReplayEvent {
-                tick: checked_u64("replay_events.tick", replay_row.tick)?,
-                seq: checked_u64("replay_events.seq", replay_row.seq)?,
-                event,
-            });
-        }
-        Ok(events)
+        rows.iter()
+            .map(persisted_replay_event_from_query_row)
+            .collect()
     }
 
     /// Load a bounded page of the newest replay events in deterministic chronological order.
@@ -12686,15 +12683,10 @@ impl StorageReader {
             REPLAY_EVENT_SELECT_DESCENDING_BOUNDED,
             &[sqlite_run_id(self.run_id), bound.into()],
         )?;
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let replay_row = replay_event_row_from_query_row(&row)?;
-            events.push(PersistedReplayEvent {
-                tick: checked_u64("replay_events.tick", replay_row.tick)?,
-                seq: checked_u64("replay_events.seq", replay_row.seq)?,
-                event: replay_event_from_row(&replay_row)?,
-            });
-        }
+        let mut events = rows
+            .iter()
+            .map(persisted_replay_event_from_query_row)
+            .collect::<Result<Vec<_>, _>>()?;
         events.reverse();
         Ok(events)
     }
@@ -23840,23 +23832,15 @@ impl Storage {
             .transpose()
     }
 
-    /// Load all replay events ordered by tick/sequence and reconstruct their payloads.
+    /// Load all replay events ordered by tick/island/sequence and reconstruct their payloads.
     pub fn load_replay_events(&mut self) -> Result<Vec<PersistedReplayEvent>, StorageError> {
         self.flush()?;
         let rows = self
             .connection()?
             .query_with_params(REPLAY_EVENT_SELECT_ASCENDING, &[sqlite_run_id(self.run_id)])?;
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let replay_row = replay_event_row_from_query_row(&row)?;
-            let event = replay_event_from_row(&replay_row)?;
-            events.push(PersistedReplayEvent {
-                tick: checked_u64("replay_events.tick", replay_row.tick)?,
-                seq: checked_u64("replay_events.seq", replay_row.seq)?,
-                event,
-            });
-        }
-        Ok(events)
+        rows.iter()
+            .map(persisted_replay_event_from_query_row)
+            .collect()
     }
 
     /// Return counts of replay events grouped by event type.
@@ -28754,7 +28738,7 @@ const REPLAY_EVENT_SELECT_ASCENDING: &str = concat!(
     replay_event_columns!(),
     " FROM replay_events
      WHERE run_id = ?1
-     ORDER BY tick ASC, seq ASC"
+     ORDER BY tick ASC, island_id ASC, seq ASC"
 );
 
 const REPLAY_EVENT_SELECT_DESCENDING_BOUNDED: &str = concat!(
@@ -28762,7 +28746,7 @@ const REPLAY_EVENT_SELECT_DESCENDING_BOUNDED: &str = concat!(
     replay_event_columns!(),
     " FROM replay_events
      WHERE run_id = ?1
-     ORDER BY tick DESC, seq DESC
+     ORDER BY tick DESC, island_id DESC, seq DESC
      LIMIT ?2"
 );
 
@@ -28833,6 +28817,20 @@ fn replay_event_row_from_query_row(row: &Row) -> Result<ReplayEventRow, StorageE
         // observed. The column is part of `replay_event_columns!()` so every reader widens at
         // once.
         island_id: decode(row, 11, "replay_events.island_id")?,
+    })
+}
+
+/// Preserve the complete persisted replay identity at every public readback boundary.
+fn persisted_replay_event_from_query_row(row: &Row) -> Result<PersistedReplayEvent, StorageError> {
+    let replay_row = replay_event_row_from_query_row(row)?;
+    Ok(PersistedReplayEvent {
+        tick: checked_u64("replay_events.tick", replay_row.tick)?,
+        island_id: IslandId(checked_u32(
+            "replay_events.island_id",
+            replay_row.island_id,
+        )?),
+        seq: checked_u64("replay_events.seq", replay_row.seq)?,
+        event: replay_event_from_row(&replay_row)?,
     })
 }
 
@@ -39002,6 +39000,7 @@ mod tests {
             },
         )?;
 
+        let mut emitted_replay = BTreeMap::<IslandId, Vec<ReplayEvent>>::new();
         let mut complete_barriers = 0_u32;
         let mut refusal: Option<StorageError> = None;
         for _ in 0..BARRIERS {
@@ -39012,6 +39011,10 @@ mod tests {
                 captured.borrow_mut().drain(..).collect();
             let mut by_tick: BTreeMap<u64, Vec<(IslandId, PersistenceBatch)>> = BTreeMap::new();
             for (island, batch) in drained {
+                emitted_replay
+                    .entry(island)
+                    .or_default()
+                    .extend(batch.replay_events.iter().cloned());
                 by_tick
                     .entry(batch.summary.tick.0)
                     .or_default()
@@ -39098,8 +39101,168 @@ mod tests {
             "every island must record its own narrative input stream"
         );
 
+        let writer_replay = storage.load_replay_events()?;
         storage.close()?;
+        assert_island_replay_export(&path, &writer_replay, &emitted_replay)?;
         Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real archipelago journey compares writer, cold reader, bounded pages and hash-valid portable-bundle corruption against emitted per-island science"
+    )]
+    fn assert_island_replay_export(
+        path: &Path,
+        expected: &[PersistedReplayEvent],
+        emitted: &BTreeMap<IslandId, Vec<ReplayEvent>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = |row: &PersistedReplayEvent| (row.tick, row.island_id, row.seq);
+        assert!(!expected.is_empty());
+        assert!(
+            expected
+                .windows(2)
+                .all(|pair| key(&pair[0]) < key(&pair[1]))
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .map(|row| row.island_id)
+                .collect::<BTreeSet<_>>(),
+            emitted.keys().copied().collect::<BTreeSet<_>>()
+        );
+        // Each island owns its own sequence namespace. The fixture must actually
+        // contain collisions that dropping island_id would make indistinguishable.
+        assert!(
+            expected
+                .iter()
+                .map(|row| (row.tick, row.seq))
+                .collect::<BTreeSet<_>>()
+                .len()
+                < expected.len()
+        );
+        for (island, emitted_events) in emitted {
+            let mut actual = expected
+                .iter()
+                .filter(|row| row.island_id == *island)
+                .map(|row| serde_json::to_string(&row.event))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut original = emitted_events
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()?;
+            actual.sort();
+            original.sort();
+            assert_eq!(actual, original, "replay payloads crossed island {island}");
+        }
+
+        let reader = StorageReader::open_finished(&path.to_string_lossy())?;
+        assert_eq!(reader.load_replay_events()?, expected);
+        for limit in [
+            0,
+            1,
+            emitted.len() - 1,
+            emitted.len(),
+            expected.len() - 1,
+            expected.len(),
+        ] {
+            assert_eq!(
+                reader.recent_replay_events(limit)?,
+                expected[expected.len().saturating_sub(limit)..],
+                "newest page lost the total island order at limit {limit}"
+            );
+        }
+        reader.close()?;
+
+        let bundle_dir = path.with_extension("bundle");
+        let bundle = create_run_bundle(path, &bundle_dir)?;
+        let event_index = bundle
+            .artifacts
+            .iter()
+            .position(|artifact| artifact.relative_path == "events.json")
+            .expect("the bundle contains the complete replay artifact");
+        assert_eq!(
+            bundle.artifacts[event_index].artifact_type,
+            RUN_BUNDLE_REPLAY_EVENTS_FORMAT
+        );
+        assert_eq!(bundle.digests.event_count, u64::try_from(expected.len())?);
+        let event_path = bundle_dir.join("events.json");
+        let manifest_path = bundle_dir.join("bundle_manifest.json");
+        let original_bytes = fs::read(&event_path)?;
+        assert_eq!(
+            serde_json::from_slice::<Vec<PersistedReplayEvent>>(&original_bytes)?,
+            expected
+        );
+        assert_eq!(
+            verify_run_bundle(&bundle_dir)?.total_artifacts_verified,
+            bundle.artifacts.len()
+        );
+
+        // Recompute the byte identity after forging a real island's event into
+        // another island. Only semantic DB readback can refuse this artifact.
+        let mut forged: Vec<PersistedReplayEvent> = serde_json::from_slice(&original_bytes)?;
+        forged
+            .iter_mut()
+            .find(|row| row.island_id != IslandId(0))
+            .expect("the real fixture contains foreign-island evidence")
+            .island_id = IslandId(0);
+        let forged_bytes = serde_json::to_vec_pretty(&forged)?;
+        let mut forged_bundle = bundle.clone();
+        forged_bundle.artifacts[event_index].bytes_len = u64::try_from(forged_bytes.len())?;
+        forged_bundle.artifacts[event_index].blake3_hex =
+            blake3::hash(&forged_bytes).to_hex().to_string();
+        fs::write(&event_path, &forged_bytes)?;
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&forged_bundle)?)?;
+        assert!(matches!(
+            verify_run_bundle(&bundle_dir),
+            Err(BundleError::DatabaseProjectionMismatch("events.json"))
+        ));
+
+        fs::write(&event_path, &original_bytes)?;
+        let mut legacy_bundle = bundle.clone();
+        legacy_bundle.artifacts[event_index].artifact_type = "events".to_owned();
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&legacy_bundle)?)?;
+        assert!(matches!(
+            verify_run_bundle(&bundle_dir),
+            Err(BundleError::MissingArtifact(path)) if path == Path::new("events.json")
+        ));
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&bundle)?)?;
+        verify_run_bundle(&bundle_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replay_event_wire_requires_an_explicit_valid_island() {
+        for island_id in [IslandId(0), IslandId(7), IslandId(u32::MAX)] {
+            let event = PersistedReplayEvent {
+                tick: 1,
+                island_id,
+                seq: NARRATIVE_INPUT_REPLAY_SEQ,
+                event: sample_narrative_event(sample_narrative_record(1, 1.0, 0, 0, 8)),
+            };
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(value["island_id"], serde_json::json!(island_id.0));
+            assert_eq!(
+                serde_json::from_value::<PersistedReplayEvent>(value.clone()).unwrap(),
+                event
+            );
+            let mut missing = value.clone();
+            assert!(
+                missing
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("island_id")
+                    .is_some()
+            );
+            assert!(serde_json::from_value::<PersistedReplayEvent>(missing).is_err());
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(u64::from(u32::MAX) + 1),
+            ] {
+                let mut malformed = value.clone();
+                malformed["island_id"] = invalid;
+                assert!(serde_json::from_value::<PersistedReplayEvent>(malformed).is_err());
+            }
+        }
     }
 
     /// bd-5tyo: DSR long lane: 4 heterogeneous islands reach tick 2,000 persisting into exactly
