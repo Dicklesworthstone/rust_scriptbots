@@ -162,6 +162,18 @@ impl Connection {
         block_on_inline(Box::pin(fut))
     }
 
+    /// Visit query rows without collecting another complete result in this facade.
+    /// The engine may still buffer an ordered query or a fallback execution path.
+    fn query_with_params_for_each(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+        visitor: impl FnMut(&Row) -> Result<(), FrankenError>,
+    ) -> Result<(), FrankenError> {
+        let fut = self.inner.query_with_params_for_each(sql, params, visitor);
+        block_on_inline(Box::pin(fut))
+    }
+
     /// Query one row using the engine's single-row contract.
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
         let fut = self.inner.query_row(sql);
@@ -12802,6 +12814,52 @@ impl StorageReader {
             .collect()
     }
 
+    /// Traverse a leased finished run without retaining the complete decoded history.
+    fn visit_finished_replay_events<E>(
+        &self,
+        visitor: impl FnMut(PersistedReplayEvent) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+    {
+        self.visit_finished_rows(
+            REPLAY_EVENT_SELECT_ASCENDING,
+            persisted_replay_event_from_query_row,
+            visitor,
+        )
+    }
+
+    fn visit_finished_rows<T, E>(
+        &self,
+        sql: &str,
+        decode_row: impl Fn(&Row) -> Result<T, StorageError>,
+        mut visitor: impl FnMut(T) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+    {
+        let mut callback_error = None;
+        let result =
+            self.finished_connection()
+                .map_err(E::from)?
+                .query_with_params_for_each(sql, &[sqlite_run_id(self.run_id)], |row| {
+                    match decode_row(row).map_err(E::from).and_then(&mut visitor) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            callback_error = Some(error);
+                            Err(FrankenError::Abort)
+                        }
+                    }
+                });
+        // Restore the original decode/consumer error only for our callback abort.
+        // A separate engine failure (including read cleanup) must remain visible.
+        match (result, callback_error) {
+            (Err(FrankenError::Abort) | Ok(()), Some(error)) => Err(error),
+            (Err(error), _) => Err(E::from(StorageError::from(error))),
+            (Ok(()), None) => Ok(()),
+        }
+    }
+
     /// Load a bounded page of the newest replay events in deterministic chronological order.
     pub fn recent_replay_events(
         &self,
@@ -13466,30 +13524,27 @@ impl StorageReader {
 
     /// Load checkpoints in tick/ordinal order.
     pub fn load_checkpoints(&self) -> Result<Vec<PersistedCheckpointRecord>, StorageError> {
-        let rows = self.connection()?.query_with_params(
-            "SELECT checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json
-             FROM checkpoints
-             WHERE run_id = ?1
-             ORDER BY tick ASC, checkpoint_ordinal ASC",
-            &[sqlite_run_id(self.run_id)],
-        )?;
-        let mut checkpoints = Vec::with_capacity(rows.len());
-        for row in rows {
-            let tick_val: i64 = decode(&row, 1, "checkpoints.tick")?;
-            let ord_val: i64 = decode(&row, 2, "checkpoints.checkpoint_ordinal")?;
-            let checkpoint = PersistedCheckpointRecord {
-                checkpoint_id: decode(&row, 0, "checkpoints.checkpoint_id")?,
-                tick: checked_u64("checkpoints.tick", tick_val)?,
-                checkpoint_ordinal: checked_u64("checkpoints.checkpoint_ordinal", ord_val)?,
-                format: decode(&row, 3, "checkpoints.format")?,
-                payload: decode(&row, 4, "checkpoints.payload")?,
-                payload_digest: decode(&row, 5, "checkpoints.payload_digest")?,
-                metadata_json: decode(&row, 6, "checkpoints.metadata_json")?,
-            };
-            checkpoint.world_checkpoint()?;
-            checkpoints.push(checkpoint);
-        }
-        Ok(checkpoints)
+        let rows = self
+            .connection()?
+            .query_with_params(CHECKPOINT_SELECT_ASCENDING, &[sqlite_run_id(self.run_id)])?;
+        rows.iter()
+            .map(persisted_checkpoint_from_query_row)
+            .collect()
+    }
+
+    /// Validate and visit one checkpoint at a time while retaining the finished-run lease.
+    fn visit_finished_checkpoints<E>(
+        &self,
+        visitor: impl FnMut(PersistedCheckpointRecord) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+    {
+        self.visit_finished_rows(
+            CHECKPOINT_SELECT_ASCENDING,
+            persisted_checkpoint_from_query_row,
+            visitor,
+        )
     }
 
     /// Load the latest checkpoint in tick/ordinal order.
@@ -13507,20 +13562,7 @@ impl StorageReader {
         if rows.is_empty() {
             return Ok(None);
         }
-        let row = &rows[0];
-        let tick_val: i64 = decode(row, 1, "checkpoints.tick")?;
-        let ord_val: i64 = decode(row, 2, "checkpoints.checkpoint_ordinal")?;
-        let checkpoint = PersistedCheckpointRecord {
-            checkpoint_id: decode(row, 0, "checkpoints.checkpoint_id")?,
-            tick: checked_u64("checkpoints.tick", tick_val)?,
-            checkpoint_ordinal: checked_u64("checkpoints.checkpoint_ordinal", ord_val)?,
-            format: decode(row, 3, "checkpoints.format")?,
-            payload: decode(row, 4, "checkpoints.payload")?,
-            payload_digest: decode(row, 5, "checkpoints.payload_digest")?,
-            metadata_json: decode(row, 6, "checkpoints.metadata_json")?,
-        };
-        checkpoint.world_checkpoint()?;
-        Ok(Some(checkpoint))
+        persisted_checkpoint_from_query_row(&rows[0]).map(Some)
     }
 
     /// Load every agent-arrival ancestry edge recorded in this run for offline rebuild.
@@ -29064,6 +29106,12 @@ const REPLAY_EVENT_SELECT_DESCENDING_BOUNDED: &str = concat!(
      LIMIT ?2"
 );
 
+const CHECKPOINT_SELECT_ASCENDING: &str =
+    "SELECT checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json
+     FROM checkpoints
+     WHERE run_id = ?1
+     ORDER BY tick ASC, checkpoint_ordinal ASC";
+
 const NARRATIVE_INPUT_SELECT_AFTER: &str = concat!(
     "SELECT ",
     replay_event_columns!(),
@@ -29146,6 +29194,24 @@ fn persisted_replay_event_from_query_row(row: &Row) -> Result<PersistedReplayEve
         seq: checked_u64("replay_events.seq", replay_row.seq)?,
         event: replay_event_from_row(&replay_row)?,
     })
+}
+
+fn persisted_checkpoint_from_query_row(
+    row: &Row,
+) -> Result<PersistedCheckpointRecord, StorageError> {
+    let tick_val: i64 = decode(row, 1, "checkpoints.tick")?;
+    let ord_val: i64 = decode(row, 2, "checkpoints.checkpoint_ordinal")?;
+    let checkpoint = PersistedCheckpointRecord {
+        checkpoint_id: decode(row, 0, "checkpoints.checkpoint_id")?,
+        tick: checked_u64("checkpoints.tick", tick_val)?,
+        checkpoint_ordinal: checked_u64("checkpoints.checkpoint_ordinal", ord_val)?,
+        format: decode(row, 3, "checkpoints.format")?,
+        payload: decode(row, 4, "checkpoints.payload")?,
+        payload_digest: decode(row, 5, "checkpoints.payload_digest")?,
+        metadata_json: decode(row, 6, "checkpoints.metadata_json")?,
+    };
+    checkpoint.world_checkpoint()?;
+    Ok(checkpoint)
 }
 
 /// Decode the shared interaction/replay join used by both bounded UI pages and

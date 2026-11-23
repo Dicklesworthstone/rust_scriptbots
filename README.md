@@ -818,6 +818,16 @@ promote incomplete build provenance to reproducibility. Database-free experiment
 report zero database-persisted events/checkpoints even though their final owner cut is included.
 A failed export retains partial files without a success manifest.
 
+Database-backed event and checkpoint projections are written and independently
+verified one record at a time. The bundle layer no longer retains complete decoded
+histories and JSON copies together; individual checkpoints and database query/sort
+state can still require substantial memory. Replay artifacts declare
+`scriptbots.replay-events.v2` and retain each event's island identity in canonical
+tick/island/sequence order. Semantic verification rejects hash-valid omissions,
+extra rows, reordered records and changed fields, while accepting harmless JSON
+whitespace and object-key ordering. Hard-bounded verification still refuses
+database-backed bundles rather than claiming an engine memory or time bound.
+
 ### Dual-window mode (GUI)
 - ScriptBots opens two GPUI windows as one transactional launch and tiles them inside the primary display's visible frame: a flexible World window and a narrow `ScriptBots Lab` companion. The Lab's Overview, Inspect, Analytics, Timeline, Experiments, Checkpoints and Maps tabs keep one task-focused surface visible at a time, with dense diagnostics closed by default and the active section vertically scrollable. On narrow displays the pair stacks without overlap. This is the optional GPUI route, built with `--features gui` and selected with `--mode gui`.
 - Display-local controls—agents, food, outlines, follow, camera fit, zoom, pan, debug overlays, palette, narration, and settings—stay in the World window they affect. Shared run controls—pause, step, speed, spawning, environment, and presets—live in the Lab. If either window cannot be created (for example because of window-manager or remote-session limits), ScriptBots terminates the partial application lifetime and returns an actionable error; it never silently changes the requested layout. GPUI uses `QuitMode::LastWindowClosed`, and closing either member of the pair closes the application rather than leaving an orphaned window or hidden process.

@@ -2,6 +2,23 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Streaming database bundle projections (2026-11-23):**
+[Implemented and independently source-reviewed — Codex; scoped contributions to
+`bd-2z0.17` and `bd-2z0.5.11.1`; original native and resource acceptance retained]
+
+Traverse replay and checkpoint rows through the pinned database's callback API,
+serialize each row directly to a hashed buffered file, and independently compare
+each exported JSON record with the copied database. Preserve canonical identity,
+checkpoint validation, manifest counts, trailing-byte refusal, leases and final
+manifest publication only after full verification. This removes whole-history
+vectors and JSON copies from the bundle layer; engine sorting and individual
+records remain outside a hard memory/time bound. Bounded verification retains its
+database refusal. Authored regressions cover a 1,028-row colliding-island run,
+valid checkpoints, hash-valid semantic mutations, callback errors and lease reuse,
+short writes, and retained partial evidence after a late corrupt checkpoint.
+Native execution qualification is pending; no measured memory/performance or
+broader bundle acceptance is claimed.
+
 **Complete saved-narrative verification (2026-11-23):**
 [Implemented and independently source-reviewed — Codex; scoped contribution to
 `bd-16g.2.9.2` and `bd-16g.2.9.3`, original acceptance retained]
@@ -39,8 +56,11 @@ and inspection, and permits explicit replacement without overwriting saved
 recovery or its previous storage diagnosis. Remote controls remain independent.
 Authored native regressions use the real volatile journal at two capacities;
 DOM regressions use the explicitly documented WASM/socket doubles and real
-IndexedDB. Execution qualification remains pending; this does not establish
-WASM codec qualification or the broader browser acceptance.
+IndexedDB. Pinned DSR on `d1d123947d2c478cdfa6d4458cfb929b840b759c` passed
+12 native Rust tests, including both new regressions, nine checkpoint cases and
+the final completed-fault case, plus scoped Rust formatting and three JavaScript
+syntax checks. DOM execution remains unavailable after the official Chromium
+download was refused; WASM codec and broader packaged-browser acceptance remain open.
 
 **Checkpoint-start replay preserves the exact owner cut (2026-11-23):**
 [Implemented and independently source-reviewed — Codex; scoped contribution to

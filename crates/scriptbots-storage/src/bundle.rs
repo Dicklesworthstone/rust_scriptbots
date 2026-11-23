@@ -1,9 +1,11 @@
 //! Portable deterministic run bundle assembly and verification.
 
 use crate::{PersistenceWatermarks, RunManifestRecord, StorageError, StorageReader};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::ser::SerializeSeq;
+use serde::{Deserialize, Deserializer as _, Serialize, Serializer as _};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -239,8 +241,8 @@ fn validate_relative_path(relative_path: &str) -> Result<&Path, BundleError> {
 
 /// Write one artifact into the bundle and return its manifest entry.
 ///
-/// JSON exports and caller-supplied payloads share path validation, hashing and
-/// byte accounting here. The database image is copied from its leased descriptor.
+/// Caller-supplied payloads are already materialized. Database projections use
+/// `stage_projection` instead; the database image is copied from its leased descriptor.
 fn stage_artifact(
     bundle_dir: &Path,
     relative_path: &str,
@@ -273,6 +275,105 @@ fn stage_artifact(
         bytes_len: bytes.len() as u64,
         artifact_type: artifact_type.to_owned(),
     })
+}
+
+/// Hash the bytes accepted by the buffered writer, publishing no entry until
+/// the buffer and file have both been flushed successfully.
+struct ProjectionWriter<W> {
+    file: W,
+    hash: blake3::Hasher,
+    bytes_len: u64,
+}
+
+impl<W: Write> Write for ProjectionWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        self.hash.update(&bytes[..written]);
+        self.bytes_len = self
+            .bytes_len
+            .checked_add(written as u64)
+            .ok_or_else(|| std::io::Error::other("bundle artifact byte count exceeds u64"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn projection_json_error(error: serde_json::Error, path: &Path) -> BundleError {
+    if error.is_io() {
+        BundleError::Io {
+            path: path.to_path_buf(),
+            error: error.into(),
+        }
+    } else {
+        BundleError::Json(error)
+    }
+}
+
+/// Serialize records directly from one finished-run traversal. Only the current
+/// decoded record and fixed output buffer are retained by the bundle layer;
+/// individual records and the engine's query/sort state are not byte-bounded.
+fn stage_projection<T: Serialize>(
+    bundle_dir: &Path,
+    relative_path: &'static str,
+    artifact_type: &str,
+    visit: impl FnOnce(&mut dyn FnMut(T) -> Result<(), BundleError>) -> Result<(), BundleError>,
+) -> Result<(RunBundleArtifactEntry, u64), BundleError> {
+    let destination = bundle_dir.join(validate_relative_path(relative_path)?);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| BundleError::Io {
+            path: parent.to_path_buf(),
+            error,
+        })?;
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .map_err(|error| BundleError::Io {
+            path: destination.clone(),
+            error,
+        })?;
+    let mut writer = ProjectionWriter {
+        file: BufWriter::with_capacity(64 * 1024, file),
+        hash: blake3::Hasher::new(),
+        bytes_len: 0,
+    };
+    let mut serializer = serde_json::Serializer::pretty(&mut writer);
+    let mut sequence = serializer
+        .serialize_seq(None)
+        .map_err(|error| projection_json_error(error, &destination))?;
+    let mut count = 0_u64;
+    visit(&mut |record| {
+        sequence
+            .serialize_element(&record)
+            .map_err(|error| projection_json_error(error, &destination))?;
+        count = count
+            .checked_add(1)
+            .ok_or(BundleError::DatabaseProjectionMismatch(relative_path))?;
+        Ok(())
+    })?;
+    sequence
+        .end()
+        .map_err(|error| projection_json_error(error, &destination))?;
+    writer
+        .flush()
+        .and_then(|()| writer.file.get_ref().sync_all())
+        .map_err(|error| BundleError::Io {
+            path: destination,
+            error,
+        })?;
+    Ok((
+        RunBundleArtifactEntry {
+            relative_path: relative_path.to_owned(),
+            blake3_hex: writer.hash.finalize().to_hex().to_string(),
+            bytes_len: writer.bytes_len,
+            artifact_type: artifact_type.to_owned(),
+        },
+        count,
+    ))
 }
 
 /// Serialize the assembled bundle to the canonical `bundle_manifest.json`.
@@ -312,8 +413,6 @@ pub fn create_run_bundle(
     reader.require_finished_bundle_state()?;
     let manifest = reader.run_manifest()?;
     let max_tick = reader.max_tick()?.unwrap_or(0);
-    let events = reader.load_replay_events()?;
-    let checkpoints = reader.load_checkpoints()?;
     let persistence_watermarks = reader.persistence_watermarks()?.into();
     let run_id = manifest.run_id.to_string();
 
@@ -338,8 +437,18 @@ pub fn create_run_bundle(
         })?
         .len();
     let db_blake3_hex = hash_file_exact_bounded(&db_path, db_bytes_len)?;
-    let events_json = serde_json::to_string_pretty(&events)?;
-    let checkpoints_json = serde_json::to_string_pretty(&checkpoints)?;
+    let (events, event_count) = stage_projection(
+        output_bundle_dir,
+        "events.json",
+        RUN_BUNDLE_REPLAY_EVENTS_FORMAT,
+        |visitor| reader.visit_finished_replay_events(visitor),
+    )?;
+    let (checkpoints, checkpoint_count) = stage_projection(
+        output_bundle_dir,
+        "checkpoints.json",
+        "checkpoints",
+        |visitor| reader.visit_finished_checkpoints(visitor),
+    )?;
 
     let artifacts = vec![
         RunBundleArtifactEntry {
@@ -348,18 +457,8 @@ pub fn create_run_bundle(
             bytes_len: db_bytes_len,
             artifact_type: "database".to_owned(),
         },
-        stage_artifact(
-            output_bundle_dir,
-            "events.json",
-            RUN_BUNDLE_REPLAY_EVENTS_FORMAT,
-            events_json.as_bytes(),
-        )?,
-        stage_artifact(
-            output_bundle_dir,
-            "checkpoints.json",
-            "checkpoints",
-            checkpoints_json.as_bytes(),
-        )?,
+        events,
+        checkpoints,
     ];
 
     let bundle = RunBundleV1 {
@@ -370,8 +469,8 @@ pub fn create_run_bundle(
             lockfile_digest: Some(manifest.cargo_lock_digest.clone()),
             run_id,
             max_tick,
-            event_count: events.len() as u64,
-            checkpoint_count: checkpoints.len() as u64,
+            event_count,
+            checkpoint_count,
             persistence_watermarks: Some(persistence_watermarks),
         },
         manifest,
@@ -537,6 +636,134 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
     })
 }
 
+#[derive(Clone, Copy)]
+enum DatabaseProjection {
+    ReplayEvents,
+    Checkpoints,
+}
+
+impl DatabaseProjection {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::ReplayEvents => "events.json",
+            Self::Checkpoints => "checkpoints.json",
+        }
+    }
+}
+
+enum ProjectionReadError<E> {
+    Json(E),
+    Bundle(BundleError),
+}
+
+impl<E> From<StorageError> for ProjectionReadError<E> {
+    fn from(error: StorageError) -> Self {
+        Self::Bundle(BundleError::Storage(error))
+    }
+}
+
+fn compare_projection_record<'de, T: Serialize, A: SeqAccess<'de>>(
+    record: T,
+    sequence: &mut A,
+    count: &mut u64,
+    path: &'static str,
+) -> Result<(), ProjectionReadError<A::Error>> {
+    let actual = serde_json::to_value(record)
+        .map_err(|error| ProjectionReadError::Bundle(BundleError::Json(error)))?;
+    let exported = sequence
+        .next_element::<serde_json::Value>()
+        .map_err(ProjectionReadError::Json)?;
+    // Value equality preserves the previous projection contract: unknown fields
+    // are rejected, while harmless whitespace and object key order are accepted.
+    if exported != Some(actual) {
+        return Err(ProjectionReadError::Bundle(
+            BundleError::DatabaseProjectionMismatch(path),
+        ));
+    }
+    *count = count.checked_add(1).ok_or(ProjectionReadError::Bundle(
+        BundleError::DatabaseProjectionMismatch(path),
+    ))?;
+    Ok(())
+}
+
+struct ProjectionArrayVisitor<'a> {
+    reader: &'a StorageReader,
+    projection: DatabaseProjection,
+    expected_count: u64,
+    failure: &'a mut Option<BundleError>,
+}
+
+impl<'de> Visitor<'de> for ProjectionArrayVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an array containing the complete database projection in order")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+        let path = self.projection.path();
+        let mut count = 0_u64;
+        let result = match self.projection {
+            DatabaseProjection::ReplayEvents => {
+                self.reader.visit_finished_replay_events(|record| {
+                    compare_projection_record(record, &mut sequence, &mut count, path)
+                })
+            }
+            DatabaseProjection::Checkpoints => self.reader.visit_finished_checkpoints(|record| {
+                compare_projection_record(record, &mut sequence, &mut count, path)
+            }),
+        };
+        if let Err(error) = result {
+            return match error {
+                ProjectionReadError::Json(error) => Err(error),
+                ProjectionReadError::Bundle(error) => {
+                    *self.failure = Some(error);
+                    Err(de::Error::custom("database projection verification failed"))
+                }
+            };
+        }
+        if count != self.expected_count || sequence.next_element::<de::IgnoredAny>()?.is_some() {
+            *self.failure = Some(BundleError::DatabaseProjectionMismatch(path));
+            return Err(de::Error::custom("database projection row count disagrees"));
+        }
+        Ok(())
+    }
+}
+
+/// Compare one exported row at a time against an independent database traversal.
+/// The engine and an individual record may still require substantial memory.
+fn verify_projection(
+    bundle_dir: &Path,
+    reader: &StorageReader,
+    projection: DatabaseProjection,
+    expected_count: u64,
+) -> Result<(), BundleError> {
+    let full_path = bundle_dir.join(projection.path());
+    let (file, _) = open_regular_bundle_file(&full_path)?;
+    let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(file));
+    let mut failure = None;
+    let result = deserializer.deserialize_seq(ProjectionArrayVisitor {
+        reader,
+        projection,
+        expected_count,
+        failure: &mut failure,
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    result.map_err(|error| {
+        if error.is_data() {
+            BundleError::DatabaseProjectionMismatch(projection.path())
+        } else {
+            projection_json_error(error, &full_path)
+        }
+    })?;
+    // An exact prefix is insufficient: reject another JSON value or trailing garbage.
+    deserializer
+        .end()
+        .map_err(|error| projection_json_error(error, &full_path))
+}
+
 /// Reopen the materialized database and compare logical state, not just file hashes.
 fn verify_database_projection(
     bundle_dir: &Path,
@@ -578,34 +805,14 @@ fn verify_database_projection(
             "persistence watermarks",
         ));
     }
-    let events = reader.load_replay_events()?;
-    let checkpoints = reader.load_checkpoints()?;
-    for (path, actual, expected_count) in [
+    for (projection, expected_count) in [
+        (DatabaseProjection::ReplayEvents, bundle.digests.event_count),
         (
-            "events.json",
-            serde_json::to_value(&events)?,
-            bundle.digests.event_count,
-        ),
-        (
-            "checkpoints.json",
-            serde_json::to_value(&checkpoints)?,
+            DatabaseProjection::Checkpoints,
             bundle.digests.checkpoint_count,
         ),
     ] {
-        let full_path = bundle_dir.join(path);
-        let (mut file, _) = open_regular_bundle_file(&full_path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|error| BundleError::Io {
-                path: full_path,
-                error,
-            })?;
-        let exported: serde_json::Value = serde_json::from_slice(&bytes)?;
-        if exported != actual
-            || actual.as_array().map(|rows| rows.len() as u64) != Some(expected_count)
-        {
-            return Err(BundleError::DatabaseProjectionMismatch(path));
-        }
+        verify_projection(bundle_dir, reader, projection, expected_count)?;
     }
     Ok(())
 }
@@ -865,6 +1072,360 @@ mod tests {
             .unwrap_or(0);
         path.push(format!("scriptbots-bundle-{name}-{nanos}"));
         path
+    }
+
+    fn streaming_fixture(
+        name: &str,
+        rows_per_island: u16,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        use scriptbots_core::rng_domains::IslandId;
+        use scriptbots_core::{
+            AgentUid, PersistenceBatch, ReplayEvent, ReplayEventKind, Tick, TickSummary,
+        };
+
+        let path = temp_db_path(name);
+        let mut storage = Storage::create_unattributed_file(&path.to_string_lossy())?;
+        let world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            rng_seed: Some(42),
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })?;
+        for ordinal in 0..2 {
+            storage.record_checkpoint(
+                &format!("checkpoint-{ordinal}"),
+                ordinal,
+                &world.checkpoint_v1()?,
+                &serde_json::json!({"ordinal": ordinal, "note": "record\nwith escapes"}),
+            )?;
+        }
+        for tick in [1, 2] {
+            let batch = PersistenceBatch {
+                summary: TickSummary {
+                    tick: Tick(tick),
+                    agent_count: 0,
+                    births: 0,
+                    deaths: 0,
+                    total_energy: 0.0,
+                    average_energy: 0.0,
+                    average_health: 0.0,
+                    max_age: 0,
+                    spike_hits: 0,
+                },
+                epoch: 0,
+                closed: false,
+                metrics: Vec::new(),
+                events: Vec::new(),
+                agents: Vec::new(),
+                births: Vec::new(),
+                deaths: Vec::new(),
+                replay_events: (0..rows_per_island)
+                    .map(|seq| ReplayEvent {
+                        agent_uid: Some(AgentUid(7)),
+                        position: None,
+                        counterpart: None,
+                        counterpart_position: None,
+                        kind: ReplayEventKind::BrainOutputs {
+                            outputs: vec![0.25, f32::from(seq)],
+                        },
+                    })
+                    .collect(),
+                narrative_events: Vec::new(),
+                genomes: Vec::new(),
+            };
+            // Deliberately collide every tick, sequence and agent identity across islands.
+            storage.persist_barrier(&[(IslandId(7), &batch), (IslandId(0), &batch)])?;
+        }
+        storage.close()?;
+        Ok(path)
+    }
+
+    fn rehash_test_artifact(
+        bundle_dir: &Path,
+        bundle: &mut RunBundleV1,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::write(bundle_dir.join(path), bytes)?;
+        let entry = bundle
+            .artifacts
+            .iter_mut()
+            .find(|entry| entry.relative_path == path)
+            .expect("fixture artifact");
+        entry.blake3_hex = hash_hex(bytes);
+        entry.bytes_len = bytes.len() as u64;
+        replace_test_manifest(bundle_dir, bundle)?;
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_bundle_preserves_large_island_projection_and_rejects_json_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = streaming_fixture("streaming-projections", 257)?;
+        let source_bytes = fs::read(&source)?;
+        let reader = StorageReader::open_finished(&source.to_string_lossy())?;
+        let events = reader.load_replay_events()?;
+        let checkpoints = reader.load_checkpoints()?;
+        reader.close()?;
+        assert_eq!(events.len(), 1_028);
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(events[0].island_id.0, 0);
+        assert_eq!(events[257].island_id.0, 7);
+        assert_eq!(events[0].seq, events[257].seq);
+        let expected_events = serde_json::to_vec_pretty(&events)?;
+        let expected_checkpoints = serde_json::to_vec_pretty(&checkpoints)?;
+        assert!(
+            expected_events.len() > 64 * 1024,
+            "exercise output-buffer flushes"
+        );
+        let output = temp_bundle_dir("streaming-projections");
+        let bundle = create_run_bundle(&source, &output)?;
+        assert_eq!(bundle.digests.event_count, 1_028);
+        assert_eq!(bundle.digests.checkpoint_count, 2);
+        assert_eq!(fs::read(output.join("events.json"))?, expected_events);
+        assert_eq!(
+            fs::read(output.join("checkpoints.json"))?,
+            expected_checkpoints
+        );
+        verify_run_bundle(&output)?;
+
+        let original: serde_json::Value = serde_json::from_slice(&expected_events)?;
+        for mutation in [
+            "missing",
+            "extra",
+            "reordered",
+            "unknown-field",
+            "missing-field",
+            "island",
+        ] {
+            let mut changed = original.clone();
+            let rows = changed.as_array_mut().expect("event array");
+            match mutation {
+                "missing" => {
+                    assert!(rows.pop().is_some());
+                }
+                "extra" => rows.push(rows.last().expect("last event").clone()),
+                "reordered" => rows.swap(0, 1),
+                "unknown-field" => rows[0]["unrecorded_fact"] = true.into(),
+                "missing-field" => {
+                    assert!(
+                        rows[0]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("island_id")
+                            .is_some()
+                    );
+                }
+                "island" => rows[0]["island_id"] = 7.into(),
+                _ => unreachable!("fixed mutations"),
+            }
+            let mut contradictory = bundle.clone();
+            // A count matching the forged export cannot conceal a DB disagreement.
+            contradictory.digests.event_count = rows.len() as u64;
+            rehash_test_artifact(
+                &output,
+                &mut contradictory,
+                "events.json",
+                &serde_json::to_vec(&changed)?,
+            )?;
+            assert!(
+                matches!(
+                    verify_run_bundle(&output),
+                    Err(BundleError::DatabaseProjectionMismatch("events.json"))
+                ),
+                "hash-valid mutation was accepted: {mutation}"
+            );
+        }
+        for non_array in ["null", "false", "42", "\"events\"", "{}"] {
+            rehash_test_artifact(
+                &output,
+                &mut bundle.clone(),
+                "events.json",
+                non_array.as_bytes(),
+            )?;
+            assert!(matches!(
+                verify_run_bundle(&output),
+                Err(BundleError::DatabaseProjectionMismatch("events.json"))
+            ));
+        }
+        let mut trailing = expected_events.clone();
+        trailing.extend_from_slice(b"\n[]");
+        rehash_test_artifact(&output, &mut bundle.clone(), "events.json", &trailing)?;
+        assert!(matches!(
+            verify_run_bundle(&output),
+            Err(BundleError::Json(_))
+        ));
+
+        let mut wrong_count = bundle.clone();
+        wrong_count.digests.event_count += 1;
+        rehash_test_artifact(&output, &mut wrong_count, "events.json", &expected_events)?;
+        assert!(matches!(
+            verify_run_bundle(&output),
+            Err(BundleError::DatabaseProjectionMismatch("events.json"))
+        ));
+
+        // Compact serialization reorders object keys; both it and trailing whitespace
+        // remain valid under the original semantic Value comparison contract.
+        let mut reformatted = serde_json::to_vec(&original)?;
+        reformatted.extend_from_slice(b"\n \t");
+        rehash_test_artifact(&output, &mut bundle.clone(), "events.json", &reformatted)?;
+        verify_run_bundle(&output)?;
+        rehash_test_artifact(
+            &output,
+            &mut bundle.clone(),
+            "events.json",
+            &expected_events,
+        )?;
+        verify_run_bundle(&output)?;
+        assert_eq!(fs::read(source)?, source_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_projection_preserves_callback_errors_and_reader_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = streaming_fixture("streaming-abort", 2)?;
+        let reader = StorageReader::open_finished(&source.to_string_lossy())?;
+        let companion = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(crate::storage_writer_lock_path(&source.to_string_lossy()))?;
+        let mut visited = 0;
+        let refused = reader.visit_finished_replay_events(|_| {
+            visited += 1;
+            Err(BundleError::Io {
+                path: PathBuf::from("consumer-output"),
+                error: std::io::Error::new(std::io::ErrorKind::WriteZero, "consumer stopped"),
+            })
+        });
+        assert_eq!(
+            visited, 1,
+            "consumer failure must abort the remaining traversal"
+        );
+        assert!(matches!(
+            refused,
+            Err(BundleError::Io { path, error })
+                if path == Path::new("consumer-output")
+                    && error.kind() == std::io::ErrorKind::WriteZero
+                    && error.to_string() == "consumer stopped"
+        ));
+        assert!(matches!(
+            companion.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        let engine_failure: Result<(), BundleError> = reader.visit_finished_rows(
+            "SELECT tick FROM bundle_missing_table WHERE run_id = ?1",
+            |_| Ok(()),
+            |()| panic!("a refused engine query must not deliver a row"),
+        );
+        assert!(matches!(
+            engine_failure,
+            Err(BundleError::Storage(StorageError::Database(error)))
+                if !matches!(error, crate::FrankenError::Abort)
+        ));
+        let mut event_count = 0;
+        reader.visit_finished_replay_events(|_| -> Result<(), BundleError> {
+            event_count += 1;
+            Ok(())
+        })?;
+        assert_eq!(
+            event_count, 8,
+            "the same reader remains usable after both failures"
+        );
+        let mut checkpoint_count = 0;
+        reader.visit_finished_checkpoints(|_| -> Result<(), BundleError> {
+            checkpoint_count += 1;
+            Ok(())
+        })?;
+        assert_eq!(checkpoint_count, 2);
+        assert!(matches!(
+            companion.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        reader.close()?;
+        companion.try_lock()?;
+        companion.unlock()?;
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_bundle_rejects_late_checkpoint_corruption_without_success_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = streaming_fixture("streaming-corrupt-checkpoint", 1)?;
+        let connection = crate::Connection::open(source.to_string_lossy().into_owned())?;
+        assert_eq!(
+            connection.execute(
+                "UPDATE checkpoints SET payload_digest = 'blake3:corrupt'
+                 WHERE checkpoint_id = 'checkpoint-1'"
+            )?,
+            1
+        );
+        connection.close()?;
+        let source_bytes = fs::read(&source)?;
+        let output = temp_bundle_dir("streaming-corrupt-checkpoint");
+        let result = create_run_bundle(&source, &output);
+        assert!(matches!(
+            result,
+            Err(BundleError::Storage(StorageError::InvalidData { context: "checkpoints.payload", reason }))
+                if reason.contains("checkpoint-1") && reason.contains("digest mismatch")
+        ));
+        assert!(output.join("run.db").is_file());
+        assert!(output.join("events.json").is_file());
+        assert!(output.join("checkpoints.json").is_file());
+        assert!(!output.join("bundle_manifest.json").exists());
+        assert_eq!(fs::read(&source)?, source_bytes);
+        // Failure releases both leases; inspecting retained evidence must remain possible.
+        StorageReader::open_finished(&source.to_string_lossy())?.close()?;
+        StorageReader::open_finished(&output.join("run.db").to_string_lossy())?.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn projection_writer_counts_only_successful_short_writes() -> std::io::Result<()> {
+        struct ShortWrites {
+            bytes: Vec<u8>,
+        }
+        impl Write for ShortWrites {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let remaining = 5 - self.bytes.len();
+                if remaining == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "sink full",
+                    ));
+                }
+                let count = bytes.len().min(remaining).min(3);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush refused"))
+            }
+        }
+        let mut writer = ProjectionWriter {
+            file: ShortWrites { bytes: Vec::new() },
+            hash: blake3::Hasher::new(),
+            bytes_len: 0,
+        };
+        assert_eq!(writer.write(b"abcdef")?, 3);
+        assert_eq!(writer.write(b"defghi")?, 2);
+        assert_eq!(
+            writer.write(b"fgh").unwrap_err().kind(),
+            std::io::ErrorKind::WriteZero
+        );
+        assert_eq!(writer.bytes_len, 5);
+        assert_eq!(writer.file.bytes, b"abcde");
+        assert_eq!(writer.hash.finalize(), blake3::hash(b"abcde"));
+        assert_eq!(writer.flush().unwrap_err().to_string(), "flush refused");
+        assert_eq!(writer.bytes_len, 5);
+        assert_eq!(writer.hash.finalize(), blake3::hash(b"abcde"));
+        Ok(())
     }
 
     #[test]
