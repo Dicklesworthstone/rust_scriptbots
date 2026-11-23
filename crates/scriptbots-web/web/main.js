@@ -171,6 +171,7 @@ let remoteMode = false;
 let remoteClient = null;
 let remoteFrame = null;
 let remoteConnected = false;
+const remoteOwnerState = document.getElementById("remote-owner-state");
 let lastRemoteRequestId = null;
 let lastRemoteCommandId = null;
 let lastRemoteStatusRequestId = null;
@@ -324,6 +325,7 @@ function updateLocalTransferControl(controller = checkpointLab) {
 }
 
 function updateCheckpointLabVisibility() {
+  checkpointLab.setOwnerWritable(remoteOwnerAllowsMutation());
   const observed = remoteFrame && lastPaintedLiveFrame?.sessionId === remoteFrame.identity.sessionId
     && lastPaintedLiveFrame.simulationGeneration === simulationGeneration;
   checkpointLab.setEnabled(remoteMode && remoteConnected && !!observed && !!checkpointLabPanel?.open && !document.hidden);
@@ -517,9 +519,12 @@ document.getElementById("lab-checkpoint-download")?.addEventListener("click", ()
 document.getElementById("lab-report-download")?.addEventListener("click", () => { void offerLabDownload(() => checkpointLab.downloadReport()); });
 document.getElementById("lab-artifact-download")?.addEventListener("click", () => { void offerLabDownload(() => checkpointLab.downloadSelectedArtifact()); });
 function startLabPolling() {
-  if (labPollTimer === null) labPollTimer = setInterval(() => { void checkpointLab.poll(); void experiments.poll(); }, 1000);
+  if (labPollTimer === null) labPollTimer = setInterval(() => {
+    void remoteClient?.pollOwnerStatus();
+    void checkpointLab.poll(); void experiments.poll();
+  }, 1000);
 }
-window.addEventListener("pageshow", () => { updateCheckpointLabVisibility(); updateExperimentVisibility(); startLabPolling(); });
+window.addEventListener("pageshow", () => { updateRemoteOwnerPolling(); updateCheckpointLabVisibility(); updateExperimentVisibility(); startLabPolling(); });
 updateLabTreatmentFields();
 renderCheckpointLab(checkpointLabPanel, checkpointLab);
 renderStudyReport(labReportPanel, checkpointLab.reportModel);
@@ -631,9 +636,12 @@ interventions = localInterventions;
 let localInterventionOwner = null;
 let remoteInterventionEndpoint = null;
 let interventionNeedsAttach = false;
-const updateInterventionVisibility = () => interventions.setEnabled(!reviewedCheckpoint && Boolean(interventionPanel?.open)
-  && !document.hidden && !interventionNeedsAttach
-  && (remoteMode ? remoteConnected && remoteFrame !== null : localOwnerAllowsCommands()));
+const updateInterventionVisibility = () => {
+  interventions.setMutationAllowed(remoteMode ? remoteOwnerAllowsMutation() : localOwnerAllowsCommands());
+  interventions.setEnabled(!reviewedCheckpoint && Boolean(interventionPanel?.open)
+    && !document.hidden && !interventionNeedsAttach
+    && (remoteMode ? remoteConnected && remoteFrame !== null : localOwnerAllowsCommands()));
+};
 function observeInterventions(frame) {
   if (interventionNeedsAttach) {
     // A verified source must also have painted before it can stage an experiment.
@@ -912,6 +920,7 @@ document.addEventListener("visibilitychange", () => {
   try { applyPlaybackSpeed(); }
   catch (error) { appendLog(`Simulation clock stopped: ${error.message || error}`); }
   updateCheckpointControls();
+  updateRemoteOwnerPolling();
 });
 
 populationSlider.addEventListener("input", () => {
@@ -1031,6 +1040,42 @@ function stopLocalClock(error) {
   updateInterventionVisibility();
 }
 
+function remoteOwnerAllowsMutation() {
+  return remoteMode && remoteConnected && remoteClient?.ownerAllowsMutation === true;
+}
+
+function updateRemoteOwnerPolling() {
+  remoteClient?.setOwnerStatusEnabled(remoteMode && remoteConnected && !document.hidden);
+}
+
+function renderRemoteOwnerStatus() {
+  if (!remoteOwnerState) return;
+  remoteOwnerState.hidden = !remoteMode;
+  const status = remoteClient?.ownerStatus;
+  const current = remoteConnected && remoteClient?.ownerStatusAvailable === true
+    && remoteClient.ownerStatusEnabled && status?.identity.sessionId === remoteClient.tracker.sessionId;
+  const state = !current ? "unavailable" : status.health === "faulted" ? "faulted"
+    : status.lifecycle !== "running" ? status.lifecycle : status.health;
+  remoteOwnerState.dataset.state = state;
+  remoteOwnerState.dataset.sessionId = status?.identity.sessionId ?? "";
+  remoteOwnerState.dataset.tick = status?.identity.tick ?? "";
+  remoteOwnerState.dataset.publicationRevision = status?.identity.publicationRevision ?? "";
+  remoteOwnerState.dataset.faultCode = status?.fault?.code ?? "";
+  let description = "Waiting for a current owner observation. Live-world commands are disabled.";
+  if (status) {
+    const fault = status.fault;
+    const boundary = fault?.kind === "scientific" ? `tick ${fault.tick}`
+      : fault?.kind === "journal" ? `journal batch ${fault.session_id}/${fault.batch_sequence}` : `tick ${status.identity.tick}`;
+    description = fault ? `${fault.kind} fault at ${boundary} (${fault.code}): ${fault.message}${fault.diagnostic_truncated ? " [diagnostic truncated]" : ""}`
+      : `Owner ${status.lifecycle}, ${status.health}${status.blocker ? ` (${status.blocker})` : ""}; ${status.playback.paused ? "paused" : "running"} at tick ${status.identity.tick}.`;
+    description = `${current ? "Observed" : "Last observed"} ${description}`;
+    if (!current) description += " Current owner health is unavailable; live-world commands are disabled.";
+    else if (!remoteOwnerAllowsMutation()) description += " Live-world commands are disabled. Inspection and saved checkpoint transfer remain available.";
+  }
+  if (remoteClient?.ownerStatusError) description += ` Status read failed: ${remoteClient.ownerStatusError}`;
+  remoteOwnerState.textContent = description;
+}
+
 function updateRemoteControls() {
   updateInterventionVisibility();
   updateCheckpointLabVisibility();
@@ -1041,13 +1086,14 @@ function updateRemoteControls() {
   }
   remoteLocal.disabled = !remoteMode;
   remoteReconnect.disabled = !remoteMode || !remoteClient || remoteConnected;
-  for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteConnected || !!reviewedCheckpoint;
+  for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteOwnerAllowsMutation() || !!reviewedCheckpoint;
   remoteRefresh.disabled = !remoteConnected || !lastRemoteCommandId;
-  remoteRetry.disabled = !remoteConnected || !!reviewedCheckpoint || !lastRemoteRequestId;
+  remoteRetry.disabled = !remoteOwnerAllowsMutation() || !!reviewedCheckpoint || !lastRemoteRequestId;
   captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
   remoteOverlay.hidden = !remoteMode || !!remoteFrame || !!reviewedCheckpoint;
   renderCheckpointView();
   renderLocalOwnerStatus();
+  renderRemoteOwnerStatus();
   updateCheckpointControls();
   updateWorldNavigation();
 }
@@ -1141,6 +1187,7 @@ function receiveRemoteState(state) {
   if (!remoteMode) return;
   const hadFrame = remoteFrame !== null;
   remoteConnected = state.state === "connected";
+  updateRemoteOwnerPolling();
   narrative.setConnection(remoteConnected ? null
     : `Server history is not live: ${String(state.message || state.state).slice(0, 512)}. Retained events describe the earlier observation.`);
   if (!remoteConnected) {
@@ -1195,6 +1242,7 @@ function connectRemote() {
       onFrame: receiveRemoteFrame,
       onState: receiveRemoteState,
       onReceipt: receiveRemoteReceipt,
+      onOwnerStatus: (client) => { if (remoteMode && remoteClient === client) updateRemoteControls(); },
     });
     // Freeze local science before changing the active source. The saved local
     // owner is resumed only by the user's explicit Return to Local action.
@@ -1304,6 +1352,7 @@ remoteLocal.addEventListener("click", returnToLocalSimulation);
 
 function sendRemoteControl(command) {
   try {
+    if (!remoteOwnerAllowsMutation()) throw new Error("Wait for a current running owner before sending live-world commands");
     if (reviewedCheckpoint) throw new Error("Return to live before controlling the server");
     lastRemoteCommandId = null;
     lastRemoteStatusRequestId = null;
@@ -1330,6 +1379,7 @@ remoteRefresh.addEventListener("click", () => {
 });
 remoteRetry.addEventListener("click", () => {
   try {
+    if (!remoteOwnerAllowsMutation()) throw new Error("Wait for a current running owner before retrying live-world commands");
     if (reviewedCheckpoint) throw new Error("Return to live before retrying a server command");
     remoteClient.retryControl(lastRemoteRequestId);
     remoteReceipt.textContent = `Retried the same command identity (${lastRemoteRequestId}); awaiting the server's receipt.`;

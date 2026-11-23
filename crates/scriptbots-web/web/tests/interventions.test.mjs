@@ -307,6 +307,40 @@ test("admission and queue application do not permit another experiment before a 
   assert.equal(h.controller.canStage, true);
 });
 
+test("owner health gates mutations while retaining in-flight outcomes and read-only evidence", async () => {
+  const h = harness();
+  const staged = h.controller.stage(action()), sent = h.sends[0].request;
+  h.controller.setMutationAllowed(false);
+  assert.equal(h.sends[0].signal.aborted, false, "health cannot erase an already submitted outcome");
+  assert.equal(h.controller.canStage, false);
+  await assert.rejects(h.controller.stage(action()));
+  await h.controller.retry();
+  assert.equal(h.sends.length, 1);
+  h.sends[0].resolve(receipt(sent, { journal: "pending" }));
+  await staged;
+  assert.equal(h.controller.receipt.commandId, COMMAND);
+
+  const read = h.controller.refreshReceipt();
+  assert.equal(h.statuses.length, 1);
+  h.statuses[0].resolve(receipt(sent, { journal: "durable" }));
+  await read;
+  assert.equal(h.controller.receipt.journalState, "durable");
+  h.histories[0].resolve(history(h.histories[0].request));
+  await flush();
+  const refreshed = h.controller.refreshHistory(true);
+  assert.equal(h.histories.length, 2);
+  h.histories[1].resolve(history(h.histories[1].request));
+  await refreshed;
+  assert.equal(h.controller.historyPage.records.length, 2);
+  assert.equal(h.identities(), 1, "read-only observation must retain the original command identity");
+
+  h.controller.setMutationAllowed(true);
+  const retried = h.controller.retry();
+  assert.equal(h.sends[1].request, sent, "a newly observed running owner can retry the same retained request");
+  h.sends[1].resolve(receipt(sent, { journal: "durable" }));
+  await retried;
+});
+
 test("an actual stale-control rejection remains a refusal and permits a fresh paused experiment", async () => {
   const h = harness();
   const staged = h.controller.stage(action());

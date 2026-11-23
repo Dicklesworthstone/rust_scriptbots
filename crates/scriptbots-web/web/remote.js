@@ -15,10 +15,63 @@ const MAX_SEND_BUFFER_BYTES = 64 * 1024;
 const MAX_REQUESTS = 32;
 const MAX_INSPECTION_BYTES = 16 * 1024;
 const MAX_BRAIN_ACTIVITY_BYTES = 512 * 1024;
+const MAX_OWNER_STATUS_BYTES = 16 * 1024;
+const OWNER_STATUS_POLL_MS = 1000;
 const CHANNELS = ["canvas", "telemetry", "events"];
 const IDENTITY_FIELDS = ["sessionId", "publicationRevision", "scientificRevision",
   "controlRevision", "configRevision", "tick"];
 const encoder = new TextEncoder();
+
+/** Validate one canonical health observation, independently of socket connectivity. */
+export function validateRemoteOwnerStatus(value, sessionId, previous = null) {
+  if (value?.schema !== "scriptbots.remote-owner-status.v1" || !value.identity
+      || !["running", "stopping", "stopped"].includes(value.lifecycle)
+      || !["healthy", "blocked", "faulted"].includes(value.health)
+      || typeof value.playback?.paused !== "boolean" || !Number.isFinite(value.playback.speedMultiplier)
+      || value.playback.speedMultiplier < 0) {
+    throw new Error("Invalid remote owner status");
+  }
+  for (const field of IDENTITY_FIELDS) decimal(value.identity[field]);
+  if (value.identity.sessionId !== sessionId) throw new Error("Remote owner status belongs to another session");
+  if (value.health === "blocked" ? typeof value.blocker !== "string" || encoder.encode(value.blocker).length > 512
+    : value.blocker !== null) throw new Error("Invalid remote owner blocker");
+  let fault = null;
+  if (value.health === "faulted") {
+    const detail = value.fault;
+    if (!detail || !["scientific", "journal", "protocol"].includes(detail.kind)
+        || typeof detail.code !== "string" || encoder.encode(detail.code).length > 128
+        || typeof detail.message !== "string" || encoder.encode(detail.message).length > 2048
+        || typeof detail.diagnostic_truncated !== "boolean") throw new Error("Invalid bounded remote owner fault");
+    fault = { kind: detail.kind, code: detail.code, message: detail.message,
+      diagnostic_truncated: detail.diagnostic_truncated };
+    if (detail.kind === "scientific") {
+      if (decimal(detail.tick) > decimal(value.identity.tick)) throw new Error("Remote fault follows its owner publication");
+      fault.tick = detail.tick;
+    } else if (detail.kind === "journal") {
+      decimal(detail.session_id); decimal(detail.batch_sequence);
+      if (detail.session_id !== sessionId) throw new Error("Remote journal fault belongs to another session");
+      fault.session_id = detail.session_id; fault.batch_sequence = detail.batch_sequence;
+    }
+  } else if (value.fault !== null) throw new Error("Unexpected fault in healthy remote owner status");
+  const status = { schema: value.schema,
+    identity: Object.fromEntries(IDENTITY_FIELDS.map((field) => [field, value.identity[field]])),
+    lifecycle: value.lifecycle, health: value.health, blocker: value.blocker, fault,
+    playback: { paused: value.playback.paused, speedMultiplier: value.playback.speedMultiplier } };
+  if (previous) {
+    if (previous.identity.sessionId !== sessionId
+        || IDENTITY_FIELDS.some((field) => field !== "sessionId" && decimal(status.identity[field]) < decimal(previous.identity[field]))) {
+      throw new Error("Remote owner status regressed behind its previous publication");
+    }
+    const lifecycle = ["running", "stopping", "stopped"];
+    if ((previous.health === "faulted" && status.health !== "faulted")
+        || lifecycle.indexOf(status.lifecycle) < lifecycle.indexOf(previous.lifecycle)
+        || (status.identity.publicationRevision === previous.identity.publicationRevision
+          && JSON.stringify(status) !== JSON.stringify(previous))) {
+      throw new Error("Remote owner status contradicts its retained publication");
+    }
+  }
+  return status;
+}
 
 /** Preserve actual HTTP refusal separately from transport failures and lost receipts. */
 export class RemoteOwnerHttpError extends Error {
@@ -344,7 +397,7 @@ function controlText(command, options) {
 /** Bounded browser WebSocket client. Reconnect and command retries are explicit. */
 export class RemoteStreamClient {
   constructor({ url, decodeFrame, channels = CHANNELS, maxFps = 60,
-    onFrame = () => {}, onState = () => {}, onReceipt = () => {} }) {
+    onFrame = () => {}, onState = () => {}, onReceipt = () => {}, onOwnerStatus = () => {} }) {
     const parsed = new URL(url, globalThis.location?.href);
     if (!["ws:", "wss:"].includes(parsed.protocol) || parsed.username || parsed.password) {
       throw new Error("Use a ws:// or wss:// endpoint without URL credentials");
@@ -357,6 +410,14 @@ export class RemoteStreamClient {
     this.onFrame = onFrame;
     this.onState = onState;
     this.onReceipt = onReceipt;
+    this.onOwnerStatus = onOwnerStatus;
+    this.ownerStatus = null;
+    this.ownerStatusError = null;
+    this.ownerStatusAvailable = false;
+    this.ownerStatusEnabled = false;
+    this.ownerStatusPending = null;
+    this.ownerStatusEpoch = 0;
+    this.ownerStatusAttemptAt = -Infinity;
     this.tracker = new RemoteFrameTracker(this.channels);
     this.requests = new Map();
     this.socket = null;
@@ -366,6 +427,58 @@ export class RemoteStreamClient {
   }
 
   get resume() { return this.tracker.resume(this.channels); }
+
+  get ownerAllowsMutation() {
+    return this.state === "connected" && this.ownerStatusEnabled && this.ownerStatusAvailable
+      && this.ownerStatus?.identity.sessionId === this.tracker.sessionId
+      && this.ownerStatus.lifecycle === "running" && this.ownerStatus.health !== "faulted";
+  }
+
+  /** Hidden/disconnected sources retain their last observation, never its authority. */
+  setOwnerStatusEnabled(value) {
+    const enabled = Boolean(value) && this.state === "connected";
+    if (enabled === this.ownerStatusEnabled) return;
+    this.ownerStatusEnabled = enabled;
+    this.ownerStatusAvailable = false;
+    this.ownerStatusAttemptAt = -Infinity;
+    this.ownerStatusEpoch += 1;
+    this.ownerStatusPending?.abort.abort();
+    this.onOwnerStatus(this);
+    if (enabled) void this.pollOwnerStatus();
+  }
+
+  /** One pending request across source changes; a cancelled read cannot overwrite a new owner. */
+  async pollOwnerStatus(now = performance.now()) {
+    if (!this.ownerStatusEnabled || this.state !== "connected" || this.ownerStatusPending
+        || now < this.ownerStatusAttemptAt + OWNER_STATUS_POLL_MS) return false;
+    const pending = { abort: new AbortController(), epoch: this.ownerStatusEpoch,
+      generation: this.generation, sessionId: this.tracker.sessionId };
+    this.ownerStatusPending = pending;
+    this.ownerStatusAttemptAt = now;
+    const current = () => this.ownerStatusPending === pending && this.ownerStatusEnabled
+      && this.state === "connected" && this.ownerStatusEpoch === pending.epoch
+      && this.generation === pending.generation && this.tracker.sessionId === pending.sessionId;
+    try {
+      const response = await this.labJson("/api/v1/owner/status", pending.sessionId, MAX_OWNER_STATUS_BYTES,
+        { signal: pending.abort.signal, timeoutMs: 2000 });
+      if (!current()) return false;
+      const previous = this.ownerStatus?.identity.sessionId === pending.sessionId ? this.ownerStatus : null;
+      this.ownerStatus = validateRemoteOwnerStatus(response, pending.sessionId, previous);
+      this.ownerStatusError = null;
+      this.ownerStatusAvailable = true;
+      this.onOwnerStatus(this);
+      return true;
+    } catch (error) {
+      if (current()) {
+        this.ownerStatusAvailable = false;
+        this.ownerStatusError = String(error.message || error).slice(0, 1024);
+        this.onOwnerStatus(this);
+      }
+      return false;
+    } finally {
+      if (this.ownerStatusPending === pending) this.ownerStatusPending = null;
+    }
+  }
 
   /** Read bounded scientific detail from the same host as the negotiated stream. */
   async inspectAgent(uid, { sessionId, epoch, signal } = {}) {
@@ -618,6 +731,7 @@ export class RemoteStreamClient {
 
   report(state, message, extra = {}) {
     this.state = state;
+    if (state !== "connected") this.setOwnerStatusEnabled(false);
     this.onState({ state, message, sessionId: this.tracker.sessionId, ...extra });
   }
 

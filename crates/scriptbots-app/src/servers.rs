@@ -49,9 +49,9 @@ use crate::control::{
     MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH,
     MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
     PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse,
-    PaginatedExperimentsResponse, Scoreboard, SelectionModeDto, SelectionSnapshotDto,
-    SelectionStateDto, SimulationStatusDto, SpeedRequest, parse_intervention_command,
-    parse_map_artifact,
+    PaginatedExperimentsResponse, RemoteOwnerStatusDto, Scoreboard, SelectionModeDto,
+    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
+    parse_intervention_command, parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
@@ -1710,6 +1710,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
         post_control_shutdown,
         get_control_status,
         get_status,
+        get_v1_owner_status,
         get_selection,
         get_interventions,
         post_map_generate,
@@ -1776,6 +1777,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
             StepRequestBody,
             SpeedRequestBody,
             SimulationStatusDto,
+            RemoteOwnerStatusDto,
             MapGenerateRequestBody,
             MapApplyRequestBody,
             MapApplyAgentPolicy,
@@ -4364,6 +4366,30 @@ async fn get_status(State(state): State<ApiState>) -> Result<Json<SimulationStat
     Ok(Json(status))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/owner/status",
+    tag = "control",
+    params(
+        ("X-ScriptBots-Session" = Option<String>, Header, description = "Exact canonical decimal host session negotiated by the browser stream")
+    ),
+    responses(
+        (status = 200, description = "Read-only canonical owner health with exact decimal identities and bounded diagnostics", body = RemoteOwnerStatusDto),
+        (status = 400, description = "Malformed expected owner identity"),
+        (status = 409, description = "Expected owner session differs from this host"),
+        (status = 503, description = "Owner observation temporarily unavailable")
+    )
+)]
+async fn get_v1_owner_status(
+    State(state): State<ApiState>,
+) -> Result<Json<RemoteOwnerStatusDto>, AppError> {
+    let status = run_control(ControlWorkLane::Command, move || {
+        state.handle.remote_owner_status()
+    })
+    .await?;
+    Ok(Json(status))
+}
+
 /// Query parameters for paginated list endpoints.
 #[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 pub struct PaginationQueryParams {
@@ -5191,6 +5217,7 @@ fn prepare_rest_server(
             "/api/v1/checkpoints/branches/{branch_id}/cancel",
             post(post_v1_checkpoint_branch_cancel),
         )
+        .route("/api/v1/owner/status", get(get_v1_owner_status))
         .route("/api/v1/artifacts", get(get_v1_artifacts))
         .route(
             "/api/v1/artifacts/{artifact_id}",
@@ -8159,6 +8186,7 @@ mod tests {
             .build()
             .unwrap();
         for (method, path) in [
+            (reqwest::Method::GET, "/api/v1/owner/status"),
             (reqwest::Method::POST, "/api/v1/experiments"),
             (reqwest::Method::GET, "/api/v1/experiments"),
             (reqwest::Method::GET, "/api/v1/experiments/missing"),
@@ -8248,7 +8276,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected_preflight.status().as_u16(), 403);
-        for path in ["/api/v1/checkpoints", "/api/v1/experiments"] {
+        for path in [
+            "/api/v1/checkpoints",
+            "/api/v1/experiments",
+            "/api/v1/owner/status",
+        ] {
             for expected_session in [None, Some(session.as_str())] {
                 let mut request = client.get(format!("http://{address}{path}"));
                 if let Some(value) = expected_session {
@@ -8260,6 +8292,45 @@ mod tests {
                     "{path}"
                 );
             }
+        }
+        let owner_url = format!("http://{address}/api/v1/owner/status");
+        let original_publication = handle.read_snapshot().unwrap();
+        let observed: Value = client
+            .get(&owner_url)
+            .header(LAB_SESSION_HEADER, &session)
+            .header("Origin", browser_origin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            observed,
+            serde_json::to_value(handle.remote_owner_status().unwrap()).unwrap()
+        );
+        assert_eq!(observed["identity"]["sessionId"], session);
+        assert_eq!(observed["playback"]["speedMultiplier"], 1.0);
+        assert!(Arc::ptr_eq(
+            &original_publication,
+            &handle.read_snapshot().unwrap()
+        ));
+        for (header, value, expected) in [
+            (LAB_SESSION_HEADER, "01", 400),
+            ("Origin", "https://untrusted.example", 403),
+            ("Host", "untrusted.example", 403),
+        ] {
+            assert_eq!(
+                client
+                    .get(&owner_url)
+                    .header(header, value)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16(),
+                expected
+            );
         }
         let experiment_url = format!("http://{address}/api/v1/experiments");
         let experiment = json!({

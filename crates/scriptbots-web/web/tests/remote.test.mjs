@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import test from "node:test";
-import { RemoteFrameTracker, RemoteStreamClient, consumeRemoteFrame } from "../remote.js";
+import { RemoteFrameTracker, RemoteStreamClient, consumeRemoteFrame, validateRemoteOwnerStatus } from "../remote.js";
 import { EXPERIMENT_LIMITS, prepareExperimentRequest } from "../experiment-protocol.js";
 import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
 
@@ -450,15 +450,182 @@ test("a synchronous reconnect during consumption retains the new connection's fr
   assert.equal(value.resume().after_revision, "10");
 });
 
-function experimentTransport() {
+function experimentTransport(sessionId = SESSION) {
   const client = new RemoteStreamClient({ url: "wss://lab.example/prefix/api/ws/stream?discard=yes#fragment", decodeFrame() {} });
   client.state = "connected";
-  client.tracker.acknowledge(SESSION);
+  client.tracker.acknowledge(sessionId);
   const prepared = prepareExperimentRequest({ experiment_id: "cohort.example", seeds: ["9007199254740993", "18446744073709551615"],
     variants: [{ variant_id: "control", brain_family: "mlp" }, { variant_id: "treatment", brain_family: "dwraon" }],
     ticks_per_run: 20, max_concurrency: 1, idempotency_key: "one-exact-cohort" });
   return { client, prepared, sessionId: client.tracker.sessionId };
 }
+
+const OWNER_SESSION = "18446744073709551615";
+function ownerStatusFixture(sessionId = OWNER_SESSION, revision = "9007199254740993") {
+  return { schema: "scriptbots.remote-owner-status.v1",
+    identity: { sessionId, publicationRevision: revision, scientificRevision: "9007199254740993",
+      controlRevision: "9007199254740992", configRevision: "18446744073709551615", tick: "9007199254740993" },
+    lifecycle: "running", health: "healthy", blocker: null, fault: null,
+    playback: { paused: true, speedMultiplier: 1 } };
+}
+const settleOwnerStatus = () => new Promise((resolve) => setImmediate(resolve));
+
+test("remote owner status preserves exact fault identities and refuses contradictory publications", () => {
+  const source = ownerStatusFixture();
+  const healthy = validateRemoteOwnerStatus(source, OWNER_SESSION);
+  assert.equal(healthy.identity.sessionId, OWNER_SESSION);
+  assert.equal(healthy.identity.scientificRevision, "9007199254740993");
+  assert.equal(healthy.identity.controlRevision, "9007199254740992");
+  assert.equal(healthy.identity.configRevision, "18446744073709551615");
+  const fastOwner = structuredClone(source); fastOwner.playback.speedMultiplier = 99;
+  assert.equal(validateRemoteOwnerStatus(fastOwner, OWNER_SESSION).playback.speedMultiplier, 99,
+    "remote status follows the canonical finite nonnegative speed contract");
+  assert.throws(() => validateRemoteOwnerStatus(ownerStatusFixture("18446744073709551616"),
+    "18446744073709551616"), /identity/, "owner sessions follow the canonical u64 REST header contract");
+  const failed = ownerStatusFixture(OWNER_SESSION, "9007199254740994");
+  failed.health = "faulted";
+  failed.fault = { kind: "scientific", tick: failed.identity.tick, code: "brain_spawn",
+    message: "<img src=x onerror=bad()> real diagnostic", diagnostic_truncated: false };
+  const faulted = validateRemoteOwnerStatus(failed, OWNER_SESSION, healthy);
+  assert.equal(faulted.fault.tick, failed.identity.tick);
+  const journal = structuredClone(failed);
+  journal.fault = { kind: "journal", session_id: OWNER_SESSION, batch_sequence: "18446744073709551615",
+    code: "disk", message: "🦋".repeat(512), diagnostic_truncated: true };
+  assert.equal(validateRemoteOwnerStatus(journal, OWNER_SESSION).fault.batch_sequence, "18446744073709551615");
+  for (const change of [
+    (status) => { status.schema = "unknown"; },
+    (status) => { status.identity.sessionId = "8"; },
+    (status) => { status.identity.tick = 9007199254740992; },
+    (status) => { status.identity.configRevision = "18446744073709551616"; },
+    (status) => { status.playback = { paused: true, speed_multiplier: 1 }; },
+    (status) => { status.health = "faulted"; },
+    (status) => { status.blocker = "unexpected"; },
+  ]) {
+    const invalid = structuredClone(source); change(invalid);
+    assert.throws(() => validateRemoteOwnerStatus(invalid, OWNER_SESSION));
+  }
+  for (const change of [
+    (status) => { status.fault.message += "🦋"; },
+    (status) => { status.fault.session_id = "1"; },
+    (status) => { status.fault.session_id = "18446744073709551616"; },
+    (status) => { delete status.fault.diagnostic_truncated; },
+  ]) {
+    const invalid = structuredClone(journal); change(invalid);
+    assert.throws(() => validateRemoteOwnerStatus(invalid, OWNER_SESSION));
+  }
+  assert.throws(() => validateRemoteOwnerStatus(source, OWNER_SESSION, faulted), /regressed/);
+  const inventedRecovery = ownerStatusFixture(OWNER_SESSION, "9007199254740995");
+  assert.throws(() => validateRemoteOwnerStatus(inventedRecovery, OWNER_SESSION, faulted), /contradicts/);
+  const changedPublication = structuredClone(source); changedPublication.playback.paused = false;
+  assert.throws(() => validateRemoteOwnerStatus(changedPublication, OWNER_SESSION, healthy), /contradicts/);
+  const stopped = structuredClone(healthy); stopped.lifecycle = "stopped";
+  assert.throws(() => validateRemoteOwnerStatus(inventedRecovery, OWNER_SESSION, stopped), /contradicts/);
+});
+
+test("remote health polling requires a fresh session-bound read and never overlaps requests", async () => {
+  const original = globalThis.fetch, requests = [];
+  const { client, sessionId } = experimentTransport(OWNER_SESSION);
+  globalThis.fetch = (url, options) => new Promise((resolve) => requests.push({ url: new URL(url), options, resolve }));
+  try {
+    assert.equal(client.ownerAllowsMutation, false, "a connected socket is not an owner-health observation");
+    client.setOwnerStatusEnabled(true);
+    for (let count = 0; count < 8; count += 1) assert.equal(await client.pollOwnerStatus(), false);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url.href, "https://lab.example/prefix/api/v1/owner/status");
+    assert.equal(requests[0].options.headers["X-ScriptBots-Session"], sessionId);
+    assert.equal(requests[0].options.method, "GET");
+    requests[0].resolve(new Response(JSON.stringify(ownerStatusFixture(sessionId))));
+    await settleOwnerStatus();
+    assert.equal(client.ownerAllowsMutation, true);
+    // A recorded fractional performance clock can cross a double-precision
+    // boundary on its next exact deadline; elapsed-time subtraction loses it.
+    client.ownerStatusAttemptAt = 2010.2;
+    assert.equal(await client.pollOwnerStatus(client.ownerStatusAttemptAt + 999), false);
+    const pending = client.pollOwnerStatus(client.ownerStatusAttemptAt + 1000);
+    assert.equal(requests.length, 2);
+    const fault = ownerStatusFixture(sessionId, "9007199254740994");
+    fault.health = "faulted";
+    fault.fault = { kind: "scientific", tick: fault.identity.tick, code: "brain_spawn",
+      message: "completed fault", diagnostic_truncated: false };
+    requests[1].resolve(new Response(JSON.stringify(fault)));
+    assert.equal(await pending, true);
+    assert.equal(client.ownerAllowsMutation, false);
+    assert.equal(client.state, "connected", "owner fault does not impersonate a socket failure");
+    const older = client.pollOwnerStatus(client.ownerStatusAttemptAt + 1000);
+    requests[2].resolve(new Response(JSON.stringify(ownerStatusFixture(sessionId))));
+    assert.equal(await older, false);
+    assert.equal(client.ownerStatus.fault.code, "brain_spawn");
+    assert.equal(client.ownerStatusAvailable, false);
+    assert.match(client.ownerStatusError, /regressed/);
+  } finally { client.setOwnerStatusEnabled(false); globalThis.fetch = original; }
+});
+
+test("hidden and replaced sources abort health reads without admitting stale responses", async () => {
+  const original = globalThis.fetch, requests = [];
+  const { client, sessionId } = experimentTransport(OWNER_SESSION);
+  globalThis.fetch = (url, options) => new Promise((resolve) => requests.push({ options, resolve }));
+  try {
+    client.setOwnerStatusEnabled(true);
+    client.setOwnerStatusEnabled(false);
+    assert.equal(requests[0].options.signal.aborted, true);
+    client.setOwnerStatusEnabled(true);
+    assert.equal(requests.length, 1, "wait for even a cancelled request to release its single slot");
+    requests[0].resolve(new Response(JSON.stringify(ownerStatusFixture(sessionId))));
+    await settleOwnerStatus();
+    assert.equal(client.ownerStatus, null);
+    assert.equal(client.ownerAllowsMutation, false);
+    const visible = client.pollOwnerStatus();
+    assert.equal(requests.length, 2);
+    client.disconnect();
+    assert.equal(requests[1].options.signal.aborted, true);
+    client.tracker = new RemoteFrameTracker(["canvas"]);
+    client.tracker.acknowledge("9007199254740993");
+    client.report("connected", "replacement subscription fixture");
+    client.setOwnerStatusEnabled(true);
+    requests[1].resolve(new Response(JSON.stringify(ownerStatusFixture(sessionId))));
+    assert.equal(await visible, false);
+    assert.equal(client.ownerStatus, null);
+    const fresh = client.pollOwnerStatus();
+    assert.equal(requests[2].options.headers["X-ScriptBots-Session"], "9007199254740993");
+    const blocked = ownerStatusFixture("9007199254740993"); blocked.health = "blocked"; blocked.blocker = "JournalFull";
+    requests[2].resolve(new Response(JSON.stringify(blocked)));
+    assert.equal(await fresh, true);
+    assert.equal(client.ownerAllowsMutation, true, "a running blocked owner retains canonical control handling");
+  } finally { client.setOwnerStatusEnabled(false); globalThis.fetch = original; }
+});
+
+test("status HTTP failure and actual byte overflow disable writes while retaining readable observations", async () => {
+  const original = globalThis.fetch;
+  const { client, sessionId } = experimentTransport(OWNER_SESSION);
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify(ownerStatusFixture(sessionId)));
+    client.setOwnerStatusEnabled(true);
+    await settleOwnerStatus();
+    const observed = structuredClone(client.ownerStatus);
+    assert.equal(client.ownerAllowsMutation, true);
+    globalThis.fetch = async () => new Response('{"message":"temporarily unavailable"}', { status: 503 });
+    assert.equal(await client.pollOwnerStatus(client.ownerStatusAttemptAt + 1000), false);
+    assert.deepEqual(client.ownerStatus, observed);
+    assert.equal(client.ownerAllowsMutation, false);
+    globalThis.fetch = async () => new Response(JSON.stringify(ownerStatusFixture(sessionId)));
+    assert.equal(await client.pollOwnerStatus(client.ownerStatusAttemptAt + 1000), true);
+    assert.equal(client.ownerAllowsMutation, true, "a new successful observation restores a running owner's controls");
+    assert.equal(client.ownerStatusError, null);
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(16 * 1024 + 1)); },
+      cancel() { cancelled = true; },
+    }));
+    assert.equal(await client.pollOwnerStatus(client.ownerStatusAttemptAt + 1000), false);
+    assert.equal(cancelled, true);
+    assert.match(client.ownerStatusError, /exceeds/);
+    const stopping = ownerStatusFixture(sessionId, "9007199254740994"); stopping.lifecycle = "stopping";
+    globalThis.fetch = async () => new Response(JSON.stringify(stopping));
+    assert.equal(await client.pollOwnerStatus(client.ownerStatusAttemptAt + 1000), true);
+    assert.equal(client.ownerStatusAvailable, true);
+    assert.equal(client.ownerAllowsMutation, false);
+  } finally { client.setOwnerStatusEnabled(false); globalThis.fetch = original; }
+});
 
 test("run artifact inventory uses the same host and session, exact seeds and a bounded nonpaginated response", async () => {
   const original = globalThis.fetch, requests = [];

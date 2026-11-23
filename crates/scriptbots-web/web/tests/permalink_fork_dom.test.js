@@ -1501,6 +1501,12 @@ async function runRemoteScientificTransferCase(page, context, baseUrl, localFaul
   // Real page, remote client, bounded HTTP reads and SHA-256 verification. The
   // socket and WASM codec are explicit doubles, as in the local lifecycle cases.
   const sessionId = "18446744073709551610";
+  let ownerStatusHttp = 200;
+  const ownerStatus = { schema: "scriptbots.remote-owner-status.v1",
+    identity: { sessionId, publicationRevision: "100", scientificRevision: "91",
+      controlRevision: "2", configRevision: "1", tick: "91" },
+    lifecycle: "running", health: "healthy", blocker: null, fault: null,
+    playback: { paused: false, speedMultiplier: 1 } };
   const bytes = Buffer.from([77]);
   const checkpoint = { checkpoint_id: "saved-native-world", tick: 73, agent_count: 0, byte_size: bytes.length,
     world_digest_v1: "a".repeat(16), checksum_blake3: "b".repeat(64),
@@ -1515,6 +1521,11 @@ async function runRemoteScientificTransferCase(page, context, baseUrl, localFaul
     const request = route.request(), pathname = new URL(request.url()).pathname;
     requests.push({ path: pathname, method: request.method(), session: request.headers()["x-scriptbots-session"] });
     if (request.method() !== "GET") return route.fulfill({ status: 405, body: "Unexpected mutation" });
+    if (pathname === "/api/v1/owner/status") {
+      if (request.headers()["x-scriptbots-session"] !== sessionId) throw new Error("Owner status omitted its exact session header");
+      return route.fulfill({ status: ownerStatusHttp, contentType: "application/json",
+        body: JSON.stringify(ownerStatusHttp === 200 ? ownerStatus : { message: "controlled status read refusal" }) });
+    }
     if (pathname === `/api/v1/artifacts/${checkpoint.checkpoint_id}/download`) {
       return route.fulfill({ status: 200, contentType: artifact.content_type,
         headers: { "Content-Length": String(bytes.length) }, body: bytes });
@@ -1527,6 +1538,21 @@ async function runRemoteScientificTransferCase(page, context, baseUrl, localFaul
         : pathname === `/api/v1/artifacts/${checkpoint.checkpoint_id}` ? artifact : null;
     return route.fulfill({ status: body ? 200 : 404, contentType: "application/json", body: JSON.stringify(body) });
   });
+  const waitOwnerStatus = async (expected) => {
+    let timeout;
+    try {
+      await Promise.race([
+        page.evaluate((expected) => new Promise((resolve) => {
+          const node = document.getElementById("remote-owner-state");
+          const check = () => { if (node.dataset.state === expected) { observer.disconnect(); resolve(); } };
+          const observer = new MutationObserver(check);
+          observer.observe(node, { attributes: true });
+          check();
+        }), expected),
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(`Remote status never reached ${expected}`)), 10000); }),
+      ]);
+    } finally { clearTimeout(timeout); }
+  };
   await page.goto(baseUrl);
   await context.clock.runFor(32);
   let faultedLocal = null;
@@ -1582,6 +1608,7 @@ async function runRemoteScientificTransferCase(page, context, baseUrl, localFaul
     document.getElementById("remote-connect").click();
   }, sessionId);
   await context.clock.runFor(32);
+  await waitOwnerStatus("healthy");
   await page.selectOption("#lab-checkpoint-select", checkpoint.checkpoint_id);
   const state = () => page.evaluate(() => ({
     records: window.__ownerTest.records, closes: window.__remoteTransferTest.closes,
@@ -1594,6 +1621,8 @@ async function runRemoteScientificTransferCase(page, context, baseUrl, localFaul
     remoteStepDisabled: document.getElementById("remote-step").disabled,
     launchKind: document.getElementById("launch-info").dataset.kind,
     localNoticeHidden: document.getElementById("local-owner-state").hidden,
+    ownerState: { ...document.getElementById("remote-owner-state").dataset },
+    ownerNotice: document.getElementById("remote-owner-state").textContent,
   }));
   const connected = await state();
   const retained = connected.records.find((owner) => owner.freeCalls === 0);
@@ -1640,6 +1669,42 @@ async function runRemoteScientificTransferCase(page, context, baseUrl, localFaul
     }
     refusals.push({ failure, retainedOwner: retained.id, rejectedOwner: candidates[0]?.id ?? null });
   }
+  ownerStatusHttp = 503;
+  await context.clock.runFor(1100);
+  await waitOwnerStatus("unavailable");
+  const unavailable = await state();
+  if (unavailable.remote !== "connected" || !unavailable.remoteStepDisabled || unavailable.transferDisabled
+      || !unavailable.ownerNotice.includes("Status read failed")) {
+    throw new Error("A failed owner read disabled transport/read-only transfer or admitted unverified mutations");
+  }
+  ownerStatusHttp = 200;
+  await context.clock.runFor(1100);
+  await waitOwnerStatus("healthy");
+  if ((await state()).remoteStepDisabled) throw new Error("A fresh valid owner observation did not restore controls");
+
+  ownerStatus.identity.publicationRevision = "101";
+  if (localFault) {
+    ownerStatus.health = "faulted";
+    ownerStatus.fault = { kind: "scientific", tick: "91", code: "brain_spawn",
+      message: "<img src=x onerror=window.__remoteFaultMarkup=true> canonical remote fault", diagnostic_truncated: false };
+  } else ownerStatus.lifecycle = "stopping";
+  await context.clock.runFor(1100);
+  await waitOwnerStatus(localFault ? "faulted" : "stopping");
+  const terminal = await state();
+  const disabled = await page.evaluate(() => {
+    for (const id of ["remote-pause", "remote-resume", "remote-step"]) {
+      document.getElementById(id).dispatchEvent(new Event("click"));
+    }
+    return ["remote-pause", "remote-resume", "remote-step", "lab-checkpoint-save"]
+      .every((id) => document.getElementById(id).disabled);
+  });
+  if (!disabled || terminal.remote !== "connected" || terminal.transferDisabled
+      || terminal.ownerState.sessionId !== sessionId || terminal.ownerState.tick !== "91"
+      || terminal.records[retained.id - 1].driveCalls !== retained.driveCalls
+      || await page.locator("#remote-owner-state img").count() !== 0
+      || await page.evaluate(() => !!window.__remoteFaultMarkup)) {
+    throw new Error(`Remote owner failure was not isolated from transport/local state: ${JSON.stringify(terminal)}`);
+  }
   const imported = await transfer(null);
   const live = imported.records.filter((owner) => owner.freeCalls === 0);
   if (live.length !== 1 || live[0].id === retained.id || live[0].kind !== "scientific"
@@ -1656,6 +1721,7 @@ async function runRemoteScientificTransferCase(page, context, baseUrl, localFaul
   }
   return { evidence: "production DOM/remote client/HTTP integrity checks with explicit socket and WASM doubles",
     localOwnerHealth: localFault ? "settled_scientific_fault" : "healthy",
+    remoteOwnerHealth: terminal.ownerState, unavailableOwnerRead: unavailable.ownerState,
     sourceSession: sessionId, sourceTick: 91, savedTick: checkpoint.tick, retainedOwner: retained.id,
     importedOwner: live[0].id, refusals, requests, remoteCommands: imported.sent.map((request) => request.command),
     socketCloses: imported.closes, paused: live[0].speed === 0 };

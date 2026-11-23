@@ -1485,14 +1485,21 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     await page.fill("#remote-url", endpoint.replace("http:", "ws:") + "/api/ws/stream");
     await page.click("#remote-connect");
     await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "connected"
+      && document.getElementById("remote-owner-state").dataset.state === "healthy"
+      && !document.getElementById("remote-step").disabled
       && ["canvas", "telemetry", "events"].every((kind) => window.__remoteWire.frames[kind]));
     observations.frozenLocal = await page.evaluate(() => window.__remoteLocalHandle.frame().identity);
     observations.connected = await page.evaluate(() => ({ frames: window.__remoteWire.frames,
+      owner: { ...document.getElementById("remote-owner-state").dataset },
       sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
       disabled: ["steps-per-frame", "population", "reset-btn", "brain-preset", "checkpoint-save", "checkpoint-load",
         "checkpoint-browser-save", "checkpoint-browser-restore", "world-checkpoint-export", "world-checkpoint-import"]
         .map((id) => [id, document.getElementById(id)?.disabled]) }));
     const { canvas, telemetry, events } = observations.connected.frames;
+    if (observations.connected.owner.sessionId !== canvas.identity.sessionId
+        || observations.connected.owner.tick !== String(observations.initial.tick)) {
+      throw new Error("Remote health observation does not identify the independently paused owner");
+    }
     for (const frame of [canvas, telemetry, events]) {
       if (frame.identity.tick !== String(observations.initial.tick)
           || frame.identity.publicationRevision !== String(observations.initial.snapshot_revision)
@@ -1610,7 +1617,9 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "disconnected");
     const consumed = await page.evaluate(() => window.__remoteWire.sent.filter((message) => message.command === "stream_ack"));
     await page.click("#remote-reconnect");
-    await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "connected");
+    await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "connected"
+      && document.getElementById("remote-owner-state").dataset.state === "healthy"
+      && !document.getElementById("remote-step").disabled);
     observations.reconnect = await page.evaluate(() => window.__remoteWire.sent.filter((message) => message.command === "subscribe").at(-1));
     const cursor = observations.reconnect.resume;
     const revisions = ["canvas", "telemetry"].map((kind) => BigInt(consumed.findLast((ack) => ack.channel === kind).publication_revision));

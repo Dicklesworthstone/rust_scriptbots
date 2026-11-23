@@ -68,6 +68,140 @@ pub struct SimulationStatusDto {
     pub snapshot_revision: u64,
 }
 
+/// Exact, bounded browser observation of one immutable owner publication.
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteOwnerStatusDto {
+    pub schema: String,
+    pub identity: RemoteOwnerIdentityDto,
+    #[schema(value_type = String)]
+    pub lifecycle: scriptbots_runtime::HostLifecycle,
+    pub playback: RemoteOwnerPlaybackDto,
+    pub health: String,
+    pub blocker: Option<String>,
+    pub fault: Option<RemoteOwnerFaultDto>,
+}
+
+/// Decimal strings preserve full-width identities in ordinary browser JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteOwnerIdentityDto {
+    pub session_id: String,
+    pub publication_revision: String,
+    pub scientific_revision: String,
+    pub control_revision: String,
+    pub config_revision: String,
+    pub tick: String,
+}
+
+/// Browser playback uses the same field names as its remote canvas projection.
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteOwnerPlaybackDto {
+    pub paused: bool,
+    pub speed_multiplier: f32,
+}
+
+/// Typed fault identity; bounded diagnostic text never becomes HTML in the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteOwnerFaultDto {
+    Scientific {
+        tick: String,
+        code: String,
+        message: String,
+        diagnostic_truncated: bool,
+    },
+    Journal {
+        session_id: String,
+        batch_sequence: String,
+        code: String,
+        message: String,
+        diagnostic_truncated: bool,
+    },
+    Protocol {
+        code: String,
+        message: String,
+        diagnostic_truncated: bool,
+    },
+}
+
+fn bounded_owner_diagnostic(value: &str, byte_limit: usize) -> (String, bool) {
+    let mut end = value.len().min(byte_limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_owned(), end != value.len())
+}
+
+impl RemoteOwnerStatusDto {
+    fn from_snapshot(snapshot: &RenderSnapshot) -> Self {
+        use scriptbots_runtime::{HostFault, HostHealth};
+
+        // Even worst-case JSON escaping of these two text budgets fits the
+        // browser's 16 KiB response ceiling, with room for all exact identities.
+        let fault = snapshot.health.fault().map(|fault| {
+            let (code, message) = match fault {
+                HostFault::Scientific { code, message, .. }
+                | HostFault::Protocol { code, message } => (code.as_str(), message.as_str()),
+                HostFault::Journal { failure, .. } => {
+                    (failure.code.as_str(), failure.message.as_str())
+                }
+            };
+            let (code, code_truncated) = bounded_owner_diagnostic(code, 128);
+            let (message, message_truncated) = bounded_owner_diagnostic(message, 2048);
+            let diagnostic_truncated = code_truncated || message_truncated;
+            match fault {
+                HostFault::Scientific { tick, .. } => RemoteOwnerFaultDto::Scientific {
+                    tick: tick.0.to_string(),
+                    code,
+                    message,
+                    diagnostic_truncated,
+                },
+                HostFault::Journal { batch_id, .. } => RemoteOwnerFaultDto::Journal {
+                    session_id: batch_id.session_id().get().to_string(),
+                    batch_sequence: batch_id.sequence().to_string(),
+                    code,
+                    message,
+                    diagnostic_truncated,
+                },
+                HostFault::Protocol { .. } => RemoteOwnerFaultDto::Protocol {
+                    code,
+                    message,
+                    diagnostic_truncated,
+                },
+            }
+        });
+        Self {
+            schema: "scriptbots.remote-owner-status.v1".to_owned(),
+            identity: RemoteOwnerIdentityDto {
+                session_id: snapshot.session_id.get().to_string(),
+                publication_revision: snapshot.revision.get().to_string(),
+                scientific_revision: snapshot.revisions.scientific.get().to_string(),
+                control_revision: snapshot.revisions.control.get().to_string(),
+                config_revision: snapshot.revisions.config.get().to_string(),
+                tick: snapshot.world.tick.to_string(),
+            },
+            lifecycle: snapshot.lifecycle,
+            playback: RemoteOwnerPlaybackDto {
+                paused: snapshot.playback.paused,
+                speed_multiplier: snapshot.playback.speed_multiplier,
+            },
+            health: match &snapshot.health {
+                HostHealth::Healthy => "healthy",
+                HostHealth::Blocked(_) => "blocked",
+                HostHealth::Faulted(_) => "faulted",
+            }
+            .to_owned(),
+            blocker: snapshot
+                .health
+                .blocker()
+                .map(|blocker| format!("{blocker:?}")),
+            fault,
+        }
+    }
+}
+
 /// Snapshot describing the current hydrology state.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HydrologySnapshot {
@@ -7323,6 +7457,12 @@ impl ControlHandle {
             command_queue_depth: snapshot.command_queue_depth,
             snapshot_revision: snapshot.revision.get(),
         })
+    }
+
+    /// Read exact owner health for browsers without driving time or admitting work.
+    pub fn remote_owner_status(&self) -> Result<RemoteOwnerStatusDto, ControlError> {
+        let snapshot = self.read_snapshot()?;
+        Ok(RemoteOwnerStatusDto::from_snapshot(&snapshot))
     }
 
     /// Retrieve a snapshot of the current hydrology state, if available.
@@ -16459,6 +16599,139 @@ pub(crate) mod tests {
             current, expected,
             "the projection must refresh after the queued change applies"
         );
+    }
+
+    #[test]
+    fn remote_owner_status_is_exact_read_only_and_reports_real_lifecycle() {
+        let world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(77),
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let mut host = TestHost::spawn_with_identity(
+            world,
+            None,
+            scriptbots_runtime::HostSessionId::new(u64::MAX),
+        );
+        let handle = host.handle();
+        let publication = handle.read_snapshot().unwrap();
+        let observed = serde_json::to_value(handle.remote_owner_status().unwrap()).unwrap();
+        assert_eq!(observed["schema"], "scriptbots.remote-owner-status.v1");
+        assert_eq!(observed["identity"]["sessionId"], u64::MAX.to_string());
+        assert_eq!(
+            observed["identity"]["publicationRevision"],
+            publication.revision.get().to_string()
+        );
+        assert_eq!(observed["identity"]["tick"], "0");
+        assert_eq!(observed["health"], "healthy");
+        assert!(observed["fault"].is_null());
+        assert_eq!(
+            observed["playback"],
+            serde_json::json!({"paused": true, "speedMultiplier": 1.0})
+        );
+        assert!(Arc::ptr_eq(&publication, &handle.read_snapshot().unwrap()));
+        host.port
+            .submit(CommandEnvelope::new(
+                CommandId::new(u128::MAX - 9),
+                HostCommand::Shutdown,
+            ))
+            .unwrap();
+        host.worker.take().unwrap().join().unwrap();
+        let stopped = serde_json::to_value(handle.remote_owner_status().unwrap()).unwrap();
+        assert_eq!(stopped["identity"]["sessionId"], u64::MAX.to_string());
+        assert_eq!(stopped["lifecycle"], "stopped");
+        assert_eq!(stopped["identity"]["tick"], "0");
+    }
+
+    #[test]
+    fn remote_owner_status_preserves_completed_fault_and_bounds_unicode_diagnostics() {
+        use scriptbots_runtime::{
+            HostCore, HostCoreOptions, HostFault, HostHealth, ManualHostDriver, ManualInstant,
+        };
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(77),
+            population_minimum: 0,
+            population_spawn_interval: 2,
+            population_spawn_count: 1,
+            closed: false,
+            persistence_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .brain_registry_mut()
+            .unwrap()
+            .register("test.remote-owner-fault", |_rng| {
+                Err(scriptbots_core::BrainSpawnError::new(
+                    "test.remote-owner-fault",
+                    std::io::Error::other("deliberate remote owner fault"),
+                ))
+            });
+        let session = scriptbots_runtime::HostSessionId::new(u64::MAX);
+        let mut owner = HostCore::new(session, world, HostCoreOptions::default()).unwrap();
+        owner.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(
+            owner
+                .drive(ManualInstant::from_nanos(100_000_000))
+                .unwrap()
+                .scientific_steps,
+            2
+        );
+        let publication = owner.latest_snapshot();
+        let actual =
+            serde_json::to_value(RemoteOwnerStatusDto::from_snapshot(&publication)).unwrap();
+        assert_eq!(actual["health"], "faulted");
+        assert_eq!(
+            actual["lifecycle"], "running",
+            "a fault does not prove completed shutdown"
+        );
+        assert_eq!(actual["identity"]["tick"], "2");
+        assert_eq!(actual["fault"]["tick"], "2");
+        assert_eq!(actual["fault"]["code"], "brain_spawn");
+        assert_eq!(actual["fault"]["diagnostic_truncated"], false);
+        assert!(Arc::ptr_eq(&publication, &owner.latest_snapshot()));
+
+        // Declared wire fixtures test impossible-to-run full-width counters and
+        // hostile diagnostic strings, independently of the real fault above.
+        let mut wide = (*publication).clone();
+        wide.revision = scriptbots_runtime::SnapshotRevision::new(u64::MAX);
+        wide.revisions.scientific = ScientificRevision::new((1_u64 << 53) + 1);
+        wide.revisions.control = scriptbots_runtime::ControlRevision::new(1_u64 << 53);
+        wide.health = HostHealth::Faulted(HostFault::Journal {
+            batch_id: scriptbots_runtime::JournalBatchId::new(session, u64::MAX),
+            failure: scriptbots_runtime::JournalFailure {
+                code: "\0".repeat(200),
+                message: "\0".repeat(3000),
+            },
+        });
+        let bytes = serde_json::to_vec(&RemoteOwnerStatusDto::from_snapshot(&wide)).unwrap();
+        assert!(bytes.len() < 16 * 1024);
+        let journal: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            journal["identity"]["publicationRevision"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(
+            journal["identity"]["scientificRevision"],
+            "9007199254740993"
+        );
+        assert_eq!(journal["identity"]["controlRevision"], "9007199254740992");
+        assert_eq!(journal["fault"]["session_id"], u64::MAX.to_string());
+        assert_eq!(journal["fault"]["batch_sequence"], u64::MAX.to_string());
+        assert_eq!(journal["fault"]["diagnostic_truncated"], true);
+        wide.health = HostHealth::Faulted(HostFault::Protocol {
+            code: "unicode".to_owned(),
+            message: format!("x{}", "🦋".repeat(1000)),
+        });
+        let protocol = serde_json::to_value(RemoteOwnerStatusDto::from_snapshot(&wide)).unwrap();
+        assert_eq!(
+            protocol["fault"]["message"],
+            format!("x{}", "🦋".repeat(511))
+        );
+        assert_eq!(protocol["fault"]["diagnostic_truncated"], true);
     }
 
     #[test]

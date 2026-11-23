@@ -269,6 +269,23 @@ remain intact. Load a saved continuation, restore recovery, or explicitly reset
 to start another world. A failed replacement preserves the faulted world. A
 connected remote host uses its own controls independently of a retained local fault.
 
+Remote mode observes owner health separately from its WebSocket connection. The
+browser reads `/api/v1/owner/status` with its negotiated `X-ScriptBots-Session`
+header, preserving the session, completed tick and revision counters as exact
+decimal strings. One status request at a time runs at most once per second while
+the page is visible, with a two-second deadline and a 16 KiB response limit.
+The endpoint uses the existing authority, origin and session guards and reads
+one immutable owner publication without advancing the world.
+
+Live playback, intervention submission and new checkpoint saves require a current
+successful observation of a running, healthy or blocked owner. Faulted, stopping,
+stopped and unavailable observations disable those writes; the connection state
+remains distinct. The last observed fault stays visible during a failed read, and
+diagnostic truncation is explicit. Receipt/history reads, inspection and transfer
+of existing saved scientific checkpoints remain available. Studies of saved cuts
+retain their independent lifecycle controls. A fault does not itself establish
+that the owner's shutdown or journal drain has completed.
+
 The demo starts with **MLP**, with canonical inherited genomes and evaluator
 state. **Brain for new worlds** also offers DWRAON, experimental Assembly, Mixed,
 Unbound and the legacy Wander movement demo; the choice takes effect on Reset.

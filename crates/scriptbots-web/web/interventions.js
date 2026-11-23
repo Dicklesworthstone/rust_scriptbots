@@ -149,12 +149,18 @@ export function interventionReceiptText(receipt) {
 /** One retained command and one history page; rendering never advances scientific time. */
 export class InterventionController {
   constructor({ send, status, history, onChange = () => {}, now = () => performance.now(), id = interventionRequestId }) {
-    Object.assign(this, { send, status, history, onChange, now, id, enabled: false,
+    Object.assign(this, { send, status, history, onChange, now, id, enabled: false, mutationAllowed: true,
       frame: null, context: null, retained: null, receipt: null, commandPending: null,
       historyPending: null, historyPage: null, historyAfter: "0", commandError: null, historyError: null, attachmentError: null,
       lastHistoryAt: -Infinity, lastStatusAt: -Infinity, lastHistoryPublication: null, lastStatusPublication: null });
   }
   emit() { this.onChange(this); }
+  setMutationAllowed(value) {
+    const allowed = Boolean(value);
+    if (allowed === this.mutationAllowed) return;
+    this.mutationAllowed = allowed;
+    this.emit();
+  }
   reset() {
     this.commandPending?.abort.abort(); this.historyPending?.abort.abort();
     Object.assign(this, { frame: null, context: null, retained: null, receipt: null, commandPending: null,
@@ -216,7 +222,7 @@ export class InterventionController {
     if (changed) this.emit();
   }
   get canStage() {
-    return this.enabled && this.frame?.playback?.paused === true && !this.commandPending
+    return this.enabled && this.mutationAllowed && this.frame?.playback?.paused === true && !this.commandPending
       && (!this.retained || (this.receipt && ["rejected", "failed"].includes(this.receipt.applicationState))
         || (this.receipt?.applicationState === "applied"
           && BigInt(this.frame.identity.tick) > BigInt(this.receipt.applicationBoundary.tick)));
@@ -229,7 +235,7 @@ export class InterventionController {
     return this.deliver();
   }
   async retry() {
-    if (!this.enabled || !this.retained || this.commandPending) return;
+    if (!this.enabled || !this.mutationAllowed || !this.retained || this.commandPending) return;
     return this.deliver();
   }
   async deliver() {
@@ -296,14 +302,14 @@ export function renderInterventions(panel, controller) {
   const query = (id) => panel.querySelector(`#intervention-${id}`);
   const { frame, retained, receipt, commandPending, commandError, historyPage, historyError, attachmentError } = controller;
   query("stage").disabled = !controller.canStage;
-  query("retry").disabled = !controller.enabled || !retained || !!commandPending;
+  query("retry").disabled = !controller.enabled || !controller.mutationAllowed || !retained || !!commandPending;
   query("status-refresh").disabled = !controller.enabled || !receipt || !!commandPending;
   query("history-refresh").disabled = !frame || !controller.enabled;
   query("history-first").disabled = !frame || !controller.enabled;
   query("history-next").disabled = !historyPage?.hasMore || !!controller.historyPending || !controller.enabled;
-  query("pause").disabled = !controller.enabled || !frame || frame.playback?.paused === true;
-  query("step").disabled = !controller.enabled || !frame || frame.playback?.paused !== true || !!commandPending;
-  query("resume").disabled = !controller.enabled || !frame || frame.playback?.paused !== true || !!commandPending;
+  query("pause").disabled = !controller.enabled || !controller.mutationAllowed || !frame || frame.playback?.paused === true;
+  query("step").disabled = !controller.enabled || !controller.mutationAllowed || !frame || frame.playback?.paused !== true || !!commandPending;
+  query("resume").disabled = !controller.enabled || !controller.mutationAllowed || !frame || frame.playback?.paused !== true || !!commandPending;
   query("owner").textContent = attachmentError ? "Displayed owner has regressed behind an earlier observation. Intervention actions remain disabled."
     : frame ? `Displayed owner: ${frame.playback?.paused ? "paused" : "running"} · tick ${frame.identity.tick} · control revision ${frame.identity.controlRevision}. Pause to stage; Step or Resume applies queued effects.` : "Waiting for an observed world.";
   query("request").textContent = retained ? `${retained.request.intervention.kind.replaceAll("_", " ")} · request ${retained.request.requestId}${receipt ? ` · command ${receipt.commandId}` : ""}` : "No intervention request in this owner session.";

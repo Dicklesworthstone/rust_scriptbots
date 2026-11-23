@@ -338,6 +338,47 @@ test("an uncertain save retains one immutable retry identity and forbids a fresh
   assert.equal(h.identities(), 1);
 });
 
+test("owner health gates live checkpoint writes while saved-cut review and local transfer remain usable", async () => {
+  const h = await harness(), selected = h.controller.selected;
+  const saved = h.controller.save(), original = h.queues.save[0].request;
+  h.controller.setOwnerWritable(false);
+  assert.equal(h.queues.save[0].signal.aborted, false, "retain the outcome of an already submitted save");
+  h.queues.save[0].reject(new Error("connection lost after possible admission"));
+  await saved;
+  assert.equal(h.controller.saveState, "unconfirmed");
+  assert.equal(h.controller.canSave, false);
+  assert.equal(await h.controller.save(), null);
+  assert.equal(await h.controller.retrySave(), null);
+  assert.equal(h.queues.save.length, 1);
+  assert.equal(h.controller.selected, selected);
+
+  const { panel, nodes } = labPanel();
+  renderCheckpointLab(panel, h.controller);
+  assert.equal(nodes.get("#lab-checkpoint-save").disabled, true);
+  assert.equal(nodes.get("#lab-checkpoint-retry").disabled, true);
+  assert.equal(nodes.get("#lab-checkpoint-review").disabled, false);
+  assert.equal(nodes.get("#lab-checkpoint-local").disabled, false);
+  const reviewed = h.controller.reviewSelected();
+  h.queues.review[0].resolve(savedCanvas());
+  await reviewed;
+  const transfer = h.controller.prepareLocalImport(2048);
+  h.queues.download[0].resolve(scientificDownload(selected));
+  const imported = await transfer;
+  assert.equal(imported.checkpoint, selected);
+  assert.equal(imported.bytes.byteLength, selected.byte_size);
+  assert.equal(h.identities(), 1, "read-only work cannot allocate another save identity");
+  h.controller.returnToLive();
+  assert.equal(h.controller.canLaunch, true, "isolated saved-cut studies have their own lifecycle");
+
+  h.controller.setOwnerWritable(true);
+  const retry = h.controller.retrySave();
+  assert.equal(h.queues.save[1].request, original);
+  h.queues.save[1].resolve(checkpoint({ checkpoint_id: "ckpt-recovered" }));
+  await retry;
+  assert.equal(h.controller.saveState, "saved");
+  assert.equal(h.identities(), 1);
+});
+
 test("study retries preserve the exact checkpoint and detached treatment after a lost admission response", async () => {
   const h = await harness();
   const treatment = { type: "Drought", params: { region: null, duration_ticks: 10, growth_scale: 0.1 } };

@@ -212,6 +212,7 @@ export class CheckpointLabController {
     this.now = now;
     this.parseReport = parseReport;
     this.enabled = false;
+    this.ownerWritable = true;
     this.source = null;
     this.generation = 0;
     this.operation = null;
@@ -243,13 +244,20 @@ export class CheckpointLabController {
 
   get busy() { return this.operation !== null; }
   get canOperate() { return this.enabled && this.source !== null && !this.busy; }
-  get canSave() { return this.canOperate && this.canvasPreview === null && this.saveState !== "unconfirmed"; }
+  get canSave() { return this.canOperate && this.ownerWritable && this.canvasPreview === null && this.saveState !== "unconfirmed"; }
   get canReview() { return this.canOperate && this.selected !== null && typeof this.services.review === "function"; }
   get canSelectStudy() { return this.canOperate && this.branchState !== "unconfirmed"; }
   get canLaunch() { return this.canOperate && this.canvasPreview === null && this.selected !== null
     && (!this.branch || this.branchState === "refused" || TERMINAL.has(this.branch.status?.status)); }
 
   emit() { this.onChange(this); }
+
+  setOwnerWritable(value) {
+    const writable = Boolean(value);
+    if (writable === this.ownerWritable) return;
+    this.ownerWritable = writable;
+    this.emit();
+  }
 
   invalidate() {
     this.generation += 1;
@@ -473,13 +481,13 @@ export class CheckpointLabController {
   }
 
   retrySave() {
-    if (!this.canOperate || this.canvasPreview !== null || this.saveState !== "unconfirmed"
+    if (!this.canOperate || !this.ownerWritable || this.canvasPreview !== null || this.saveState !== "unconfirmed"
         || this.saveRequest?.sessionId !== this.source.sessionId) return Promise.resolve(null);
     return this.submitSave();
   }
 
   submitSave() {
-    if (this.canvasPreview !== null) return Promise.resolve(null);
+    if (!this.ownerWritable || this.canvasPreview !== null) return Promise.resolve(null);
     const request = this.saveRequest;
     const priorUncertainty = this.saveState === "unconfirmed";
     this.saveState = "pending";
@@ -722,7 +730,7 @@ export function renderCheckpointLab(panel, controller) {
     : retention ? `${controller.page.total} saved checkpoints; ${retention.file_bytes} of ${retention.max_bytes} retained bytes. Choose one to study.` : "No saved checkpoint selected.");
   disable("lab-checkpoint-select", !ready);
   disable("lab-checkpoint-save", !controller.canSave);
-  disable("lab-checkpoint-retry", !ready || controller.canvasPreview !== null || controller.saveState !== "unconfirmed");
+  disable("lab-checkpoint-retry", !ready || !controller.ownerWritable || controller.canvasPreview !== null || controller.saveState !== "unconfirmed");
   disable("lab-checkpoint-refresh", !ready);
   disable("lab-checkpoint-first", !ready || controller.cursor === null);
   disable("lab-checkpoint-next", !ready || !controller.page?.next_cursor);

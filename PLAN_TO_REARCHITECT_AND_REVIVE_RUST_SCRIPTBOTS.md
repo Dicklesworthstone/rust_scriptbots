@@ -2,6 +2,26 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Session-bound remote owner health (2026-11-23):**
+[Implemented and independently source-reviewed — Codex; scoped contributions to
+`bd-2z0.12.2` and `bd-2z0.12.3`; original native and packaged-browser acceptance retained]
+
+Expose `/api/v1/owner/status` under the existing authority, origin and session
+guards, with exact decimal identities and bounded, typed fault diagnostics from
+one immutable publication. The remote browser distinguishes transport connectivity
+from owner health, polls one bounded request at a time, and requires a fresh
+session-matched running owner before live mutations. Faulted, stopping, stopped
+and unavailable states preserve inspection, command evidence and saved-checkpoint
+transfer. Retained request outcomes and independent saved-cut studies keep their
+own lifecycle. Generation, session and publication checks refuse stale observations.
+
+Pinned DSR passed all 109 Node tests, six JavaScript syntax checks and scoped Rust
+formatting. The suite reproduced and then verified the exact fractional-deadline
+recovery case without relaxing its timing assertion. Native DTO/HTTP tests remain
+unexecuted because both storage test codegen and production metadata compilation
+were killed in the pinned Asupersync dependency. Chromium DOM execution also remains
+unavailable. These limits do not waive the original full compiler, Clippy or browser gates.
+
 **Streaming database bundle projections (2026-11-23):**
 [Implemented and independently source-reviewed — Codex; scoped contributions to
 `bd-2z0.17` and `bd-2z0.5.11.1`; original native and resource acceptance retained]
