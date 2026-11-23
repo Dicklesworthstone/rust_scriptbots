@@ -5547,36 +5547,23 @@ fn run_replay_cli(
         .expect("replay_db required to enter replay mode");
     let db_display = db_path.display().to_string();
 
-    let storage = StorageReader::open(&db_display)
-        .with_context(|| format!("failed to open replay database {db_display}"))?;
+    // The checkpoint and its journal cut must describe the same immutable run as
+    // the scientific rows. Hold this identity-bound lease across every input read.
+    let storage = StorageReader::open_finished(&db_display).with_context(|| {
+        format!(
+            "failed to read replay database {db_display} as a finished run \
+             (an unclean run needs `--recover-storage {db_display}` first; \
+             a recording from an earlier release requires that release)"
+        )
+    })?;
     let recorded_max_tick = storage.max_tick()?.unwrap_or(0);
     let mut persisted_events = storage.load_replay_events()?;
     canonicalize_replay_event_order(&mut persisted_events)
         .context("recorded replay stream contains an invalid or duplicate identity")?;
     let recorded_batch_ticks = storage.summary_ticks()?;
-    let journaled = !storage.host_journal_sessions()?.is_empty();
     // Ordered by tick; interval recording usually leaves one at the final tick, which
     // would leave nothing to verify, so resume from the latest one before the limit.
     let checkpoints = storage.load_checkpoints()?;
-    storage.close()?;
-    // A host-driven run journaled its operator commands; the journal is read through a
-    // finished-run reader, which takes the file's exclusive lease once the plain one is closed.
-    // An unclean shutdown is refused while the journal pages are read, an earlier release's
-    // recording (journal archive v3 to v5) when the finished reader opens, so the hint covers
-    // both steps. The cause names the release that wrote a refused archive (#6).
-    let operator_commands = if journaled {
-        finished_run_operator_commands(&db_display).with_context(|| {
-            format!(
-                "failed to read the command journal of {db_display} as a finished run \
-                 (a run that did not shut down cleanly needs `--recover-storage {db_display}` \
-                 first; a run recorded by an earlier release replays with that release, which \
-                 the cause below names)"
-            )
-        })?
-    } else {
-        BTreeMap::new()
-    };
-
     let events_max_tick = persisted_events.iter().map(|e| e.tick).max().unwrap_or(0);
     let tick_limit = cli
         .tick_limit
@@ -5590,6 +5577,38 @@ fn run_replay_cli(
         .find(|record| record.tick < tick_limit)
         .or_else(|| checkpoints.last())
         .cloned();
+    let replay_checkpoint = if cli.checkpoint_start {
+        let record = latest_checkpoint.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--checkpoint-start requested, but database contains no valid checkpoint in {db_display}"
+            )
+        })?;
+        let (world, cut) = if record.format
+            == format!(
+                "{}+postcard_hex",
+                scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA
+            ) {
+            let host = record.host_checkpoint()?;
+            (host.world_checkpoint().clone(), Some(host.journal_cut()))
+        } else {
+            (record.world_checkpoint()?, None)
+        };
+        if world.tick().0 >= tick_limit {
+            bail!(
+                "checkpoint tick {} is already at or past requested tick limit {tick_limit}",
+                world.tick().0
+            );
+        }
+        Some((world, cut))
+    } else {
+        None
+    };
+    let checkpoint_cut = replay_checkpoint
+        .as_ref()
+        .and_then(|(world, cut)| cut.map(|cut| (world.tick().0, cut)));
+    let operator_commands = recorded_operator_commands(&storage, checkpoint_cut)
+        .with_context(|| format!("failed to read the command journal of {db_display}"))?;
+    storage.close()?;
     let flush_ticks = recorded_flush_ticks(&recorded_batch_ticks, config, tick_limit);
 
     if config.rng_seed.is_none() {
@@ -5599,32 +5618,22 @@ fn run_replay_cli(
         );
     }
 
-    let (replay_run, start_tick) = if cli.checkpoint_start {
-        let cp_record = latest_checkpoint.ok_or_else(|| {
-            anyhow::anyhow!(
-                "--checkpoint-start requested, but database contains no valid checkpoint in {db_display}"
-            )
-        })?;
-        let cp = cp_record.world_checkpoint()?;
+    let (replay_run, start_tick) = if let Some((cp, cut)) = replay_checkpoint {
         let cp_tick = cp.tick().0;
-        if cp_tick >= tick_limit {
-            bail!(
-                "checkpoint tick {cp_tick} is already at or past requested tick limit {tick_limit}"
-            );
-        }
         info!(
-            checkpoint_id = %cp_record.checkpoint_id,
+            checkpoint_id = %latest_checkpoint.as_ref().expect("selected checkpoint").checkpoint_id,
             checkpoint_tick = cp_tick,
             tick_limit = tick_limit,
             "Resuming deterministic replay from validated checkpoint"
         );
         persisted_events.retain(|e| e.tick > cp_tick && e.tick <= tick_limit);
         let digest_ticks = recorded_digest_ticks(&persisted_events, tick_limit);
-        // Commands applied at or before the checkpoint tick are already in its state. One applied
-        // on that very tick after the capture cannot be told apart from one before it; if that
-        // happened, the replay diverges and says so rather than guessing.
         let mut operator_commands = operator_commands;
-        operator_commands.retain(|&tick, _| tick > cp_tick);
+        if cut.is_none() {
+            // A science-only artifact has no owner journal cursor. Preserve its conservative
+            // boundary: same-tick commands remain ambiguous and any mismatch must diverge.
+            operator_commands.retain(|&tick, _| tick > cp_tick);
+        }
         let mirror = ReplayMirror {
             digest_ticks: (!digest_ticks.is_empty()).then_some(digest_ticks),
             flush_ticks,
@@ -6196,14 +6205,6 @@ struct ReplayMirror {
     operator_commands: BTreeMap<u64, Vec<ReplayOperatorCommand>>,
 }
 
-/// Opens `db` as a finished run and reads its journaled operator commands.
-fn finished_run_operator_commands(db: &str) -> Result<BTreeMap<u64, Vec<ReplayOperatorCommand>>> {
-    let finished = StorageReader::open_finished(db)?;
-    let commands = recorded_operator_commands(&finished)?;
-    finished.close()?;
-    Ok(commands)
-}
-
 /// Every science-changing operator command a recorded host applied, by applied tick (bd-1leq).
 ///
 /// A server or interactive run journals each command it applies. Replay from tick zero used to
@@ -6213,12 +6214,45 @@ fn finished_run_operator_commands(db: &str) -> Result<BTreeMap<u64, Vec<ReplayOp
 /// migrations need an archipelago and are refused.
 fn recorded_operator_commands(
     storage: &StorageReader,
+    checkpoint: Option<(u64, scriptbots_runtime::HostJournalCutV1)>,
 ) -> Result<BTreeMap<u64, Vec<ReplayOperatorCommand>>> {
     use scriptbots_core::ControlCommand;
     use scriptbots_runtime::{ApplicationState, HostCommand};
 
+    let sessions = storage.host_journal_sessions()?;
+    if let Some((tick, cut)) = checkpoint {
+        if !matches!(sessions.as_slice(), [session] if *session == cut.session_id) {
+            bail!("checkpoint replay requires its exact recorded host session");
+        }
+        let after = cut
+            .last_journal_sequence
+            .checked_sub(1)
+            .filter(|sequence| *sequence != 0)
+            .map(|sequence| scriptbots_runtime::JournalBatchId::new(cut.session_id, sequence));
+        let page = storage.host_journal_session_conformance_page(
+            cut.session_id,
+            after,
+            1,
+            scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+        )?;
+        let boundary_matches = if cut.last_journal_sequence == 0 {
+            tick == 0 && cut.last_scientific_event_sequence == 0
+        } else {
+            page.records.first().is_some_and(|record| {
+                record.batch_id.sequence() == cut.last_journal_sequence
+                    && record.applied.tick.0 == tick
+            })
+        };
+        if !boundary_matches
+            || cut.commitment_requirement != scriptbots_runtime::ShutdownCommitRequirement::Durable
+            || cut.last_journal_sequence > page.progress.journal.durable
+            || cut.last_scientific_event_sequence > page.progress.events.durable
+        {
+            bail!("checkpoint replay journal cut differs from the recorded durable boundary");
+        }
+    }
     let mut commands: BTreeMap<u64, Vec<ReplayOperatorCommand>> = BTreeMap::new();
-    for session in storage.host_journal_sessions()? {
+    for session in sessions {
         let mut after = None;
         loop {
             let page = storage
@@ -6235,6 +6269,17 @@ fn recorded_operator_commands(
                     )
                 })?;
             for record in page.commands {
+                if let Some((tick, cut)) = checkpoint {
+                    if record.batch_id.sequence() <= cut.last_journal_sequence {
+                        if record.terminal_boundary.tick.0 > tick {
+                            bail!("checkpoint journal prefix contains a later command boundary");
+                        }
+                        continue;
+                    }
+                    if record.terminal_boundary.tick.0 < tick {
+                        bail!("checkpoint journal suffix contains an earlier command boundary");
+                    }
+                }
                 let applied = record.lifecycle.terminal().is_some_and(|transition| {
                     matches!(transition.application(), ApplicationState::Applied(_))
                 });
@@ -10976,6 +11021,202 @@ activation = "Sigmoid"
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the real file owner proves the exact captured cut, post-capture commands, replay equivalence and independent boundary refusals together"
+    )]
+    fn checkpoint_start_replay_preserves_same_tick_commands_after_the_host_cut() -> Result<()> {
+        use scriptbots_core::ControlCommand;
+        use scriptbots_runtime::{
+            CommandId, HostCommand, HostLifecycle, ShutdownCommitRequirement,
+        };
+
+        let directory = tempdir()?;
+        let database = directory.path().join("same-tick-checkpoint-replay.sqlite");
+        let path = database.to_str().expect("temporary UTF-8 path");
+        let mut pipeline = StoragePipeline::create_unattributed_file(path)?;
+        let (mut config, _) = replay_culling_fixture();
+        config.persistence_interval = 1;
+        let (mut world, persistence) =
+            WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
+        let brains = install_brains(&mut world, BrainPreset::Mlp)?.population;
+        seed_agents(&mut world, &brains, FounderRecipe::CornerGrid)?;
+        let agent = world.agents().iter().next().expect("nonempty MLP world").0;
+        let agent_uid = world.agent_uid(agent).expect("stable founder identity");
+        let session = HostSessionId::new(0x6370_7265);
+        let journal = pipeline.journal_port(session, Default::default())?;
+        let host = HostThread::spawn(
+            session,
+            world,
+            persistence,
+            Box::new(journal),
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            ChannelHostOptions::default(),
+        )?;
+        let mut port = host.port();
+        submit_durable_replay_command(&mut port, CommandId::new(1), HostCommand::Step)?;
+        let before = ControlCommand::AdjustAgentMutationRates {
+            agent_uid,
+            delta_primary: 0.01,
+            delta_secondary: 0.02,
+        };
+        submit_durable_replay_command(
+            &mut port,
+            CommandId::new(2),
+            HostCommand::try_from(before.clone())?,
+        )?;
+        let checkpoint = port.capture_host_checkpoint_v1()?;
+        assert_eq!(checkpoint.tick().0, 1);
+        assert!(checkpoint.world_checkpoint().agent_count() > 0);
+        pipeline.checkpoint_writer().record_host(
+            "before-same-tick-command",
+            &checkpoint,
+            &serde_json::json!({"source": "same_tick_replay_regression"}),
+        )?;
+        let cli = AppCli::try_parse_from([
+            "scriptbots-app",
+            "--replay-db",
+            path,
+            "--checkpoint-start",
+            "--tick-limit",
+            "2",
+        ])?;
+        let live_error = run_replay_cli(&cli, &config, FounderRecipe::CornerGrid, &[])
+            .expect_err("a live writer cannot supply an immutable checkpoint/journal join");
+        assert!(format!("{live_error:#}").contains("finished run"));
+
+        let after = ControlCommand::AdjustAgentMutationRates {
+            agent_uid,
+            delta_primary: 0.03,
+            delta_secondary: 0.04,
+        };
+        submit_durable_replay_command(
+            &mut port,
+            CommandId::new(3),
+            HostCommand::try_from(after.clone())?,
+        )?;
+        assert_eq!(port.snapshot_after(None)?.unwrap().world.tick, 1);
+        port.request_replay_world_digest()?;
+        submit_durable_replay_command(&mut port, CommandId::new(4), HostCommand::Step)?;
+        submit_durable_replay_command(&mut port, CommandId::new(5), HostCommand::Shutdown)?;
+        drop(port);
+        let observed = host.join()?;
+        assert_eq!(observed.snapshot.lifecycle, HostLifecycle::Stopped);
+        let final_digest = observed.final_digest?;
+        pipeline.shutdown()?;
+
+        let reader = StorageReader::open_finished(path)?;
+        let all_commands = recorded_operator_commands(&reader, None)?;
+        assert_eq!(
+            all_commands[&1]
+                .iter()
+                .filter(|command| matches!(command, ReplayOperatorCommand::World(_)))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                ReplayOperatorCommand::World(before),
+                ReplayOperatorCommand::World(after.clone()),
+            ]
+        );
+        let cut = checkpoint.journal_cut();
+        let commands = recorded_operator_commands(&reader, Some((1, cut)))?;
+        assert_eq!(commands[&1], [ReplayOperatorCommand::World(after)]);
+
+        let progress = reader
+            .host_journal_session_conformance_page(
+                session,
+                None,
+                1,
+                scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+            )?
+            .progress;
+        for (tick, invalid_cut) in [
+            (
+                1,
+                scriptbots_runtime::HostJournalCutV1 {
+                    session_id: HostSessionId::new(session.get() + 1),
+                    ..cut
+                },
+            ),
+            (2, cut),
+            (
+                1,
+                scriptbots_runtime::HostJournalCutV1 {
+                    last_journal_sequence: progress.journal.durable + 1,
+                    ..cut
+                },
+            ),
+            (
+                1,
+                scriptbots_runtime::HostJournalCutV1 {
+                    last_scientific_event_sequence: progress.events.durable + 1,
+                    ..cut
+                },
+            ),
+            (
+                1,
+                scriptbots_runtime::HostJournalCutV1 {
+                    commitment_requirement: ShutdownCommitRequirement::CommittedVolatile,
+                    ..cut
+                },
+            ),
+        ] {
+            assert!(
+                recorded_operator_commands(&reader, Some((tick, invalid_cut))).is_err(),
+                "foreign, impossible or weaker checkpoint cut must refuse: {tick}, {invalid_cut:?}"
+            );
+        }
+        let mut recorded = reader.load_replay_events()?;
+        let batch_ticks = reader.summary_ticks()?;
+        reader.close()?;
+        canonicalize_replay_event_order(&mut recorded)?;
+        recorded.retain(|event| event.tick > 1);
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event.event.kind, ReplayEventKind::WorldDigest { .. }))
+        );
+        let mut mirror = ReplayMirror {
+            digest_ticks: Some(recorded_digest_ticks(&recorded, 2)),
+            flush_ticks: recorded_flush_ticks(&batch_ticks, &config, 2),
+            operator_commands: commands,
+        };
+        let replay = run_headless_simulation_from_checkpoint(
+            checkpoint.world_checkpoint(),
+            &config,
+            2,
+            BrainPreset::Mlp,
+            &[],
+            &mirror,
+        )?;
+        assert_eq!(replay.simulated_ticks, 1);
+        assert_eq!(replay.final_digest, final_digest);
+        assert_eq!(replay.events, recorded);
+        run_replay_cli(&cli, &config, FounderRecipe::CornerGrid, &[])?;
+
+        // Reproduce the original tick-only selection: the post-capture mutation
+        // disappears even though its completed tick equals the checkpoint tick.
+        mirror.operator_commands.retain(|&tick, _| tick > 1);
+        let missing_command = run_headless_simulation_from_checkpoint(
+            checkpoint.world_checkpoint(),
+            &config,
+            2,
+            BrainPreset::Mlp,
+            &[],
+            &mirror,
+        )?;
+        assert_ne!(missing_command.final_digest, final_digest);
+        assert_ne!(missing_command.events, recorded);
+        Ok(())
+    }
+
+    #[test]
     fn replay_map_journal_preserves_flush_between_same_tick_maps() -> Result<()> {
         use scriptbots_core::{ControlCommand, ExistingAgentPolicy};
         use scriptbots_runtime::{CommandId, HostCommand, HostLifecycle};
@@ -11039,7 +11280,7 @@ activation = "Sigmoid"
         let final_digest = observed.final_digest?;
         pipeline.shutdown()?;
         let reader = StorageReader::open_finished(path)?;
-        let operator_commands = recorded_operator_commands(&reader)?;
+        let operator_commands = recorded_operator_commands(&reader, None)?;
         assert_eq!(
             operator_commands[&1],
             [

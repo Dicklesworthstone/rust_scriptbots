@@ -2,6 +2,25 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Checkpoint-start replay preserves the exact owner cut (2026-11-23):**
+[Implemented and independently source-reviewed — Codex; scoped contribution to
+`bd-2z0.5.13`, original acceptance retained]
+
+Keep the full checkpoint's host session and journal sequence when selecting
+operator commands for replay. Commands applied after capture at that same
+scientific tick must replay; commands already included in the captured prefix
+must not apply twice. Hold one finished-run lease across scientific, checkpoint
+and journal reads, and refuse foreign, impossible or weaker journal boundaries.
+Science-only checkpoints retain their conservative tick-only selection.
+
+The authored real-file regression uses nonempty MLP founders and distinct
+additive mutation-rate commands on both sides of capture, compares the next
+tick's complete replay events and final digest, and includes the former lost
+command as a negative control. Targeted pinned DSR parsing/formatting passed on
+the exact candidate. Native compilation/tests are still blocked in cold
+dependency acquisition; no runtime pass or broader continuation acceptance is
+claimed.
+
 **Completed-fault journal admission through real drivers (2026-11-23):**
 [Implemented and independently source-reviewed — Codex; native execution unavailable]
 
