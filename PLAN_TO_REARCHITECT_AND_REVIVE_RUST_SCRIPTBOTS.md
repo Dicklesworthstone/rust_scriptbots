@@ -2,6 +2,24 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Storage cleanup ownership under pressure (2026-11-23):**
+[Implemented and independently source-reviewed — Codex; native execution unavailable]
+
+Recover the exact payload from a full or disconnected cleanup queue and transfer
+it to an actual cleanup worker. Account for successful destruction, destructor
+panics and synchronous fallbacks separately. Retain the 4,096-item queue and bound
+overflow work to four workers with lifetime-owned permits, including failed thread
+startup. A recursive queued cleanup on the same worker is still background work.
+Six authored regressions observe thread identity, blocked destruction, failed
+startup, overflow saturation, recursive handoff and worker continuation after an
+unwinding destructor panic. The executor became unavailable before any native
+build, test, Clippy or formatting result; source review is the only validation.
+
+This repairs ownership and reporting within the preparation-cleanup contract of
+`bd-2z0.5.17`. Resource exhaustion still requires a counted synchronous fallback
+without a caller-time bound; the broader hard-bound acceptance is not established.
+The original storage throughput and long-running server acceptance remain open.
+
 **Checkpoint continuation and terminal scientific evidence (2026-11-23):**
 [Currently In Progress — Codex; scoped contributions to `bd-2z0.5.13`,
 `bd-2z0.12.2`, `bd-ywtv` and persistent-run reliability; original acceptance retained]

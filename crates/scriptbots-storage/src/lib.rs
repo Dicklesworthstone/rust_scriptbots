@@ -6574,66 +6574,209 @@ fn fallible_string_with_capacity(
 /// Global statistics for preparation cleanup handoffs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CleanupHandoffStats {
-    /// Total number of payloads handed off to background cleanup.
+    /// Total number of payloads submitted for cleanup, including inline fallbacks.
     pub handed_off_count: u64,
-    /// Total number of payloads whose cleanup was completed.
+    /// Total number of payloads whose destructor returned successfully.
     pub completed_count: u64,
+    /// Total number of payloads whose destructor panicked during cleanup.
+    pub failed_count: u64,
+    /// Payload cleanups attempted on their submitting thread after bounded handoff failed.
+    pub inline_fallback_count: u64,
     /// Current number of payloads actively queued or being cleaned up.
     pub active_count: usize,
 }
 
-static CLEANUP_STATS: Mutex<CleanupHandoffStats> = Mutex::new(CleanupHandoffStats {
-    handed_off_count: 0,
-    completed_count: 0,
-    active_count: 0,
-});
+const CLEANUP_QUEUE_CAPACITY: usize = 4096;
+const MAX_CLEANUP_OVERFLOW_WORKERS: usize = 4;
 
-static CLEANUP_CHANNEL: OnceLock<std::sync::mpsc::SyncSender<Box<dyn Any + Send + 'static>>> =
-    OnceLock::new();
+#[derive(Default)]
+struct CleanupAccounting {
+    stats: Mutex<CleanupHandoffStats>,
+    overflow_workers: AtomicUsize,
+}
 
-fn cleanup_channel() -> &'static std::sync::mpsc::SyncSender<Box<dyn Any + Send + 'static>> {
+static CLEANUP_ACCOUNTING: OnceLock<Arc<CleanupAccounting>> = OnceLock::new();
+static CLEANUP_CHANNEL: OnceLock<std::sync::mpsc::SyncSender<CleanupTask>> = OnceLock::new();
+
+fn cleanup_accounting() -> &'static Arc<CleanupAccounting> {
+    CLEANUP_ACCOUNTING.get_or_init(|| Arc::new(CleanupAccounting::default()))
+}
+
+struct CleanupOverflowSlot {
+    accounting: Arc<CleanupAccounting>,
+}
+
+impl Drop for CleanupOverflowSlot {
+    fn drop(&mut self) {
+        self.accounting
+            .overflow_workers
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Own both destruction and its accounting, including when a failed thread spawn drops
+/// the captured closure on the caller. Scheduling a thread is never cleanup completion.
+struct CleanupTask {
+    value: Option<Box<dyn Any + Send + 'static>>,
+    accounting: Arc<CleanupAccounting>,
+    submitted_on: thread::ThreadId,
+    background: bool,
+    // Drop the permit after the payload's complete destruction path, including unwinding.
+    overflow_slot: Option<CleanupOverflowSlot>,
+}
+
+impl CleanupTask {
+    fn new<T: Send + 'static>(value: T, accounting: Arc<CleanupAccounting>) -> Self {
+        let value = Box::new(value);
+        {
+            let mut stats = accounting
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            stats.handed_off_count = stats.handed_off_count.saturating_add(1);
+            stats.active_count = stats.active_count.saturating_add(1);
+        }
+        Self {
+            value: Some(value),
+            accounting,
+            submitted_on: thread::current().id(),
+            background: false,
+            overflow_slot: None,
+        }
+    }
+
+    fn reserve_overflow_slot(&mut self) -> bool {
+        if self.overflow_slot.is_some() {
+            return true;
+        }
+        if self
+            .accounting
+            .overflow_workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CLEANUP_OVERFLOW_WORKERS).then_some(active + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.overflow_slot = Some(CleanupOverflowSlot {
+            accounting: Arc::clone(&self.accounting),
+        });
+        true
+    }
+}
+
+impl Drop for CleanupTask {
+    fn drop(&mut self) {
+        let value = self.value.take();
+        let inline = !self.background && thread::current().id() == self.submitted_on;
+        // Catch an unwinding payload panic so the shared worker can process its next item.
+        // The failed payload is never used again. Abort-profile panics and a panic while
+        // destroying the panic payload itself retain their ordinary Rust behavior.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)));
+        {
+            let mut stats = self
+                .accounting
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if outcome.is_ok() {
+                stats.completed_count = stats.completed_count.saturating_add(1);
+            } else {
+                stats.failed_count = stats.failed_count.saturating_add(1);
+            }
+            if inline {
+                stats.inline_fallback_count = stats.inline_fallback_count.saturating_add(1);
+            }
+            stats.active_count = stats.active_count.saturating_sub(1);
+        }
+        if inline {
+            warn!(
+                overflow_slot = self.overflow_slot.is_some(),
+                "storage cleanup handoff unavailable; payload cleanup ran on its submitting thread"
+            );
+        }
+        if outcome.is_err() {
+            warn!("storage cleanup payload destructor panicked; cleanup did not complete");
+        }
+    }
+}
+
+fn run_cleanup_worker(rx: std::sync::mpsc::Receiver<CleanupTask>) {
+    while let Ok(mut item) = rx.recv() {
+        // A destructor may submit another payload from this same worker. Executing its
+        // later queued handoff is background work, not a synchronous caller fallback.
+        item.background = true;
+        drop(item);
+    }
+}
+
+fn start_cleanup_channel(
+    spawn: impl FnOnce(std::sync::mpsc::Receiver<CleanupTask>) -> std::io::Result<()>,
+) -> std::sync::mpsc::SyncSender<CleanupTask> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(CLEANUP_QUEUE_CAPACITY);
+    if let Err(error) = spawn(rx) {
+        warn!(%error, "storage cleanup worker failed to start; using bounded overflow handoff");
+    }
+    tx
+}
+
+fn cleanup_channel() -> &'static std::sync::mpsc::SyncSender<CleanupTask> {
     CLEANUP_CHANNEL.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Box<dyn Any + Send + 'static>>(4096);
-        let _ = thread::Builder::new()
-            .name("storage-cleanup-worker".to_string())
-            .spawn(move || {
-                while let Ok(item) = rx.recv() {
-                    drop(item);
-                    if let Ok(mut stats) = CLEANUP_STATS.lock() {
-                        stats.completed_count = stats.completed_count.saturating_add(1);
-                        stats.active_count = stats.active_count.saturating_sub(1);
-                    }
-                }
-            });
-        tx
+        start_cleanup_channel(|rx| {
+            thread::Builder::new()
+                .name("storage-cleanup-worker".to_owned())
+                .spawn(move || run_cleanup_worker(rx))
+                .map(|_worker| ())
+        })
     })
 }
 
-/// Hands off cleanup of an arbitrarily large allocated payload to the background cleanup
-/// worker so the caller thread does not stall performing deallocations after a timeout or refusal.
+fn dispatch_cleanup_task(
+    sender: &std::sync::mpsc::SyncSender<CleanupTask>,
+    task: CleanupTask,
+    spawn: impl FnOnce(CleanupTask) -> std::io::Result<()>,
+) {
+    let Err(
+        std::sync::mpsc::TrySendError::Full(mut task)
+        | std::sync::mpsc::TrySendError::Disconnected(mut task),
+    ) = sender.try_send(task)
+    else {
+        return;
+    };
+    if !task.reserve_overflow_slot() {
+        // There is no unbounded emergency queue or thread-per-refusal escape hatch.
+        // When all bounded workers are occupied, ownership still requires destruction.
+        drop(task);
+        return;
+    }
+    if let Err(error) = spawn(task) {
+        // Thread creation drops its captured task on failure. CleanupTask accounts for
+        // that actual inline destruction and releases the reserved overflow slot.
+        warn!(%error, "storage cleanup overflow worker failed to start");
+    }
+}
+
+/// Submit an allocated payload for background destruction after a timeout or refusal.
+///
+/// A full or disconnected 4096-item queue uses at most four overflow workers. If those
+/// workers are occupied or the OS refuses thread creation, destruction falls back to the
+/// submitting thread and is logged and counted; this exceptional path has no latency bound.
 pub fn handoff_cleanup<T: Send + 'static>(value: T) {
-    let boxed: Box<dyn Any + Send + 'static> = Box::new(value);
-    if let Ok(mut stats) = CLEANUP_STATS.lock() {
-        stats.handed_off_count = stats.handed_off_count.saturating_add(1);
-        stats.active_count = stats.active_count.saturating_add(1);
-    }
-    let sender = cleanup_channel();
-    if sender.try_send(boxed).is_err() {
-        let _ = thread::Builder::new()
-            .name("storage-cleanup-overflow".to_string())
-            .spawn(move || {
-                if let Ok(mut stats) = CLEANUP_STATS.lock() {
-                    stats.completed_count = stats.completed_count.saturating_add(1);
-                    stats.active_count = stats.active_count.saturating_sub(1);
-                }
-            });
-    }
+    let task = CleanupTask::new(value, Arc::clone(cleanup_accounting()));
+    dispatch_cleanup_task(cleanup_channel(), task, |task| {
+        thread::Builder::new()
+            .name("storage-cleanup-overflow".to_owned())
+            .spawn(move || drop(task))
+            .map(|_worker| ())
+    });
 }
 
 /// Snapshot of current cleanup handoff statistics.
 #[must_use]
 pub fn cleanup_handoff_stats() -> CleanupHandoffStats {
-    *CLEANUP_STATS
+    *cleanup_accounting()
+        .stats
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -6643,10 +6786,394 @@ pub fn drain_cleanup_handoffs_for_test() {
     let started = Instant::now();
     while Instant::now().duration_since(started) < Duration::from_secs(2) {
         let stats = cleanup_handoff_stats();
-        if stats.active_count == 0 && stats.completed_count >= stats.handed_off_count {
+        if stats.active_count == 0
+            && stats.completed_count.saturating_add(stats.failed_count) >= stats.handed_off_count
+        {
             return;
         }
         thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
+mod cleanup_handoff_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    struct DropProbe {
+        tag: usize,
+        entered: mpsc::Sender<(usize, thread::ThreadId)>,
+        release: Option<mpsc::Receiver<()>>,
+        panics: bool,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let _ = self.entered.send((self.tag, thread::current().id()));
+            if let Some(release) = self.release.as_ref() {
+                // Disconnect also releases the probe if an assertion fails, so a negative
+                // control cannot leave a permanently blocked test thread.
+                let _ = release.recv();
+            }
+            assert!(!self.panics, "injected cleanup destructor panic");
+        }
+    }
+
+    fn receive<T>(receiver: &mpsc::Receiver<T>) -> T {
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("cleanup ownership observation")
+    }
+
+    fn stats(accounting: &CleanupAccounting) -> CleanupHandoffStats {
+        *accounting
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn assert_overflow_owns_payload(disconnected: bool) {
+        let accounting = Arc::new(CleanupAccounting::default());
+        // A live rendezvous receiver that is not waiting deterministically returns Full.
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let _receiver_guard = if disconnected {
+            drop(receiver);
+            None
+        } else {
+            Some(receiver)
+        };
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (caller_tx, caller_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let caller_accounting = Arc::clone(&accounting);
+        let caller = thread::spawn(move || {
+            caller_tx
+                .send(thread::current().id())
+                .expect("record submitting thread");
+            let task = CleanupTask::new(
+                DropProbe {
+                    tag: 0,
+                    entered: entered_tx,
+                    release: Some(release_rx),
+                    panics: false,
+                },
+                caller_accounting,
+            );
+            dispatch_cleanup_task(&sender, task, |task| {
+                let worker = thread::Builder::new().spawn(move || drop(task))?;
+                worker_tx.send(worker).expect("retain overflow worker");
+                Ok(())
+            });
+            returned_tx.send(()).expect("record handoff return");
+        });
+
+        let submitted_on = receive(&caller_rx);
+        let (tag, destroyed_on) = receive(&entered_rx);
+        assert_eq!(tag, 0);
+        assert_ne!(
+            destroyed_on, submitted_on,
+            "the send error must transfer its exact payload to the overflow worker"
+        );
+        receive(&returned_rx);
+        assert_eq!(
+            stats(&accounting),
+            CleanupHandoffStats {
+                handed_off_count: 1,
+                active_count: 1,
+                ..CleanupHandoffStats::default()
+            },
+            "a blocked destructor has not completed merely because handoff returned"
+        );
+        assert_eq!(accounting.overflow_workers.load(Ordering::Acquire), 1);
+        release_tx.send(()).expect("release destructor");
+        receive(&worker_rx).join().expect("overflow cleanup");
+        caller.join().expect("submitting thread");
+        assert_eq!(
+            stats(&accounting),
+            CleanupHandoffStats {
+                handed_off_count: 1,
+                completed_count: 1,
+                ..CleanupHandoffStats::default()
+            }
+        );
+        assert_eq!(accounting.overflow_workers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cleanup_full_queue_transfers_the_payload_off_the_submitting_thread() {
+        assert_overflow_owns_payload(false);
+    }
+
+    #[test]
+    fn cleanup_disconnected_queue_transfers_the_payload_off_the_submitting_thread() {
+        assert_overflow_owns_payload(true);
+    }
+
+    #[test]
+    fn cleanup_spawn_failures_destroy_inline_and_release_accounting() {
+        let accounting = Arc::new(CleanupAccounting::default());
+        let sender = start_cleanup_channel(|receiver| {
+            drop(receiver);
+            Err(std::io::Error::other(
+                "injected shared-worker startup failure",
+            ))
+        });
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (caller_tx, caller_rx) = mpsc::channel();
+        let caller_accounting = Arc::clone(&accounting);
+        let caller = thread::spawn(move || {
+            caller_tx
+                .send(thread::current().id())
+                .expect("record submitting thread");
+            let task = CleanupTask::new(
+                DropProbe {
+                    tag: 0,
+                    entered: entered_tx,
+                    release: Some(release_rx),
+                    panics: false,
+                },
+                caller_accounting,
+            );
+            dispatch_cleanup_task(&sender, task, |task| {
+                // A failed Builder::spawn drops its captured task on this thread.
+                drop(task);
+                Err(std::io::Error::other(
+                    "injected overflow-worker startup failure",
+                ))
+            });
+        });
+
+        assert_eq!(receive(&entered_rx).1, receive(&caller_rx));
+        assert_eq!(stats(&accounting).completed_count, 0);
+        assert_eq!(stats(&accounting).active_count, 1);
+        assert_eq!(accounting.overflow_workers.load(Ordering::Acquire), 1);
+        release_tx.send(()).expect("release inline destructor");
+        caller.join().expect("failed-spawn caller");
+        assert_eq!(
+            stats(&accounting),
+            CleanupHandoffStats {
+                handed_off_count: 1,
+                completed_count: 1,
+                inline_fallback_count: 1,
+                ..CleanupHandoffStats::default()
+            }
+        );
+        assert_eq!(accounting.overflow_workers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cleanup_overflow_cap_falls_back_inline_without_starting_another_worker() {
+        let accounting = Arc::new(CleanupAccounting::default());
+        let (sender, receiver) = mpsc::sync_channel(0);
+        drop(receiver);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut workers = Vec::new();
+        for tag in 0..MAX_CLEANUP_OVERFLOW_WORKERS {
+            let (release_tx, release_rx) = mpsc::channel();
+            releases.push(release_tx);
+            let task = CleanupTask::new(
+                DropProbe {
+                    tag,
+                    entered: entered_tx.clone(),
+                    release: Some(release_rx),
+                    panics: false,
+                },
+                Arc::clone(&accounting),
+            );
+            dispatch_cleanup_task(&sender, task, |task| {
+                workers.push(thread::Builder::new().spawn(move || drop(task))?);
+                Ok(())
+            });
+            let (observed_tag, worker) = receive(&entered_rx);
+            assert_eq!(observed_tag, tag);
+            assert_ne!(worker, thread::current().id());
+        }
+        let (release_tx, release_rx) = mpsc::channel();
+        let (caller_tx, caller_rx) = mpsc::channel();
+        let caller_accounting = Arc::clone(&accounting);
+        let caller = thread::spawn(move || {
+            caller_tx
+                .send(thread::current().id())
+                .expect("record saturated submitting thread");
+            let task = CleanupTask::new(
+                DropProbe {
+                    tag: MAX_CLEANUP_OVERFLOW_WORKERS,
+                    entered: entered_tx,
+                    release: Some(release_rx),
+                    panics: false,
+                },
+                caller_accounting,
+            );
+            dispatch_cleanup_task(&sender, task, |_task| {
+                panic!("overflow cap must refuse another worker");
+            });
+        });
+        let (tag, destroyed_on) = receive(&entered_rx);
+        assert_eq!(tag, MAX_CLEANUP_OVERFLOW_WORKERS);
+        assert_eq!(destroyed_on, receive(&caller_rx));
+        assert_eq!(
+            stats(&accounting).active_count,
+            MAX_CLEANUP_OVERFLOW_WORKERS + 1
+        );
+        assert_eq!(stats(&accounting).completed_count, 0);
+        assert_eq!(
+            accounting.overflow_workers.load(Ordering::Acquire),
+            MAX_CLEANUP_OVERFLOW_WORKERS
+        );
+        release_tx.send(()).expect("release saturated inline cleanup");
+        caller.join().expect("saturated submitting thread");
+        for release in releases {
+            release.send(()).expect("release bounded overflow cleanup");
+        }
+        for worker in workers {
+            worker.join().expect("bounded overflow worker");
+        }
+        assert_eq!(
+            stats(&accounting),
+            CleanupHandoffStats {
+                handed_off_count: (MAX_CLEANUP_OVERFLOW_WORKERS + 1) as u64,
+                completed_count: (MAX_CLEANUP_OVERFLOW_WORKERS + 1) as u64,
+                inline_fallback_count: 1,
+                ..CleanupHandoffStats::default()
+            }
+        );
+        assert_eq!(accounting.overflow_workers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cleanup_reentrant_handoff_is_queued_background_work_on_the_same_worker() {
+        struct OnDrop(Option<Box<dyn FnOnce() + Send>>);
+
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                if let Some(action) = self.0.take() {
+                    action();
+                }
+            }
+        }
+
+        let accounting = Arc::new(CleanupAccounting::default());
+        let mut worker = None;
+        let sender = start_cleanup_channel(|receiver| {
+            worker = Some(thread::Builder::new().spawn(move || run_cleanup_worker(receiver))?);
+            Ok(())
+        });
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let nested_sender = sender.clone();
+        let nested_accounting = Arc::clone(&accounting);
+        let task = CleanupTask::new(
+            OnDrop(Some(Box::new(move || {
+                let submitted_on = thread::current().id();
+                let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed_returned = Arc::clone(&returned);
+                let nested_task = CleanupTask::new(
+                    OnDrop(Some(Box::new(move || {
+                        let _ = observed_tx.send((
+                            observed_returned.load(Ordering::Acquire),
+                            submitted_on,
+                            thread::current().id(),
+                        ));
+                    }))),
+                    nested_accounting,
+                );
+                dispatch_cleanup_task(&nested_sender, nested_task, |_task| {
+                    panic!("the shared worker's nested handoff must fit in its queue");
+                });
+                returned.store(true, Ordering::Release);
+            }))),
+            Arc::clone(&accounting),
+        );
+        dispatch_cleanup_task(&sender, task, |_task| {
+            panic!("empty shared queue must accept the outer task");
+        });
+        let (returned_before_drop, submitted_on, destroyed_on) = receive(&observed_rx);
+        assert!(returned_before_drop, "nested handoff must return before destruction");
+        assert_eq!(submitted_on, destroyed_on);
+        assert_ne!(destroyed_on, thread::current().id());
+        drop(sender);
+        worker
+            .expect("shared worker started")
+            .join()
+            .expect("shared worker completed the nested cleanup");
+        assert_eq!(
+            stats(&accounting),
+            CleanupHandoffStats {
+                handed_off_count: 2,
+                completed_count: 2,
+                ..CleanupHandoffStats::default()
+            },
+            "later queued work is not an inline fallback even when its submitter is the worker"
+        );
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn cleanup_worker_counts_panicking_drop_as_failure_and_continues() {
+        let accounting = Arc::new(CleanupAccounting::default());
+        let mut worker = None;
+        let sender = start_cleanup_channel(|receiver| {
+            worker = Some(thread::Builder::new().spawn(move || run_cleanup_worker(receiver))?);
+            Ok(())
+        });
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let panic_task = CleanupTask::new(
+            DropProbe {
+                tag: 0,
+                entered: entered_tx.clone(),
+                release: None,
+                panics: true,
+            },
+            Arc::clone(&accounting),
+        );
+        dispatch_cleanup_task(&sender, panic_task, |_task| {
+            panic!("empty shared queue must accept the first task");
+        });
+        let next_task = CleanupTask::new(
+            DropProbe {
+                tag: 1,
+                entered: entered_tx,
+                release: Some(release_rx),
+                panics: false,
+            },
+            Arc::clone(&accounting),
+        );
+        dispatch_cleanup_task(&sender, next_task, |_task| {
+            panic!("shared queue must remain connected after a payload panic");
+        });
+        let (first_tag, first_worker) = receive(&entered_rx);
+        let (next_tag, next_worker) = receive(&entered_rx);
+        assert_eq!((first_tag, next_tag), (0, 1));
+        assert_eq!(first_worker, next_worker);
+        assert_ne!(next_worker, thread::current().id());
+        assert_eq!(
+            stats(&accounting),
+            CleanupHandoffStats {
+                handed_off_count: 2,
+                failed_count: 1,
+                active_count: 1,
+                ..CleanupHandoffStats::default()
+            }
+        );
+        release_tx.send(()).expect("release next destructor");
+        drop(sender);
+        worker
+            .expect("shared worker started")
+            .join()
+            .expect("shared cleanup worker survives unwinding payload panic");
+        assert_eq!(
+            stats(&accounting),
+            CleanupHandoffStats {
+                handed_off_count: 2,
+                completed_count: 1,
+                failed_count: 1,
+                ..CleanupHandoffStats::default()
+            }
+        );
     }
 }
 
