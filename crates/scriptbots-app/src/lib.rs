@@ -4114,12 +4114,113 @@ pub mod renderer {
     pub fn lab_workflow_submit(
         control: crate::control::ControlHandle,
     ) -> scriptbots_runtime::lab_workflows::LabWorkflowSubmit {
+        let export_directory = std::env::current_dir()
+            .map_err(|error| format!("Cannot resolve the native export directory: {error}"))
+            .and_then(|directory| {
+                resolve_lab_export_directory(
+                    &directory,
+                    std::env::var_os("SCRIPTBOTS_EXPORT_DIR").as_deref(),
+                )
+            });
+        lab_workflow_submit_with_export_directory(control, export_directory)
+    }
+
+    fn resolve_lab_export_directory(
+        current_directory: &std::path::Path,
+        configured: Option<&std::ffi::OsStr>,
+    ) -> Result<String, String> {
+        use std::path::{Component, Path, PathBuf};
+
+        let configured = configured.map_or_else(|| Path::new("exports"), Path::new);
+        if configured.as_os_str().is_empty() || !current_directory.is_absolute() {
+            return Err("The native export directory must resolve to an absolute path.".into());
+        }
+        let requested = current_directory.join(configured);
+        let mut directory = PathBuf::new();
+        for component in requested.components() {
+            match component {
+                Component::ParentDir => {
+                    return Err(
+                        "The native export directory cannot contain parent traversal.".into(),
+                    );
+                }
+                Component::CurDir => {}
+                component => directory.push(component.as_os_str()),
+            }
+        }
+        let directory = directory
+            .to_str()
+            .ok_or_else(|| "The native export directory must be valid UTF-8.".to_owned())?;
+        if directory.len() > 4096 || directory.chars().any(char::is_control) {
+            return Err(
+                "The native export directory is too long or contains control characters.".into(),
+            );
+        }
+        Ok(directory.to_owned())
+    }
+
+    fn project_lab_artifact(
+        artifact: crate::control::ArtifactMetadataDto,
+    ) -> scriptbots_runtime::lab_workflows::LabArtifact {
+        scriptbots_runtime::lab_workflows::LabArtifact {
+            artifact_id: artifact.artifact_id,
+            filename: artifact.filename,
+            content_type: artifact.content_type,
+            byte_size: artifact.byte_size,
+            checksum_blake3: artifact.checksum_blake3,
+            checksum_sha256: artifact.checksum_sha256,
+            created_at_utc: artifact.created_at_utc,
+            relative_path: artifact.relative_path,
+        }
+    }
+
+    // Resolve configuration once per provider. A later environment or working
+    // directory change cannot redirect an export after the UI displays its path.
+    fn lab_workflow_submit_with_export_directory(
+        control: crate::control::ControlHandle,
+        export_directory: Result<String, String>,
+    ) -> scriptbots_runtime::lab_workflows::LabWorkflowSubmit {
         use scriptbots_runtime::lab_workflows::{
-            LAB_PAGE_SIZE, LabCheckpoint, LabCheckpointPage, LabComparison, LabExperimentPage,
-            LabWorkflowRequest, LabWorkflowResponse,
+            LAB_PAGE_SIZE, LabArtifactPage, LabCheckpoint, LabCheckpointPage, LabComparison,
+            LabExperimentPage, LabWorkflowRequest, LabWorkflowResponse,
         };
         Arc::new(move |request| {
             let result = match request {
+                LabWorkflowRequest::ListArtifacts { cursor } => export_directory
+                    .as_ref()
+                    .map_err(|reason| crate::control::ControlError::BadRequest(reason.clone()))
+                    .and_then(|directory| {
+                        control
+                            .list_artifacts(Some(LAB_PAGE_SIZE), cursor.as_deref())
+                            .map(|page| {
+                                LabWorkflowResponse::Artifacts(LabArtifactPage {
+                                    items: page.items.into_iter().map(project_lab_artifact).collect(),
+                                    total: page.total,
+                                    offset: page.offset,
+                                    next_cursor: page.next_cursor,
+                                    export_directory: directory.clone(),
+                                })
+                            })
+                    }),
+                LabWorkflowRequest::ExportArtifact {
+                    request_id,
+                    session_id,
+                    artifact,
+                    export_directory: requested_directory,
+                } => export_directory
+                    .as_ref()
+                    .map_err(|reason| crate::control::ControlError::BadRequest(reason.clone()))
+                    .and_then(|directory| {
+                        if requested_directory != *directory {
+                            return Err(crate::control::ControlError::Conflict(
+                                "Native artifact export destination changed after catalog display."
+                                    .into(),
+                            ));
+                        }
+                        control
+                            .export_lab_artifact(&request_id, session_id, &artifact, directory)
+                            .map(LabWorkflowResponse::ArtifactExported)
+                    }),
                 LabWorkflowRequest::BranchCapabilities => {
                     native_lab_branch_capabilities().map(LabWorkflowResponse::BranchCapabilities)
                 }
@@ -5086,6 +5187,216 @@ pub mod renderer {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             None
+        }
+
+        #[test]
+        fn native_lab_export_directory_resolution_is_explicit_and_side_effect_free() {
+            use std::ffi::OsStr;
+
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().canonicalize().unwrap();
+            let default = resolve_lab_export_directory(&root, None).unwrap();
+            assert_eq!(std::path::Path::new(&default), root.join("exports"));
+            assert!(!root.join("exports").exists());
+            let nested = root.join("chosen").join("files");
+            let explicit = resolve_lab_export_directory(&root, Some(nested.as_os_str())).unwrap();
+            assert_eq!(std::path::Path::new(&explicit), nested);
+            assert!(!nested.exists());
+            let relative =
+                resolve_lab_export_directory(&root, Some(OsStr::new("./chosen/files"))).unwrap();
+            assert_eq!(relative, explicit);
+            for invalid in ["", "../outside", "chosen/../outside", "line\nbreak"] {
+                assert!(
+                    resolve_lab_export_directory(&root, Some(OsStr::new(invalid))).is_err(),
+                    "invalid export configuration accepted: {invalid:?}"
+                );
+            }
+            assert!(
+                resolve_lab_export_directory(&root, Some(OsStr::new(&"x".repeat(4097)))).is_err()
+            );
+            assert!(
+                resolve_lab_export_directory(std::path::Path::new("relative"), None).is_err()
+            );
+        }
+
+        #[test]
+        fn native_lab_artifact_provider_exports_real_checkpoint_and_experiment_bytes() {
+            use scriptbots_runtime::lab_workflows::{
+                LAB_PAGE_SIZE, LabWorkflowRequest as Request, LabWorkflowResponse as Response,
+            };
+
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().canonicalize().unwrap();
+            let destination = root.join("exports");
+            let destination_text = destination.to_str().unwrap().to_owned();
+            let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+                .unwrap()
+                .population;
+            crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host
+                .handle()
+                .with_artifacts_dir(root.clone())
+                .unwrap();
+            let checkpoint = handle
+                .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+                .unwrap();
+            assert!(checkpoint.agent_count > 0);
+            let runner = crate::control::tests::comparison_catalog_runner(
+                &root,
+                "native-artifact-export",
+                vec![7],
+                0.0,
+            );
+            runner
+                .execute_batch(&runner.output_dir.join("status.json"))
+                .unwrap();
+            let before = handle.read_snapshot().unwrap();
+            let digest = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit_with_export_directory(
+                handle.clone(),
+                Ok(destination_text.clone()),
+            );
+            let mut cursor = None;
+            let mut offset = 0;
+            let mut artifacts = std::collections::BTreeMap::new();
+            loop {
+                let Response::Artifacts(page) =
+                    provider(Request::ListArtifacts { cursor }).unwrap()
+                else {
+                    panic!("expected the actual artifact catalog");
+                };
+                assert_eq!(page.export_directory, destination_text);
+                assert_eq!(page.offset, offset);
+                assert!(page.items.len() <= LAB_PAGE_SIZE);
+                offset += page.items.len();
+                for artifact in page.items {
+                    assert!(artifacts.insert(artifact.artifact_id.clone(), artifact).is_none());
+                }
+                if page.next_cursor.is_none() {
+                    assert_eq!(artifacts.len(), page.total);
+                    break;
+                }
+                assert!(offset < page.total);
+                cursor = page.next_cursor;
+            }
+            assert!(!destination.exists(), "catalog reads must not create export files");
+            let saved = artifacts.get(&checkpoint.checkpoint_id).unwrap().clone();
+            let experiment = artifacts
+                .values()
+                .find(|artifact| artifact.artifact_id != checkpoint.checkpoint_id)
+                .expect("the completed experiment exposes a verified artifact")
+                .clone();
+            let redirected = root.join("not-displayed");
+            let refusal = provider(Request::ExportArtifact {
+                request_id: "redirected-export".into(),
+                session_id: before.session_id,
+                artifact: saved.clone(),
+                export_directory: redirected.to_str().unwrap().into(),
+            })
+            .err()
+            .expect("a changed destination must be refused");
+            assert!(refusal.contains("destination changed"));
+            assert!(!redirected.exists());
+            assert!(!destination.exists());
+
+            for (index, artifact) in [saved, experiment].into_iter().enumerate() {
+                let request_id = format!("native-export-{index}");
+                let (metadata, expected) = handle.read_artifact_bytes(&artifact.artifact_id).unwrap();
+                assert_eq!(serde_json::to_value(&artifact).unwrap(), serde_json::to_value(metadata).unwrap());
+                let request = Request::ExportArtifact {
+                    request_id: request_id.clone(),
+                    session_id: before.session_id,
+                    artifact: artifact.clone(),
+                    export_directory: destination_text.clone(),
+                };
+                let Response::ArtifactExported(receipt) = provider(request.clone()).unwrap() else {
+                    panic!("only a completed file export may return this receipt");
+                };
+                assert_eq!(receipt.request_id, request_id);
+                assert_eq!(receipt.session_id, before.session_id);
+                assert_eq!(receipt.artifact, artifact);
+                assert_eq!(receipt.export_directory, destination_text);
+                let expected_path = destination.join(&request_id).join(&artifact.filename);
+                assert_eq!(std::path::Path::new(&receipt.output_path), expected_path);
+                assert_eq!(
+                    std::path::Path::new(&receipt.manifest_path),
+                    destination.join(&request_id).join("export-manifest.json")
+                );
+                let written = std::fs::read(&receipt.output_path).unwrap();
+                assert_eq!(written, expected);
+                assert_eq!(crate::control::compute_blake3(&written), artifact.checksum_blake3);
+                assert_eq!(crate::control::compute_sha256(&written), artifact.checksum_sha256);
+                let manifest_bytes = std::fs::read(&receipt.manifest_path).unwrap();
+                let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+                assert_eq!(manifest["schema"], "scriptbots.native-artifact-export.v1");
+                assert_eq!(manifest["request_id"], request_id);
+                assert_eq!(manifest["source_session_id"], before.session_id.get().to_string());
+                assert_eq!(manifest["artifact"], serde_json::to_value(&artifact).unwrap());
+                assert_eq!(manifest["output_path"], receipt.output_path);
+                assert_eq!(manifest["manifest_path"], receipt.manifest_path);
+                assert!(
+                    provider(request).is_err(),
+                    "repeated export must preserve the existing operation directory"
+                );
+                assert_eq!(std::fs::read(&receipt.output_path).unwrap(), expected);
+                assert_eq!(std::fs::read(&receipt.manifest_path).unwrap(), manifest_bytes);
+            }
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &before));
+            handle.data_services().shutdown_experiments().unwrap();
+        }
+
+        #[test]
+        fn native_lab_export_configuration_failure_keeps_other_services_available() {
+            use scriptbots_runtime::lab_workflows::{
+                LabWorkflowRequest as Request, LabWorkflowResponse as Response,
+            };
+
+            let temporary = tempfile::tempdir().unwrap();
+            let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(17),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let host = TestHost::spawn(world);
+            let handle = host
+                .handle()
+                .with_artifacts_dir(temporary.path().to_path_buf())
+                .unwrap();
+            let provider = lab_workflow_submit_with_export_directory(
+                handle,
+                Err("Export directory configuration is invalid.".into()),
+            );
+            let refusal = provider(Request::ListArtifacts { cursor: None })
+                .err()
+                .expect("export configuration failure remains visible");
+            assert!(refusal.contains("Export directory configuration is invalid."));
+            let Response::Checkpoints(page) =
+                provider(Request::ListCheckpoints { cursor: None }).unwrap()
+            else {
+                panic!("an unavailable export directory must not disable checkpoint inspection");
+            };
+            assert_eq!(page.total, 0);
         }
 
         #[test]

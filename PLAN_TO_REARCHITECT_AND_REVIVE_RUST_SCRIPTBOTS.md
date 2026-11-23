@@ -2,6 +2,24 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Native Lab artifact export (2026-11-23):**
+[Currently In Progress — Codex; scoped contribution to `bd-2z0.7.6.1`;
+original ownership and full native/GPU acceptance retained]
+
+Add a shared, paginated retained-artifact catalog and an application export service
+that freezes the selected descriptor, source session and displayed destination.
+Exports copy the verified retained bytes into an exclusive request directory and
+write a versioned manifest with the original catalog metadata, source session and
+both checksums. Files are synced and independently read back; existing paths,
+changed sources and mismatched receipts are refused. Partial files remain
+inspectable, and navigation does not discard a pending export's eventual outcome.
+The GPUI and Bevy panes are the next commit in this scoped implementation.
+
+Reducer and real application/filesystem regressions are authored. The execution
+environment became unavailable during toolchain/DSR setup, so compilation,
+formatting, Clippy, tests and native/GPU execution are not claimed. The original
+acceptance criteria and execution gates remain open.
+
 **Session-bound remote owner health (2026-11-23):**
 [Implemented and independently source-reviewed — Codex; scoped contributions to
 `bd-2z0.12.2` and `bd-2z0.12.3`; original native and packaged-browser acceptance retained]

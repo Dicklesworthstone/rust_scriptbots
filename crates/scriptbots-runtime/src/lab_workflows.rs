@@ -28,6 +28,8 @@ pub const LAB_MAX_EXPERIMENT_SEEDS: usize = 128;
 pub const LAB_MAX_TREATMENT_PERCENT: u16 = 400;
 /// Maximum verified JSON bytes decoded for a native saved-study preview.
 pub const LAB_MAX_BRANCH_REPORT_BYTES: usize = 1024 * 1024;
+/// Maximum bytes copied by one explicit native artifact export.
+pub const LAB_MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 // Run IDs append "-challenger-seed" and up to twenty decimal seed digits to
 // the experiment identity. Reserve that suffix within the runner's 128-byte bound.
 const MAX_EXPERIMENT_REQUEST_ID_BYTES: usize = 92;
@@ -643,6 +645,22 @@ pub enum LabWorkflowRequest {
         /// Final-state observation to compare across the matched seed pairs.
         metric: LabMetric,
     },
+    /// Read one bounded application-wide artifact catalog page.
+    ListArtifacts {
+        /// Canonical offset cursor; the application chooses the displayed destination.
+        cursor: Option<String>,
+    },
+    /// Export one exact catalog observation to the displayed application destination.
+    ExportArtifact {
+        /// Unique capsule identity, allocated only on explicit user submission.
+        request_id: String,
+        /// Application source from which the artifact was observed.
+        session_id: HostSessionId,
+        /// Complete frozen catalog descriptor, including both content checksums.
+        artifact: LabArtifact,
+        /// Exact absolute destination root displayed before submission.
+        export_directory: String,
+    },
     /// Read one checkpoint catalog page.
     ListCheckpoints {
         /// Application page cursor.
@@ -797,6 +815,121 @@ pub struct LabComparison {
     pub plan_digest: String,
     /// Exact source status generation.
     pub status_generation: u64,
+}
+
+/// Complete catalog observation for one retained application artifact.
+///
+/// Size is metadata, not admission: oversized records remain visible in the
+/// catalog, while export refuses them before reading or creating any files.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabArtifact {
+    /// Canonical artifact identity used by application lookup.
+    pub artifact_id: String,
+    /// Safe single-component name used inside the new export capsule.
+    pub filename: String,
+    /// Declared content type; exporting never opens or executes this content.
+    pub content_type: String,
+    /// Exact stored byte count, including a valid empty artifact.
+    pub byte_size: u64,
+    /// Canonical lowercase BLAKE3 checksum of the exact artifact bytes.
+    pub checksum_blake3: String,
+    /// Canonical lowercase SHA-256 checksum of the exact artifact bytes.
+    pub checksum_sha256: String,
+    /// Bounded original catalog creation timestamp.
+    pub created_at_utc: String,
+    /// Safe catalog-relative source path, never a caller-chosen filesystem path.
+    pub relative_path: String,
+}
+
+impl LabArtifact {
+    /// Validate metadata shape without excluding an oversized catalog record.
+    ///
+    /// # Errors
+    ///
+    /// Refuses unsafe identifiers, filenames or relative paths, unbounded text,
+    /// the reserved receipt-manifest filename, and noncanonical checksums.
+    pub fn validate(&self) -> Result<(), String> {
+        if !branch_identifier_is_valid(&self.artifact_id)
+            || !artifact_filename_is_valid(&self.filename)
+            || self.filename.eq_ignore_ascii_case("export-manifest.json")
+            || !artifact_text_is_bounded(&self.content_type, 128)
+            || !artifact_text_is_bounded(&self.created_at_utc, 64)
+            || self.relative_path.len() > 4096
+            || !self.relative_path.split('/').all(artifact_filename_is_valid)
+            || !lowercase_hex_is_valid(&self.checksum_blake3, 64)
+            || !lowercase_hex_is_valid(&self.checksum_sha256, 64)
+        {
+            return Err("Artifact metadata is unsafe, malformed or exceeds its bounds.".into());
+        }
+        Ok(())
+    }
+}
+
+/// One bounded page of the application's complete retained artifact catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabArtifactPage {
+    /// At most twelve complete catalog observations.
+    pub items: Vec<LabArtifact>,
+    /// Total retained artifacts, including files above the export byte limit.
+    pub total: usize,
+    /// Canonical offset of this page.
+    pub offset: usize,
+    /// Canonical offset of the next full page, if one exists.
+    pub next_cursor: Option<String>,
+    /// Actual absolute destination root chosen by the application provider.
+    pub export_directory: String,
+}
+
+/// Application-observed export after file and manifest verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabArtifactExportReceipt {
+    /// Exact submitted capsule identity.
+    pub request_id: String,
+    /// Original application source, even if the frontend has since switched.
+    pub session_id: HostSessionId,
+    /// Complete source descriptor verified by the exporting service.
+    pub artifact: LabArtifact,
+    /// Exact destination root disclosed before the request.
+    pub export_directory: String,
+    /// Actual verified copied file in the request's exclusive capsule.
+    pub output_path: String,
+    /// Actual verified export manifest beside the copied file.
+    pub manifest_path: String,
+}
+
+/// Latest explicit file export, independent of the current viewing context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabArtifactExport {
+    /// Unique capsule identity; a later explicit export receives a different one.
+    pub request_id: String,
+    /// Frozen source session, never attached to a newly selected owner.
+    pub session_id: HostSessionId,
+    /// Frozen source metadata, never refreshed during file export.
+    pub artifact: LabArtifact,
+    /// Frozen destination root, never taken from a later catalog response.
+    pub export_directory: String,
+    /// Actual worker outcome; viewing cancellation never cancels a file operation.
+    pub state: LabArtifactExportState,
+}
+
+/// Observed lifecycle of the most recent explicit native artifact export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabArtifactExportState {
+    /// The worker is still occupied and the file operation may complete.
+    Pending,
+    /// The service returned a fully matching verified output receipt.
+    Exported(LabArtifactExportReceipt),
+    /// A worker did not start, or the service returned a failure.
+    Failed {
+        /// Bounded error; partial files may remain when the service failed.
+        reason: String,
+    },
+    /// The worker disconnected or returned a mismatched response.
+    Unconfirmed {
+        /// Bounded explanation; no automatic retry can duplicate a file operation.
+        reason: String,
+    },
 }
 
 /// Retained checkpoint catalog row.
@@ -1179,6 +1312,10 @@ pub enum LabWorkflowResponse {
     Experiment(LabExperiment),
     /// Verified endpoint comparison.
     Comparison(LabComparison),
+    /// Complete bounded retained-artifact page and its displayed destination.
+    Artifacts(LabArtifactPage),
+    /// Verified receipt for the exact frozen file export.
+    ArtifactExported(LabArtifactExportReceipt),
     /// Retained checkpoint catalog page.
     Checkpoints(LabCheckpointPage),
     /// Verified service receipt for one source-bound save request.
@@ -1296,6 +1433,21 @@ pub enum LabAction {
         /// Observed failed generation; never refreshed implicitly during submission.
         expected_generation: u64,
     },
+    /// Open or page retained artifacts within Experiments or Checkpoints.
+    ArtifactsPage(Option<String>),
+    /// Return to the prior panel without cancelling any file operation.
+    BackFromArtifacts,
+    /// Select one exact descriptor on the currently observed catalog page.
+    SelectArtifact(String),
+    /// Explicit frozen source and destination, checked again before submission.
+    ExportArtifact {
+        /// Owner observed when the button was rendered.
+        session_id: HostSessionId,
+        /// Complete catalog descriptor observed when the button was rendered.
+        artifact: LabArtifact,
+        /// Exact absolute destination displayed when the button was rendered.
+        export_directory: String,
+    },
     /// Move to another checkpoint catalog page.
     CheckpointsPage(Option<String>),
     /// Select a retained cut.
@@ -1379,6 +1531,15 @@ pub struct LabWorkflows {
     pub variant_offset: usize,
     /// Last accepted comparison for the current plan and status generation.
     pub comparison: Option<LabComparison>,
+    /// Whether retained artifacts replace the current Experiments or Checkpoints view.
+    pub viewing_artifacts: bool,
+    /// Last validated complete artifact page from the current application source.
+    pub artifacts: Option<LabArtifactPage>,
+    artifact_cursor: Option<String>,
+    /// Selected catalog identity; its complete metadata comes only from this page.
+    pub selected_artifact: Option<String>,
+    /// Historical file-operation observation retained across panel and source changes.
+    pub latest_artifact_export: Option<LabArtifactExport>,
     /// Last accepted checkpoint page.
     pub checkpoints: Option<LabCheckpointPage>,
     checkpoint_cursor: Option<String>,
@@ -1416,6 +1577,70 @@ fn bounded_message(message: &str) -> String {
 
 fn identity_is_bounded(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn artifact_text_is_bounded(value: &str, limit: usize) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= limit
+        && value.bytes().all(|byte| byte.is_ascii() && !byte.is_ascii_control())
+}
+
+fn artifact_filename_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn artifact_directory_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && !value.chars().any(char::is_control)
+        && std::path::Path::new(value).is_absolute()
+        && !std::path::Path::new(value)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+}
+
+/// Whether an export capsule identity is one bounded safe path component.
+#[must_use]
+pub fn artifact_export_request_identity_is_valid(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= 256
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn artifact_cursor_offset(cursor: Option<&str>) -> Option<usize> {
+    match cursor {
+        None => Some(0),
+        Some(value) => value.parse::<usize>().ok().filter(|offset| {
+            value.len() <= 20
+                && *offset > 0
+                && offset.is_multiple_of(LAB_PAGE_SIZE)
+                && offset.to_string() == value
+        }),
+    }
+}
+
+fn artifact_export_receipt_matches(
+    receipt: &LabArtifactExportReceipt,
+    export: &LabArtifactExport,
+) -> bool {
+    let capsule = std::path::Path::new(&export.export_directory).join(&export.request_id);
+    receipt.request_id == export.request_id
+        && receipt.session_id == export.session_id
+        && receipt.artifact == export.artifact
+        && receipt.export_directory == export.export_directory
+        && receipt.artifact.validate().is_ok()
+        && receipt.artifact.byte_size <= LAB_MAX_ARTIFACT_BYTES as u64
+        && artifact_export_request_identity_is_valid(&receipt.request_id)
+        && artifact_directory_is_valid(&receipt.export_directory)
+        && capsule.join(&receipt.artifact.filename).to_str() == Some(receipt.output_path.as_str())
+        && capsule.join("export-manifest.json").to_str() == Some(receipt.manifest_path.as_str())
 }
 
 /// Whether a save identity can cross the native application boundary.
@@ -1768,6 +1993,10 @@ impl LabWorkflows {
         }
         if self.panel != panel {
             self.invalidate();
+            self.viewing_artifacts = false;
+            self.artifacts = None;
+            self.artifact_cursor = None;
+            self.selected_artifact = None;
             self.panel = panel;
         }
     }
@@ -2325,6 +2554,196 @@ impl LabWorkflows {
         }
     }
 
+    /// Metadata selected from the current validated application artifact page.
+    #[must_use]
+    pub fn selected_artifact_metadata(&self) -> Option<&LabArtifact> {
+        let selected = self.selected_artifact.as_deref()?;
+        self.artifacts
+            .as_ref()?
+            .items
+            .iter()
+            .find(|artifact| artifact.artifact_id == selected)
+    }
+
+    /// Exact source and destination shown by the export button.
+    ///
+    /// The action stays available while busy so frontends can keep a disabled
+    /// button stable. Dispatch separately requires the sole worker to be free.
+    #[must_use]
+    pub fn export_artifact_action(&self) -> Option<LabAction> {
+        if !self.viewing_artifacts
+            || !matches!(self.panel, LabPanel::Experiments | LabPanel::Checkpoints)
+            || self.submit.is_none()
+        {
+            return None;
+        }
+        let session_id = self.session?;
+        let page = self.artifacts.as_ref()?;
+        let artifact = self.selected_artifact_metadata()?;
+        if artifact.validate().is_err()
+            || artifact.byte_size > LAB_MAX_ARTIFACT_BYTES as u64
+            || !artifact_directory_is_valid(&page.export_directory)
+        {
+            return None;
+        }
+        Some(LabAction::ExportArtifact {
+            session_id,
+            artifact: artifact.clone(),
+            export_directory: page.export_directory.clone(),
+        })
+    }
+
+    /// Whether one explicit file export may acquire the shared worker slot.
+    #[must_use]
+    pub fn can_export_artifact(&self) -> bool {
+        !self.is_busy() && self.export_artifact_action().is_some()
+    }
+
+    fn artifacts_page(&mut self, cursor: Option<String>) {
+        if !matches!(self.panel, LabPanel::Experiments | LabPanel::Checkpoints)
+            || artifact_cursor_offset(cursor.as_deref()).is_none()
+        {
+            self.set_notice("Open Experiments or Checkpoints and use a canonical artifact page.");
+            return;
+        }
+        self.invalidate();
+        self.viewing_artifacts = true;
+        self.artifact_cursor = cursor;
+        self.artifacts = None;
+        self.selected_artifact = None;
+        if !self.is_busy() {
+            self.start(LabWorkflowRequest::ListArtifacts {
+                cursor: self.artifact_cursor.clone(),
+            });
+        }
+    }
+
+    fn back_from_artifacts(&mut self) {
+        self.invalidate();
+        self.viewing_artifacts = false;
+        self.set_notice("Returned from artifacts. An active file export may still complete; its observed outcome is retained.");
+    }
+
+    fn select_artifact(&mut self, id: String) {
+        if self.viewing_artifacts
+            && matches!(self.panel, LabPanel::Experiments | LabPanel::Checkpoints)
+            && self.artifacts.as_ref().is_some_and(|page| {
+                page.items.iter().any(|artifact| artifact.artifact_id == id)
+            })
+        {
+            self.invalidate();
+            self.selected_artifact = Some(id);
+        } else {
+            self.set_notice("Select a retained artifact from the current application catalog.");
+        }
+    }
+
+    fn export_artifact(&mut self, action: LabAction) {
+        if !self.can_export_artifact()
+            || self.export_artifact_action().as_ref() != Some(&action)
+        {
+            self.set_notice("Artifact export requires the same observed file, source and destination, a supported byte size, and a free worker slot. Refresh before submitting a changed selection.");
+            return;
+        }
+        let LabAction::ExportArtifact {
+            session_id,
+            artifact,
+            export_directory,
+        } = action
+        else {
+            return;
+        };
+        let Some(request_id) = next_checkpoint_request(session_id) else {
+            self.set_notice("Artifact export request identities are exhausted.");
+            return;
+        };
+        let request = LabWorkflowRequest::ExportArtifact {
+            request_id: request_id.clone(),
+            session_id,
+            artifact: artifact.clone(),
+            export_directory: export_directory.clone(),
+        };
+        self.latest_artifact_export = Some(LabArtifactExport {
+            request_id,
+            session_id,
+            artifact,
+            export_directory,
+            state: LabArtifactExportState::Pending,
+        });
+        self.start(request);
+        if self.is_busy() {
+            self.set_notice("Exporting the selected artifact to a new exclusive capsule. The application is verifying the copied bytes and manifest.");
+        } else {
+            let reason = self.notice.clone().unwrap_or_else(|| "Export worker did not start.".into());
+            if let Some(export) = &mut self.latest_artifact_export {
+                export.state = LabArtifactExportState::Failed {
+                    reason: bounded_message(&reason),
+                };
+            }
+        }
+    }
+
+    fn finish_artifact_export(
+        &mut self,
+        request: &LabWorkflowRequest,
+        result: Result<LabWorkflowResponse, String>,
+        disconnected: bool,
+    ) {
+        let LabWorkflowRequest::ExportArtifact {
+            request_id,
+            session_id,
+            artifact,
+            export_directory,
+        } = request
+        else {
+            return;
+        };
+        let Some(export) = &mut self.latest_artifact_export else {
+            return;
+        };
+        if export.request_id != *request_id
+            || export.session_id != *session_id
+            || export.artifact != *artifact
+            || export.export_directory != *export_directory
+        {
+            self.set_notice("Artifact export finished without matching its retained request; its file outcome is unconfirmed.");
+            return;
+        }
+        let (state, notice) = match result {
+            Ok(LabWorkflowResponse::ArtifactExported(receipt))
+                if artifact_export_receipt_matches(&receipt, export) =>
+            {
+                let notice = format!(
+                    "Export verified for source {}: {}. The receipt is retained independently of the current view.",
+                    session_id.get(),
+                    receipt.output_path,
+                );
+                (LabArtifactExportState::Exported(receipt), notice)
+            }
+            Ok(_) => {
+                let reason = "Export response did not match the exact request, source, catalog descriptor or destination paths.".to_owned();
+                (
+                    LabArtifactExportState::Unconfirmed { reason: reason.clone() },
+                    format!("Artifact export is unconfirmed: {reason} No automatic retry was started."),
+                )
+            }
+            Err(error) => {
+                let reason = bounded_message(&error);
+                let state = if disconnected {
+                    LabArtifactExportState::Unconfirmed { reason: reason.clone() }
+                } else {
+                    LabArtifactExportState::Failed { reason: reason.clone() }
+                };
+                (
+                    state,
+                    format!("Artifact export did not return a verified receipt: {reason} Partial files may remain; no automatic retry was started."),
+                )
+            }
+        };
+        export.state = state;
+        self.set_notice(notice);
+    }
+
     /// Whether the current source can admit one save request.
     ///
     /// The frontend must additionally require its live presentation, because
@@ -2614,12 +3033,19 @@ impl LabWorkflows {
     /// any newer local live-view intent before displaying either result.
     pub fn poll(&mut self) -> Option<(String, Arc<RenderSnapshot>)> {
         let job = self.job.as_ref()?;
-        let result = match job.result.try_recv() {
-            Ok(result) => result,
+        let (result, disconnected) = match job.result.try_recv() {
+            Ok(result) => (result, false),
             Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => Err("Lab worker disconnected".to_owned()),
+            Err(TryRecvError::Disconnected) => (Err("Lab worker disconnected".to_owned()), true),
         };
         let job = self.job.take()?;
+        // A file operation outlives a viewing context. Verify its outcome against
+        // the frozen request even after cancellation, selection or owner changes;
+        // this never selects an artifact or authorizes work on the new source.
+        if matches!(&job.request, LabWorkflowRequest::ExportArtifact { .. }) {
+            self.finish_artifact_export(&job.request, result, disconnected);
+            return None;
+        }
         if job.generation != self.generation
             || job.context != self.context
             || self.session != Some(job.session)
@@ -2677,6 +3103,10 @@ impl LabWorkflows {
                 }
                 if matches!(&job.request, LabWorkflowRequest::BranchCapabilities) {
                     self.branch_capabilities = None;
+                }
+                if matches!(&job.request, LabWorkflowRequest::ListArtifacts { .. }) {
+                    self.artifacts = None;
+                    self.selected_artifact = None;
                 }
                 if matches!(
                     &job.request,
@@ -2762,6 +3192,10 @@ impl LabWorkflows {
                 request @ LabWorkflowRequest::Compare { .. },
                 LabWorkflowResponse::Comparison(comparison),
             ) => self.accept_comparison(request, comparison),
+            (
+                LabWorkflowRequest::ListArtifacts { cursor },
+                LabWorkflowResponse::Artifacts(page),
+            ) => self.accept_artifact_page(cursor.as_deref(), page),
             (
                 LabWorkflowRequest::ListCheckpoints { cursor },
                 LabWorkflowResponse::Checkpoints(page),
@@ -2913,6 +3347,10 @@ impl LabWorkflows {
         if !accepted && matches!(request, LabWorkflowRequest::BranchCapabilities) {
             self.branch_capabilities = None;
         }
+        if !accepted && matches!(request, LabWorkflowRequest::ListArtifacts { .. }) {
+            self.artifacts = None;
+            self.selected_artifact = None;
+        }
         if !accepted
             && matches!(
                 request,
@@ -2961,6 +3399,33 @@ impl LabWorkflows {
             return false;
         }
         self.experiments = Some(page);
+        true
+    }
+
+    fn accept_artifact_page(&mut self, cursor: Option<&str>, page: LabArtifactPage) -> bool {
+        if !self.viewing_artifacts
+            || !matches!(self.panel, LabPanel::Experiments | LabPanel::Checkpoints)
+            || cursor != self.artifact_cursor.as_deref()
+            || artifact_cursor_offset(cursor) != Some(page.offset)
+            || !page_is_bounded(&page.items, page.offset, page.total, page.next_cursor.as_deref())
+            || page.items.len() != LAB_PAGE_SIZE.min(page.total.saturating_sub(page.offset))
+            || page.next_cursor.as_ref().is_some_and(|next| {
+                artifact_cursor_offset(Some(next)) != page.offset.checked_add(page.items.len())
+            })
+            || !artifact_directory_is_valid(&page.export_directory)
+            || page.items.iter().any(|artifact| artifact.validate().is_err())
+            || page.items.iter().enumerate().any(|(index, artifact)| {
+                page.items[..index].iter().any(|previous| previous.artifact_id == artifact.artifact_id)
+            })
+        {
+            return false;
+        }
+        if self.selected_artifact.as_ref().is_some_and(|id| {
+            !page.items.iter().any(|artifact| &artifact.artifact_id == id)
+        }) {
+            self.selected_artifact = None;
+        }
+        self.artifacts = Some(page);
         true
     }
 
@@ -3036,6 +3501,13 @@ impl LabWorkflows {
     }
 
     fn refresh_request(&self) -> Option<LabWorkflowRequest> {
+        if self.viewing_artifacts
+            && matches!(self.panel, LabPanel::Experiments | LabPanel::Checkpoints)
+        {
+            return Some(LabWorkflowRequest::ListArtifacts {
+                cursor: self.artifact_cursor.clone(),
+            });
+        }
         match self.panel {
             LabPanel::Inactive | LabPanel::Narrative => None,
             LabPanel::Experiments if self.composing_experiment => {
@@ -3064,6 +3536,9 @@ impl LabWorkflows {
             return;
         }
         let needs_refresh = match self.panel {
+            LabPanel::Experiments | LabPanel::Checkpoints if self.viewing_artifacts => {
+                self.artifacts.is_none()
+            }
             LabPanel::Inactive | LabPanel::Narrative => false,
             LabPanel::Checkpoints => match self.checkpoint_view {
                 LabCheckpointView::SavedCuts => self.checkpoints.is_none(),
@@ -3154,6 +3629,10 @@ impl LabWorkflows {
         self.baseline = None;
         self.challenger = None;
         self.comparison = None;
+        self.viewing_artifacts = false;
+        self.artifacts = None;
+        self.artifact_cursor = None;
+        self.selected_artifact = None;
         self.checkpoints = None;
         self.checkpoint_cursor = None;
         self.selected_checkpoint = None;
@@ -3434,7 +3913,26 @@ impl LabWorkflows {
 
     /// Apply one native UI intent, preserving request identity and bounded state.
     pub fn dispatch(&mut self, action: LabAction) {
+        if self.viewing_artifacts
+            && !matches!(
+                &action,
+                LabAction::ArtifactsPage(_)
+                    | LabAction::BackFromArtifacts
+                    | LabAction::SelectArtifact(_)
+                    | LabAction::ExportArtifact { .. }
+                    | LabAction::Refresh
+                    | LabAction::CancelRequest
+                    | LabAction::ReturnLive
+            )
+        {
+            self.set_notice("Return from artifacts before submitting an action from another Lab view.");
+            return;
+        }
         match action {
+            LabAction::ArtifactsPage(cursor) => self.artifacts_page(cursor),
+            LabAction::BackFromArtifacts => self.back_from_artifacts(),
+            LabAction::SelectArtifact(id) => self.select_artifact(id),
+            action @ LabAction::ExportArtifact { .. } => self.export_artifact(action),
             LabAction::NewCheckpointBranch => self.open_branch_composer(),
             LabAction::BackToCheckpoints => self.back_to_checkpoints(),
             LabAction::CheckpointBranchesPage(cursor) => self.checkpoint_branches_page(cursor),
@@ -3460,7 +3958,13 @@ impl LabWorkflows {
             LabAction::ReturnLive => self.invalidate(),
             LabAction::CancelRequest => {
                 self.invalidate();
-                self.set_notice("Result cancelled. The worker remains occupied until it finishes; submitted actions may still complete. Unconfirmed saves and admissions retain their retry identity.");
+                if self.job.as_ref().is_some_and(|job| {
+                    matches!(&job.request, LabWorkflowRequest::ExportArtifact { .. })
+                }) {
+                    self.set_notice("Viewing context discarded. The file export is still running and may complete; its observed receipt will be retained. The worker slot remains occupied.");
+                } else {
+                    self.set_notice("Result cancelled. The worker remains occupied until it finishes; submitted actions may still complete. Unconfirmed saves and admissions retain their retry identity.");
+                }
             }
             LabAction::SelectExperiment(id) => self.select_experiment(id),
             LabAction::AllExperiments | LabAction::BackToExperiments => self.back_to_experiments(),
@@ -3709,6 +4213,41 @@ impl LabWorkflows {
     }
 }
 
+/// Bounded historical file-operation details shared by native frontends.
+///
+/// This reports the original source and destination even after a source switch;
+/// it does not attach the exported artifact to the current scientific selection.
+#[must_use]
+pub fn artifact_export_lines(export: &LabArtifactExport) -> Vec<String> {
+    let capsule = std::path::Path::new(&export.export_directory).join(&export.request_id);
+    let mut lines = vec![
+        format!("Export request {} · original source {}.", export.request_id, export.session_id.get()),
+        format!("Artifact {} · {} · {} bytes.", export.artifact.artifact_id, export.artifact.filename, export.artifact.byte_size),
+        format!("Disclosed destination: {}.", export.export_directory),
+        format!("Requested output: {}.", capsule.join(&export.artifact.filename).display()),
+    ];
+    match &export.state {
+        LabArtifactExportState::Pending => lines.push(
+            "Export pending: its worker is still occupied. Leaving this view cannot cancel the file operation; it may still complete.".into(),
+        ),
+        LabArtifactExportState::Exported(receipt) => {
+            lines.push(format!("Verified copied file: {}.", receipt.output_path));
+            lines.push(format!("Verified export manifest: {}.", receipt.manifest_path));
+            lines.push(format!("BLAKE3: {}.", receipt.artifact.checksum_blake3));
+            lines.push(format!("SHA-256: {}.", receipt.artifact.checksum_sha256));
+        }
+        LabArtifactExportState::Failed { reason } => {
+            lines.push(format!("Export failed: {reason}"));
+            lines.push("No verified export receipt was returned. Partial files may remain; no automatic retry is performed.".into());
+        }
+        LabArtifactExportState::Unconfirmed { reason } => {
+            lines.push(format!("Export outcome unconfirmed: {reason}"));
+            lines.push("The file operation may have completed. Inspect the requested capsule before explicitly exporting again.".into());
+        }
+    }
+    lines
+}
+
 /// Shared bounded presentation of actual terminal observations from one saved seed.
 ///
 /// These lines do not turn repeated ticks into independent replication, infer a
@@ -3901,6 +4440,309 @@ mod tests {
         Mutex,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
+
+    fn artifact_fixture(index: usize) -> LabArtifact {
+        LabArtifact {
+            artifact_id: format!("artifact-{index}"),
+            filename: format!("world-{index}.json"),
+            content_type: "application/json".into(),
+            byte_size: 17,
+            checksum_blake3: "a".repeat(64),
+            checksum_sha256: "b".repeat(64),
+            created_at_utc: "2026-11-23T12:00:00Z".into(),
+            relative_path: format!("runs/artifact-{index}.json"),
+        }
+    }
+
+    fn artifact_page(offset: usize, total: usize) -> LabArtifactPage {
+        let end = offset.saturating_add(LAB_PAGE_SIZE).min(total);
+        LabArtifactPage {
+            items: (offset..end).map(artifact_fixture).collect(),
+            total,
+            offset,
+            next_cursor: (end < total).then(|| end.to_string()),
+            export_directory: std::env::temp_dir()
+                .join("scriptbots-native-artifact-contract")
+                .to_str()
+                .unwrap()
+                .into(),
+        }
+    }
+
+    fn artifact_state() -> LabWorkflows {
+        let mut state = LabWorkflows {
+            submit: Some(Arc::new(|_| Err("unexpected service invocation".into()))),
+            ..LabWorkflows::default()
+        };
+        state.synchronize(HostSessionId::new(7), LabPanel::Experiments);
+        state.viewing_artifacts = true;
+        assert!(state.accept_artifact_page(None, artifact_page(0, 2)));
+        state.dispatch(LabAction::SelectArtifact("artifact-0".into()));
+        state
+    }
+
+    fn artifact_receipt(request: &LabWorkflowRequest) -> LabArtifactExportReceipt {
+        let LabWorkflowRequest::ExportArtifact {
+            request_id,
+            session_id,
+            artifact,
+            export_directory,
+        } = request
+        else {
+            panic!("expected an artifact export");
+        };
+        let capsule = std::path::Path::new(export_directory).join(request_id);
+        LabArtifactExportReceipt {
+            request_id: request_id.clone(),
+            session_id: *session_id,
+            artifact: artifact.clone(),
+            export_directory: export_directory.clone(),
+            output_path: capsule.join(&artifact.filename).to_str().unwrap().into(),
+            manifest_path: capsule.join("export-manifest.json").to_str().unwrap().into(),
+        }
+    }
+
+    fn pending_artifact_export(state: &mut LabWorkflows) -> LabWorkflowRequest {
+        let artifact = state.selected_artifact_metadata().unwrap().clone();
+        let export_directory = state.artifacts.as_ref().unwrap().export_directory.clone();
+        let request_id = "native-lab-test-artifact".to_owned();
+        let session_id = state.session.unwrap();
+        state.latest_artifact_export = Some(LabArtifactExport {
+            request_id: request_id.clone(),
+            session_id,
+            artifact: artifact.clone(),
+            export_directory: export_directory.clone(),
+            state: LabArtifactExportState::Pending,
+        });
+        LabWorkflowRequest::ExportArtifact {
+            request_id,
+            session_id,
+            artifact,
+            export_directory,
+        }
+    }
+
+    #[test]
+    fn artifact_metadata_retains_empty_and_oversized_rows_but_bounds_export_authority() {
+        let mut state = artifact_state();
+        for size in [0, LAB_MAX_ARTIFACT_BYTES as u64, u64::MAX] {
+            state.artifacts.as_mut().unwrap().items[0].byte_size = size;
+            assert!(state.selected_artifact_metadata().unwrap().validate().is_ok());
+            assert_eq!(state.can_export_artifact(), size <= LAB_MAX_ARTIFACT_BYTES as u64);
+        }
+        for filename in [
+            "", ".", "..", "../world.json", "dir/world.json", "dir\\world.json",
+            "C:world.json", "line\nbreak", "export-manifest.json", "Export-Manifest.json",
+            "naïve.json",
+        ] {
+            let mut artifact = artifact_fixture(0);
+            artifact.filename = filename.into();
+            assert!(artifact.validate().is_err(), "{filename:?}");
+        }
+        for path in ["", "/world.json", "../world.json", "runs//world.json", "runs/./world.json"] {
+            let mut artifact = artifact_fixture(0);
+            artifact.relative_path = path.into();
+            assert!(artifact.validate().is_err(), "{path:?}");
+        }
+        for checksum in ["A".repeat(64), "z".repeat(64), "a".repeat(63), "b".repeat(65)] {
+            let mut artifact = artifact_fixture(0);
+            artifact.checksum_blake3.clone_from(&checksum);
+            assert!(artifact.validate().is_err());
+            artifact = artifact_fixture(0);
+            artifact.checksum_sha256 = checksum;
+            assert!(artifact.validate().is_err());
+        }
+        let artifact = artifact_fixture(0);
+        let mut value = serde_json::to_value(&artifact).unwrap();
+        assert_eq!(serde_json::from_value::<LabArtifact>(value.clone()).unwrap(), artifact);
+        value["source_file"] = serde_json::json!("/unexpected/source");
+        assert!(serde_json::from_value::<LabArtifact>(value).is_err());
+        for request_id in ["", ".", "..", "nested/request", "nested\\request", "drive:request"] {
+            assert!(!artifact_export_request_identity_is_valid(request_id));
+        }
+    }
+
+    #[test]
+    fn artifact_pages_require_complete_canonical_rows_and_disclosed_absolute_destination() {
+        let mut state = artifact_state();
+        assert!(state.accept_artifact_page(None, artifact_page(0, 13)));
+        for corruption in 0..9 {
+            let mut page = artifact_page(0, 13);
+            match corruption {
+                0 => page.items.push(artifact_fixture(12)),
+                1 => { page.items.pop(); }
+                2 => page.items[1] = page.items[0].clone(),
+                3 => page.next_cursor = Some("012".into()),
+                4 => page.next_cursor = None,
+                5 => page.offset = 1,
+                6 => page.export_directory = "relative/exports".into(),
+                7 => page.items[0].filename = "../escape".into(),
+                8 => page.export_directory = std::env::temp_dir()
+                    .join("exports/../escape").to_str().unwrap().into(),
+                _ => unreachable!(),
+            }
+            state.artifacts = Some(artifact_page(0, 13));
+            state.selected_artifact = Some("artifact-0".into());
+            assert!(deliver(
+                &mut state,
+                LabWorkflowRequest::ListArtifacts { cursor: None },
+                LabWorkflowResponse::Artifacts(page),
+            ).is_none());
+            assert!(state.artifacts.is_none(), "malformed page {corruption}");
+            assert!(state.selected_artifact.is_none());
+            assert!(!state.can_export_artifact());
+        }
+        state.artifact_cursor = Some("12".into());
+        assert!(state.accept_artifact_page(Some("12"), artifact_page(12, 13)));
+        assert!(!state.accept_artifact_page(Some("012"), artifact_page(12, 13)));
+        state.artifact_cursor = None;
+        assert!(state.accept_artifact_page(None, artifact_page(0, 0)));
+        assert!(state.artifacts.as_ref().unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn artifact_export_actions_refuse_changed_descriptor_destination_selection_and_source() {
+        for change in 0..6 {
+            let mut state = artifact_state();
+            let action = state.export_artifact_action().unwrap();
+            match change {
+                0 => state.artifacts.as_mut().unwrap().items[0].checksum_sha256 = "c".repeat(64),
+                1 => state.artifacts.as_mut().unwrap().export_directory.push_str("-changed"),
+                2 => state.artifacts.as_mut().unwrap().items[0].byte_size += 1,
+                3 => state.dispatch(LabAction::SelectArtifact("artifact-1".into())),
+                4 => state.synchronize(HostSessionId::new(8), LabPanel::Experiments),
+                5 => state.dispatch(LabAction::BackFromArtifacts),
+                _ => unreachable!(),
+            }
+            state.dispatch(action);
+            assert!(!state.is_busy(), "stale rendered action {change}");
+            assert!(state.latest_artifact_export.is_none());
+        }
+        let mut state = artifact_state();
+        assert_eq!(state.refresh_request(), Some(LabWorkflowRequest::ListArtifacts { cursor: None }));
+        state.dispatch(LabAction::CreateExperiment);
+        assert!(!state.is_busy());
+        assert!(state.latest_experiment_creation.is_none());
+    }
+
+    #[test]
+    fn artifact_export_retains_occupied_worker_and_historical_receipt_through_invalidation() {
+        for invalidation in 0..6 {
+            let (started, observed_start) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let released = Mutex::new(released);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let mut state = artifact_state();
+            state.submit = Some(Arc::new(move |request| {
+                observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                started.send(request.clone()).unwrap();
+                released.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(LabWorkflowResponse::ArtifactExported(artifact_receipt(&request)))
+            }));
+            let action = state.export_artifact_action().unwrap();
+            state.dispatch(action.clone());
+            let original = observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(state.is_busy());
+            assert!(!state.can_export_artifact());
+            assert_eq!(state.export_artifact_action(), Some(action.clone()));
+            match invalidation {
+                0 => state.dispatch(LabAction::CancelRequest),
+                1 => state.dispatch(LabAction::BackFromArtifacts),
+                2 => state.dispatch(LabAction::SelectArtifact("artifact-1".into())),
+                3 => state.synchronize(HostSessionId::new(7), LabPanel::Checkpoints),
+                4 => state.synchronize(HostSessionId::new(8), LabPanel::Experiments),
+                5 => state.reset_observations(),
+                _ => unreachable!(),
+            }
+            assert!(state.is_busy(), "invalidation cannot free the file worker");
+            assert!(matches!(
+                state.latest_artifact_export.as_ref().unwrap().state,
+                LabArtifactExportState::Pending
+            ));
+            let selected_after_invalidation = state.selected_artifact.clone();
+            state.dispatch(action);
+            state.maybe_refresh();
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+            release.send(()).unwrap();
+            drain_worker(&mut state);
+            let expected = artifact_receipt(&original);
+            let export = state.latest_artifact_export.as_ref().unwrap();
+            assert_eq!(export.session_id, HostSessionId::new(7));
+            assert_eq!(export.state, LabArtifactExportState::Exported(expected.clone()));
+            assert_eq!(state.selected_artifact, selected_after_invalidation);
+            let lines = artifact_export_lines(export).join("\n");
+            assert!(lines.contains(&expected.output_path));
+            assert!(lines.contains(&expected.manifest_path));
+            assert!(lines.contains("original source 7"));
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn artifact_export_receipt_must_match_frozen_request_source_descriptor_and_paths() {
+        for corruption in 0..7 {
+            let mut state = artifact_state();
+            let request = pending_artifact_export(&mut state);
+            let mut receipt = artifact_receipt(&request);
+            match corruption {
+                0 => receipt.request_id.push_str("-changed"),
+                1 => receipt.session_id = HostSessionId::new(8),
+                2 => receipt.artifact.checksum_blake3 = "c".repeat(64),
+                3 => receipt.artifact.relative_path = "runs/other.json".into(),
+                4 => receipt.export_directory.push_str("-changed"),
+                5 => receipt.output_path.push_str("-changed"),
+                6 => receipt.manifest_path.push_str("-changed"),
+                _ => unreachable!(),
+            }
+            state.finish_artifact_export(
+                &request,
+                Ok(LabWorkflowResponse::ArtifactExported(receipt)),
+                false,
+            );
+            assert!(matches!(
+                state.latest_artifact_export.as_ref().unwrap().state,
+                LabArtifactExportState::Unconfirmed { .. }
+            ), "receipt mismatch {corruption}");
+            assert!(!state.is_busy());
+        }
+    }
+
+    #[test]
+    fn artifact_export_failures_and_disconnects_preserve_evidence_without_retry() {
+        let mut state = artifact_state();
+        let request = pending_artifact_export(&mut state);
+        state.finish_artifact_export(&request, Err("failure".repeat(500)), false);
+        let LabArtifactExportState::Failed { reason } =
+            &state.latest_artifact_export.as_ref().unwrap().state
+        else {
+            panic!("service failure must be recorded");
+        };
+        assert_eq!(reason.chars().count(), 2048);
+        let request = pending_artifact_export(&mut state);
+        let (send, result) = std::sync::mpsc::channel();
+        drop(send);
+        state.job = Some(LabJob {
+            request,
+            generation: state.generation,
+            context: state.context,
+            session: state.session.unwrap(),
+            result,
+        });
+        state.synchronize(HostSessionId::new(8), LabPanel::Experiments);
+        assert!(state.poll().is_none());
+        assert!(matches!(
+            state.latest_artifact_export.as_ref().unwrap().state,
+            LabArtifactExportState::Unconfirmed { .. }
+        ));
+        let historical_export = state.latest_artifact_export.clone();
+        state.submit = None;
+        state.dispatch(LabAction::ArtifactsPage(None));
+        assert!(state.viewing_artifacts, "history stays accessible without services");
+        assert_eq!(state.latest_artifact_export, historical_export);
+        assert!(state.selected_artifact.is_none());
+        assert!(!state.is_busy());
+    }
 
     fn batch(variants: usize) -> LabExperiment {
         LabExperiment {

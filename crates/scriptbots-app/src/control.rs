@@ -1152,7 +1152,8 @@ pub struct PaginatedArtifactsResponse {
 }
 
 /// Maximum artifact download size enforced at boundary (64 MB).
-pub const MAX_ARTIFACT_DOWNLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_ARTIFACT_DOWNLOAD_BYTES: usize =
+    scriptbots_runtime::lab_workflows::LAB_MAX_ARTIFACT_BYTES;
 
 /// Standard FIPS 180-4 SHA-256 digest in pure Rust.
 #[allow(
@@ -1465,6 +1466,162 @@ fn sync_checkpoint_directory(path: &Path) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+const NATIVE_ARTIFACT_EXPORT_SCHEMA: &str = "scriptbots.native-artifact-export.v1";
+const MAX_NATIVE_ARTIFACT_EXPORT_MANIFEST_BYTES: usize = 32 * 1024;
+
+/// Copy provenance, separate from checkpoint/journal durability receipts.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeArtifactExportManifestV1 {
+    schema: String,
+    request_id: String,
+    // A decimal string preserves the complete identity in ordinary JSON tools.
+    source_session_id: String,
+    artifact: scriptbots_runtime::lab_workflows::LabArtifact,
+    export_directory: String,
+    output_path: String,
+    manifest_path: String,
+}
+
+fn native_artifact_export_path_is_canonical(path: &Path, canonical: &Path) -> bool {
+    if path == canonical {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut requested = path.components();
+        let mut resolved = canonical.components();
+        let (Some(Component::Prefix(left)), Some(Component::Prefix(right))) =
+            (requested.next(), resolved.next())
+        else {
+            return false;
+        };
+        // Windows canonicalize adds this prefix without changing the location.
+        let same_prefix = match (left.kind(), right.kind()) {
+            (Prefix::Disk(left), Prefix::VerbatimDisk(right)) => {
+                left.eq_ignore_ascii_case(&right)
+            }
+            (Prefix::UNC(left_server, left_share), Prefix::VerbatimUNC(right_server, right_share)) => {
+                left_server == right_server && left_share == right_share
+            }
+            _ => false,
+        };
+        same_prefix && requested.eq(resolved)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn verify_native_artifact_export_directory(
+    path: &Path,
+    expected: Option<&fs::Metadata>,
+) -> Result<fs::Metadata, ControlError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || !native_artifact_export_path_is_canonical(path, &canonical)
+        || expected.is_some_and(|expected| !same_artifact_identity(expected, &metadata))
+    {
+        return Err(ControlError::BadRequest(format!(
+            "native artifact export directory {} is aliased, replaced or not a directory",
+            path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
+fn native_artifact_export_existing_ancestor(
+    path: &Path,
+) -> Result<(PathBuf, fs::Metadata), ControlError> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                return verify_native_artifact_export_directory(ancestor, None)
+                    .map(|metadata| (ancestor.to_path_buf(), metadata));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ControlError::Serialization(error.to_string())),
+        }
+    }
+    Err(ControlError::BadRequest(
+        "native artifact export has no existing absolute parent directory".to_owned(),
+    ))
+}
+
+/// Keep a partial write intact when the filesystem cannot complete the copy.
+/// The writer argument makes that real I/O failure boundary independently testable.
+fn write_native_artifact_export_file(
+    path: &Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<fs::File, ControlError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+    verify_open_artifact(path, &file)?;
+    write(&mut file, bytes).map_err(|error| ControlError::Serialization(error.to_string()))?;
+    file.sync_all()
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+    verify_open_artifact(path, &file)?;
+    Ok(file)
+}
+
+fn verify_native_artifact_export_file(
+    path: &Path,
+    written: &fs::File,
+    max_bytes: usize,
+    byte_size: u64,
+    checksum_blake3: &str,
+    checksum_sha256: &str,
+) -> Result<(), ControlError> {
+    let (read, bytes) = open_artifact_file_bounded(path, max_bytes, false)?;
+    verify_artifact_identity(
+        &written
+            .metadata()
+            .map_err(|error| ControlError::Serialization(error.to_string()))?,
+        &read
+            .metadata()
+            .map_err(|error| ControlError::Serialization(error.to_string()))?,
+    )?;
+    if bytes.len() as u64 != byte_size
+        || compute_blake3(&bytes) != checksum_blake3
+        || compute_sha256(&bytes) != checksum_sha256
+    {
+        return Err(ControlError::InvalidPatch(format!(
+            "native artifact export {} failed copied-byte verification",
+            path.display()
+        )));
+    }
+    verify_open_artifact(path, written)
+}
+
+fn preserve_native_artifact_export_failure(path: &Path, error: ControlError) -> ControlError {
+    ControlError::Serialization(format!(
+        "native artifact export was not confirmed: {error}; any partial or existing files are preserved at {}",
+        path.display()
+    ))
 }
 
 const MAX_EXPERIMENT_DEFINITION_BYTES: u64 = 1024 * 1024;
@@ -6048,6 +6205,173 @@ impl ControlHandle {
         }
 
         Ok((artifact, bytes))
+    }
+
+    /// Copy the exact selected retained bytes into one exclusive export capsule.
+    ///
+    /// Every file is synced and read back before a receipt is returned. Unix also
+    /// syncs the directory entries; this is not a host-journal durability receipt.
+    /// Parent identity checks detect aliases/replacements but do not make an
+    /// untrusted, concurrently modified directory tree an isolation boundary.
+    /// Failures preserve every created file and report its containing directory.
+    pub(crate) fn export_lab_artifact(
+        &self,
+        request_id: &str,
+        session_id: scriptbots_runtime::HostSessionId,
+        expected: &scriptbots_runtime::lab_workflows::LabArtifact,
+        export_directory: &str,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabArtifactExportReceipt, ControlError> {
+        use scriptbots_runtime::lab_workflows::{
+            LabArtifactExportReceipt, artifact_export_request_identity_is_valid,
+        };
+
+        if session_id != self.session_id() {
+            return Err(ControlError::Conflict(
+                "native artifact export belongs to a different source session".to_owned(),
+            ));
+        }
+        if !artifact_export_request_identity_is_valid(request_id) {
+            return Err(ControlError::BadRequest(
+                "native artifact export request identity is unsafe or exceeds its bound".to_owned(),
+            ));
+        }
+        expected.validate().map_err(ControlError::BadRequest)?;
+        if expected.byte_size > MAX_ARTIFACT_DOWNLOAD_BYTES as u64 {
+            return Err(ControlError::PayloadTooLarge(
+                "native artifact exceeds the export byte bound".to_owned(),
+            ));
+        }
+        let root = Path::new(export_directory);
+        if !root.is_absolute()
+            || export_directory.len() > 4096
+            || export_directory.chars().any(char::is_control)
+            || root
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(ControlError::BadRequest(
+                "native artifact export requires a bounded absolute directory without traversal"
+                    .to_owned(),
+            ));
+        }
+
+        // Verify the retained source and every frozen catalog field before mkdir
+        // or exclusive file creation. Never reconstruct a scientific artifact.
+        let (actual, bytes) = self.read_artifact_bytes(&expected.artifact_id)?;
+        if actual.artifact_id != expected.artifact_id
+            || actual.filename != expected.filename
+            || actual.content_type != expected.content_type
+            || actual.byte_size != expected.byte_size
+            || actual.checksum_blake3 != expected.checksum_blake3
+            || actual.checksum_sha256 != expected.checksum_sha256
+            || actual.created_at_utc != expected.created_at_utc
+            || actual.relative_path != expected.relative_path
+        {
+            return Err(ControlError::Conflict(
+                "native artifact catalog changed after selection; refresh before exporting"
+                    .to_owned(),
+            ));
+        }
+        let capsule = root.join(request_id);
+        let output_path = capsule.join(&expected.filename);
+        let manifest_path = capsule.join("export-manifest.json");
+        let path_string = |path: &Path| {
+            path.to_str().map(str::to_owned).ok_or_else(|| {
+                ControlError::BadRequest("native artifact export path is not UTF-8".to_owned())
+            })
+        };
+        let receipt = LabArtifactExportReceipt {
+            request_id: request_id.to_owned(),
+            session_id,
+            artifact: expected.clone(),
+            export_directory: export_directory.to_owned(),
+            output_path: path_string(&output_path)?,
+            manifest_path: path_string(&manifest_path)?,
+        };
+        let manifest = NativeArtifactExportManifestV1 {
+            schema: NATIVE_ARTIFACT_EXPORT_SCHEMA.to_owned(),
+            request_id: request_id.to_owned(),
+            source_session_id: session_id.get().to_string(),
+            artifact: expected.clone(),
+            export_directory: export_directory.to_owned(),
+            output_path: receipt.output_path.clone(),
+            manifest_path: receipt.manifest_path.clone(),
+        };
+        let manifest_bytes =
+            serde_json::to_vec_pretty(&manifest).map_err(ControlError::serialization)?;
+        if manifest_bytes.len() > MAX_NATIVE_ARTIFACT_EXPORT_MANIFEST_BYTES {
+            return Err(ControlError::PayloadTooLarge(
+                "native artifact export manifest exceeds its byte bound".to_owned(),
+            ));
+        }
+        let (ancestor, ancestor_identity) = native_artifact_export_existing_ancestor(root)?;
+        let directories = (|| -> Result<Vec<(PathBuf, fs::Metadata)>, ControlError> {
+            fs::create_dir_all(root)
+                .map_err(|error| ControlError::Serialization(error.to_string()))?;
+            verify_native_artifact_export_directory(&ancestor, Some(&ancestor_identity))?;
+            let mut directories = Vec::new();
+            for directory in root.ancestors().take_while(|path| *path != ancestor.as_path()) {
+                directories.push((
+                    directory.to_path_buf(),
+                    verify_native_artifact_export_directory(directory, None)?,
+                ));
+            }
+            directories.push((ancestor, ancestor_identity));
+            Ok(directories)
+        })()
+        .map_err(|error| preserve_native_artifact_export_failure(root, error))?;
+
+        let result = (|| -> Result<(), ControlError> {
+            // An existing capsule, even an empty one from an unconfirmed attempt,
+            // is never reused. A later explicit export must have a new identity.
+            fs::create_dir(&capsule)
+                .map_err(|error| ControlError::Conflict(error.to_string()))?;
+            let capsule_identity = verify_native_artifact_export_directory(&capsule, None)?;
+            for (directory, identity) in &directories {
+                verify_native_artifact_export_directory(directory, Some(identity))?;
+            }
+            let payload = write_native_artifact_export_file(&output_path, &bytes, |file, bytes| {
+                file.write_all(bytes)
+            })?;
+            verify_native_artifact_export_file(
+                &output_path,
+                &payload,
+                MAX_ARTIFACT_DOWNLOAD_BYTES,
+                expected.byte_size,
+                &expected.checksum_blake3,
+                &expected.checksum_sha256,
+            )?;
+            let saved_manifest =
+                write_native_artifact_export_file(&manifest_path, &manifest_bytes, |file, bytes| {
+                    file.write_all(bytes)
+                })?;
+            verify_native_artifact_export_file(
+                &manifest_path,
+                &saved_manifest,
+                MAX_NATIVE_ARTIFACT_EXPORT_MANIFEST_BYTES,
+                manifest_bytes.len() as u64,
+                &compute_blake3(&manifest_bytes),
+                &compute_sha256(&manifest_bytes),
+            )?;
+            for (directory, identity) in
+                std::iter::once((&capsule, &capsule_identity)).chain(
+                    directories
+                        .iter()
+                        .map(|(directory, identity)| (directory, identity)),
+                )
+            {
+                verify_native_artifact_export_directory(directory, Some(identity))?;
+                #[cfg(unix)]
+                sync_checkpoint_directory(directory)
+                    .map_err(|error| ControlError::Serialization(error.to_string()))?;
+                verify_native_artifact_export_directory(directory, Some(identity))?;
+            }
+            verify_open_artifact(&output_path, &payload)?;
+            verify_open_artifact(&manifest_path, &saved_manifest)?;
+            Ok(())
+        })();
+        result.map_err(|error| preserve_native_artifact_export_failure(&capsule, error))?;
+        Ok(receipt)
     }
 
     /// Admit a finite independent future from an exact retained scientific cut.
@@ -14232,6 +14556,450 @@ pub(crate) mod tests {
             .create_checkpoint(CheckpointCreateRequest::default())
             .unwrap();
         (handle, host, checkpoint, directory)
+    }
+
+    fn native_export_test_artifact(
+        metadata: &ArtifactMetadataDto,
+    ) -> scriptbots_runtime::lab_workflows::LabArtifact {
+        serde_json::from_value(serde_json::to_value(metadata).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn native_artifact_export_preserves_real_nonempty_checkpoint_and_paused_owner() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 2);
+        assert!(checkpoint.agent_count > 0);
+        let before = handle.status().unwrap();
+        assert!(before.paused);
+        let digest = host.port.scientific_digest_v1().unwrap();
+        let (metadata, original) = handle
+            .read_artifact_bytes(&checkpoint.checkpoint_id)
+            .unwrap();
+        let selected = native_export_test_artifact(&metadata);
+        let root = directory.canonicalize().unwrap().join("exports").join("nested");
+        assert!(!root.exists());
+
+        let receipt = handle
+            .export_lab_artifact(
+                "native-checkpoint-copy",
+                handle.session_id(),
+                &selected,
+                root.to_str().unwrap(),
+            )
+            .unwrap();
+        let capsule = root.join("native-checkpoint-copy");
+        assert_eq!(receipt.request_id, "native-checkpoint-copy");
+        assert_eq!(receipt.session_id, handle.session_id());
+        assert_eq!(receipt.artifact, selected);
+        assert_eq!(receipt.export_directory, root.to_str().unwrap());
+        assert_eq!(
+            Path::new(&receipt.output_path),
+            capsule.join(&selected.filename)
+        );
+        assert_eq!(
+            Path::new(&receipt.manifest_path),
+            capsule.join("export-manifest.json")
+        );
+        let copied = fs::read(&receipt.output_path).unwrap();
+        assert_eq!(copied, original);
+        assert_eq!(compute_blake3(&copied), metadata.checksum_blake3);
+        assert_eq!(compute_sha256(&copied), metadata.checksum_sha256);
+        let manifest: NativeArtifactExportManifestV1 =
+            serde_json::from_slice(&fs::read(&receipt.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.schema, "scriptbots.native-artifact-export.v1");
+        assert_eq!(manifest.request_id, receipt.request_id);
+        assert_eq!(
+            manifest.source_session_id,
+            handle.session_id().get().to_string()
+        );
+        assert_eq!(manifest.artifact, selected);
+        assert_eq!(manifest.export_directory, receipt.export_directory);
+        assert_eq!(manifest.output_path, receipt.output_path);
+        assert_eq!(manifest.manifest_path, receipt.manifest_path);
+        assert_eq!(fs::read_dir(&capsule).unwrap().count(), 2);
+        assert_eq!(
+            handle
+                .read_artifact_bytes(&checkpoint.checkpoint_id)
+                .unwrap(),
+            (metadata, original)
+        );
+        assert_eq!(handle.status().unwrap(), before);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+    }
+
+    #[test]
+    fn native_artifact_export_rejects_every_stale_descriptor_before_creating_destination() {
+        let (handle, host, checkpoint, directory) = checkpoint_branch_fixture(None, 0);
+        let (metadata, original) = handle
+            .read_artifact_bytes(&checkpoint.checkpoint_id)
+            .unwrap();
+        let selected = native_export_test_artifact(&metadata);
+        let root = directory.canonicalize().unwrap().join("refused-exports");
+        let digest = host.port.scientific_digest_v1().unwrap();
+        for field in [
+            "artifact_id",
+            "filename",
+            "content_type",
+            "byte_size",
+            "checksum_blake3",
+            "checksum_sha256",
+            "created_at_utc",
+            "relative_path",
+        ] {
+            let mut stale = selected.clone();
+            match field {
+                "artifact_id" => stale.artifact_id = "missing-native-artifact".to_owned(),
+                "filename" => stale.filename = "different.bin".to_owned(),
+                "content_type" => stale.content_type = "application/x-different".to_owned(),
+                "byte_size" => stale.byte_size += 1,
+                "checksum_blake3" => stale.checksum_blake3 = compute_blake3(b"different"),
+                "checksum_sha256" => stale.checksum_sha256 = compute_sha256(b"different"),
+                "created_at_utc" => stale.created_at_utc = "2000-01-01T00:00:00Z".to_owned(),
+                "relative_path" => stale.relative_path = "different-source.bin".to_owned(),
+                _ => unreachable!(),
+            }
+            stale.validate().unwrap();
+            assert!(
+                handle
+                    .export_lab_artifact(
+                        field,
+                        handle.session_id(),
+                        &stale,
+                        root.to_str().unwrap(),
+                    )
+                    .is_err(),
+                "{field}"
+            );
+            assert!(!root.exists(), "{field} created an export directory");
+        }
+        assert_eq!(
+            handle
+                .read_artifact_bytes(&checkpoint.checkpoint_id)
+                .unwrap()
+                .1,
+            original
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+    }
+
+    #[test]
+    fn native_artifact_export_rejects_wrong_session_unsafe_identity_and_size_before_output() {
+        let (handle, _host, checkpoint, directory) = checkpoint_branch_fixture(None, 0);
+        let selected =
+            native_export_test_artifact(&checkpoint_artifact_metadata(&checkpoint));
+        let root = directory.canonicalize().unwrap().join("refused-exports");
+        let wrong_session =
+            scriptbots_runtime::HostSessionId::new(handle.session_id().get() + 1);
+        assert!(matches!(
+            handle.export_lab_artifact(
+                "wrong-session",
+                wrong_session,
+                &selected,
+                root.to_str().unwrap(),
+            ),
+            Err(ControlError::Conflict(_))
+        ));
+        for request in ["", "../escape", "/absolute", "nested/request", "has space"] {
+            assert!(matches!(
+                handle.export_lab_artifact(
+                    request,
+                    handle.session_id(),
+                    &selected,
+                    root.to_str().unwrap(),
+                ),
+                Err(ControlError::BadRequest(_))
+            ));
+        }
+        let mut oversized = selected.clone();
+        oversized.byte_size = MAX_ARTIFACT_DOWNLOAD_BYTES as u64 + 1;
+        assert!(matches!(
+            handle.export_lab_artifact(
+                "oversized",
+                handle.session_id(),
+                &oversized,
+                root.to_str().unwrap(),
+            ),
+            Err(ControlError::PayloadTooLarge(_))
+        ));
+        let mut reserved = selected.clone();
+        reserved.filename = "export-manifest.json".to_owned();
+        assert!(matches!(
+            handle.export_lab_artifact(
+                "reserved-filename",
+                handle.session_id(),
+                &reserved,
+                root.to_str().unwrap(),
+            ),
+            Err(ControlError::BadRequest(_))
+        ));
+        for destination in [
+            "relative-export".to_owned(),
+            format!("{}/../escaped-export", root.display()),
+            format!("{}\ninvalid", root.display()),
+        ] {
+            assert!(matches!(
+                handle.export_lab_artifact(
+                    "invalid-directory",
+                    handle.session_id(),
+                    &selected,
+                    &destination,
+                ),
+                Err(ControlError::BadRequest(_))
+            ));
+        }
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn native_artifact_export_refuses_corrupt_source_without_creating_destination() {
+        let (handle, host, checkpoint, directory) = checkpoint_branch_fixture(None, 0);
+        let metadata = checkpoint_artifact_metadata(&checkpoint);
+        let selected = native_export_test_artifact(&metadata);
+        let directory = directory.canonicalize().unwrap();
+        let source = directory.join(&metadata.relative_path);
+        let saved_original = directory.join("original-checkpoint-before-corruption.bin");
+        fs::rename(&source, &saved_original).unwrap();
+        fs::write(&source, b"corrupt source bytes").unwrap();
+        let root = directory.join("refused-export");
+        let digest = host.port.scientific_digest_v1().unwrap();
+        assert!(
+            handle
+                .export_lab_artifact(
+                    "corrupt-source",
+                    handle.session_id(),
+                    &selected,
+                    root.to_str().unwrap(),
+                )
+                .is_err()
+        );
+        assert!(!root.exists());
+        assert!(saved_original.is_file());
+        assert_eq!(fs::read(&source).unwrap(), b"corrupt source bytes");
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+    }
+
+    #[test]
+    fn native_artifact_export_never_reuses_existing_request_directory() {
+        let (handle, _host, checkpoint, directory) = checkpoint_branch_fixture(None, 0);
+        let selected =
+            native_export_test_artifact(&checkpoint_artifact_metadata(&checkpoint));
+        let root = directory.canonicalize().unwrap().join("exports");
+        let capsule = root.join("already-present");
+        fs::create_dir_all(&capsule).unwrap();
+        let sentinel = capsule.join("keep-this.txt");
+        fs::write(&sentinel, b"original user content").unwrap();
+        let error = handle
+            .export_lab_artifact(
+                "already-present",
+                handle.session_id(),
+                &selected,
+                root.to_str().unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not confirmed"));
+        assert!(error.contains("preserved"));
+        assert!(error.contains(capsule.to_str().unwrap()));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"original user content");
+        assert_eq!(fs::read_dir(&capsule).unwrap().count(), 1);
+        assert!(!capsule.join(&selected.filename).exists());
+        assert!(!capsule.join("export-manifest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_artifact_export_refuses_source_root_and_request_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let (handle, _host, checkpoint, directory) = checkpoint_branch_fixture(None, 0);
+        let metadata = checkpoint_artifact_metadata(&checkpoint);
+        let selected = native_export_test_artifact(&metadata);
+        let directory = directory.canonicalize().unwrap();
+        let outside = directory.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        let alias = directory.join("aliased-export-root");
+        symlink(&outside, &alias).unwrap();
+        let aliased_root = alias.join("new-root");
+        assert!(
+            handle
+                .export_lab_artifact(
+                    "root-alias",
+                    handle.session_id(),
+                    &selected,
+                    aliased_root.to_str().unwrap(),
+                )
+                .is_err()
+        );
+        assert!(!outside.join("new-root").exists());
+
+        let root = directory.join("exports");
+        fs::create_dir(&root).unwrap();
+        symlink(&outside, root.join("request-alias")).unwrap();
+        assert!(
+            handle
+                .export_lab_artifact(
+                    "request-alias",
+                    handle.session_id(),
+                    &selected,
+                    root.to_str().unwrap(),
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+
+        let source = directory.join(&metadata.relative_path);
+        let original = directory.join("original-before-source-symlink.bin");
+        fs::rename(&source, &original).unwrap();
+        symlink(&original, &source).unwrap();
+        let refused = directory.join("refused-source-alias");
+        assert!(
+            handle
+                .export_lab_artifact(
+                    "source-alias",
+                    handle.session_id(),
+                    &selected,
+                    refused.to_str().unwrap(),
+                )
+                .is_err()
+        );
+        assert!(!refused.exists());
+        assert!(original.is_file());
+    }
+
+    #[test]
+    fn native_artifact_export_accepts_an_exact_empty_retained_file() {
+        let directory = tempfile::Builder::new()
+            .prefix("native-empty-artifact-")
+            .tempdir()
+            .unwrap()
+            .keep()
+            .canonicalize()
+            .unwrap();
+        let (handle, host) = checkpoint_test_handle(&directory, 2, 8 * 1024 * 1024);
+        let metadata = ArtifactMetadataDto {
+            artifact_id: "ordinary-empty".to_owned(),
+            filename: "empty.jsonl".to_owned(),
+            content_type: "application/x-ndjson".to_owned(),
+            byte_size: 0,
+            checksum_blake3: compute_blake3(&[]),
+            checksum_sha256: compute_sha256(&[]),
+            created_at_utc: "2026-01-01T00:00:00Z".to_owned(),
+            relative_path: "empty.jsonl".to_owned(),
+        };
+        fs::write(directory.join(&metadata.relative_path), b"").unwrap();
+        handle.data_services.artifacts.lock().unwrap().insert(
+            metadata.artifact_id.clone(),
+            RetainedArtifact {
+                metadata: metadata.clone(),
+                directory: directory.clone(),
+            },
+        );
+        let selected = native_export_test_artifact(&metadata);
+        let digest = host.port.scientific_digest_v1().unwrap();
+        let root = directory.join("exports");
+        let receipt = handle
+            .export_lab_artifact(
+                "empty-copy",
+                handle.session_id(),
+                &selected,
+                root.to_str().unwrap(),
+            )
+            .unwrap();
+        assert!(fs::read(&receipt.output_path).unwrap().is_empty());
+        let manifest: NativeArtifactExportManifestV1 =
+            serde_json::from_slice(&fs::read(&receipt.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.artifact, selected);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+    }
+
+    #[test]
+    fn native_artifact_export_retains_partial_write_and_refuses_overwrite() {
+        let directory = tempfile::Builder::new()
+            .prefix("native-partial-export-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = directory.join("payload.bin");
+        let bytes = b"the exact retained source bytes";
+        let error = write_native_artifact_export_file(&path, bytes, |file, bytes| {
+            file.write_all(&bytes[..4])?;
+            Err(std::io::Error::other("injected write failure after four bytes"))
+        })
+        .map_err(|error| preserve_native_artifact_export_failure(&directory, error))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("injected write failure"));
+        assert!(error.contains("preserved"));
+        assert!(error.contains(directory.to_str().unwrap()));
+        assert_eq!(fs::read(&path).unwrap(), &bytes[..4]);
+        assert!(
+            write_native_artifact_export_file(&path, bytes, |file, bytes| {
+                file.write_all(bytes)
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), &bytes[..4]);
+    }
+
+    #[test]
+    fn native_artifact_export_readback_rejects_corruption_and_same_bytes_replacement() {
+        let directory = tempfile::Builder::new()
+            .prefix("native-export-readback-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let path = directory.join("payload.bin");
+        let bytes = b"verified retained bytes";
+        let original = write_native_artifact_export_file(&path, bytes, |file, bytes| {
+            file.write_all(bytes)
+        })
+        .unwrap();
+        fs::write(&path, b"corrupt copied bytes").unwrap();
+        assert!(
+            verify_native_artifact_export_file(
+                &path,
+                &original,
+                MAX_ARTIFACT_DOWNLOAD_BYTES,
+                bytes.len() as u64,
+                &compute_blake3(bytes),
+                &compute_sha256(bytes),
+            )
+            .is_err()
+        );
+        fs::rename(&path, directory.join("preserved-corrupt-copy.bin")).unwrap();
+        fs::write(&path, bytes).unwrap();
+        assert!(
+            verify_native_artifact_export_file(
+                &path,
+                &original,
+                MAX_ARTIFACT_DOWNLOAD_BYTES,
+                bytes.len() as u64,
+                &compute_blake3(bytes),
+                &compute_sha256(bytes),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_artifact_export_accepts_only_equivalent_windows_canonical_prefixes() {
+        assert!(native_artifact_export_path_is_canonical(
+            Path::new(r"C:\exports"),
+            Path::new(r"\\?\C:\exports"),
+        ));
+        assert!(native_artifact_export_path_is_canonical(
+            Path::new(r"\\server\share\exports"),
+            Path::new(r"\\?\UNC\server\share\exports"),
+        ));
+        assert!(!native_artifact_export_path_is_canonical(
+            Path::new(r"C:\aliased"),
+            Path::new(r"\\?\C:\different"),
+        ));
     }
 
     fn checkpoint_branch_request(checkpoint_id: &str, key: &str) -> CheckpointBranchRequest {
