@@ -7024,7 +7024,9 @@ mod cleanup_handoff_tests {
             accounting.overflow_workers.load(Ordering::Acquire),
             MAX_CLEANUP_OVERFLOW_WORKERS
         );
-        release_tx.send(()).expect("release saturated inline cleanup");
+        release_tx
+            .send(())
+            .expect("release saturated inline cleanup");
         caller.join().expect("saturated submitting thread");
         for release in releases {
             release.send(()).expect("release bounded overflow cleanup");
@@ -7091,7 +7093,10 @@ mod cleanup_handoff_tests {
             panic!("empty shared queue must accept the outer task");
         });
         let (returned_before_drop, submitted_on, destroyed_on) = receive(&observed_rx);
-        assert!(returned_before_drop, "nested handoff must return before destruction");
+        assert!(
+            returned_before_drop,
+            "nested handoff must return before destruction"
+        );
         assert_eq!(submitted_on, destroyed_on);
         assert_ne!(destroyed_on, thread::current().id());
         drop(sender);
@@ -45115,6 +45120,224 @@ mod tests {
             drop(core);
             let shutdown = pipeline.shutdown()?;
             assert_eq!(shutdown.watermarks, flush.watermarks);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real-worker journey proves exact partial-tail admission, fault draining, and cold scientific readback for both commitment strengths"
+    )]
+    fn paired_host_completed_fault_commits_the_partial_persistence_tail_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_core::BrainSpawnError;
+        use scriptbots_runtime::{
+            ApplicationState, EventCommitment, EventPoll, HostDriveInterest, HostFault, HostHealth,
+        };
+
+        for file_backed in [false, true] {
+            let path = temp_db_path("storage-host-completed-fault-tail");
+            let path_string = path.to_string_lossy().into_owned();
+            let mut pipeline = if file_backed {
+                StoragePipeline::create_unattributed_file(&path_string)?
+            } else {
+                StoragePipeline::unattributed_memory_with_thresholds(1, 1, 1, 1)?
+            };
+            let session_id = HostSessionId::new(0x51f7);
+            let journal = pipeline.journal_port(session_id, StorageJournalOptions::default())?;
+            pipeline.set_deadlines(StorageDeadlines {
+                admission_ack: Duration::from_millis(10),
+                ..StorageDeadlines::default()
+            })?;
+            let (mut world, persistence) = WorldState::with_persistence(
+                ScriptBotsConfig {
+                    world_width: 64,
+                    world_height: 64,
+                    food_cell_size: 16,
+                    rng_seed: Some(0x51f7),
+                    closed: false,
+                    population_minimum: 2,
+                    population_spawn_interval: 0,
+                    persistence_interval: 7,
+                    narrative_interval: 0,
+                    chart_flush_interval: 0,
+                    ..ScriptBotsConfig::default()
+                },
+                Box::new(pipeline.sink()),
+            )?;
+            let founder = world.try_spawn_agent(AgentData::default())?;
+            let founder_uid = world.agent_uid(founder).expect("real founder identity");
+            world
+                .brain_registry_mut()?
+                .register("test.storage-fault-tail", |_rng| {
+                    Err(BrainSpawnError::new(
+                        "test.storage-fault-tail",
+                        std::io::Error::other("deliberate population factory failure"),
+                    ))
+                });
+            let mut core = HostCore::with_journal_and_persistence(
+                session_id,
+                world,
+                journal_fault_host_options(),
+                Box::new(journal),
+                persistence,
+            )?;
+            let mut frontend = NullFrontend::new(core.local_port(), session_id.get() ^ 0xfeed);
+            let mut next_nanos = 0;
+            let envelope = fault_step_envelope(session_id);
+            let admitted =
+                submit_fault_envelope(&mut frontend, &mut core, &envelope, &mut next_nanos);
+            assert_eq!(admitted.application(), &ApplicationState::Admitted);
+            let pause = pipeline.pause_worker_for_test()?;
+            let completed = frontend.drive_at(&mut core, ManualInstant::from_nanos(next_nanos))?;
+            next_nanos += 1;
+            assert_eq!(completed.scientific_steps, 1);
+            assert_eq!(core.world_tick(), Tick(1));
+            assert!(matches!(
+                core.health(),
+                HostHealth::Faulted(HostFault::Scientific { tick: Tick(1), code, .. })
+                    if code == "brain_spawn"
+            ));
+            let fault = core.health().clone();
+            let founder_state = serde_json::to_value(
+                core.world()
+                    .snapshot_agent(founder)
+                    .expect("founder survives the completed boundary"),
+            )?;
+            let history = core.world().history().cloned().collect::<Vec<_>>();
+            let retained = core
+                .persistence()
+                .pending_batch()
+                .expect("the completed fault must stage its partial cadence tail")
+                .clone();
+            assert_eq!(retained.summary.tick, Tick(1));
+            assert_eq!(retained.births.len(), 1);
+            assert_eq!(retained.births[0].agent_uid, founder_uid);
+            assert!(retained.replay_events.iter().any(|event| matches!(
+                event.kind,
+                ReplayEventKind::NarrativeInputV1 { record } if record.input.tick == Tick(1)
+            )));
+            assert_eq!(core.persistence().last_admitted_tick(), None);
+            assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+            assert!(pipeline.inflight_bytes() > 0);
+            for _ in 0..3 {
+                let waiting =
+                    frontend.drive_at(&mut core, ManualInstant::from_nanos(next_nanos))?;
+                next_nanos += 1;
+                assert_eq!(waiting.scientific_steps, 0);
+                assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+                assert_eq!(pipeline.sink.tx.len(), 1, "only one JournalAdmit is queued");
+                assert_eq!(
+                    pipeline.analytics_provider().snapshot().committed_tick,
+                    None
+                );
+            }
+            pause.release();
+            let flush = pipeline.flush_and_wait()?;
+            let status = drive_journal_command_to_terminal(
+                &mut frontend,
+                &mut core,
+                envelope.command_id,
+                &mut next_nanos,
+            );
+            assert!(matches!(
+                status.application(),
+                ApplicationState::Applied(applied) if applied.tick == Tick(1)
+            ));
+            let (guarantee, journal_state, commitment) = if file_backed {
+                (
+                    PersistenceGuarantee::Durable,
+                    JournalState::Durable,
+                    EventCommitment::Durable,
+                )
+            } else {
+                (
+                    PersistenceGuarantee::CommittedVolatile,
+                    JournalState::CommittedVolatile,
+                    EventCommitment::CommittedVolatile,
+                )
+            };
+            assert_eq!(status.journal(), &journal_state);
+            assert_eq!(flush.guarantee, guarantee);
+            assert_eq!(flush.committed_tick, Some(1));
+            let batch_id = PersistenceBatchId::new(1).expect("first science batch");
+            assert_eq!(
+                flush.watermarks,
+                PersistenceWatermarks {
+                    admitted: Some(batch_id),
+                    applied: Some(batch_id),
+                    durable: file_backed.then_some(batch_id),
+                }
+            );
+            assert_eq!(core.persistence().last_admitted_tick(), Some(Tick(1)));
+            assert!(!core.persistence().has_pending_batch());
+            assert_eq!(pipeline.inflight_bytes(), 0);
+            assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+            assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+            let EventPoll::Contiguous(events) = frontend.read_events(2)? else {
+                panic!("the one completed scientific event must remain readable");
+            };
+            assert_eq!(events.events.len(), 1);
+            let event = &events.events[0];
+            assert_eq!(event.commitment, commitment);
+            assert_eq!(event.event.tick, Tick(1));
+            let scientific_fault = event.event.boundary.fault().expect("archivable fault");
+            assert_eq!(scientific_fault.code(), "brain_spawn");
+            assert!(
+                scientific_fault
+                    .message()
+                    .contains("deliberate population factory failure")
+            );
+            assert_eq!(frontend.submit_envelope(envelope.clone())?, status);
+            for _ in 0..3 {
+                assert_eq!(
+                    frontend
+                        .drive_at(&mut core, ManualInstant::from_nanos(next_nanos))?
+                        .scientific_steps,
+                    0
+                );
+                next_nanos += 1;
+            }
+            assert_eq!(core.health(), &fault);
+            assert_eq!(core.world_tick(), Tick(1));
+            assert_eq!(
+                serde_json::to_value(core.world().snapshot_agent(founder).unwrap())?,
+                founder_state
+            );
+            assert_eq!(core.world().history().cloned().collect::<Vec<_>>(), history);
+            assert_eq!(pipeline.flush_and_wait()?.watermarks, flush.watermarks);
+            drop(frontend);
+            drop(core);
+            assert_eq!(pipeline.shutdown()?.watermarks, flush.watermarks);
+
+            if file_backed {
+                let reader = StorageReader::open_finished(&path_string)?;
+                assert_eq!(reader.summary_ticks()?, vec![1]);
+                assert_eq!(reader.persistence_watermarks()?, flush.watermarks);
+                let births = reader.load_ancestry_births()?;
+                assert_eq!(births.len(), 1);
+                assert_eq!(births[0].agent_uid, founder_uid);
+                assert_eq!(births[0].tick, retained.births[0].tick);
+                assert_eq!(births[0].spawn_ordinal, retained.births[0].spawn_ordinal);
+                assert_eq!(births[0].origin, retained.births[0].origin);
+                let replay = reader.load_replay_events()?;
+                assert_eq!(replay.len(), retained.replay_events.len());
+                for expected in &retained.replay_events {
+                    assert!(replay.iter().any(|stored| &stored.event == expected));
+                }
+                let page = reader.host_journal_session_conformance_page(
+                    session_id,
+                    None,
+                    2,
+                    MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+                )?;
+                assert_eq!(page.records.len(), 1);
+                assert_eq!(page.records[0].event.as_ref(), Some(event));
+                assert!(page.next_after.is_none());
+                reader.close()?;
+                assert_complete_journal_prefix(&journal_database_snapshot(&path_string), 1, 1);
+            }
         }
         Ok(())
     }
