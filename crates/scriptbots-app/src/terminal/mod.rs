@@ -121,7 +121,9 @@ const PROBE_CONE_ROWS: usize = 6;
 const TARGET_SIM_HZ: f32 = 60.0;
 const UI_TICK_MILLIS: u64 = 100;
 const DEFAULT_HEADLESS_FRAMES: usize = 12;
-const MAX_HEADLESS_FRAMES: usize = 360;
+/// Maximum rendered captures retained by one terminal headless report.
+pub const MAX_HEADLESS_FRAMES: usize = 360;
+const MAX_HEADLESS_TICKS: usize = 1_000_000;
 const EVENT_LOG_CAPACITY: usize = 16;
 /// Observed visual publications, not a complete checkpoint/replay archive.
 const MAX_CANVAS_HISTORY_FRAMES: usize = 128;
@@ -3098,7 +3100,10 @@ fn terminal_runtime_finished(
 
 impl TerminalRenderer {
     fn run_headless(&self, ctx: RendererContext<'_>) -> Result<HeadlessReport> {
-        self.run_headless_frames(ctx, self.headless_frame_budget())
+        let frames = std::env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES");
+        let ticks = std::env::var_os("SCRIPTBOTS_TERMINAL_HEADLESS_TICKS");
+        let budget = HeadlessBudget::from_values(frames.as_deref(), ticks.as_deref())?;
+        self.run_headless_budget(ctx, budget)
     }
 
     /// Execute and inspect a bounded sequence of real terminal TestBackend frames.
@@ -3109,25 +3114,42 @@ impl TerminalRenderer {
         ctx: RendererContext<'_>,
         frames: usize,
     ) -> Result<HeadlessReport> {
-        ensure!(
-            (1..=MAX_HEADLESS_FRAMES).contains(&frames),
-            "headless frame budget must be in 1..={MAX_HEADLESS_FRAMES}"
-        );
+        self.run_headless_budget(ctx, HeadlessBudget::new(frames, frames)?)
+    }
+
+    fn run_headless_budget(
+        &self,
+        ctx: RendererContext<'_>,
+        budget: HeadlessBudget,
+    ) -> Result<HeadlessReport> {
         let backend = ratatui::backend::TestBackend::new(80, 36);
         let mut terminal = Terminal::new(backend).context("failed to build test backend")?;
         let mut app = TerminalApp::new(self, ctx);
         app.palette = Palette::test_backend_evidence();
-        let mut report = HeadlessReport::new(app.snapshot().clone(), app.scenario.as_ref());
+        let session_id = app.retained_render.session_id;
+        let mut report = HeadlessReport::new(app.snapshot().clone(), app.scenario.as_ref(), budget);
 
-        for frame_index in 0..frames {
+        for tick_index in 0..budget.ticks {
             app.ensure_control_runtime_running()?;
             // bd-2z0.8.9.8: ask the final tick's batch to carry the canonical world digest
             // so replay verification can compare final science state.
-            if frame_index + 1 == frames {
+            if tick_index + 1 == budget.ticks {
                 app.host.request_replay_world_digest()?;
             }
             app.submit_and_wait(ControlCommand::Step)?;
             app.refresh_snapshot();
+            ensure!(
+                app.retained_render.session_id == session_id,
+                "headless Step changed its world owner session"
+            );
+            // Science advances through its existing receipt/publication barrier
+            // on every iteration. Rendering and retained frame evidence have a
+            // separate fixed bound, so a long study cannot be silently shortened
+            // to the visual capture limit or accumulate an unbounded report.
+            if !budget.capture_after_tick(tick_index) {
+                report.record(app.snapshot(), None)?;
+                continue;
+            }
             terminal.draw(|frame| app.draw(frame))?;
             let backend_buffer = terminal.backend().buffer();
             // The layout is read back from the app AFTER the draw, so the regions
@@ -3139,17 +3161,24 @@ impl TerminalRenderer {
             // headless+REST deployments rather than refusing there. The buffer is
             // already in hand for the evidence pass above.
             app.publish_presented_frame(Some(backend_buffer.clone()));
-            report.record(app.snapshot(), evidence);
+            report.record(app.snapshot(), Some(evidence))?;
         }
 
-        let world_digest = match app.host.scientific_digest_v1() {
-            Ok(digest) => {
+        let world_digest = match app.host.scientific_digest_cut() {
+            Ok(cut) => {
+                ensure!(
+                    cut.digest.tick.0 == report.summary.final_tick
+                        && cut.session_id == app.retained_render.session_id
+                        && cut.scientific_revision == app.retained_render.revisions.scientific
+                        && cut.config_revision == app.retained_render.revisions.config,
+                    "headless final digest does not match the observed scientific boundary"
+                );
                 tracing::info!(
                     tick = app.snapshot().tick,
-                    world_digest = %digest.overall,
+                    world_digest = %cut.digest.overall,
                     "captured final world digest for the replay stream"
                 );
-                Some(digest.overall)
+                Some(cut.digest.overall)
             }
             Err(error) => {
                 tracing::warn!("failed to capture final world digest: {error}");
@@ -3157,7 +3186,7 @@ impl TerminalRenderer {
             }
         };
 
-        report.finalize(world_digest);
+        report.finalize(world_digest)?;
 
         if let Some(path) = report_file_path_from_env() {
             report.write_json(&path).with_context(|| {
@@ -3167,14 +3196,52 @@ impl TerminalRenderer {
 
         Ok(report)
     }
+}
 
-    fn headless_frame_budget(&self) -> usize {
-        std::env::var("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .map(|value| value.min(MAX_HEADLESS_FRAMES))
-            .unwrap_or(DEFAULT_HEADLESS_FRAMES)
+/// Independent limits for scientific execution and retained terminal captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct HeadlessBudget {
+    ticks: usize,
+    frame_limit: usize,
+}
+
+impl HeadlessBudget {
+    fn new(ticks: usize, frame_limit: usize) -> Result<Self> {
+        ensure!(
+            (1..=MAX_HEADLESS_TICKS).contains(&ticks),
+            "headless tick budget must be in 1..={MAX_HEADLESS_TICKS}"
+        );
+        ensure!(
+            (1..=MAX_HEADLESS_FRAMES).contains(&frame_limit),
+            "headless frame budget must be in 1..={MAX_HEADLESS_FRAMES}; use SCRIPTBOTS_TERMINAL_HEADLESS_TICKS for longer studies"
+        );
+        Ok(Self { ticks, frame_limit })
+    }
+
+    fn from_values(frames: Option<&OsStr>, ticks: Option<&OsStr>) -> Result<Self> {
+        fn parse(raw: &OsStr, name: &str) -> Result<usize> {
+            raw.to_str()
+                .with_context(|| format!("{name} must contain a Unicode integer"))?
+                .trim()
+                .parse()
+                .with_context(|| format!("{name} must contain a positive integer"))
+        }
+
+        let frame_limit = frames
+            .map(|raw| parse(raw, "SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES"))
+            .transpose()?
+            .unwrap_or(DEFAULT_HEADLESS_FRAMES);
+        let ticks = ticks
+            .map(|raw| parse(raw, "SCRIPTBOTS_TERMINAL_HEADLESS_TICKS"))
+            .transpose()?
+            .unwrap_or(frame_limit);
+        Self::new(ticks, frame_limit)
+    }
+
+    fn capture_after_tick(self, tick_index: usize) -> bool {
+        let frames = self.frame_limit.min(self.ticks);
+        // At most 1,000,000 * 360: bounded even on a 32-bit target.
+        ((tick_index + 1) * frames) / self.ticks > (tick_index * frames) / self.ticks
     }
 }
 
@@ -11198,9 +11265,14 @@ pub const HEADLESS_REPORT_SCHEMA: &str = "scriptbots.terminal-headless.v1";
 pub struct HeadlessReport {
     schema: &'static str,
     scenario: ScenarioSummary,
+    /// Scientific horizon and maximum number of evenly spaced captures.
+    budget: HeadlessBudget,
     initial: FrameStats,
     frames: Vec<FrameStats>,
     summary: ReportSummary,
+    /// Running sum over every completed scientific tick, including uncaptured ones.
+    #[serde(skip)]
+    energy_sum: f64,
     /// The final observed narrative ring, not a claim that every run event was retained.
     narrative_events: Vec<scriptbots_core::narrative::EventRecord>,
     narrative_dropped_events: u64,
@@ -11225,27 +11297,109 @@ impl From<&ScenarioIdentityV0> for ScenarioSummary {
 }
 
 impl HeadlessReport {
-    fn new(initial_snapshot: Snapshot, scenario: &ScenarioIdentityV0) -> Self {
+    fn new(
+        initial_snapshot: Snapshot,
+        scenario: &ScenarioIdentityV0,
+        budget: HeadlessBudget,
+    ) -> Self {
+        let initial = FrameStats::from_snapshot(&initial_snapshot, None);
+        let summary = ReportSummary::from_initial(&initial);
         Self {
             schema: HEADLESS_REPORT_SCHEMA,
             scenario: ScenarioSummary::from(scenario),
-            initial: FrameStats::from_snapshot(&initial_snapshot, None),
+            budget,
+            initial,
             frames: Vec::new(),
-            summary: ReportSummary::default(),
+            summary,
+            energy_sum: 0.0,
             narrative_events: initial_snapshot.narrative,
             narrative_dropped_events: initial_snapshot.narrative_dropped,
         }
     }
 
-    fn record(&mut self, snapshot: &Snapshot, buffer: HeadlessBufferEvidence) {
-        self.frames
-            .push(FrameStats::from_snapshot(snapshot, Some(buffer)));
+    fn record(
+        &mut self,
+        snapshot: &Snapshot,
+        buffer: Option<HeadlessBufferEvidence>,
+    ) -> Result<()> {
+        ensure!(
+            Some(snapshot.tick) == self.summary.final_tick.checked_add(1),
+            "headless Step must publish exactly one next tick: expected tick {:?}, observed tick {}",
+            self.summary.final_tick.checked_add(1),
+            snapshot.tick
+        );
+        ensure!(
+            self.summary.ticks_simulated < self.budget.ticks as u64,
+            "headless report exceeded its requested tick budget"
+        );
+        ensure!(
+            buffer.is_none() || self.frames.len() < self.budget.frame_limit,
+            "headless report exceeded its capture budget"
+        );
+        let total_births = self
+            .summary
+            .total_births
+            .checked_add(snapshot.births)
+            .context("headless birth count overflow")?;
+        let total_deaths = self
+            .summary
+            .total_deaths
+            .checked_add(snapshot.deaths)
+            .context("headless death count overflow")?;
+        let total_spike_hits = self
+            .summary
+            .total_spike_hits
+            .checked_add(u64::from(snapshot.spike_hits))
+            .context("headless spike count overflow")?;
+        let energy_sum = self.energy_sum + f64::from(snapshot.avg_energy);
+        ensure!(
+            energy_sum.is_finite(),
+            "headless energy aggregate is not finite"
+        );
+
+        if buffer.is_some() {
+            self.frames
+                .push(FrameStats::from_snapshot(snapshot, buffer));
+        }
+        if self.summary.ticks_simulated == 0 {
+            self.summary.avg_energy_min = snapshot.avg_energy;
+            self.summary.avg_energy_max = snapshot.avg_energy;
+        } else {
+            self.summary.avg_energy_min = self.summary.avg_energy_min.min(snapshot.avg_energy);
+            self.summary.avg_energy_max = self.summary.avg_energy_max.max(snapshot.avg_energy);
+        }
+        self.energy_sum = energy_sum;
+        self.summary.frame_count = self.frames.len();
+        self.summary.ticks_simulated += 1;
+        self.summary.final_tick = snapshot.tick;
+        self.summary.final_epoch = snapshot.epoch;
+        self.summary.final_agent_count = snapshot.agent_count;
+        self.summary.total_births = total_births;
+        self.summary.total_deaths = total_deaths;
+        self.summary.total_spike_hits = total_spike_hits;
         self.narrative_events.clone_from(&snapshot.narrative);
         self.narrative_dropped_events = snapshot.narrative_dropped;
+        Ok(())
     }
 
-    fn finalize(&mut self, world_digest: Option<String>) {
-        self.summary = ReportSummary::from(&self.initial, &self.frames, world_digest);
+    fn finalize(&mut self, world_digest: Option<String>) -> Result<()> {
+        ensure!(
+            self.summary.ticks_simulated == self.budget.ticks as u64,
+            "headless run completed {} ticks, requested {}",
+            self.summary.ticks_simulated,
+            self.budget.ticks
+        );
+        ensure!(
+            self.frames.len() == self.budget.frame_limit.min(self.budget.ticks)
+                && self
+                    .frames
+                    .last()
+                    .is_some_and(|frame| frame.tick == self.summary.final_tick),
+            "headless report is missing its requested captures or final frame"
+        );
+        self.summary.avg_energy_mean =
+            (self.energy_sum / self.summary.ticks_simulated as f64) as f32;
+        self.summary.world_digest = world_digest;
         match serde_json::to_string(&self.narrative_events) {
             Ok(events_json) => info!(
                 final_tick = self.summary.final_tick,
@@ -11256,6 +11410,7 @@ impl HeadlessReport {
             ),
             Err(error) => warn!(%error, "headless narrative ring serialization failed"),
         }
+        Ok(())
     }
 
     fn write_json(&self, path: &Path) -> Result<()> {
@@ -11809,65 +11964,20 @@ struct ReportSummary {
 }
 
 impl ReportSummary {
-    fn from(initial: &FrameStats, frames: &[FrameStats], world_digest: Option<String>) -> Self {
-        if frames.is_empty() {
-            return Self {
-                frame_count: 0,
-                ticks_simulated: 0,
-                final_tick: initial.tick,
-                final_epoch: initial.epoch,
-                final_agent_count: initial.agent_count,
-                total_births: 0,
-                total_deaths: 0,
-                total_spike_hits: 0,
-                avg_energy_mean: initial.avg_energy,
-                avg_energy_min: initial.avg_energy,
-                avg_energy_max: initial.avg_energy,
-                world_digest,
-            };
-        }
-
-        let frame_count = frames.len();
-        let final_stats = frames.last().expect("frame list not empty");
-        let ticks_simulated = final_stats.tick.saturating_sub(initial.tick);
-
-        let total_births = frames.iter().map(|frame| frame.births).sum();
-        let total_deaths = frames.iter().map(|frame| frame.deaths).sum();
-        let total_spike_hits = frames.iter().map(|frame| u64::from(frame.spike_hits)).sum();
-
-        let mut min_energy = f32::INFINITY;
-        let mut max_energy = f32::NEG_INFINITY;
-        let mut energy_sum = 0.0_f32;
-        for frame in frames {
-            let energy = frame.avg_energy;
-            if energy < min_energy {
-                min_energy = energy;
-            }
-            if energy > max_energy {
-                max_energy = energy;
-            }
-            energy_sum += energy;
-        }
-
-        let avg_energy_mean = if frame_count > 0 {
-            energy_sum / frame_count as f32
-        } else {
-            initial.avg_energy
-        };
-
+    fn from_initial(initial: &FrameStats) -> Self {
         Self {
-            frame_count,
-            ticks_simulated,
-            final_tick: final_stats.tick,
-            final_epoch: final_stats.epoch,
-            final_agent_count: final_stats.agent_count,
-            total_births,
-            total_deaths,
-            total_spike_hits,
-            avg_energy_mean,
-            avg_energy_min: min_energy,
-            avg_energy_max: max_energy,
-            world_digest,
+            frame_count: 0,
+            ticks_simulated: 0,
+            final_tick: initial.tick,
+            final_epoch: initial.epoch,
+            final_agent_count: initial.agent_count,
+            total_births: 0,
+            total_deaths: 0,
+            total_spike_hits: 0,
+            avg_energy_mean: initial.avg_energy,
+            avg_energy_min: initial.avg_energy,
+            avg_energy_max: initial.avg_energy,
+            world_digest: None,
         }
     }
 }
@@ -26644,13 +26754,247 @@ for case in ('panic', 'subscription', 'renderer'):
     fn headless_report_format_version_is_independent_of_scenario_version() {
         let mut scenario = ScenarioIdentityV0::caller_seeded("report-format-test");
         scenario.schema_version = 37;
-        let report = HeadlessReport::new(Snapshot::default(), &scenario);
+        let report = HeadlessReport::new(
+            Snapshot::default(),
+            &scenario,
+            HeadlessBudget::new(12, 12).expect("default budget"),
+        );
         let encoded = serde_json::to_value(report).expect("serialize actual report type");
         assert_eq!(encoded["schema"], "scriptbots.terminal-headless.v1");
         assert_eq!(encoded["scenario"]["schema_version"], 37);
         assert!(encoded["initial"].is_object());
         assert!(encoded["summary"].is_object());
         assert!(encoded["frames"].is_array());
+        assert_eq!(encoded["budget"]["ticks"], 12);
+        assert_eq!(encoded["budget"]["frame_limit"], 12);
+        assert!(encoded.get("energy_sum").is_none());
+    }
+
+    #[test]
+    fn headless_budgets_preserve_valid_frame_runs_and_refuse_truncation() {
+        assert_eq!(
+            HeadlessBudget::from_values(None, None).expect("default"),
+            HeadlessBudget::new(DEFAULT_HEADLESS_FRAMES, DEFAULT_HEADLESS_FRAMES).unwrap()
+        );
+        assert_eq!(
+            HeadlessBudget::from_values(Some(OsStr::new(" 24 ")), None).expect("legacy frames"),
+            HeadlessBudget::new(24, 24).unwrap()
+        );
+        assert_eq!(
+            HeadlessBudget::from_values(Some(OsStr::new("360")), Some(OsStr::new("10000")))
+                .expect("explicit long science horizon"),
+            HeadlessBudget::new(10_000, 360).unwrap()
+        );
+        assert_eq!(
+            HeadlessBudget::from_values(None, Some(OsStr::new("10000")))
+                .expect("default capture bound"),
+            HeadlessBudget::new(10_000, DEFAULT_HEADLESS_FRAMES).unwrap()
+        );
+        for bad in ["", "0", "-1", "abc", "1.5", "184467440737095516160"] {
+            assert!(HeadlessBudget::from_values(Some(OsStr::new(bad)), None).is_err());
+            assert!(HeadlessBudget::from_values(None, Some(OsStr::new(bad))).is_err());
+        }
+        let frame_overflow = (MAX_HEADLESS_FRAMES + 1).to_string();
+        let tick_overflow = (MAX_HEADLESS_TICKS + 1).to_string();
+        assert!(
+            HeadlessBudget::from_values(Some(OsStr::new(&frame_overflow)), None).is_err(),
+            "a legacy request above the capture ceiling must not silently run fewer ticks"
+        );
+        assert!(HeadlessBudget::from_values(None, Some(OsStr::new(&tick_overflow))).is_err());
+        assert!(HeadlessBudget::new(0, 1).is_err());
+        assert!(HeadlessBudget::new(1, 0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_budgets_refuse_non_unicode_values() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let invalid = OsStr::from_bytes(&[0xff]);
+        assert!(HeadlessBudget::from_values(Some(invalid), None).is_err());
+        assert!(HeadlessBudget::from_values(None, Some(invalid)).is_err());
+    }
+
+    #[test]
+    fn headless_capture_schedule_is_bounded_and_always_includes_the_endpoint() {
+        for ticks in [1, 2, 360, 361, 10_000, MAX_HEADLESS_TICKS] {
+            for frames in [1, 7, DEFAULT_HEADLESS_FRAMES, MAX_HEADLESS_FRAMES] {
+                let budget = HeadlessBudget::new(ticks, frames).expect("bounded budget");
+                let captures: Vec<_> = (0..ticks)
+                    .filter(|&index| budget.capture_after_tick(index))
+                    .map(|index| index + 1)
+                    .collect();
+                assert_eq!(captures.len(), frames.min(ticks));
+                assert_eq!(captures.last(), Some(&ticks));
+                assert!(captures.windows(2).all(|pair| pair[0] < pair[1]));
+            }
+        }
+        let budget = HeadlessBudget::new(10, 3).unwrap();
+        assert_eq!(
+            (0..10)
+                .filter(|&index| budget.capture_after_tick(index))
+                .map(|index| index + 1)
+                .collect::<Vec<_>>(),
+            [4, 7, 10]
+        );
+    }
+
+    #[test]
+    fn headless_summary_counts_uncaptured_ticks_and_refuses_gaps_and_early_completion() {
+        let scenario = ScenarioIdentityV0::caller_seeded("uncaptured-tick-accounting");
+        let initial = Snapshot {
+            tick: 7,
+            epoch: 3,
+            ..Snapshot::default()
+        };
+        let mut report =
+            HeadlessReport::new(initial, &scenario, HeadlessBudget::new(3, 1).unwrap());
+        let first = Snapshot {
+            tick: 8,
+            epoch: 3,
+            agent_count: 4,
+            births: 5,
+            deaths: 2,
+            spike_hits: 7,
+            avg_energy: 0.25,
+            ..Snapshot::default()
+        };
+        report.record(&first, None).expect("uncaptured tick");
+        assert!(report.finalize(Some("premature".to_owned())).is_err());
+        let before = serde_json::to_value(&report).unwrap();
+        let mut invalid = first.clone();
+        assert!(report.record(&invalid, None).is_err(), "repeated tick");
+        invalid.tick = 10;
+        assert!(report.record(&invalid, None).is_err(), "missing tick");
+        invalid.tick = 9;
+        invalid.avg_energy = f32::NAN;
+        assert!(report.record(&invalid, None).is_err(), "invalid aggregate");
+        assert_eq!(serde_json::to_value(&report).unwrap(), before);
+        assert_eq!(report.energy_sum.to_bits(), 0.25_f64.to_bits());
+
+        let second = Snapshot {
+            tick: 9,
+            epoch: 4,
+            agent_count: 6,
+            births: 3,
+            deaths: 1,
+            spike_hits: 11,
+            avg_energy: 0.75,
+            ..Snapshot::default()
+        };
+        report
+            .record(&second, None)
+            .expect("second uncaptured tick");
+        assert_eq!(report.summary.ticks_simulated, 2);
+        assert_eq!(report.summary.frame_count, 0);
+        assert_eq!(report.summary.final_tick, 9);
+        assert_eq!(report.summary.final_epoch, 4);
+        assert_eq!(report.summary.final_agent_count, 6);
+        assert_eq!(report.summary.total_births, 8);
+        assert_eq!(report.summary.total_deaths, 3);
+        assert_eq!(report.summary.total_spike_hits, 18);
+        assert_eq!(report.summary.avg_energy_min.to_bits(), 0.25_f32.to_bits());
+        assert_eq!(report.summary.avg_energy_max.to_bits(), 0.75_f32.to_bits());
+        assert_eq!(report.energy_sum.to_bits(), 1.0_f64.to_bits());
+        assert!(report.frames.is_empty());
+    }
+
+    #[test]
+    fn headless_long_horizon_advances_real_owner_independently_of_capture_budget() {
+        let renderer = TerminalRenderer::default();
+        let ticks = MAX_HEADLESS_FRAMES + 7;
+        let mut observed = Vec::new();
+        for frames in [7, MAX_HEADLESS_FRAMES] {
+            let world = command_characterization_world();
+            {
+                let mut world = world.lock().expect("prepare real epoch boundary");
+                for _ in 0..9_999 {
+                    world.step().expect("advance actual pre-owner science");
+                }
+                assert_eq!(world.epoch(), 0);
+                let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)
+                    .expect("install the production versioned MLP family");
+                for index in 0..3 {
+                    let mut agent = scriptbots_core::AgentData::default();
+                    agent.position.x = 20.0 + index as f32 * 30.0;
+                    agent.position.y = 50.0;
+                    let id = world.try_spawn_agent(agent).expect("real founding agent");
+                    assert!(
+                        world
+                            .bind_agent_brain(id, brains.population()[0])
+                            .expect("bind a real MLP evaluator")
+                    );
+                }
+            }
+            let host = TerminalTestHost::take(world);
+            let initial_digest = host
+                .port()
+                .scientific_digest_v1()
+                .expect("initial populated scientific identity");
+            let (runtime, _) = crate::servers::ControlRuntime::dummy();
+            let report = renderer
+                .run_headless_budget(
+                    host.context(&runtime),
+                    HeadlessBudget::new(ticks, frames).unwrap(),
+                )
+                .expect("real owner completes the full requested horizon");
+            assert_eq!(report.summary.ticks_simulated, ticks as u64);
+            assert_eq!(report.initial.agent_count, 3);
+            assert_eq!(
+                report.summary.final_tick,
+                report.initial.tick + ticks as u64
+            );
+            assert_eq!(report.summary.final_epoch, report.initial.epoch + 1);
+            assert_eq!(report.frames.len(), frames);
+            assert_eq!(report.summary.frame_count, frames);
+            assert_eq!(
+                report.frames.last().unwrap().tick,
+                report.summary.final_tick
+            );
+            let final_digest = host
+                .port()
+                .scientific_digest_v1()
+                .expect("real owner digest");
+            assert_eq!(final_digest.tick.0, report.summary.final_tick);
+            assert_ne!(initial_digest.agents, final_digest.agents);
+            assert_ne!(initial_digest.brains, final_digest.brains);
+            assert_eq!(
+                report.summary.world_digest.as_ref(),
+                Some(&final_digest.overall)
+            );
+            let presented = runtime
+                .presented_frame_slot()
+                .load_full()
+                .expect("final capture");
+            assert!(
+                export::buffer_to_plain_text(&presented.buffer)
+                    .contains(&report.summary.final_tick.to_string())
+            );
+            observed.push(report);
+        }
+        assert_eq!(
+            observed[0].summary.world_digest,
+            observed[1].summary.world_digest
+        );
+        assert_eq!(
+            observed[0].summary.final_agent_count,
+            observed[1].summary.final_agent_count
+        );
+        assert_eq!(
+            observed[0].summary.total_births,
+            observed[1].summary.total_births
+        );
+        assert_eq!(
+            observed[0].summary.total_deaths,
+            observed[1].summary.total_deaths
+        );
+        assert_eq!(
+            observed[0].summary.total_spike_hits,
+            observed[1].summary.total_spike_hits
+        );
+        assert_eq!(
+            observed[0].summary.avg_energy_mean.to_bits(),
+            observed[1].summary.avg_energy_mean.to_bits()
+        );
     }
 
     #[test]

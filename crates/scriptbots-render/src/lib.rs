@@ -6161,9 +6161,6 @@ impl SimulationView {
                         cx,
                     )),
             )
-            .child(div().text_xs().text_color(chrome::text_muted()).child(format!(
-                "Draft JSON limit {MAP_DRAFT_MAX_BYTES} bytes, {MAP_DRAFT_MAX_RULE_TILES} rule tiles. Copy, edit and paste generator/paint fields to author custom rules or samples. Switching selects a preset; Undo restores your prior configuration."
-            )))
             .child(div().text_xs().text_color(chrome::text_muted()).child("GENERATE A PREVIEW"))
             .child(
                 div()
@@ -6393,7 +6390,14 @@ impl SimulationView {
         } else {
             panel = panel.child(application_controls);
         }
+        // Keep the bounded working preview ahead of reference material. The
+        // narrow Lab window must expose its paint targets beside the controls
+        // that act on them; long recipe guidance otherwise pushes even the
+        // first preview row below the viewport.
         panel
+            .child(div().text_xs().text_color(chrome::text_muted()).child(format!(
+                "Draft JSON limit {MAP_DRAFT_MAX_BYTES} bytes, {MAP_DRAFT_MAX_RULE_TILES} rule tiles. Copy, edit and paste generator/paint fields to author custom rules or samples. Switching selects a preset; Undo restores your prior configuration."
+            )))
             .child(div().text_xs().child("Applying replaces live terrain/hydrology. An intervening science change rejects the preview; regenerate while paused. Culling requires a recorded open lifecycle boundary."))
             .child(self.render_dashboard_status(snapshot))
     }

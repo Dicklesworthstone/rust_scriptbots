@@ -377,7 +377,15 @@ RUST_LOG=info cargo run -p scriptbots-app
   SCRIPTBOTS_TERMINAL_HEADLESS_REPORT=terminal_report.json \
   cargo run -p scriptbots-app -- --storage memory --threads 2
   ```
-  This renders offscreen for N frames and writes a JSON summary (frames, ticks, births/deaths, energy stats) to `terminal_report.json`.
+  This executes 24 acknowledged science ticks, renders 24 offscreen frames and
+  writes the observations to `terminal_report.json`. For a longer study, also set
+  `SCRIPTBOTS_TERMINAL_HEADLESS_TICKS=10000`: the simulation executes all 10,000
+  ticks while capturing only 24 evenly spaced frames, including the final tick.
+  Birth/death totals, spike hits and energy statistics cover every executed tick,
+  including ticks between captures. The report's `budget` distinguishes the
+  requested science horizon from its capture limit; `summary.world_digest`, when
+  available, is verified against the final observed owner, tick and revisions.
+  Invalid or excessive budgets return an error instead of silently shortening a run.
   The top-level `schema` is `"scriptbots.terminal-headless.v1"`; check it before
   interpreting or comparing reports. `scenario.schema_version` describes the
   scenario inputs and does not identify the report format. V1 keeps the existing
@@ -729,7 +737,8 @@ endpoint captures keep their existing contract.
 - `SCRIPTBOTS_FORCE_TERMINAL` / `SCRIPTBOTS_FORCE_GUI` — override Auto-mode renderer detection (`1|true|yes`); explicit `--mode` remains authoritative.
 - `SCRIPTBOTS_BOOTSTRAP_TICKS` — explicit pre-frontend science ticks (default `0`, equivalent to `--bootstrap-ticks`; set a nonzero value only when an intentional warmup is part of the run).
 - `SCRIPTBOTS_TERMINAL_HEADLESS` — render TUI to an in-memory buffer for CI smoke tests.
-- `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — number of frames to render in headless mode (default 12; max 360).
+- `SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES` — maximum evenly spaced frames to render and retain in headless mode (default 12; range 1–360). The final tick is always captured. Without an explicit tick budget, this also selects the number of science ticks, preserving one tick per frame.
+- `SCRIPTBOTS_TERMINAL_HEADLESS_TICKS` — explicit scientific tick budget (range 1–1,000,000), independent of the frame limit. Every tick passes through the real host's Step acknowledgement and publication barrier. A run that cannot complete its requested horizon fails instead of reporting partial success.
 - `SCRIPTBOTS_TERMINAL_HEADLESS_REPORT` — file path to write a JSON summary from a headless run. It includes the final observed typed `narrative_events` ring and its `narrative_dropped_events` count. The same ring is logged at info level; zero dropped events is required before treating it as the complete run timeline.
 - `SCRIPTBOTS_MAX_THREADS` — explicit application thread budget, below `--threads` and above auto-tune or low-power defaults. Startup passes the resolved number directly to Rayon. Standalone core callers retain the physical-CPU-capped default when `RAYON_NUM_THREADS` is absent; world construction never rewrites either variable.
   Full-host checkpoint continuation restores the launch manifest's resolved budget, when present, before reconstructing the world. The debug observation reports pool capacity at science-step entry, rather than busy-worker utilization.

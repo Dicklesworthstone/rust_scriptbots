@@ -2,6 +2,28 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Complete headless scenario horizons and usable map editing (2026-11-22):**
+[Implemented and independently reviewed; focused budget tests passed — Codex;
+scoped contributions to `bd-du9o`, `bd-pih9` and `bd-2z0.10.7`;
+original acceptance retained]
+
+Separate the requested scientific tick horizon from bounded terminal frame
+capture, so long scenarios cannot silently stop at the 360-frame capture limit.
+Preserve every acknowledged tick in aggregate observations and bind the final
+digest to the observed endpoint. Retain scenario envelopes and scientific
+defaults. Move map-reference guidance below the working preview so it does not
+push essential painting controls outside the existing compact viewport.
+Retain normal epoch rollover while checking the actual owner session. The
+nonempty MLP regression crosses tick 10,000 and compares sparse and dense
+captures without changing scenario envelopes or scientific defaults.
+
+DSR `scriptbots-headless-focused/20261122T194625-4tWeYJoP` parsed the three
+changed Rust files and passed three exact production budget/sampling tests in
+an isolated, source-hashed probe using the locked dependency versions. This
+does not execute the full terminal, owner/aggregate regressions, native map
+inputs or scenario cohorts. Their execution and original full-workspace
+acceptance remain pending.
+
 **Owner responsiveness during persistence (2026-11-22):**
 [Implemented and independently reviewed; native execution qualification pending
 — Codex; scoped contributions to `bd-w1oi` and `bd-kgob`; original acceptance retained]

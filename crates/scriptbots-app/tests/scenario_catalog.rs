@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scriptbots_app::precedence::{ConfigLayerKind, ConfigLayerStatement, resolve_config_layers};
+use scriptbots_app::terminal::MAX_HEADLESS_FRAMES;
 use scriptbots_app::{ScenarioDocumentV1, ScenarioEnvelopeV1};
 use scriptbots_core::ScriptBotsConfig;
 
@@ -45,6 +46,7 @@ fn run_dir(label: &str) -> PathBuf {
 
 #[derive(Debug, serde::Deserialize)]
 struct HeadlessSummaryDto {
+    frame_count: usize,
     final_agent_count: usize,
     total_births: usize,
     total_deaths: usize,
@@ -66,7 +68,7 @@ struct CohortRun {
 fn launch_scenario(
     document_path: &Path,
     seed: u64,
-    frames: u64,
+    ticks: u64,
     report_path: &Path,
 ) -> std::process::Output {
     let mut command = Command::new(binary());
@@ -78,7 +80,11 @@ fn launch_scenario(
         .env("SCRIPTBOTS_RNG_SEED", seed.to_string())
         .env("SCRIPTBOTS_MODE", "terminal")
         .env("SCRIPTBOTS_TERMINAL_HEADLESS", "1")
-        .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", frames.to_string())
+        .env("SCRIPTBOTS_TERMINAL_HEADLESS_TICKS", ticks.to_string())
+        .env(
+            "SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES",
+            ticks.min(MAX_HEADLESS_FRAMES as u64).to_string(),
+        )
         .env("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT", report_path)
         .env("SCRIPTBOTS_CONTROL_REST_ENABLED", "0")
         .env("SCRIPTBOTS_CONTROL_MCP", "disabled")
@@ -95,28 +101,10 @@ fn launch_scenario(
     command.output().expect("the app binary runs")
 }
 
-fn parse_digest(stdout: &str, stderr: &str) -> String {
-    for line in stderr.lines().chain(stdout.lines()) {
-        if let Some(index) = line.find("world_digest=") {
-            let raw = &line[index + "world_digest=".len()..];
-            let token = raw
-                .split_whitespace()
-                .next()
-                .expect("digest token")
-                .trim_matches('"')
-                .trim_matches(',');
-            return token.to_owned();
-        }
-    }
-    panic!(
-        "no world digest found in run output:\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
-    );
-}
-
-fn run_cohort(document_path: &Path, seed: u64, frames: u64) -> CohortRun {
+fn run_cohort(document_path: &Path, seed: u64, ticks: u64) -> CohortRun {
     let dir = run_dir(&format!("s{seed}"));
     let report_path = dir.join("report.json");
-    let output = launch_scenario(document_path, seed, frames, &report_path);
+    let output = launch_scenario(document_path, seed, ticks, &report_path);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!(
@@ -132,10 +120,16 @@ fn run_cohort(document_path: &Path, seed: u64, frames: u64) -> CohortRun {
     let report: HeadlessReportDto =
         serde_json::from_slice(&std::fs::read(&report_path).expect("headless report exists"))
             .expect("headless report parses");
-    let world_digest = match report.summary.world_digest.clone() {
-        Some(d) => d,
-        None => parse_digest(&stdout, &stderr),
-    };
+    assert_eq!(
+        report.summary.frame_count,
+        ticks.min(MAX_HEADLESS_FRAMES as u64) as usize,
+        "the requested capture budget is distinct from the complete scientific horizon"
+    );
+    let world_digest = report
+        .summary
+        .world_digest
+        .clone()
+        .expect("the completed report must contain its final scientific digest");
     let _ = std::fs::remove_dir_all(&dir);
     CohortRun {
         summary: report.summary,
