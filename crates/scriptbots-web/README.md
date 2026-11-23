@@ -63,6 +63,12 @@ The crate exposes the following wasm-bindgen surface:
   the host's bounded automatic catch-up policy; invalid/backwards time or a
   nanosecond receipt beyond JavaScript's safe-integer range refuses before work.
   This is a scheduling entry point, never a render callback.
+- `SimHandle::ownerStatus() -> JsValue` — reads canonical health, lifecycle and
+  drive interest without driving or polling receipts. The versioned status carries
+  exact decimal-string publication identities and typed scientific, journal or
+  protocol faults. A completed fault may still report `draining`; subsequent
+  `drive` calls settle its retained evidence at the frozen clock boundary before
+  returning the original terminal fault. Read-only frames remain available.
 - `SimHandle::setSpeed(multiplier: number) -> JsValue` — atomically sets speed
   and pause state through one canonical host command in `0..=32`, returning its
   two-axis status. Zero pauses; positive values resume a paused owner.
@@ -254,6 +260,14 @@ Browser timers and rendering still share the main JS thread, so suspended or bus
 pages have no hard real-time guarantee. The receipt exposes skipped opportunities.
 Full packaged-browser/DSR acceptance remains with `bd-2z0.12.3` and `bd-azi3`;
 native unit tests alone do not establish browser scheduling or durability.
+
+When automatic playback faults, the demo displays the completed tick and fault
+diagnostic immediately. It keeps the owner alive to settle journal receipts,
+then stops its simulation timer while rendering and inspection remain usable.
+Playback and new saves stop; existing browser saves and prior recovery errors
+remain intact. Load a saved continuation, restore recovery, or explicitly reset
+to start another world. A failed replacement preserves the faulted world. A
+connected remote host uses its own controls independently of a retained local fault.
 
 The demo starts with **MLP**, with canonical inherited genomes and evaluator
 state. **Brain for new worlds** also offers DWRAON, experimental Assembly, Mixed,

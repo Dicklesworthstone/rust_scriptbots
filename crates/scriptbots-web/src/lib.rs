@@ -64,8 +64,8 @@ use scriptbots_runtime::remote_subscription::{
 };
 use scriptbots_runtime::{
     ApplicationState, CommandStatus, DriveReceipt, HostCommand, HostCore, HostCoreOptions,
-    HostSessionId, LocalHostPort, ManualHostDriver, ManualInstant, NullFrontend, PlaybackSnapshot,
-    RenderSnapshot,
+    HostDriveInterest, HostFault, HostHealth, HostLifecycle, HostSessionId, LocalHostPort,
+    ManualHostDriver, ManualInstant, NullFrontend, PlaybackSnapshot, RenderSnapshot,
 };
 
 /// Browser files obey the canonical paired-owner codec's byte bound.
@@ -334,6 +334,79 @@ struct BrowserFrameIdentity {
     control_revision: String,
     config_revision: String,
     tick: String,
+}
+
+/// Read-only owner state is separate from paint and from command application receipts.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserOwnerStatus<'a> {
+    schema: &'static str,
+    identity: BrowserFrameIdentity,
+    lifecycle: HostLifecycle,
+    drive_interest: HostDriveInterest,
+    health: &'static str,
+    blocker: Option<String>,
+    fault: Option<BrowserOwnerFault<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BrowserOwnerFault<'a> {
+    Scientific {
+        tick: String,
+        code: &'a str,
+        message: &'a str,
+    },
+    Journal {
+        session_id: String,
+        batch_sequence: String,
+        code: &'a str,
+        message: &'a str,
+    },
+    Protocol {
+        code: &'a str,
+        message: &'a str,
+    },
+}
+
+impl<'a> BrowserOwnerStatus<'a> {
+    fn new(publication: &'a RenderSnapshot, drive_interest: HostDriveInterest) -> Self {
+        let health = match &publication.health {
+            HostHealth::Healthy => "healthy",
+            HostHealth::Blocked(_) => "blocked",
+            HostHealth::Faulted(_) => "faulted",
+        };
+        let fault = publication.health.fault().map(|fault| match fault {
+            HostFault::Scientific {
+                tick,
+                code,
+                message,
+            } => BrowserOwnerFault::Scientific {
+                tick: tick.0.to_string(),
+                code,
+                message,
+            },
+            HostFault::Journal { batch_id, failure } => BrowserOwnerFault::Journal {
+                session_id: batch_id.session_id().get().to_string(),
+                batch_sequence: batch_id.sequence().to_string(),
+                code: &failure.code,
+                message: &failure.message,
+            },
+            HostFault::Protocol { code, message } => BrowserOwnerFault::Protocol { code, message },
+        });
+        Self {
+            schema: "scriptbots.browser-owner-status.v1",
+            identity: RemoteFrameIdentity::from(publication).into(),
+            lifecycle: publication.lifecycle,
+            drive_interest,
+            health,
+            blocker: publication
+                .health
+                .blocker()
+                .map(|blocker| format!("{blocker:?}")),
+            fault,
+        }
+    }
 }
 
 impl<'a> BrowserFrame<'a> {
@@ -1076,26 +1149,48 @@ impl Simulation {
     }
 
     fn drive(&mut self, elapsed_ms: f64) -> Result<DriveReceipt> {
-        let duration = std::time::Duration::try_from_secs_f64(elapsed_ms / 1000.0)
-            .context("browser elapsed milliseconds must be finite and nonnegative")?;
-        let now_nanos = u64::try_from(duration.as_nanos())
-            .context("browser elapsed milliseconds exceed the host clock range")?;
-        let max_safe_nanos = (1_u64 << f64::MANTISSA_DIGITS) - 1;
-        ensure!(
-            now_nanos <= max_safe_nanos,
-            "browser elapsed time exceeds JavaScript's exact nanosecond range ({max_safe_nanos}ns)"
-        );
-        ensure!(
-            now_nanos >= self.now_nanos,
-            "browser elapsed time moved backwards: {now_nanos}ns before {}ns",
-            self.now_nanos
-        );
-        // The host may complete work before returning a fault. Keep its observed
-        // monotonic boundary even on failure; never retry against an older clock.
-        self.now_nanos = now_nanos;
-        self.core
-            .drive(ManualInstant::from_nanos(now_nanos))
-            .context("HostCore failed at the browser time boundary")
+        let retry_retained = self.core.journal_full_retry_needed();
+        if self.core.health().fault().is_some() {
+            if self.core.drive_interest() != HostDriveInterest::Draining {
+                // A terminal retry must preserve the first diagnosis and clock, even
+                // if its caller supplies a later or otherwise invalid timestamp.
+                self.require_healthy_owner()?;
+            }
+        } else {
+            let duration = std::time::Duration::try_from_secs_f64(elapsed_ms / 1000.0)
+                .context("browser elapsed milliseconds must be finite and nonnegative")?;
+            let now_nanos = u64::try_from(duration.as_nanos())
+                .context("browser elapsed milliseconds exceed the host clock range")?;
+            let max_safe_nanos = (1_u64 << f64::MANTISSA_DIGITS) - 1;
+            ensure!(
+                now_nanos <= max_safe_nanos,
+                "browser elapsed time exceeds JavaScript's exact nanosecond range ({max_safe_nanos}ns)"
+            );
+            ensure!(
+                now_nanos >= self.now_nanos,
+                "browser elapsed time moved backwards: {now_nanos}ns before {}ns",
+                self.now_nanos
+            );
+            // Keep the observed monotonic boundary even if this drive completes a
+            // faulting tick. Later fault maintenance reuses it without accruing time.
+            self.now_nanos = now_nanos;
+        }
+        let receipt = self
+            .core
+            .drive(ManualInstant::from_nanos(self.now_nanos))
+            .context("HostCore failed at the browser time boundary")?;
+        // Polling above releases the live-memory journal's outstanding capacity.
+        // A restored owner may have a smaller archive than one catch-up batch.
+        // Reoffer its exact retained allocation once, never Closed or failed work.
+        if retry_retained && self.core.journal_full_retry_needed() {
+            self.core
+                .retry_retained_journal()
+                .context("browser journal could not retry its retained allocation")?;
+        }
+        if self.core.drive_interest() != HostDriveInterest::Draining {
+            self.require_healthy_owner()?;
+        }
+        Ok(receipt)
     }
 
     fn set_speed(&mut self, multiplier: f32) -> Result<CommandStatus> {
@@ -1339,6 +1434,17 @@ impl SimHandle {
             .drive(elapsed_ms)
             .map_err(js_error)?;
         to_value(&receipt).map_err(js_error)
+    }
+
+    /// Read canonical owner health and lifecycle without driving time or polling receipts.
+    /// Fault ticks, journal identities and publication revisions remain exact decimal strings.
+    #[wasm_bindgen(js_name = ownerStatus)]
+    pub fn owner_status_js(&self) -> Result<JsValue, JsValue> {
+        let simulation = self.inner.borrow();
+        let publication = simulation.core.latest_snapshot();
+        BrowserOwnerStatus::new(&publication, simulation.core.drive_interest())
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(js_error)
     }
 
     /// Atomically apply speed and pause state through the canonical host command.
@@ -3880,6 +3986,197 @@ mod tests {
         healthy.set_speed(0.0).unwrap();
         assert_eq!(healthy.tick(2).unwrap().tick, 2);
         assert!(healthy.core.health().fault().is_none());
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real owner must retain its clock, completed tick, journal evidence, and fault through each lifecycle boundary"
+    )]
+    fn browser_automatic_fault_drains_before_terminal_refusal() {
+        use scriptbots_runtime::{EventCommitment, EventPoll};
+
+        for archive_capacity in [1, 64] {
+            let mut spec = checkpoint_world(None, SeedStrategy::None).spec;
+            spec.initial_population = 1;
+            spec.preserve_population_config = true;
+            spec.base_config.population_minimum = 0;
+            spec.base_config.population_spawn_interval = 2;
+            spec.base_config.population_spawn_count = 1;
+            spec.base_config.closed = false;
+            let mut world = WorldState::new(spec.config()).unwrap();
+            world.try_spawn_agent(AgentData::default()).unwrap();
+            world
+                .brain_registry_mut()
+                .unwrap()
+                .register("test.browser-clock-fault", |_rng| {
+                    Err(scriptbots_core::BrainSpawnError::new(
+                        "test.browser-clock-fault",
+                        std::io::Error::other("deliberate automatic browser tick failure"),
+                    ))
+                });
+            // The actual volatile adapter can retain fewer outstanding batches
+            // than the owner's hot event ring, including after a paired restore.
+            let mut core = HostCore::with_journal(
+                fresh_browser_session().unwrap(),
+                world,
+                HostCoreOptions::default(),
+                Box::new(scriptbots_runtime::VolatileJournal::with_capacity(
+                    archive_capacity,
+                )),
+            )
+            .unwrap();
+            core.drive(ManualInstant::from_nanos(0)).unwrap();
+            let controls = NullFrontend::new(core.local_port(), 1);
+            let mut simulation = Simulation {
+                core,
+                controls,
+                spec,
+                now_nanos: 0,
+                environment_cache: RemoteEnvironmentCache::default(),
+                environment_js: None,
+            };
+            let completed = simulation.drive(100.0).unwrap();
+            assert_eq!(completed.scientific_steps, 2);
+            assert_eq!(simulation.snapshot().tick, 2);
+            let fault = simulation.core.health().fault().unwrap().clone();
+            assert!(matches!(
+                &fault,
+                HostFault::Scientific { tick, code, message }
+                    if tick.0 == 2 && code == "brain_spawn"
+                        && message.contains("deliberate automatic browser tick failure")
+            ));
+            assert_eq!(
+                simulation.core.drive_interest(),
+                HostDriveInterest::Draining
+            );
+            assert_eq!(
+                simulation.core.journal_full_retry_needed(),
+                archive_capacity == 1
+            );
+            let publication = simulation.core.latest_snapshot();
+            let observed = serde_json::to_value(BrowserOwnerStatus::new(
+                &publication,
+                simulation.core.drive_interest(),
+            ))
+            .unwrap();
+            assert_eq!(observed["health"], "faulted");
+            assert_eq!(observed["driveInterest"], "draining");
+            assert_eq!(observed["fault"]["tick"], "2");
+            let snapshot = serde_json::to_value(simulation.snapshot()).unwrap();
+            let frozen_clock = simulation.now_nanos;
+            let mut drained = false;
+            for elapsed in [200.0, 300.0, 400.0] {
+                match simulation.drive(elapsed) {
+                    Ok(receipt) => {
+                        assert_eq!(receipt.scientific_steps, 0);
+                        assert_eq!(
+                            simulation.core.drive_interest(),
+                            HostDriveInterest::Draining
+                        );
+                    }
+                    Err(error) => {
+                        assert_eq!(error.downcast_ref::<BrowserHostFailure>().unwrap().0, fault);
+                        drained = true;
+                        break;
+                    }
+                }
+                assert_eq!(simulation.now_nanos, frozen_clock);
+            }
+            assert!(
+                drained,
+                "the actual volatile journal must reach its terminal commitment"
+            );
+            assert_eq!(simulation.core.drive_interest(), HostDriveInterest::Faulted);
+            assert_eq!(simulation.now_nanos, frozen_clock);
+            assert!(simulation.core.pending_journal_batch().is_none());
+            let EventPoll::Contiguous(events) = simulation.controls.read_events(8).unwrap() else {
+                panic!("the completed tick evidence remains readable after terminal failure");
+            };
+            assert_eq!(events.events.len(), 2);
+            assert!(
+                events
+                    .events
+                    .iter()
+                    .all(|event| event.commitment == EventCommitment::CommittedVolatile)
+            );
+            assert_eq!(
+                events.events[1].event.boundary.fault().unwrap().code(),
+                "brain_spawn"
+            );
+            let terminal = simulation.core.latest_snapshot();
+            for elapsed in [500.0, f64::NAN, -1.0] {
+                let error = simulation.drive(elapsed).unwrap_err();
+                assert_eq!(error.downcast_ref::<BrowserHostFailure>().unwrap().0, fault);
+                assert_eq!(simulation.now_nanos, frozen_clock);
+                assert_eq!(
+                    simulation.core.latest_snapshot().revision,
+                    terminal.revision
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(simulation.tick(0).unwrap()).unwrap(),
+                snapshot
+            );
+            simulation.reset(Some(17)).unwrap();
+            assert!(simulation.core.health().fault().is_none());
+            assert_eq!(simulation.snapshot().tick, 0);
+            assert_eq!(simulation.drive(20.0).unwrap().scientific_steps, 1);
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_owner_status_is_exact_and_read_only() {
+        let mut simulation = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None);
+        simulation.tick(2).unwrap();
+        simulation.set_speed(0.0).unwrap();
+        let before = simulation.checkpoint().unwrap();
+        let publication = simulation.core.latest_snapshot();
+        let status = serde_json::to_value(BrowserOwnerStatus::new(
+            &publication,
+            simulation.core.drive_interest(),
+        ))
+        .unwrap();
+        assert_eq!(status["schema"], "scriptbots.browser-owner-status.v1");
+        assert_eq!(
+            status["identity"],
+            serde_json::to_value(BrowserFrame::new(&publication).identity).unwrap()
+        );
+        assert_eq!(status["lifecycle"], "running");
+        assert!(status["fault"].is_null());
+        assert_eq!(simulation.checkpoint().unwrap(), before);
+
+        // A wire fixture tests full-width fault identities; it does not claim
+        // an owner that actually executed this many ticks or journal batches.
+        let mut wide = (*publication).clone();
+        wide.health = HostHealth::Faulted(HostFault::Journal {
+            batch_id: scriptbots_runtime::JournalBatchId::new(
+                HostSessionId::new(u64::MAX),
+                u64::MAX,
+            ),
+            failure: scriptbots_runtime::JournalFailure {
+                code: "journal_test".to_owned(),
+                message: "journal diagnostic".to_owned(),
+            },
+        });
+        let journal =
+            serde_json::to_value(BrowserOwnerStatus::new(&wide, HostDriveInterest::Faulted))
+                .unwrap();
+        assert_eq!(journal["fault"]["session_id"], u64::MAX.to_string());
+        assert_eq!(journal["fault"]["batch_sequence"], u64::MAX.to_string());
+        assert_eq!(journal["fault"]["code"], "journal_test");
+        wide.health = HostHealth::Faulted(HostFault::Scientific {
+            tick: scriptbots_core::Tick(u64::MAX),
+            code: "science_test".to_owned(),
+            message: "scientific diagnostic".to_owned(),
+        });
+        let scientific =
+            serde_json::to_value(BrowserOwnerStatus::new(&wide, HostDriveInterest::Faulted))
+                .unwrap();
+        assert_eq!(scientific["fault"]["tick"], u64::MAX.to_string());
+        assert_eq!(scientific["fault"]["message"], "scientific diagnostic");
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]

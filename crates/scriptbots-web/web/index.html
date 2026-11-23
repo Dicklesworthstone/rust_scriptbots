@@ -84,6 +84,15 @@
         }
 
         #checkpoint-view-status { margin: 0 0 0.65rem; font-size: 0.85rem; overflow-wrap: anywhere; }
+        #local-owner-state {
+            margin: 0;
+            padding: 0.85rem 1rem;
+            border-bottom: 1px solid #f59e0b;
+            background: #451a03;
+            color: #fef3c7;
+            line-height: 1.5;
+            overflow-wrap: anywhere;
+        }
         #sim-container[data-view="checkpoint"] #sim-canvas { cursor: default; }
 
         #stats-panel {
@@ -397,6 +406,7 @@
     <div id="mismatch-banner" role="alert" aria-live="polite"></div>
     <main>
         <section id="sim-container">
+            <p id="local-owner-state" role="status" aria-live="polite" hidden></p>
             <canvas id="sim-canvas" width="1280" height="720" tabindex="0" aria-label="Simulation canvas. Click a creature to inspect; drag to pan; scroll or plus/minus to zoom; arrows pan; Home fits; F follows; Escape clears selection."></canvas>
             <div id="remote-overlay" role="status" hidden>Waiting for a remote canvas frame…</div>
             <section id="checkpoint-view" aria-label="Saved-world review" hidden>

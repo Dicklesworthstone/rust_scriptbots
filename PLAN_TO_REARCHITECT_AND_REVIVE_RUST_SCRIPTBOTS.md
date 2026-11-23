@@ -26,6 +26,22 @@ crash-recovery qualification, cross-platform equivalence or the complete strict
 quality gate. Native validation remains in progress; no runtime pass is claimed
 by this implementation note. Record-count limits are not hard byte or time bounds.
 
+**Visible browser faults and retained-journal drain (2026-11-23):**
+[Implemented and independently source-reviewed — Codex; scoped contributions to
+`bd-2z0.12.2` and `bd-2z0.12.3`; original native and packaged-browser acceptance retained]
+
+Expose read-only, versioned owner health with exact publication and fault
+identities. Automatic playback retains its completed scientific boundary while
+draining accepted journal work and retrying only the exact retained Full batch.
+After settlement it returns the original typed fault without advancing time.
+The browser displays the diagnosis, stops its science timer, retains rendering
+and inspection, and permits explicit replacement without overwriting saved
+recovery or its previous storage diagnosis. Remote controls remain independent.
+Authored native regressions use the real volatile journal at two capacities;
+DOM regressions use the explicitly documented WASM/socket doubles and real
+IndexedDB. Execution qualification remains pending; this does not establish
+WASM codec qualification or the broader browser acceptance.
+
 **Checkpoint-start replay preserves the exact owner cut (2026-11-23):**
 [Implemented and independently source-reviewed — Codex; scoped contribution to
 `bd-2z0.5.13`, original acceptance retained]

@@ -64,6 +64,9 @@ const deathsEl = document.getElementById("metric-deaths");
 const energyEl = document.getElementById("metric-energy");
 const healthEl = document.getElementById("metric-health");
 const resetButton = document.getElementById("reset-btn");
+const localOwnerState = document.getElementById("local-owner-state");
+let localOwnerStatus = null;
+let localClockFailure = null;
 const brainPresetSelect = document.getElementById("brain-preset");
 const checkpointSaveButton = document.getElementById("checkpoint-save");
 const checkpointLoadInput = document.getElementById("checkpoint-load");
@@ -629,7 +632,8 @@ let localInterventionOwner = null;
 let remoteInterventionEndpoint = null;
 let interventionNeedsAttach = false;
 const updateInterventionVisibility = () => interventions.setEnabled(!reviewedCheckpoint && Boolean(interventionPanel?.open)
-  && !document.hidden && !interventionNeedsAttach && (!remoteMode || (remoteConnected && remoteFrame !== null)));
+  && !document.hidden && !interventionNeedsAttach
+  && (remoteMode ? remoteConnected && remoteFrame !== null : localOwnerAllowsCommands()));
 function observeInterventions(frame) {
   if (interventionNeedsAttach) {
     // A verified source must also have painted before it can stage an experiment.
@@ -896,14 +900,17 @@ document.addEventListener("keydown", (event) => {
 });
 
 stepsSlider.addEventListener("input", () => {
-  if (remoteMode) return;
+  if (remoteMode || !localOwnerAllowsCommands()) return;
   speedMultiplier = Number(stepsSlider.value);
-  applyPlaybackSpeed();
-  appendLog(`Simulation speed set to ${speedMultiplier}×`);
+  try {
+    applyPlaybackSpeed();
+    if (localOwnerAllowsCommands()) appendLog(`Simulation speed set to ${speedMultiplier}×`);
+  } catch (error) { appendLog(`Simulation speed change stopped: ${error.message || error}`); }
 });
 
 document.addEventListener("visibilitychange", () => {
-  applyPlaybackSpeed();
+  try { applyPlaybackSpeed(); }
+  catch (error) { appendLog(`Simulation clock stopped: ${error.message || error}`); }
   updateCheckpointControls();
 });
 
@@ -942,6 +949,88 @@ function hasPresentationFrame() {
   return remoteMode ? reviewedCheckpoint !== null || remoteFrame !== null : simHandle !== null;
 }
 
+function readOwnerStatus(handle, expectedSessionId) {
+  if (typeof handle.ownerStatus !== "function") {
+    throw new Error("This browser package cannot report owner health; reload an updated package");
+  }
+  const status = handle.ownerStatus();
+  const identity = status?.identity;
+  const fields = ["sessionId", "publicationRevision", "scientificRevision", "controlRevision", "configRevision", "tick"];
+  const exact = (value, bits) => typeof value === "string"
+    && value.length <= (bits === 128 ? 39 : 20) && /^(0|[1-9][0-9]*)$/.test(value)
+    && BigInt(value) < (1n << BigInt(bits));
+  if (status?.schema !== "scriptbots.browser-owner-status.v1" || !identity
+      || fields.some((field) => !exact(identity[field], field === "sessionId" ? 128 : 64))
+      || (expectedSessionId !== null && identity.sessionId !== expectedSessionId)
+      || !["running", "stopping", "stopped"].includes(status.lifecycle)
+      || !["ready_now", "deadline", "wake_only", "draining", "terminated", "faulted"].includes(status.driveInterest)
+      || !["healthy", "blocked", "faulted"].includes(status.health)
+      || (status.health === "blocked" ? typeof status.blocker !== "string" : status.blocker !== null)) {
+    throw new Error("The browser package returned an invalid or foreign owner status");
+  }
+  const fault = status.fault;
+  if (status.health === "faulted" ? !fault || !["scientific", "journal", "protocol"].includes(fault.kind)
+      || typeof fault.code !== "string" || typeof fault.message !== "string"
+      || (fault.kind === "scientific" && !exact(fault.tick, 64))
+      || (fault.kind === "journal" && (!exact(fault.session_id, 128) || !exact(fault.batch_sequence, 64)))
+    : fault !== null) {
+    throw new Error("The browser package returned an invalid owner fault");
+  }
+  return status;
+}
+
+function localOwnerAllowsCommands() {
+  return !!simHandle && !localClockFailure && localOwnerStatus?.lifecycle === "running"
+    && localOwnerStatus.health !== "faulted";
+}
+
+function localOwnerNeedsDrive() {
+  return !!simHandle && !localClockFailure && localOwnerStatus
+    && !["faulted", "terminated"].includes(localOwnerStatus.driveInterest);
+}
+
+function renderLocalOwnerStatus() {
+  if (!localOwnerState) return;
+  const status = localOwnerStatus;
+  const fault = status?.fault;
+  const state = fault ? status.driveInterest === "draining" && !localClockFailure ? "draining" : "faulted"
+    : localClockFailure ? "clock_error" : status?.lifecycle ?? "unavailable";
+  localOwnerState.hidden = remoteMode || !simHandle || (state === "running" && !localClockFailure);
+  localOwnerState.dataset.state = state;
+  localOwnerState.dataset.sessionId = status?.identity.sessionId ?? "";
+  localOwnerState.dataset.tick = status?.identity.tick ?? "";
+  localOwnerState.dataset.faultCode = fault?.code ?? "";
+  if (localOwnerState.hidden) return;
+  const boundary = fault?.kind === "scientific" ? `tick ${fault.tick}`
+    : fault?.kind === "journal" ? `journal batch ${fault.session_id}/${fault.batch_sequence}`
+    : `tick ${status?.identity.tick ?? "unknown"}`;
+  const diagnosis = fault ? `${fault.kind} fault at ${boundary} (${fault.code}): ${fault.message}`
+    : localClockFailure ? `clock stopped at ${boundary}: ${localClockFailure}`
+    : `owner ${status?.lifecycle ?? "unavailable"} at ${boundary}`;
+  const action = state === "draining"
+    ? "No further science will run. Waiting for the retained journal evidence to settle."
+    : "The current world remains available to view and inspect. Load a saved continuation or use Reset Simulation to start another world.";
+  localOwnerState.textContent = `Local simulation ${diagnosis.slice(0, 2048)}. ${action} Existing browser saves are retained.`;
+}
+
+function observeLocalOwner() {
+  localOwnerStatus = readOwnerStatus(simHandle, localOwnerStatus?.identity.sessionId ?? null);
+  renderLocalOwnerStatus();
+  updateCheckpointControls();
+  updateInterventionVisibility();
+}
+
+function stopLocalClock(error) {
+  try { localOwnerStatus = readOwnerStatus(simHandle, localOwnerStatus?.identity.sessionId ?? null); }
+  catch (_) { /* The original drive failure remains the diagnosis if its status cannot be read. */ }
+  localClockFailure = String(error?.message || error).slice(0, 2048);
+  if (simulationTimer !== null) clearTimeout(simulationTimer);
+  simulationTimer = null;
+  renderLocalOwnerStatus();
+  updateCheckpointControls();
+  updateInterventionVisibility();
+}
+
 function updateRemoteControls() {
   updateInterventionVisibility();
   updateCheckpointLabVisibility();
@@ -958,6 +1047,7 @@ function updateRemoteControls() {
   captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
   remoteOverlay.hidden = !remoteMode || !!remoteFrame || !!reviewedCheckpoint;
   renderCheckpointView();
+  renderLocalOwnerStatus();
   updateCheckpointControls();
   updateWorldNavigation();
 }
@@ -966,18 +1056,20 @@ function updateCheckpointControls() {
   updateLocalTransferControl();
   const supportsContinuation = activeBrainPreset !== "wander";
   const recoveryBusy = browserRecovery?.pending === true;
+  const runningOwner = localOwnerAllowsCommands();
+  stepsSlider.disabled = remoteMode || !runningOwner;
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
   resetButton.disabled = remoteMode || brainPresetSelect?.value === "mixed_continuation";
-  if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !simHandle || checkpointLoadPending || !supportsContinuation;
+  if (checkpointSaveButton) checkpointSaveButton.disabled = remoteMode || !runningOwner || checkpointLoadPending || !supportsContinuation;
   if (checkpointLoadInput) checkpointLoadInput.disabled = remoteMode || !wasmInitialized || checkpointLoadPending || browserStorePending || recoveryBusy;
-  if (worldCheckpointExport) worldCheckpointExport.disabled = remoteMode || !simHandle || !supportsContinuation
+  if (worldCheckpointExport) worldCheckpointExport.disabled = remoteMode || !runningOwner || !supportsContinuation
     || checkpointLoadPending || browserStorePending || recoveryBusy || typeof simHandle.worldCheckpoint !== "function"
     || typeof wasm.world_checkpoint_byte_limit !== "function";
   if (worldCheckpointImport) worldCheckpointImport.disabled = remoteMode || !wasmInitialized
     || checkpointLoadPending || browserStorePending || recoveryBusy || typeof wasm.import_world_checkpoint !== "function"
     || typeof wasm.world_checkpoint_byte_limit !== "function";
   const storageBusy = remoteMode || !browserContinuationStore || checkpointLoadPending || browserStorePending || recoveryBusy;
-  if (browserSaveButton) browserSaveButton.disabled = storageBusy || !simHandle || !supportsContinuation;
+  if (browserSaveButton) browserSaveButton.disabled = storageBusy || !runningOwner || !supportsContinuation;
   if (browserRestoreButton) browserRestoreButton.disabled = storageBusy;
   if (checkpointCapability) checkpointCapability.textContent = remoteMode
     ? "These continuation controls apply to your local browser world. Return to Local Simulation to use them."
@@ -988,7 +1080,7 @@ function updateCheckpointControls() {
           ? "This world starts with MLP, DWRAON and Assembly founders in repeating order. Share its recipe to restart or save a continuation to retain its evolution."
           : `This saved world retains ${activeBrainFamilies.join(" + ")} brain families, including any extinct family. Resume or save it to continue; choose a new-world preset before resetting.`
         : "This local world supports saved continuations. Loading a continuation preserves its brain family and resumes paused.";
-  browserRecovery?.setAvailable(!remoteMode && !!simHandle && supportsContinuation && !document.hidden
+  browserRecovery?.setAvailable(!remoteMode && runningOwner && supportsContinuation && !document.hidden
     && !queuedReset && !checkpointLoadPending && !browserStorePending);
   renderRecoveryControls();
   updateRecipeControls();
@@ -1000,12 +1092,12 @@ function renderRecoveryControls() {
   const unobserved = browserRecovery?.error?.code === "unobserved";
   if (recoveryEnabled) {
     recoveryEnabled.checked = browserRecovery?.enabled === true;
-    recoveryEnabled.disabled = !browserRecovery || remoteMode || !simHandle || activeBrainPreset === "wander" || busy;
+    recoveryEnabled.disabled = !browserRecovery || remoteMode || !localOwnerAllowsCommands() || activeBrainPreset === "wander" || busy;
   }
   if (recoveryRestoreButton) recoveryRestoreButton.disabled = remoteMode || !wasmInitialized
     || !browserContinuationStore || busy || browserRecovery?.pending === true;
   if (recoveryRetryButton) {
-    recoveryRetryButton.disabled = remoteMode || !browserRecovery?.enabled
+    recoveryRetryButton.disabled = remoteMode || !localOwnerAllowsCommands() || !browserRecovery?.enabled
       || !browserRecovery.error || busy || browserRecovery.pending;
     recoveryRetryButton.textContent = conflict || unobserved ? "Use this world for recovery" : "Retry Recovery";
   }
@@ -1014,6 +1106,7 @@ function renderRecoveryControls() {
   if (browserRecovery?.pending) state = browserRecovery.enabled ? "Saving a recovery checkpoint…" : "Cancelling the previous world's recovery write…";
   else if (conflict || unobserved) state = `Recovery stopped: ${browserRecovery.error.message} Restore the saved recovery world, or choose Use this world for recovery to replace the shared recovery with this world's next checkpoint.`;
   else if (browserRecovery?.error) state = `Recovery stopped: ${browserRecovery.error.message} Use Retry Recovery after resolving the error.`;
+  else if (browserRecovery?.enabled && !localOwnerAllowsCommands()) state = "Recovery is paused because the local simulation stopped. Its last confirmed save is retained.";
   else if (browserRecovery?.enabled) state = browserRecovery.available
     ? "Recovery is on: saving changed owner state at most once every 30 seconds."
     : "Recovery is on, with new saves suspended while the page is hidden or another save/load is active.";
@@ -1106,8 +1199,17 @@ function connectRemote() {
     // Freeze local science before changing the active source. The saved local
     // owner is resumed only by the user's explicit Return to Local action.
     if (!remoteMode && simHandle) {
-      driveSimulation();
-      simHandle.setSpeed(0);
+      if (localOwnerNeedsDrive()) {
+        try { driveSimulation(); }
+        catch (error) { if (!localClockFailure) throw error; }
+      }
+      if (localOwnerStatus?.health === "faulted" && localOwnerNeedsDrive()) {
+        throw new Error("The local owner is still settling its fault journal. Connect after it stops draining.");
+      }
+      if (localOwnerAllowsCommands()) {
+        simHandle.setSpeed(0);
+        observeLocalOwner();
+      }
     }
     if (simulationTimer !== null) clearTimeout(simulationTimer);
     simulationTimer = null;
@@ -1192,7 +1294,8 @@ function returnToLocalSimulation() {
   remotePlayback.textContent = "";
   remoteReceipt.textContent = "";
   resetPerformanceWindows();
-  applyPlaybackSpeed();
+  try { applyPlaybackSpeed(); }
+  catch (error) { appendLog(`Local owner remains stopped: ${error.message || error}`); }
   localInterventions.emit();
   updateRemoteControls();
   scheduleSimulation();
@@ -1619,8 +1722,15 @@ function presentSimulation(now) {
 }
 
 function driveSimulation() {
-  if (remoteMode || !simHandle || simulationStartedAt === null) return;
-  const receipt = simHandle.drive(performance.now() - simulationStartedAt);
+  if (remoteMode || !localOwnerNeedsDrive() || simulationStartedAt === null) return;
+  let receipt;
+  try {
+    receipt = simHandle.drive(performance.now() - simulationStartedAt);
+    observeLocalOwner();
+  } catch (error) {
+    stopLocalClock(error);
+    throw error;
+  }
   if (receipt.automatic_steps_skipped > 0) {
     appendLog(
       `Simulation timer missed ${receipt.automatic_steps_skipped} tick opportunities; completed ${receipt.scientific_steps} bounded catch-up ticks`,
@@ -1629,11 +1739,15 @@ function driveSimulation() {
 }
 
 function applyPlaybackSpeed() {
-  if (remoteMode || !simHandle) return;
+  if (remoteMode || !localOwnerAllowsCommands()) return;
   // Settle the prior speed up to this input boundary before applying the new
   // canonical command. Resuming never accrues science for a hidden interval.
   driveSimulation();
-  simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
+  if (!localOwnerAllowsCommands()) return;
+  try {
+    simHandle.setSpeed(document.hidden ? 0 : speedMultiplier);
+    observeLocalOwner();
+  } catch (error) { stopLocalClock(error); throw error; }
 }
 
 function releaseSimulation(handle) {
@@ -1648,6 +1762,7 @@ function releaseSimulation(handle) {
 function replaceSimulation(next, { continuation = false, permalink = null, expectedTick = null, expectedBrainPreset = null, expectedLaunchKind = null } = {}) {
   const nextSpeed = continuation ? 0 : speedMultiplier;
   let frame;
+  let ownerStatus;
   let brainPreset;
   let brainFamilies = [];
   let launchInfo;
@@ -1657,6 +1772,10 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
     next.setSpeed(document.hidden ? 0 : nextSpeed);
     frame = next.frame();
     validateFrameIdentity(frame);
+    ownerStatus = readOwnerStatus(next, frame.identity.sessionId);
+    if (ownerStatus.health === "faulted" || ownerStatus.lifecycle !== "running") {
+      throw new Error("The replacement browser owner is not runnable");
+    }
     if (expectedTick !== null && frame.identity.tick !== expectedTick) {
       throw new Error("Saved continuation tick does not match its checkpoint bytes");
     }
@@ -1694,6 +1813,8 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
 
   const previous = simHandle;
   simHandle = next;
+  localOwnerStatus = ownerStatus;
+  localClockFailure = null;
   recoveryReadStatus = "";
   browserRecovery?.attach(next);
   activeBrainPreset = brainPreset;
@@ -1727,13 +1848,14 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   if (captureRequest) finishCapture(captureRequest, new Error("World changed during capture; try again"));
   captureButton.disabled = !!captureRequest || !!encodingRequest;
   updateCheckpointControls();
+  renderLocalOwnerStatus();
   if (previous) releaseSimulation(previous);
   scheduleSimulation();
   return { frame, permalink, launchInfo };
 }
 
 function scheduleSimulation() {
-  if (!remoteMode && simHandle && simulationTimer === null) {
+  if (!remoteMode && localOwnerNeedsDrive() && simulationTimer === null) {
     simulationTimer = setTimeout(pumpSimulation, 1000 / 60);
   }
 }
@@ -1759,7 +1881,7 @@ function pumpSimulation() {
     simulationTimer = null;
     return;
   }
-  if (browserRecovery?.enabled) {
+  if (browserRecovery?.enabled && localOwnerAllowsCommands()) {
     browserRecovery.setAvailable(!document.hidden && !checkpointLoadPending && !browserStorePending
       && !queuedReset && activeBrainPreset !== "wander");
     // Recovery observes the completed owner boundary. Capturing never drives

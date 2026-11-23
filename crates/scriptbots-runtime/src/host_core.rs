@@ -4783,9 +4783,13 @@ impl HostCore {
     }
 
     /// Full work remains retryable even when the published health carries a scientific fault.
-    pub(crate) fn journal_full_retry_needed(&self) -> bool {
+    #[must_use]
+    pub fn journal_full_retry_needed(&self) -> bool {
         self.failed_journal_batches.is_empty()
-            && matches!(&self.latched_fault, None | Some(HostFault::Scientific { .. }))
+            && matches!(
+                &self.latched_fault,
+                None | Some(HostFault::Scientific { .. })
+            )
             && matches!(
                 self.retained_blocker,
                 Some(HostBlocker::JournalFull { batch_id, .. })

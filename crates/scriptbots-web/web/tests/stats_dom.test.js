@@ -69,6 +69,11 @@ const camelCaseWasmModule = `
     return {
       free() {},
       setSpeed(value) { speed = value; },
+      ownerStatus() {
+        return { schema: "scriptbots.browser-owner-status.v1", identity: this.frame().identity,
+          lifecycle: "running", driveInterest: speed === 0 ? "wake_only" : "deadline",
+          health: "healthy", blocker: null, fault: null };
+      },
       drive(now) {
         credit += (now - elapsed) * speed * 60 / 1000;
         elapsed = now;
@@ -131,6 +136,11 @@ const snakeCaseWasmModule = `
     return {
       free() {},
       setSpeed(value) { speed = value; },
+      ownerStatus() {
+        return { schema: "scriptbots.browser-owner-status.v1", identity: this.frame().identity,
+          lifecycle: "running", driveInterest: speed === 0 ? "wake_only" : "deadline",
+          health: "healthy", blocker: null, fault: null };
+      },
       drive(now) {
         const steps = Math.floor((now - elapsed) * speed * 60 / 1000);
         elapsed = now;

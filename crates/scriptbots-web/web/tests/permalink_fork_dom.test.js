@@ -187,7 +187,7 @@ const mockWasmModule = `
       : ["mlp", "dwraon", "assembly"].includes(preset) ? [preset] : [];
     const record = { id: owners.records.length + 1, kind, preset, seed: String(seed), population, tick: initialTick,
       freeCalls: 0, driveCalls: 0, frameCalls: 0, narrativeReads: 0, permalinkCalls: 0, elapsed: 0, speed: 1,
-      speedCalls: 0, stepCalls: 0 };
+      speedCalls: 0, stepCalls: 0, checkpointCalls: 0, fault: null, drainRemaining: 0, journalSettled: false };
     owners.records.push(record);
     let credit = 0;
     function check(stage) {
@@ -202,6 +202,16 @@ const mockWasmModule = `
       permalinkOf() { check("permalink"); record.permalinkCalls += 1; return link; },
       brainPreset() { check("preset"); return preset; },
       brainFamilies() { check("families"); return [...families]; },
+      ownerStatus: failure === "owner_status_missing" ? undefined : function () {
+        check("owner_status");
+        return { schema: failure === "owner_status_schema" ? "unsupported" : "scriptbots.browser-owner-status.v1",
+          identity: { sessionId: String(2000 + record.id + (failure === "owner_status_foreign" ? 1 : 0)),
+            publicationRevision: String(record.tick + 400), scientificRevision: String(record.tick + 100),
+            controlRevision: "20", configRevision: "10", tick: String(record.tick) },
+          lifecycle: "running", health: record.fault ? "faulted" : "healthy", blocker: null,
+          fault: record.fault, driveInterest: record.fault ? record.drainRemaining ? "draining" : "faulted"
+            : record.speed === 0 ? "wake_only" : "deadline" };
+      },
       launchInfo: failure === "launch_missing" ? undefined : function () {
         check("launch");
         if (failure === "launch_schema") return { kind: "browser_launch", semantics: "saved_owner_continuation", shareable: true };
@@ -238,6 +248,8 @@ const mockWasmModule = `
       },
       checkpoint() {
         check("checkpoint");
+        record.checkpointCalls += 1;
+        if (record.fault) throw new Error("faulted fixture cannot checkpoint");
         const bytes = new Uint8Array(9);
         bytes[0] = 42;
         new DataView(bytes.buffer).setBigUint64(1, BigInt(record.tick), true);
@@ -248,11 +260,33 @@ const mockWasmModule = `
         record.worldExports = (record.worldExports || 0) + 1;
         return new Uint8Array([77]);
       },
-      setSpeed(value) { check("speed"); record.speedCalls += 1; record.speed = value; },
+      setSpeed(value) {
+        check("speed");
+        record.speedCalls += 1;
+        if (record.fault) throw new Error("faulted fixture cannot change playback");
+        record.speed = value;
+      },
       drive(now) {
         check("drive");
         record.driveCalls += 1;
         if (owners.failDriveId === record.id) throw new Error("intentional clock failure");
+        if (record.fault) {
+          if (owners.holdFaultDrain) return { scientific_steps: 0, automatic_steps_skipped: 0 };
+          if (record.drainRemaining > 0) record.drainRemaining -= 1;
+          if (record.drainRemaining === 0) {
+            record.journalSettled = true;
+            throw new Error("fixture completed scientific fault: " + record.fault.code);
+          }
+          return { scientific_steps: 0, automatic_steps_skipped: 0 };
+        }
+        if (owners.scientificFaultId === record.id) {
+          record.tick += 1;
+          record.elapsed = now;
+          record.fault = { kind: "scientific", tick: String(record.tick), code: "brain_spawn_fixture",
+            message: "<img src=x onerror=window.__faultMarkupExecuted=true> deliberate completed fault" };
+          record.drainRemaining = 2;
+          return { scientific_steps: 1, automatic_steps_skipped: 0 };
+        }
         if (now < record.elapsed) throw new Error("owner clock rewound");
         credit += (now - record.elapsed) * record.speed * 60 / 1000;
         record.elapsed = now;
@@ -305,7 +339,7 @@ const mockWasmModule = `
 `;
 
 async function runOwnerLifecycleCases(page, context) {
-  const observations = { refusals: [], recoveries: [], replacements: [], presentationRecoveries: [] };
+  const observations = { refusals: [], recoveries: [], replacements: [], presentationRecoveries: [], automaticFaults: [] };
   await page.evaluate(() => {
     const read = File.prototype.arrayBuffer;
     File.prototype.arrayBuffer = function () {
@@ -324,6 +358,9 @@ async function runOwnerLifecycleCases(page, context) {
     presentedTick: document.getElementById("renderer-status").dataset.snapshotTick,
     presentationState: document.getElementById("renderer-status").dataset.presentationState,
     rendererStatus: document.getElementById("renderer-status").textContent,
+    ownerState: { ...document.getElementById("local-owner-state").dataset },
+    ownerNotice: document.getElementById("local-owner-state").textContent,
+    ownerNoticeHidden: document.getElementById("local-owner-state").hidden,
     speed: document.getElementById("steps-per-frame").value,
     preset: document.getElementById("brain-preset").value,
   }));
@@ -666,7 +703,8 @@ async function runOwnerLifecycleCases(page, context) {
   // each failed candidate must be freed without moving the paused old world.
   await setSpeed(0);
   for (const operation of ["reset", "permalink", "checkpoint", "scientific"]) {
-    for (const failure of ["create", "speed", "frame", "snapshot", "identity", "launch", "launch_schema", "launch_seed",
+    for (const failure of ["create", "speed", "frame", "snapshot", "identity", "owner_status", "owner_status_missing",
+      "owner_status_schema", "owner_status_foreign", "launch", "launch_schema", "launch_seed",
       ["checkpoint", "scientific"].includes(operation) ? "preset" : "permalink",
       ...(operation === "scientific" ? ["launch_missing", "families"] : [])]) {
       const before = await state();
@@ -764,6 +802,84 @@ async function runOwnerLifecycleCases(page, context) {
     }
     observations.recoveries.push({ operation, previousOwner: previous.id, newOwner: next.id,
       tickBeforeResume: next.tick, tickAfterResume: running.tick, pendingTimers: resumed.pendingTimers });
+  }
+
+  // The explicit WASM double publishes a completed scientific fault before its
+  // journal settles. The production timer must keep draining evidence, expose
+  // the fault immediately, then stop only that timer while paint stays readable.
+  for (const operation of ["reset", "permalink", "checkpoint"]) {
+    await setSpeed(1);
+    await context.clock.runFor(32);
+    const previous = activeOwner(await state());
+    await page.evaluate((ownerId) => {
+      window.__ownerTest.scientificFaultId = ownerId;
+      window.__ownerTest.holdFaultDrain = true;
+    }, previous.id);
+    await context.clock.runFor(64);
+    const draining = await state();
+    const faulted = activeOwner(draining);
+    const controls = await page.evaluate(() => ({
+      stopped: ["steps-per-frame", "checkpoint-save", "checkpoint-browser-save", "world-checkpoint-export",
+        "checkpoint-recovery-enabled"].every((id) => document.getElementById(id).disabled),
+      canReplace: ["reset-btn", "checkpoint-load", "load-permalink-btn"]
+        .every((id) => !document.getElementById(id).disabled),
+    }));
+    if (faulted.id !== previous.id || faulted.tick !== previous.tick + 1 || faulted.journalSettled
+        || draining.pendingTimers !== 1 || draining.ownerNoticeHidden
+        || draining.ownerState.state !== "draining" || draining.ownerState.tick !== String(faulted.tick)
+        || draining.ownerState.faultCode !== "brain_spawn_fixture" || !controls.stopped || !controls.canReplace
+        || !draining.ownerNotice.includes("Waiting for the retained journal")
+        || !draining.ownerNotice.includes("<img src=x onerror=window.__faultMarkupExecuted=true>")
+        || await page.locator("#local-owner-state img").count() !== 0) {
+      throw new Error(`Completed fault was concealed or abandoned before journal settlement: ${JSON.stringify({ draining, controls })}`);
+    }
+    await setSpeed(3);
+    await page.evaluate(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      document.getElementById("remote-connect").click();
+    });
+    await context.clock.runFor(32);
+    const stillDraining = await state();
+    if (activeOwner(stillDraining).tick !== faulted.tick
+        || activeOwner(stillDraining).speedCalls !== faulted.speedCalls || stillDraining.pendingTimers !== 1
+        || !await page.isDisabled("#remote-local")
+        || !(await page.textContent("#remote-status")).includes("still settling its fault journal")
+        || await page.evaluate(() => !!window.__faultMarkupExecuted)) {
+      throw new Error("Playback or remote connection interrupted the faulted owner's journal drain");
+    }
+    await page.evaluate(() => { window.__ownerTest.holdFaultDrain = false; });
+    await context.clock.runFor(64);
+    const stopped = await state();
+    if (!activeOwner(stopped).journalSettled || stopped.pendingTimers !== 0
+        || stopped.ownerNoticeHidden || stopped.ownerState.state !== "faulted"
+        || stopped.ownerState.tick !== String(faulted.tick) || stopped.presentedTick !== String(faulted.tick)
+        || !stopped.ownerNotice.includes("Load a saved continuation or use Reset")) {
+      throw new Error(`Settled scientific fault failed to stop its clock visibly: ${JSON.stringify(stopped)}`);
+    }
+    await context.clock.runFor(128);
+    const retained = activeOwner(await state());
+    if (retained.driveCalls !== activeOwner(stopped).driveCalls || retained.tick !== faulted.tick
+        || retained.frameCalls <= activeOwner(stopped).frameCalls || retained.freeCalls !== 0) {
+      throw new Error("Terminal fault restarted time or discarded its readable world");
+    }
+    await page.evaluate(() => { window.__ownerTest.nextFailure = "owner_status"; });
+    await replace(operation);
+    const refused = await state();
+    if (activeOwner(refused).id !== previous.id || refused.pendingTimers !== 0
+        || refused.ownerState.state !== "faulted" || activeOwner(refused).tick !== faulted.tick) {
+      throw new Error(`${operation} refusal cleared the terminal scientific fault`);
+    }
+    await replace(operation);
+    const recovered = await state();
+    const next = activeOwner(recovered);
+    if (next.id === previous.id || recovered.records[previous.id - 1].freeCalls !== 1
+        || !recovered.ownerNoticeHidden || recovered.pendingTimers !== 1 || recovered.maximumTimers !== 1
+        || recovered.records[previous.id - 1].driveCalls !== retained.driveCalls) {
+      throw new Error(`${operation} did not explicitly replace the stopped owner exactly once`);
+    }
+    observations.automaticFaults.push({ operation, previousOwner: previous.id, completedTick: faulted.tick,
+      drainingTimers: draining.pendingTimers, stoppedTimers: stopped.pendingTimers, journalSettled: true,
+      retainedFrameReads: retained.frameCalls - activeOwner(stopped).frameCalls, replacementOwner: next.id });
   }
 
   for (const operation of ["permalink", "reset", "checkpoint", "reset"]) {
@@ -1255,6 +1371,71 @@ async function runOwnerLifecycleCases(page, context) {
   observations.browserRecovery = { firstRecovery, recoveryQuota, restoredTick: changedRecoveryTick,
     restoredOwner: activeOwner(restoredRecovery).id, recoveryRaces };
 
+  // A terminal scientific fault cannot replace the last committed IndexedDB
+  // recovery with an unsaveable owner, or clear a previous quota diagnosis.
+  observations.browserRecovery.automaticFaults = [];
+  const storedRecoveryCut = () => page.evaluate(async () => {
+    const { BrowserContinuationStore } = await import("/continuation-store.js");
+    const saved = await new BrowserContinuationStore(1024).readRecovery();
+    return { tick: saved.tick, source: saved.source, writeToken: saved.writeToken,
+      bytes: Array.from(new Uint8Array(await saved.blob.arrayBuffer())) };
+  });
+  for (const failure of [null, "quota"]) {
+    if (failure) await page.evaluate(() => {
+      const put = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function (record, key) {
+        if (key === "recovery") {
+          IDBObjectStore.prototype.put = put;
+          throw new DOMException("Recovery quota before scientific fault", "QuotaExceededError");
+        }
+        return put.call(this, record, key);
+      };
+    });
+    await enableRecovery(true);
+    await context.clock.runFor(32);
+    await waitRecovery({ state: failure ? "error" : "enabled", tick: changedRecoveryTick,
+      ...(failure ? { text: "quota" } : {}) });
+    const saved = await storedRecoveryCut();
+    await setSpeed(1);
+    const beforeFault = activeOwner(await state());
+    await page.evaluate((ownerId) => { window.__ownerTest.scientificFaultId = ownerId; }, beforeFault.id);
+    await context.clock.runFor(96);
+    const stopped = await state();
+    await context.clock.runFor(60_000);
+    const after = await state();
+    const recoveryUi = await page.evaluate(() => ({
+      state: document.getElementById("checkpoint-recovery-status").dataset.state,
+      text: document.getElementById("checkpoint-recovery-status").textContent,
+      enabled: document.getElementById("checkpoint-recovery-enabled").checked,
+      disabled: document.getElementById("checkpoint-recovery-enabled").disabled,
+      retryDisabled: document.getElementById("checkpoint-recovery-retry").disabled,
+      restoreDisabled: document.getElementById("checkpoint-recovery-restore").disabled,
+    }));
+    if (stopped.ownerState.state !== "faulted" || after.pendingTimers !== 0
+        || activeOwner(after).tick !== beforeFault.tick + 1
+        || activeOwner(after).checkpointCalls !== beforeFault.checkpointCalls
+        || activeOwner(after).driveCalls !== activeOwner(stopped).driveCalls
+        || JSON.stringify(await storedRecoveryCut()) !== JSON.stringify(saved)
+        || !recoveryUi.enabled || !recoveryUi.disabled || !recoveryUi.retryDisabled || recoveryUi.restoreDisabled
+        || recoveryUi.state !== (failure ? "error" : "enabled")
+        || !recoveryUi.text.includes(failure ? "quota" : "last confirmed save is retained")) {
+      throw new Error(`Faulted recovery lost its saved cut or failure diagnosis: ${JSON.stringify({ stopped, after, recoveryUi })}`);
+    }
+    await page.evaluate(() => document.getElementById("checkpoint-recovery-restore").click());
+    await waitRecovery({ state: "off", tick: saved.tick, text: "Restored recovery at tick" });
+    await context.clock.runFor(32);
+    const resumed = await state();
+    if (activeOwner(resumed).id === beforeFault.id || !resumed.ownerNoticeHidden
+        || activeOwner(resumed).tick !== Number(saved.tick) || resumed.speed !== "0"
+        || resumed.pendingTimers !== 1 || resumed.maximumTimers !== 1
+        || resumed.records[beforeFault.id - 1].freeCalls !== 1) {
+      throw new Error("Explicit IndexedDB restore did not recover the stopped scientific owner");
+    }
+    observations.browserRecovery.automaticFaults.push({ priorFailure: failure, savedTick: saved.tick,
+      completedFaultTick: activeOwner(stopped).tick, retainedWriteToken: saved.writeToken,
+      faultedOwner: beforeFault.id, restoredOwner: activeOwner(resumed).id });
+  }
+
   // Production DOM/controller integration with the explicit WASM double above.
   // This proves presentation and owner lifetime, not real detector generation.
   await setSpeed(0);
@@ -1316,7 +1497,7 @@ async function runOwnerLifecycleCases(page, context) {
   return observations;
 }
 
-async function runRemoteScientificTransferCase(page, context, baseUrl) {
+async function runRemoteScientificTransferCase(page, context, baseUrl, localFault = false) {
   // Real page, remote client, bounded HTTP reads and SHA-256 verification. The
   // socket and WASM codec are explicit doubles, as in the local lifecycle cases.
   const sessionId = "18446744073709551610";
@@ -1348,6 +1529,21 @@ async function runRemoteScientificTransferCase(page, context, baseUrl) {
   });
   await page.goto(baseUrl);
   await context.clock.runFor(32);
+  let faultedLocal = null;
+  if (localFault) {
+    await page.evaluate(() => {
+      window.__ownerTest.scientificFaultId = window.__ownerTest.records.find((owner) => owner.freeCalls === 0).id;
+    });
+    await context.clock.runFor(96);
+    faultedLocal = await page.evaluate(() => ({
+      owner: window.__ownerTest.records.find((owner) => owner.freeCalls === 0),
+      timers: window.__ownerTimers.pending.size,
+      state: document.getElementById("local-owner-state").dataset.state,
+      hidden: document.getElementById("local-owner-state").hidden,
+    }));
+    if (faultedLocal.timers !== 0 || faultedLocal.state !== "faulted" || faultedLocal.hidden
+        || !faultedLocal.owner.journalSettled) throw new Error("Remote isolation fixture did not settle a local fault");
+  }
   await page.evaluate((sourceSessionId) => {
     const speed = document.getElementById("steps-per-frame");
     speed.value = "0";
@@ -1397,11 +1593,14 @@ async function runRemoteScientificTransferCase(page, context, baseUrl) {
     transferDisabled: document.getElementById("lab-checkpoint-local").disabled,
     remoteStepDisabled: document.getElementById("remote-step").disabled,
     launchKind: document.getElementById("launch-info").dataset.kind,
+    localNoticeHidden: document.getElementById("local-owner-state").hidden,
   }));
   const connected = await state();
   const retained = connected.records.find((owner) => owner.freeCalls === 0);
   if (!retained || connected.remote !== "connected" || connected.session !== sessionId
-      || connected.timers !== 0 || connected.transferDisabled || connected.remoteStepDisabled) {
+      || connected.timers !== 0 || connected.transferDisabled || connected.remoteStepDisabled
+      || !connected.localNoticeHidden || (faultedLocal && (retained.speedCalls !== faultedLocal.owner.speedCalls
+        || retained.driveCalls !== faultedLocal.owner.driveCalls || retained.tick !== faultedLocal.owner.tick))) {
     throw new Error(`Remote transfer did not start from a usable observed host: ${JSON.stringify(connected)}`);
   }
   const transfer = async (failure) => {
@@ -1449,12 +1648,14 @@ async function runRemoteScientificTransferCase(page, context, baseUrl) {
       || imported.records[retained.id - 1].driveCalls !== retained.driveCalls
       || imported.closes !== 1 || imported.remote !== "local" || imported.session !== String(2000 + live[0].id)
       || imported.launchKind !== "scientific_checkpoint" || imported.timers !== 1 || imported.maximumTimers !== 1
+      || !imported.localNoticeHidden
       || imported.sent.some((request) => !["subscribe", "stream_ack"].includes(request.command))
       || requests.some((request) => request.method !== "GET" || request.session !== sessionId)
       || requests.filter((request) => request.path.endsWith("/download")).length !== 3) {
     throw new Error(`Remote transfer did not create one paused local owner without server mutation: ${JSON.stringify({ imported, requests })}`);
   }
   return { evidence: "production DOM/remote client/HTTP integrity checks with explicit socket and WASM doubles",
+    localOwnerHealth: localFault ? "settled_scientific_fault" : "healthy",
     sourceSession: sessionId, sourceTick: 91, savedTick: checkpoint.tick, retainedOwner: retained.id,
     importedOwner: live[0].id, refusals, requests, remoteCommands: imported.sent.map((request) => request.command),
     socketCloses: imported.closes, paused: live[0].speed === 0 };
@@ -1940,8 +2141,10 @@ async function runTests() {
       await context.close();
     }
 
-    // Real remote-view handoff, including failures before and after allocation.
-    {
+    // Real remote-view handoff with healthy and faulted retained local owners,
+    // including failures before and after allocation in both matrix cells.
+    remoteScientificTransfer = [];
+    for (const localFault of [false, true]) {
       const context = await browser.newContext();
       const epoch = Date.UTC(2026, 0, 1);
       await context.clock.install({ time: epoch });
@@ -1952,7 +2155,7 @@ async function runTests() {
       await page.route("**/pkg/scriptbots_web.js", (route) => route.fulfill({
         status: 200, contentType: "application/javascript; charset=utf-8", body: mockWasmModule,
       }));
-      remoteScientificTransfer = await runRemoteScientificTransferCase(page, context, baseUrl);
+      remoteScientificTransfer.push(await runRemoteScientificTransferCase(page, context, baseUrl, localFault));
       if (pageErrors.length) throw new Error(`Unhandled remote handoff errors: ${pageErrors.join("; ")}`);
       await context.close();
     }
