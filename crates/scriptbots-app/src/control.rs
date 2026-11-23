@@ -3036,6 +3036,54 @@ impl CheckpointRetentionState {
             .map_err(|error| ControlError::CheckpointRetentionUnavailable(error.to_string()))
     }
 
+    /// A cached receipt is usable only while its completed catalog still names
+    /// the same saved cut in exactly one retained root. Payload bytes are
+    /// verified separately by downloads and exact capture retries.
+    fn verify_completed_catalog(
+        &self,
+        directory: &Path,
+        expected: &CheckpointMetadataDto,
+    ) -> Result<(), ControlError> {
+        if self.directories.len() > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
+            return Err(ControlError::CheckpointCapacity(
+                "checkpoint discovery directory budget exceeded".into(),
+            ));
+        }
+        let id = &expected.checkpoint_id;
+        let mut found = None;
+        for root in self.directories.keys() {
+            self.verify_directory(root)?;
+            let path = root.join(format!("{id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
+            match fs::symlink_metadata(&path) {
+                Ok(_) if found.is_some() => {
+                    return Err(ControlError::Conflict(format!(
+                        "checkpoint {id} appears in multiple retained directories"
+                    )));
+                }
+                Ok(_) => found = Some(root),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(checkpoint_catalog_error(&path, error)),
+            }
+        }
+        let Some(found) = found else {
+            return Err(checkpoint_catalog_error(
+                &directory.join(format!("{id}{CHECKPOINT_CATALOG_READY_SUFFIX}")),
+                "cached checkpoint completion marker is missing",
+            ));
+        };
+        if found != directory {
+            return Err(ControlError::Conflict(format!(
+                "checkpoint {id} changed its retained artifact root"
+            )));
+        }
+        if read_checkpoint_catalog(directory, id)? != *expected {
+            return Err(ControlError::Conflict(format!(
+                "checkpoint {id} has conflicting retained descriptors"
+            )));
+        }
+        Ok(())
+    }
+
     fn request_admission(
         &self,
         key: &str,
@@ -3617,27 +3665,28 @@ impl DataServices {
             .checkpoint_retention
             .lock()
             .map_err(|_| ControlError::Lock)?;
-        if retention.directories.len() > MAX_CHECKPOINT_DISCOVERY_ENTRIES {
-            return Err(ControlError::CheckpointCapacity(
-                "checkpoint discovery directory budget exceeded".into(),
-            ));
+        let metadata = self
+            .checkpoints
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ControlError::NotFound(format!("checkpoint '{id}' not found")))?;
+        let artifact = self
+            .artifacts
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                ControlError::Conflict(format!("checkpoint {id} lost its retained artifact"))
+            })?;
+        if artifact.metadata != checkpoint_artifact_metadata(&metadata) {
+            return Err(ControlError::Conflict(format!(
+                "checkpoint {id} has conflicting retained artifact metadata"
+            )));
         }
-        let mut found = false;
-        for directory in retention.directories.keys() {
-            retention.verify_directory(directory)?;
-            let path = directory.join(format!("{id}{CHECKPOINT_CATALOG_READY_SUFFIX}"));
-            match fs::symlink_metadata(&path) {
-                Ok(_) if found => {
-                    return Err(ControlError::Conflict(format!(
-                        "checkpoint {id} appears in multiple retained directories"
-                    )));
-                }
-                Ok(_) => found = true,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(checkpoint_catalog_error(&path, error)),
-            }
-        }
-        Ok(())
+        retention.verify_completed_catalog(&artifact.directory, &metadata)
     }
 
     /// Recover only completed descriptors in leased roots. Uncatalogued binary
@@ -3703,6 +3752,23 @@ impl DataServices {
         let mut identity_counts = BTreeMap::new();
         for (_, id) in &paths {
             *identity_counts.entry(id.clone()).or_insert(0_usize) += 1;
+        }
+        for id in self
+            .checkpoints
+            .lock()
+            .map_err(|_| ControlError::Lock)?
+            .keys()
+            .filter(|id| {
+                valid_checkpoint_catalog_id(id)
+                    && requested.is_none_or(|requested| requested == id.as_str())
+                    && !identity_counts.contains_key(*id)
+            })
+        {
+            first_error.get_or_insert_with(|| {
+                ControlError::CheckpointRetentionUnavailable(format!(
+                    "checkpoint {id} lost its completed catalog marker; cached metadata cannot establish recoverability"
+                ))
+            });
         }
         for (id, count) in &identity_counts {
             if *count > 1 {
@@ -5475,6 +5541,9 @@ impl ControlHandle {
         mut retained: RetainedCheckpoint,
     ) -> Result<CheckpointMetadataDto, ControlError> {
         retention.verify_directory(&retained.directory)?;
+        if retained.acknowledged {
+            retention.verify_completed_catalog(&retained.directory, &retained.metadata)?;
+        }
         let path = retained.directory.join(&retained.artifact.relative_path);
         let (file, bytes) = open_artifact_file_bounded(
             &path,
@@ -13744,13 +13813,130 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one retained save proves warm-cache refusal, exact repair and cold retry without recapture"
+    )]
+    fn checkpoint_cached_receipts_require_the_original_completed_catalog() {
+        for corruption in [
+            "missing_ready",
+            "nonempty_ready",
+            "missing_descriptor",
+            "corrupt_descriptor",
+            "changed_descriptor",
+        ] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let (handle, host) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let request = CheckpointCreateRequest {
+                description: Some("original saved science".into()),
+                idempotency_key: Some("lost-response-exact-retry".into()),
+            };
+            let saved = handle.create_checkpoint(request.clone()).unwrap();
+            let (artifact, payload) = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap();
+            assert_eq!(handle.get_checkpoint(&saved.checkpoint_id).unwrap(), saved);
+            assert_eq!(handle.get_artifact(&saved.checkpoint_id).unwrap(), artifact);
+            assert_eq!(handle.create_checkpoint(request.clone()).unwrap(), saved);
+
+            // A retry after a lost response must never substitute a fresh cut.
+            host.wait_applied(&handle.step().unwrap());
+            let live = host.port.scientific_digest_v1().unwrap();
+            assert!(handle.status().unwrap().tick > saved.tick);
+            let suffix = if corruption.ends_with("ready") {
+                CHECKPOINT_CATALOG_READY_SUFFIX
+            } else {
+                CHECKPOINT_CATALOG_SUFFIX
+            };
+            let path = directory.join(format!("{}{suffix}", saved.checkpoint_id));
+            let original = fs::read(&path).unwrap();
+            fs::write(directory.join("original-completion-record"), &original).unwrap();
+            match corruption {
+                "missing_ready" | "missing_descriptor" => {
+                    fs::rename(&path, directory.join("missing-completion-record")).unwrap();
+                }
+                "nonempty_ready" | "corrupt_descriptor" => {
+                    fs::write(&path, b"incomplete completion record").unwrap();
+                }
+                "changed_descriptor" => {
+                    let mut record: CheckpointCatalogRecord =
+                        serde_json::from_slice(&original).unwrap();
+                    record.metadata.description = Some("different retained request".into());
+                    record.checksum_blake3 =
+                        compute_blake3(&serde_json::to_vec(&record.metadata).unwrap());
+                    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let entries = fs::read_dir(&directory).unwrap().count();
+            for _ in 0..2 {
+                assert!(
+                    handle.create_checkpoint(request.clone()).is_err(),
+                    "{corruption}: a cached acknowledgement is not a recoverable saved cut"
+                );
+                assert!(
+                    handle.get_checkpoint(&saved.checkpoint_id).is_err(),
+                    "{corruption}"
+                );
+                assert!(
+                    handle.get_artifact(&saved.checkpoint_id).is_err(),
+                    "{corruption}"
+                );
+                assert!(
+                    handle.read_artifact_bytes(&saved.checkpoint_id).is_err(),
+                    "{corruption}"
+                );
+                assert!(handle.list_checkpoints(None, None).is_err(), "{corruption}");
+                assert!(handle.list_artifacts(None, None).is_err(), "{corruption}");
+            }
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), entries);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+            assert_eq!(
+                fs::read(directory.join(&artifact.relative_path)).unwrap(),
+                payload
+            );
+            let usage = handle.checkpoint_retention_usage().unwrap();
+            assert_eq!(usage.file_count, 1);
+            assert_eq!(usage.request_entries, 1);
+            assert_eq!(usage.pending_entries, 0);
+
+            // Preserve the failed record and repair only the exact original
+            // catalog bytes. The request and immutable payload remain unchanged.
+            if path.exists() {
+                fs::rename(&path, directory.join("refused-completion-record")).unwrap();
+            }
+            fs::write(&path, &original).unwrap();
+            assert_eq!(handle.create_checkpoint(request.clone()).unwrap(), saved);
+            assert_eq!(handle.get_checkpoint(&saved.checkpoint_id).unwrap(), saved);
+            assert_eq!(handle.get_artifact(&saved.checkpoint_id).unwrap(), artifact);
+            assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 1);
+            assert_eq!(handle.list_artifacts(None, None).unwrap().total, 1);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live);
+            drop(handle);
+            drop(host);
+
+            let (restarted, owner) = checkpoint_test_handle(&directory, 4, 8 * 1024 * 1024);
+            let before = owner.port.scientific_digest_v1().unwrap();
+            assert_eq!(restarted.create_checkpoint(request).unwrap(), saved);
+            assert_eq!(
+                restarted
+                    .read_artifact_bytes(&saved.checkpoint_id)
+                    .unwrap()
+                    .1,
+                payload
+            );
+            assert_eq!(owner.port.scientific_digest_v1().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn checkpoint_catalog_rejects_ambiguous_directories_even_after_a_cached_read() {
         let first = tempfile::tempdir().unwrap().keep();
         let second = tempfile::tempdir().unwrap().keep();
         let (handle, host) = checkpoint_test_handle(&first, 4, 8 * 1024 * 1024);
-        let metadata = handle
-            .create_checkpoint(CheckpointCreateRequest::default())
-            .unwrap();
+        let request = CheckpointCreateRequest {
+            description: None,
+            idempotency_key: Some("one-admission-two-completed-catalogs".into()),
+        };
+        let metadata = handle.create_checkpoint(request.clone()).unwrap();
         let expected = handle
             .read_artifact_bytes(&metadata.checkpoint_id)
             .unwrap()
@@ -13766,6 +13952,10 @@ pub(crate) mod tests {
         let handle = handle.with_artifacts_dir(second.clone()).unwrap();
         let before = host.port.scientific_digest_v1().unwrap();
         assert!(matches!(
+            handle.create_checkpoint(request.clone()),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
             handle.get_checkpoint(&metadata.checkpoint_id),
             Err(ControlError::Conflict(_))
         ));
@@ -13778,6 +13968,10 @@ pub(crate) mod tests {
             Err(ControlError::Conflict(_))
         ));
         for _ in 0..2 {
+            assert!(matches!(
+                handle.create_checkpoint(request.clone()),
+                Err(ControlError::Conflict(_))
+            ));
             assert!(matches!(
                 handle.get_checkpoint(&metadata.checkpoint_id),
                 Err(ControlError::Conflict(_))
