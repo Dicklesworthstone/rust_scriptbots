@@ -17,12 +17,22 @@ Retain normal epoch rollover while checking the actual owner session. The
 nonempty MLP regression crosses tick 10,000 and compares sparse and dense
 captures without changing scenario envelopes or scientific defaults.
 
-DSR `scriptbots-headless-focused/20261122T194625-4tWeYJoP` parsed the three
-changed Rust files and passed three exact production budget/sampling tests in
-an isolated, source-hashed probe using the locked dependency versions. This
-does not execute the full terminal, owner/aggregate regressions, native map
-inputs or scenario cohorts. Their execution and original full-workspace
-acceptance remain pending.
+Reject a published scientific fault before headless reporting can claim success,
+including a fault on the final requested Step after its receipt is marked
+Applied. Preserve that typed fault when the owner closes command ingress before
+the receipt can be read. The real-owner fault regression uses a deliberately
+failing population brain factory; the epoch-crossing fixture uses the supported
+post-bootstrap injection API for its late arrivals.
+
+DSR `scriptbots-headless-fault-final/20261122T200559-64Z6dLNS` parsed the three
+final Rust files and passed three exact production budget/sampling tests in
+an isolated probe using the locked dependency versions, with expected source
+SHA-256 checks before and after execution. This does not execute the full
+terminal, owner/fault/aggregate regressions, native map inputs or scenario
+cohorts. Their execution and original full-workspace
+acceptance remain pending. Online native dependency acquisition timed out before
+compilation; the subsequent offline check stopped on the unavailable `direction`
+package. No native build or full-suite pass is claimed.
 
 **Owner responsiveness during persistence (2026-11-22):**
 [Implemented and independently reviewed; native execution qualification pending

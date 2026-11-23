@@ -386,6 +386,8 @@ RUST_LOG=info cargo run -p scriptbots-app
   requested science horizon from its capture limit; `summary.world_digest`, when
   available, is verified against the final observed owner, tick and revisions.
   Invalid or excessive budgets return an error instead of silently shortening a run.
+  A scientific fault also fails the run, including one on the final requested
+  tick; that failed tick cannot be presented or written as a successful report.
   The top-level `schema` is `"scriptbots.terminal-headless.v1"`; check it before
   interpreting or comparing reports. `scenario.schema_version` describes the
   scenario inputs and does not identify the report format. V1 keeps the existing

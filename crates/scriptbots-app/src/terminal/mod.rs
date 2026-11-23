@@ -3136,8 +3136,17 @@ impl TerminalRenderer {
             if tick_index + 1 == budget.ticks {
                 app.host.request_replay_world_digest()?;
             }
-            app.submit_and_wait(ControlCommand::Step)?;
+            let step_result = app.submit_and_wait(ControlCommand::Step);
             app.refresh_snapshot();
+            // A completed Step can be Applied while its scientific boundary
+            // carries a fault. The immutable publication survives ingress
+            // closure, so preserve that cause before any consequent transport
+            // error and never count or present the failed boundary as success.
+            let latest = app.host.snapshot_hub().latest();
+            if let Some(fault) = latest.health.fault() {
+                return Err(TerminalHostFailure(fault.clone()).into());
+            }
+            step_result?;
             ensure!(
                 app.retained_render.session_id == session_id,
                 "headless Step changed its world owner session"
@@ -26899,6 +26908,109 @@ for case in ('panic', 'subscription', 'renderer'):
     }
 
     #[test]
+    fn headless_final_completed_scientific_fault_refuses_a_successful_report() {
+        let world = command_characterization_world();
+        {
+            let mut world = world.lock().expect("prepare completed-fault world");
+            let config = ScriptBotsConfig {
+                population_minimum: 0,
+                population_spawn_interval: 2,
+                population_spawn_count: 1,
+                closed: false,
+                ..world.config().clone()
+            };
+            world
+                .apply_config_update(config)
+                .expect("fault on tick two");
+            world
+                .brain_registry_mut()
+                .expect("register deliberate population failure")
+                .register("test.headless-final-fault", |_rng| {
+                    Err(scriptbots_core::BrainSpawnError::new(
+                        "test.headless-final-fault",
+                        std::io::Error::other("deliberate final headless tick failure"),
+                    ))
+                });
+        }
+        let mut host = TerminalTestHost::take(world);
+        let mut port = host.port();
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let result = renderer.run_headless_budget(
+            host.context(&runtime),
+            HeadlessBudget::new(2, 2).unwrap(),
+        );
+        let snapshot = port.snapshot_hub().latest();
+        // Remove the owner before assertions can invoke the ordinary fixture's
+        // successful-shutdown Drop expectation. Faulted owners exit even while
+        // a client retains its readable snapshot and notification boards.
+        let owner = host.owner.take().expect("faulted owner");
+        let fault = snapshot
+            .health
+            .fault()
+            .expect("real owner fault publication");
+        let joined = owner.join();
+        // The driver mirrors protocol notifications after publishing the fault
+        // snapshot, so read them only after its thread has finished.
+        let events = port.events_after(scriptbots_runtime::ProtocolEventSequence::new(0), 64);
+        drop(port);
+
+        let error = result.expect_err("the last completed fault must not produce a report");
+        assert_eq!(snapshot.world.tick, 2);
+        assert!(matches!(
+            fault,
+            scriptbots_runtime::HostFault::Scientific { tick, code, message }
+                if tick.0 == 2
+                    && code == "brain_spawn"
+                    && message.contains("deliberate final headless tick failure")
+        ));
+        assert_eq!(
+            &error
+                .downcast_ref::<TerminalHostFailure>()
+                .expect("typed host fault")
+                .0,
+            fault
+        );
+        assert!(
+            events
+                .expect("retained protocol notifications")
+                .iter()
+                .any(|event| {
+                    let scriptbots_runtime::HostEventKind::CommandStatusChanged(status) =
+                        &event.kind
+                    else {
+                        return false;
+                    };
+                    Some(status.command_id()) == snapshot.last_applied_command
+                        && matches!(
+                            status.application(),
+                            ApplicationState::Applied(applied) if applied.tick.0 == 2
+                        )
+                }),
+            "the faulting Step still completed its application boundary"
+        );
+        let presented = runtime
+            .presented_frame_slot()
+            .load_full()
+            .expect("healthy first capture");
+        assert_eq!(
+            presented.tick, 1,
+            "the failed final tick must not be presented"
+        );
+
+        let join_error = joined.expect_err("the real owner terminates with its scientific fault");
+        let owner_fault = join_error
+            .downcast_ref::<crate::host_thread::HostThreadFaultError>()
+            .expect("typed owner fault receipt");
+        assert_eq!(&owner_fault.fault, fault);
+        assert_eq!(owner_fault.receipt.snapshot.world.tick, 2);
+        assert_eq!(
+            owner_fault.receipt.run.outcome,
+            scriptbots_runtime::channel::ChannelRunOutcome::Faulted
+        );
+    }
+
+    #[test]
     fn headless_long_horizon_advances_real_owner_independently_of_capture_budget() {
         let renderer = TerminalRenderer::default();
         let ticks = MAX_HEADLESS_FRAMES + 7;
@@ -26917,7 +27029,9 @@ for case in ('panic', 'subscription', 'renderer'):
                     let mut agent = scriptbots_core::AgentData::default();
                     agent.position.x = 20.0 + index as f32 * 30.0;
                     agent.position.y = 50.0;
-                    let id = world.try_spawn_agent(agent).expect("real founding agent");
+                    let id = world
+                        .try_inject_agent(agent)
+                        .expect("real post-bootstrap arrival");
                     assert!(
                         world
                             .bind_agent_brain(id, brains.population()[0])
