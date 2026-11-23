@@ -4879,6 +4879,9 @@ pub enum StorageError {
     /// A complete persisted narrative-input contract was refused.
     #[error(transparent)]
     NarrativeInputStream(#[from] NarrativeInputStreamError),
+    /// A complete persisted narrative-event page contract was refused.
+    #[error(transparent)]
+    RunEventStream(#[from] RunEventStreamError),
     /// A narrative event failed its versioned typed persistence contract.
     #[error(transparent)]
     RunEvent(#[from] RunEventDecodeError),
@@ -5929,6 +5932,135 @@ impl PersistedRunEvent {
     pub fn into_parts(self) -> (RunEventIdentity, EventRecord) {
         (self.identity, self.record)
     }
+}
+
+/// Provenance binding shared by every page of one finished run's narrative events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEventBindingV1 {
+    /// Explicitly selected durable run identity.
+    pub run_id: RunId,
+    /// Normalized configuration digest from the validated run manifest.
+    pub config_digest: String,
+    /// Digest of the complete validated run manifest, including build provenance.
+    pub manifest_digest: String,
+}
+
+/// Exclusive forward cursor naming an exact, validated persisted narrative event.
+///
+/// Resumption revalidates both the run binding and every field of the named row. The
+/// digest includes floating-point bit patterns, so a changed payload cannot silently
+/// become an accepted cursor merely because its primary-key identity was retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEventCursorV1 {
+    /// Run, configuration, and manifest to which the cursor belongs.
+    pub binding: RunEventBindingV1,
+    /// Exact persisted identity after which the next page begins.
+    pub identity: RunEventIdentity,
+    /// Length-framed BLAKE3 digest of the complete named event.
+    pub event_digest: String,
+}
+
+/// One bounded chronological page of complete narrative events, across all islands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEventPageV1 {
+    /// Validated provenance shared by every event in this page.
+    pub binding: RunEventBindingV1,
+    /// Complete events in strict [`RunEventIdentity`] order.
+    pub events: Vec<PersistedRunEvent>,
+    /// Exclusive continuation cursor, absent only when the stream has ended.
+    pub next_after: Option<RunEventCursorV1>,
+}
+
+/// Typed refusals at the complete narrative-event paging boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RunEventStreamError {
+    /// The caller requested an empty or unbounded page.
+    #[error("narrative event page size {limit} is outside 1..={max}")]
+    InvalidPageSize {
+        /// Requested event count.
+        limit: usize,
+        /// Maximum permitted event count.
+        max: usize,
+    },
+    /// Complete traversal requires an immutable finished-run lease.
+    #[error("narrative event paging requires a finished storage reader")]
+    FinishedReaderRequired,
+    /// A cursor belongs to another selected run.
+    #[error("narrative event cursor belongs to run {actual}, expected {expected}")]
+    CursorRunMismatch {
+        /// Run selected by the reader.
+        expected: RunId,
+        /// Run named by the cursor.
+        actual: RunId,
+    },
+    /// A cursor was produced under a different configuration.
+    #[error("narrative event cursor configuration digest does not match the selected run")]
+    CursorConfigDigestMismatch,
+    /// A cursor was produced under different manifest or build provenance.
+    #[error("narrative event cursor manifest digest does not match the selected run")]
+    CursorManifestDigestMismatch,
+    /// A cursor cannot identify a valid persisted row.
+    #[error("invalid narrative event cursor: {reason}")]
+    InvalidCursor {
+        /// Why the identity cannot be used for a storage lookup.
+        reason: String,
+    },
+    /// A cursor's complete identity does not exist in the selected run.
+    #[error("narrative event cursor identity {identity} is not persisted")]
+    CursorNotFound {
+        /// Missing exact event identity.
+        identity: RunEventIdentity,
+    },
+    /// The cursor's identity exists but its exact payload has changed.
+    #[error("narrative event cursor payload digest does not match {identity}")]
+    CursorEvidenceMismatch {
+        /// Identity whose payload differs from the cursor.
+        identity: RunEventIdentity,
+    },
+    /// Returned identities do not strictly advance in the canonical order.
+    #[error("narrative event identity {actual} does not follow {previous}")]
+    IdentityOrder {
+        /// Last accepted identity, including the supplied cursor when present.
+        previous: RunEventIdentity,
+        /// Non-advancing identity found in storage.
+        actual: RunEventIdentity,
+    },
+}
+
+fn run_event_cursor_digest(event: &PersistedRunEvent) -> String {
+    fn string(hasher: &mut blake3::Hasher, value: &str) {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    let record = event.record();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"scriptbots.run-event-cursor.v1\0");
+    hasher.update(&event.identity().island().0.to_le_bytes());
+    hasher.update(&record.schema_version.to_le_bytes());
+    hasher.update(&record.tick.0.to_le_bytes());
+    string(&mut hasher, record.kind.as_str());
+    string(&mut hasher, &record.metric);
+    hasher.update(&record.severity.to_bits().to_le_bytes());
+    for value in [record.magnitude, record.before, record.after, record.score] {
+        hasher.update(&value.to_bits().to_le_bytes());
+    }
+    hasher.update(&record.window.0.to_le_bytes());
+    hasher.update(&record.window.1.to_le_bytes());
+    match &record.subject {
+        Some(subject) => {
+            hasher.update(&[1]);
+            string(&mut hasher, &subject.to_db_string());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    string(&mut hasher, &record.human_text);
+    format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 /// One run-scoped narrative search result.
@@ -13986,6 +14118,188 @@ impl StorageReader {
             });
         }
         Ok(stats)
+    }
+
+    /// Traverse every persisted narrative event in bounded canonical-order pages.
+    ///
+    /// Unlike [`Self::recent_run_events`], this starts at the oldest event and has no
+    /// whole-stream truncation. The page limit is 1..=4096, with one additional decoded
+    /// lookahead row used to establish whether a continuation exists. An empty event
+    /// stream is valid. Every island is retained in `(tick, kind, metric, island)` order;
+    /// text comparisons explicitly use binary collation to match [`RunEventIdentity`].
+    ///
+    /// The finished-reader lease remains held for the reader's entire lifetime, preventing
+    /// a supported writer from changing the stream between pages. Cursors must repeat the
+    /// selected run's configuration and manifest digests and identify an exact retained
+    /// row with the same complete payload. Result bounds do not impose an execution deadline.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete event page boundary validates its immutable lease, provenance-bound exact cursor, and every typed row before returning a bounded page"
+    )]
+    pub fn run_event_page_v1(
+        &self,
+        after: Option<&RunEventCursorV1>,
+        record_limit: usize,
+    ) -> Result<RunEventPageV1, StorageError> {
+        if record_limit == 0 || record_limit > MAX_STORAGE_QUERY_PAGE {
+            return Err(RunEventStreamError::InvalidPageSize {
+                limit: record_limit,
+                max: MAX_STORAGE_QUERY_PAGE,
+            }
+            .into());
+        }
+        if self._finished_run_lease.is_none() {
+            return Err(RunEventStreamError::FinishedReaderRequired.into());
+        }
+        let connection = self.finished_connection()?;
+        let manifest = self.run_manifest()?;
+        let manifest_digest = manifest.manifest_digest()?;
+        let binding = RunEventBindingV1 {
+            run_id: self.run_id,
+            config_digest: manifest.config_digest,
+            manifest_digest,
+        };
+        let bound = checked_i64("run_event_page_v1.lookahead_limit", record_limit + 1)?;
+        let rows = if let Some(cursor) = after {
+            if cursor.binding.run_id != binding.run_id {
+                return Err(RunEventStreamError::CursorRunMismatch {
+                    expected: binding.run_id,
+                    actual: cursor.binding.run_id,
+                }
+                .into());
+            }
+            if cursor.binding.config_digest != binding.config_digest {
+                return Err(RunEventStreamError::CursorConfigDigestMismatch.into());
+            }
+            if cursor.binding.manifest_digest != binding.manifest_digest {
+                return Err(RunEventStreamError::CursorManifestDigestMismatch.into());
+            }
+            let tick = i64::try_from(cursor.identity.tick().0).map_err(|error| {
+                RunEventStreamError::InvalidCursor {
+                    reason: format!(
+                        "tick {} is not a persisted i64: {error}",
+                        cursor.identity.tick()
+                    ),
+                }
+            })?;
+            if cursor.identity.metric().is_empty() {
+                return Err(RunEventStreamError::InvalidCursor {
+                    reason: "metric is empty".to_owned(),
+                }
+                .into());
+            }
+            let kind = cursor.identity.kind().as_str();
+            let metric = cursor.identity.metric();
+            let island = i64::from(cursor.identity.island().0);
+            let exact = connection.query_with_params(
+                "SELECT tick, kind, severity, magnitude, window_start, window_end,
+                        metric, before_value, after_value, score, subject_ref, human_text,
+                        schema_version, island_id
+                 FROM run_events
+                 WHERE run_id = ?1 AND tick = ?2 AND kind COLLATE BINARY = ?3
+                       AND metric COLLATE BINARY = ?4 AND island_id = ?5
+                 LIMIT 2",
+                &[
+                    sqlite_run_id(self.run_id),
+                    tick.into(),
+                    kind.into(),
+                    metric.into(),
+                    island.into(),
+                ],
+            )?;
+            let prior = match exact.as_slice() {
+                [] => {
+                    return Err(RunEventStreamError::CursorNotFound {
+                        identity: cursor.identity.clone(),
+                    }
+                    .into());
+                }
+                [row] => persisted_run_event_from_row(&run_event_row_from_query_row(row)?)?,
+                _ => {
+                    return Err(RunEventDecodeError::DuplicateIdentity {
+                        identity: cursor.identity.clone(),
+                    }
+                    .into());
+                }
+            };
+            if prior.identity() != &cursor.identity
+                || run_event_cursor_digest(&prior) != cursor.event_digest
+            {
+                return Err(RunEventStreamError::CursorEvidenceMismatch {
+                    identity: cursor.identity.clone(),
+                }
+                .into());
+            }
+            connection.query_with_params(
+                "SELECT tick, kind, severity, magnitude, window_start, window_end,
+                        metric, before_value, after_value, score, subject_ref, human_text,
+                        schema_version, island_id
+                 FROM run_events
+                 WHERE run_id = ?1 AND (
+                     tick > ?2
+                     OR (tick = ?2 AND kind COLLATE BINARY > ?3)
+                     OR (tick = ?2 AND kind COLLATE BINARY = ?3
+                         AND metric COLLATE BINARY > ?4)
+                     OR (tick = ?2 AND kind COLLATE BINARY = ?3
+                         AND metric COLLATE BINARY = ?4 AND island_id > ?5))
+                 ORDER BY tick ASC, kind COLLATE BINARY ASC,
+                          metric COLLATE BINARY ASC, island_id ASC
+                 LIMIT ?6",
+                &[
+                    sqlite_run_id(self.run_id),
+                    tick.into(),
+                    kind.into(),
+                    metric.into(),
+                    island.into(),
+                    bound.into(),
+                ],
+            )?
+        } else {
+            connection.query_with_params(
+                "SELECT tick, kind, severity, magnitude, window_start, window_end,
+                        metric, before_value, after_value, score, subject_ref, human_text,
+                        schema_version, island_id
+                 FROM run_events
+                 WHERE run_id = ?1
+                 ORDER BY tick ASC, kind COLLATE BINARY ASC,
+                          metric COLLATE BINARY ASC, island_id ASC
+                 LIMIT ?2",
+                &[sqlite_run_id(self.run_id), bound.into()],
+            )?
+        };
+        let mut events: Vec<PersistedRunEvent> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event = persisted_run_event_from_row(&run_event_row_from_query_row(&row)?)?;
+            let previous = events
+                .last()
+                .map(PersistedRunEvent::identity)
+                .or_else(|| after.map(|cursor| &cursor.identity));
+            if let Some(previous) = previous
+                && previous >= event.identity()
+            {
+                return Err(RunEventStreamError::IdentityOrder {
+                    previous: previous.clone(),
+                    actual: event.identity().clone(),
+                }
+                .into());
+            }
+            events.push(event);
+        }
+        let next_after = if events.len() > record_limit {
+            events.truncate(record_limit);
+            events.last().map(|event| RunEventCursorV1 {
+                binding: binding.clone(),
+                identity: event.identity().clone(),
+                event_digest: run_event_cursor_digest(event),
+            })
+        } else {
+            None
+        };
+        Ok(RunEventPageV1 {
+            binding,
+            events,
+            next_after,
+        })
     }
 
     /// The most recent `limit` narrative events in canonical identity order.
@@ -40753,6 +41067,321 @@ mod tests {
             ))
         ));
         missing_tail.abandon_after_error();
+        Ok(())
+    }
+
+    #[test]
+    fn finished_run_event_pages_accept_empty_streams_and_enforce_limits_and_leases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-run-event-page-empty");
+        let path = path.to_str().ok_or("UTF-8 test path")?;
+        Storage::create_unattributed_file_with_thresholds(path, 64, 4096, 1024, 1024)?.close()?;
+        let live = StorageReader::open(path)?;
+        assert!(matches!(
+            live.run_event_page_v1(None, 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::FinishedReaderRequired
+            ))
+        ));
+        live.close()?;
+        let reader = StorageReader::open_finished(path)?;
+        let page = reader.run_event_page_v1(None, 1)?;
+        assert!(page.events.is_empty());
+        assert!(page.next_after.is_none());
+        let manifest = reader.run_manifest()?;
+        assert_eq!(page.binding.run_id, reader.run_id());
+        assert_eq!(page.binding.config_digest, manifest.config_digest);
+        assert_eq!(page.binding.manifest_digest, manifest.manifest_digest()?);
+        for limit in [0, MAX_STORAGE_QUERY_PAGE + 1, usize::MAX] {
+            assert!(matches!(
+                reader.run_event_page_v1(None, limit),
+                Err(StorageError::RunEventStream(
+                    RunEventStreamError::InvalidPageSize { limit: actual, .. }
+                )) if actual == limit
+            ));
+        }
+        assert!(matches!(
+            Storage::append_run(path, RunManifestRecord::unattributed(RunId::new(900))),
+            Err(StorageError::InvalidData {
+                context: "storage.path_lease",
+                ..
+            })
+        ));
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn finished_run_event_pages_preserve_every_canonical_key_dimension()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-run-event-page-canonical");
+        let path = path.to_str().ok_or("UTF-8 test path")?;
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(path, 64, 4096, 1024, 1024)?;
+        let mut expected = Vec::new();
+        for tick in 1..=2 {
+            let mut batches = Vec::new();
+            for island in [2, 0] {
+                let mut batch = sample_narrative_batch(tick, 1.0, 7, 8);
+                for kind in [EventKind::PopulationCrash, EventKind::DietShift] {
+                    for metric in ["énergie", "alpha", "Zulu"] {
+                        let mut record = sample_narrative_event_record(tick, 12);
+                        record.kind = kind;
+                        record.metric = metric.to_owned();
+                        record.subject = Some(SubjectRef::Species(7));
+                        let mut identity = RunEventIdentity::from_record(&record);
+                        identity.island = IslandId(island);
+                        expected.push(PersistedRunEvent {
+                            identity,
+                            record: record.clone(),
+                        });
+                        batch.narrative_events.push(record);
+                    }
+                }
+                batches.push(batch);
+            }
+            storage.persist_barrier(&[(IslandId(2), &batches[0]), (IslandId(0), &batches[1])])?;
+        }
+        storage.close()?;
+        expected.sort_by(|left, right| left.identity().cmp(right.identity()));
+        let reader = StorageReader::open_finished(path)?;
+        for limit in [1, 4, 7, expected.len(), MAX_STORAGE_QUERY_PAGE] {
+            let mut observed = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = reader.run_event_page_v1(cursor.as_ref(), limit)?;
+                assert!(!page.events.is_empty());
+                assert!(page.events.len() <= limit);
+                observed.extend(page.events);
+                cursor = page.next_after;
+                if cursor.is_none() {
+                    break;
+                }
+                assert!(observed.len() < expected.len());
+            }
+            assert_eq!(observed, expected);
+        }
+        let page = reader.run_event_page_v1(None, MAX_STORAGE_QUERY_PAGE)?;
+        let last = page.events.last().ok_or("nonempty event fixture")?;
+        let final_cursor = RunEventCursorV1 {
+            binding: page.binding.clone(),
+            identity: last.identity().clone(),
+            event_digest: run_event_cursor_digest(last),
+        };
+        let exhausted = reader.run_event_page_v1(Some(&final_cursor), 1)?;
+        assert!(exhausted.events.is_empty());
+        assert!(exhausted.next_after.is_none());
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn finished_run_event_pages_traverse_beyond_the_newest_window_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-run-event-page-long");
+        let path = path.to_str().ok_or("UTF-8 test path")?;
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(path, 64, 4096, 1024, 1024)?;
+        let mut batch = sample_narrative_batch(1, 1.0, 7, 8);
+        for index in (0..MAX_STORAGE_QUERY_PAGE + 3).rev() {
+            let mut record = sample_narrative_event_record(1, 8);
+            record.metric = format!("metric-{index:05}");
+            batch.narrative_events.push(record);
+        }
+        storage.persist(&batch)?;
+        storage.close()?;
+        let reader = StorageReader::open_finished(path)?;
+        let first = reader.run_event_page_v1(None, MAX_STORAGE_QUERY_PAGE)?;
+        assert_eq!(first.events.len(), MAX_STORAGE_QUERY_PAGE);
+        assert_eq!(first.events[0].identity().metric(), "metric-00000");
+        let input_binding = reader.narrative_input_binding_v1(0)?;
+        assert_eq!(first.binding.run_id, input_binding.run_id);
+        assert_eq!(first.binding.config_digest, input_binding.config_digest);
+        assert_eq!(first.binding.manifest_digest, input_binding.manifest_digest);
+        let cursor = first.next_after.ok_or("long stream must continue")?;
+        let second = reader.run_event_page_v1(Some(&cursor), MAX_STORAGE_QUERY_PAGE)?;
+        assert_eq!(second.events.len(), 3);
+        assert_eq!(second.events[0].identity().metric(), "metric-04096");
+        assert_eq!(second.events[2].identity().metric(), "metric-04098");
+        assert!(second.next_after.is_none());
+        assert_eq!(
+            first.events.len() + second.events.len(),
+            batch.narrative_events.len()
+        );
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture proves exact cursor roundtrips, run/provenance isolation, fabricated identity refusal, and stale payload refusal across reader lifetimes"
+    )]
+    fn finished_run_event_pages_reject_foreign_fabricated_and_stale_cursors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-run-event-page-cursors");
+        let path = path.to_str().ok_or("UTF-8 test path")?;
+        let first_run = RunId::new(810);
+        let second_run = RunId::new(811);
+        let mut storage =
+            Storage::create_new_file_for_run(path, RunManifestRecord::unattributed(first_run))?;
+        for tick in 1..=2 {
+            let mut batch = sample_narrative_batch(tick, 1.0, 7, 8);
+            batch
+                .narrative_events
+                .push(sample_narrative_event_record(tick, 8));
+            storage.persist(&batch)?;
+        }
+        storage.close()?;
+        let mut second = Storage::append_run(path, RunManifestRecord::unattributed(second_run))?;
+        let mut batch = sample_narrative_batch(1, 1.0, 7, 8);
+        let mut record = sample_narrative_event_record(1, 16);
+        record.magnitude = 19.0;
+        batch.narrative_events.push(record);
+        second.persist(&batch)?;
+        second.close()?;
+
+        let reader = StorageReader::open_finished_for_run(path, first_run)?;
+        let cursor = reader
+            .run_event_page_v1(None, 1)?
+            .next_after
+            .ok_or("two-event stream must continue")?;
+        let encoded = serde_json::to_string(&cursor)?;
+        let roundtrip: RunEventCursorV1 = serde_json::from_str(&encoded)?;
+        assert_eq!(roundtrip, cursor);
+        let page = reader.run_event_page_v1(Some(&roundtrip), 1)?;
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].identity().tick(), Tick(2));
+        assert!(page.next_after.is_none());
+
+        let mut wrong = cursor.clone();
+        wrong.binding.config_digest.push('0');
+        assert!(matches!(
+            reader.run_event_page_v1(Some(&wrong), 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::CursorConfigDigestMismatch
+            ))
+        ));
+        let mut wrong = cursor.clone();
+        wrong.binding.manifest_digest.push('0');
+        assert!(matches!(
+            reader.run_event_page_v1(Some(&wrong), 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::CursorManifestDigestMismatch
+            ))
+        ));
+        let mut wrong = cursor.clone();
+        wrong.event_digest.push('0');
+        assert!(matches!(
+            reader.run_event_page_v1(Some(&wrong), 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::CursorEvidenceMismatch { .. }
+            ))
+        ));
+        let mut wrong = cursor.clone();
+        wrong.identity.tick = Tick(2);
+        assert!(matches!(
+            reader.run_event_page_v1(Some(&wrong), 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::CursorEvidenceMismatch { .. }
+            ))
+        ));
+        wrong.identity.tick = Tick(3);
+        assert!(matches!(
+            reader.run_event_page_v1(Some(&wrong), 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::CursorNotFound { .. }
+            ))
+        ));
+        wrong.identity.tick = Tick(u64::MAX);
+        assert!(matches!(
+            reader.run_event_page_v1(Some(&wrong), 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::InvalidCursor { .. }
+            ))
+        ));
+        wrong.identity.tick = cursor.identity.tick;
+        wrong.identity.metric.clear();
+        assert!(matches!(
+            reader.run_event_page_v1(Some(&wrong), 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::InvalidCursor { .. }
+            ))
+        ));
+        reader.close()?;
+
+        let reader = StorageReader::open_finished_for_run(path, second_run)?;
+        assert!(matches!(
+            reader.run_event_page_v1(Some(&cursor), 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::CursorRunMismatch { expected, actual }
+            )) if expected == second_run && actual == first_run
+        ));
+        let second_page = reader.run_event_page_v1(None, 1)?;
+        assert_eq!(second_page.events.len(), 1);
+        assert_eq!(second_page.events[0].record().magnitude, 19.0);
+        assert!(second_page.next_after.is_none());
+        reader.close()?;
+
+        let connection = Connection::open_existing(path)?;
+        assert_eq!(
+            connection.execute_with_params(
+                "UPDATE run_events SET magnitude = 42.0 WHERE run_id = ?1 AND tick = 1",
+                &[sqlite_run_id(first_run)],
+            )?,
+            1
+        );
+        connection.close()?;
+        let reader = StorageReader::open_finished_for_run(path, first_run)?;
+        assert!(matches!(
+            reader.run_event_page_v1(Some(&cursor), 1),
+            Err(StorageError::RunEventStream(
+                RunEventStreamError::CursorEvidenceMismatch { .. }
+            ))
+        ));
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn finished_run_event_pages_validate_complete_rows_including_lookahead()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("storage-run-event-page-malformed");
+        let path = path.to_str().ok_or("UTF-8 test path")?;
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(path, 64, 4096, 1024, 1024)?;
+        for tick in 1..=2 {
+            let mut batch = sample_narrative_batch(tick, 1.0, 7, 8);
+            batch
+                .narrative_events
+                .push(sample_narrative_event_record(tick, 8));
+            storage.persist(&batch)?;
+        }
+        storage.close()?;
+        let connection = Connection::open_existing(path)?;
+        connection.execute("UPDATE run_events SET schema_version = 999 WHERE tick = 2")?;
+        connection.close()?;
+        let reader = StorageReader::open_finished(path)?;
+        assert!(matches!(
+            reader.run_event_page_v1(None, 1),
+            Err(StorageError::RunEvent(
+                RunEventDecodeError::UnsupportedSchemaVersion { found: 999, .. }
+            ))
+        ));
+        reader.close()?;
+        let connection = Connection::open_existing(path)?;
+        connection
+            .execute("UPDATE run_events SET schema_version = 1, severity = 0.1 WHERE tick = 2")?;
+        connection.close()?;
+        let reader = StorageReader::open_finished(path)?;
+        assert!(matches!(
+            reader.run_event_page_v1(None, 1),
+            Err(StorageError::RunEvent(RunEventDecodeError::InvalidField {
+                field: RunEventField::Severity,
+                ..
+            }))
+        ));
+        reader.close()?;
         Ok(())
     }
 

@@ -9,6 +9,7 @@
 //!   sb-analyze runs/scriptbots-123.sqlite run narrative-timeline --params limit=50 --json out.json -v
 //!   sb-analyze runs/scriptbots-123.sqlite export --format parquet --out-dir ./exports --verify
 //!   sb-analyze runs/scriptbots-123.sqlite summarize --epoch-size 100 --rolling-window 10 --md summary.md
+//!   sb-analyze runs/scriptbots-123.sqlite verify-narrative --json verification.json
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,7 +18,7 @@ use clap::{Parser, Subcommand};
 use scriptbots_analytics::dataframe::{
     AnalyticsExportFormat, export_database_table, summarize_run,
 };
-use scriptbots_analytics::{AnalyticsError, ReaderCtx, Registry, ReportParams};
+use scriptbots_analytics::{AnalyticsError, ReaderCtx, Registry, ReportParams, verify_narrative};
 use scriptbots_storage::{ExportTable, StorageReader};
 
 #[derive(Parser)]
@@ -56,6 +57,16 @@ enum Command {
         #[arg(long)]
         json: Option<PathBuf>,
         /// Write the human-readable markdown to this path (stdout regardless).
+        #[arg(long)]
+        md: Option<PathBuf>,
+    },
+    /// Compare every saved narrative event with an independent replay of all detector inputs.
+    /// Writes the complete comparison before returning failure on any difference.
+    VerifyNarrative {
+        /// Write the source-bound verdict, counts, digests, and first difference as JSON.
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Write the human-readable comparison to this path (also printed to stdout).
         #[arg(long)]
         md: Option<PathBuf>,
     },
@@ -209,6 +220,29 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
                 tracing::info!(path = %path.display(), "markdown written");
             }
             println!("{}", output.human_md);
+            Ok(())
+        }
+        Command::VerifyNarrative { json, md } => {
+            let reader = open_reader()?;
+            let comparison = verify_narrative(&reader)?;
+            let markdown = comparison.markdown();
+            if let Some(path) = json {
+                std::fs::write(path, serde_json::to_vec_pretty(&comparison)?)?;
+            }
+            if let Some(path) = md {
+                std::fs::write(path, &markdown)?;
+            }
+            println!("{markdown}");
+            tracing::info!(
+                run_id = %comparison.input_binding.run_id,
+                inputs = comparison.inputs_replayed,
+                reconstructed = comparison.events_reconstructed,
+                persisted = comparison.events_persisted,
+                matched = comparison.events_matched,
+                equivalent = comparison.equivalent,
+                "complete saved narrative comparison finished"
+            );
+            comparison.require_equivalent()?;
             Ok(())
         }
         Command::Export {

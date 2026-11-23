@@ -11265,6 +11265,8 @@ activation = "Sigmoid"
             "scriptbots-app",
             "--replay-db",
             path,
+            "--brain",
+            "mlp",
             "--checkpoint-start",
             "--tick-limit",
             "2",

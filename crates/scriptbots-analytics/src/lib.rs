@@ -32,8 +32,8 @@ use scriptbots_runtime::RunId;
 use scriptbots_storage::{
     FinishedRunView, NarrativeInputBindingV1, NarrativeInputPolicyV1, NarrativeInputStreamError,
     PersistedAgentObservation, PersistedInteraction, PersistedInteractionCapture, PersistedMetric,
-    PersistedRunEvent, PersistenceBatchId, RunEventIdentity, RunManifestRecord, StorageError,
-    StorageReader,
+    PersistedRunEvent, PersistenceBatchId, RunEventBindingV1, RunEventCursorV1, RunEventIdentity,
+    RunManifestRecord, StorageError, StorageReader,
 };
 use serde::{Deserialize, Serialize};
 
@@ -611,6 +611,9 @@ pub enum AnalyticsError {
     /// The canonical narrative detector refused a recorded input or policy.
     #[error("narrative reconstruction error: {0}")]
     NarrativeInput(#[from] scriptbots_core::narrative::NarrativeInputError),
+    /// Complete narrative verification refused an unsupported or incoherent source.
+    #[error("narrative verification error: {0}")]
+    NarrativeVerification(#[from] NarrativeVerificationError),
 }
 
 /// Read-only context handed to every report.
@@ -3425,6 +3428,626 @@ impl Report for RunSummary {
         log_report_stage("render", &render_started, output.row_count);
         Ok(output)
     }
+}
+
+/// Schema of the complete saved-event comparison emitted by `verify-narrative`.
+pub const NARRATIVE_VERIFICATION_SCHEMA_VERSION: u32 = 1;
+
+/// Maximum recorded history, display ring, or pending sort entries accepted by verification.
+/// Larger policies are refused explicitly; they are never replayed with reduced retention.
+pub const NARRATIVE_VERIFICATION_CAPACITY: u64 = 65_536;
+
+/// Refusals distinct from an observed difference between two complete event streams.
+#[derive(Debug, thiserror::Error)]
+pub enum NarrativeVerificationError {
+    /// The recorded detector would exceed the verifier's memory budget.
+    #[error("narrative {resource} at tick {tick} needs {requested} entries, maximum {maximum}")]
+    Capacity {
+        /// Completed input tick at the refusal.
+        tick: u64,
+        /// Bounded collection that would exceed its budget.
+        resource: &'static str,
+        /// Requested or observed number of entries.
+        requested: u64,
+        /// Verifier's hard limit.
+        maximum: u64,
+    },
+    /// The existing complete input reader covers only the default single world.
+    #[error("complete narrative verification requires single-world inputs; found island {island}")]
+    UnsupportedIsland {
+        /// Island whose independent input stream is not available to this verifier.
+        island: u32,
+    },
+    /// The independently read inputs and events are not bound to the same finished run.
+    #[error("narrative input and event source bindings disagree")]
+    SourceBinding,
+    /// The detector emitted an event outside the window used to order its output.
+    #[error("reconstructed narrative event at tick {tick} is outside [{oldest}, {completed}]")]
+    EventOutsideHistory {
+        /// Emitted event tick.
+        tick: u64,
+        /// Oldest input retained by the detector at emission.
+        oldest: u64,
+        /// Latest completed input tick.
+        completed: u64,
+    },
+    /// Reconstruction repeated an identity or moved behind the already compared prefix.
+    #[error("reconstructed narrative identity is duplicated or out of order: {identity}")]
+    EventOrder {
+        /// First identity that violates the canonical stream.
+        identity: RunEventIdentity,
+    },
+    /// A complete input traversal did not reach its validated source boundary.
+    #[error("narrative traversal read {actual} inputs, expected {expected}")]
+    IncompleteInputs {
+        /// Number actually consumed.
+        actual: u64,
+        /// Number named by the validated finished-run binding.
+        expected: u64,
+    },
+    /// A count cannot be represented without losing evidence.
+    #[error("narrative verification counter overflow: {counter}")]
+    CounterOverflow {
+        /// Counter whose next value cannot be represented.
+        counter: &'static str,
+    },
+    /// Result fields do not describe one complete, internally consistent comparison.
+    #[error("narrative verification result has inconsistent counts, digests, or verdict")]
+    IncoherentResult,
+    /// The completed comparison found a difference; the CLI has already written its report.
+    #[error("saved narrative differs from reconstruction at canonical event {index}: {identity}")]
+    Diverged {
+        /// Zero-based position in the merged canonical identity stream.
+        index: u64,
+        /// First mismatched, missing, or unexpected identity.
+        identity: RunEventIdentity,
+    },
+}
+
+/// Classification of an observed saved-event difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NarrativeDifferenceKind {
+    /// Reconstruction emitted an event absent from saved output.
+    MissingStoredEvent,
+    /// Saved output contains an event absent from reconstruction.
+    UnexpectedStoredEvent,
+    /// Both streams name the identity but disagree on a complete record field.
+    ChangedRecord,
+}
+
+/// The first difference in canonical tick/kind/metric/island order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NarrativeDifferenceV1 {
+    /// Zero-based position in the union of the two ordered identity streams.
+    pub index: u64,
+    /// Stable identity at the divergence.
+    pub identity: RunEventIdentity,
+    /// Missing, unexpected, or changed record.
+    pub kind: NarrativeDifferenceKind,
+    /// First differing serialized field, when both records exist.
+    pub field: Option<String>,
+    /// Complete independently reconstructed record, when present.
+    pub reconstructed: Option<EventRecord>,
+    /// Complete saved record, when present.
+    pub persisted: Option<EventRecord>,
+}
+
+/// Complete comparison of persisted outputs with the current canonical detector.
+///
+/// A successful return has traversed both complete streams. `equivalent` describes
+/// observed record equality, not source-version compatibility or scenario qualification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NarrativeVerificationV1 {
+    /// Version of this result contract.
+    pub schema_version: u32,
+    /// Exact run, manifest, configuration, policy, and complete input boundary.
+    pub input_binding: NarrativeInputBindingV1,
+    /// Complete input records independently replayed.
+    pub inputs_replayed: u64,
+    /// Bounded input pages consumed.
+    pub input_pages: u64,
+    /// Bounded saved-event pages consumed, including an empty first page.
+    pub event_pages: u64,
+    /// Complete reconstructed event count, independent of display-ring capacity.
+    pub events_reconstructed: u64,
+    /// Complete saved event count, with no newest-only cap.
+    pub events_persisted: u64,
+    /// Records equal in every serialized field.
+    pub events_matched: u64,
+    /// Reconstructed identities missing from saved output.
+    pub events_missing: u64,
+    /// Saved identities absent from reconstruction.
+    pub events_unexpected: u64,
+    /// Shared identities with different complete records.
+    pub events_changed: u64,
+    /// Authenticated detector policy transitions applied during replay.
+    pub policy_changes: u64,
+    /// Largest number of events retained while establishing canonical order.
+    pub peak_pending_events: u64,
+    /// Length-framed BLAKE3 digest of every canonical input record in tick order.
+    pub input_digest: String,
+    /// Length-framed BLAKE3 digest of reconstructed identity/record pairs in canonical order.
+    pub reconstructed_digest: String,
+    /// Same digest encoding over the independent complete saved-event stream.
+    pub persisted_digest: String,
+    /// True only when both complete streams have identical records.
+    pub equivalent: bool,
+    /// First canonical difference, with both exact records available for diagnosis.
+    pub first_difference: Option<NarrativeDifferenceV1>,
+}
+
+impl NarrativeVerificationV1 {
+    /// Render the complete comparison and its first observed difference.
+    #[must_use]
+    pub fn markdown(&self) -> String {
+        let mut md = String::from("# Saved narrative verification\n\n");
+        let _ = writeln!(md, "Run: `{}`\n", self.input_binding.run_id);
+        let _ = writeln!(
+            md,
+            "**{}** Replayed all {} inputs (ticks {}–{}) and compared all {} reconstructed events with all {} saved events.\n",
+            if self.equivalent {
+                "Equivalent."
+            } else {
+                "Diverged."
+            },
+            self.inputs_replayed,
+            self.input_binding.first_tick,
+            self.input_binding.terminal_tick,
+            self.events_reconstructed,
+            self.events_persisted,
+        );
+        let _ = writeln!(
+            md,
+            "Matched: {}. Missing saved events: {}. Unexpected saved events: {}. Changed records: {}.\n\nInput pages: {}. Event pages: {}. Policy changes: {}. Peak pending sort entries: {}.\n",
+            self.events_matched,
+            self.events_missing,
+            self.events_unexpected,
+            self.events_changed,
+            self.input_pages,
+            self.event_pages,
+            self.policy_changes,
+            self.peak_pending_events,
+        );
+        if let Some(difference) = &self.first_difference {
+            let _ = writeln!(
+                md,
+                "First difference at canonical event {}: `{}`, {:?}, field `{}`. The JSON result retains both complete records.\n",
+                difference.index,
+                timeline_markdown_cell(&difference.identity.to_string()),
+                difference.kind,
+                difference.field.as_deref().unwrap_or("identity"),
+            );
+        }
+        let _ = writeln!(
+            md,
+            "Input digest: `{}`\n\nReconstructed digest: `{}`\n\nSaved digest: `{}`\n\nThis comparison uses the current detector and independently stored inputs and outputs. It does not certify a historical build, scenario budgets, or cross-platform equivalence.\n",
+            self.input_digest, self.reconstructed_digest, self.persisted_digest,
+        );
+        md
+    }
+
+    /// Require equality after a caller has retained the complete comparison result.
+    pub fn require_equivalent(&self) -> Result<(), NarrativeVerificationError> {
+        if let Some(difference) = &self.first_difference {
+            return Err(NarrativeVerificationError::Diverged {
+                index: difference.index,
+                identity: difference.identity.clone(),
+            });
+        }
+        if !self.equivalent
+            || self.inputs_replayed != self.input_binding.input_count
+            || self.events_reconstructed != self.events_matched
+            || self.events_persisted != self.events_matched
+            || self.events_missing != 0
+            || self.events_unexpected != 0
+            || self.events_changed != 0
+            || self.reconstructed_digest != self.persisted_digest
+        {
+            return Err(NarrativeVerificationError::IncoherentResult);
+        }
+        Ok(())
+    }
+}
+
+struct StoredNarrativeEvents<'a> {
+    reader: &'a StorageReader,
+    binding: RunEventBindingV1,
+    events: std::vec::IntoIter<PersistedRunEvent>,
+    next_after: Option<RunEventCursorV1>,
+    pages: u64,
+}
+
+impl<'a> StoredNarrativeEvents<'a> {
+    fn new(
+        reader: &'a StorageReader,
+        input_binding: &NarrativeInputBindingV1,
+    ) -> Result<Self, AnalyticsError> {
+        let page = reader.run_event_page_v1(None, NARRATIVE_RECONSTRUCT_PAGE_SIZE)?;
+        if page.binding.run_id != input_binding.run_id
+            || page.binding.config_digest != input_binding.config_digest
+            || page.binding.manifest_digest != input_binding.manifest_digest
+        {
+            return Err(NarrativeVerificationError::SourceBinding.into());
+        }
+        Ok(Self {
+            reader,
+            binding: page.binding,
+            events: page.events.into_iter(),
+            next_after: page.next_after,
+            pages: 1,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<PersistedRunEvent>, AnalyticsError> {
+        loop {
+            if let Some(event) = self.events.next() {
+                if event.identity().island().0 != 0 {
+                    return Err(NarrativeVerificationError::UnsupportedIsland {
+                        island: event.identity().island().0,
+                    }
+                    .into());
+                }
+                return Ok(Some(event));
+            }
+            let Some(cursor) = self.next_after.take() else {
+                return Ok(None);
+            };
+            let page = self
+                .reader
+                .run_event_page_v1(Some(&cursor), NARRATIVE_RECONSTRUCT_PAGE_SIZE)?;
+            if page.binding != self.binding {
+                return Err(NarrativeVerificationError::SourceBinding.into());
+            }
+            increment_narrative_counter(&mut self.pages, "saved event pages")?;
+            self.events = page.events.into_iter();
+            self.next_after = page.next_after;
+        }
+    }
+}
+
+struct NarrativeComparison<'a> {
+    stored: StoredNarrativeEvents<'a>,
+    next_stored: Option<PersistedRunEvent>,
+    result: NarrativeVerificationV1,
+    index: u64,
+    last_reconstructed: Option<RunEventIdentity>,
+    reconstructed_hash: blake3::Hasher,
+    persisted_hash: blake3::Hasher,
+}
+
+impl NarrativeComparison<'_> {
+    fn take_stored(&mut self) -> Result<Option<PersistedRunEvent>, AnalyticsError> {
+        let Some(event) = self.next_stored.take() else {
+            return Ok(None);
+        };
+        increment_narrative_counter(&mut self.result.events_persisted, "saved events")?;
+        hash_narrative_value(
+            &mut self.persisted_hash,
+            &(event.identity(), event.record()),
+        )?;
+        self.next_stored = self.stored.next()?;
+        Ok(Some(event))
+    }
+
+    fn difference(
+        &mut self,
+        identity: RunEventIdentity,
+        kind: NarrativeDifferenceKind,
+        field: Option<String>,
+        reconstructed: Option<EventRecord>,
+        persisted: Option<EventRecord>,
+    ) {
+        if self.result.first_difference.is_none() {
+            self.result.first_difference = Some(NarrativeDifferenceV1 {
+                index: self.index,
+                identity,
+                kind,
+                field,
+                reconstructed,
+                persisted,
+            });
+        }
+    }
+
+    fn unexpected(&mut self, event: PersistedRunEvent) -> Result<(), AnalyticsError> {
+        increment_narrative_counter(&mut self.result.events_unexpected, "unexpected events")?;
+        let (identity, record) = event.into_parts();
+        self.difference(
+            identity,
+            NarrativeDifferenceKind::UnexpectedStoredEvent,
+            None,
+            None,
+            Some(record),
+        );
+        increment_narrative_counter(&mut self.index, "comparison position")
+    }
+
+    fn reconstructed(
+        &mut self,
+        identity: RunEventIdentity,
+        record: EventRecord,
+    ) -> Result<(), AnalyticsError> {
+        if self
+            .last_reconstructed
+            .as_ref()
+            .is_some_and(|previous| previous >= &identity)
+        {
+            return Err(NarrativeVerificationError::EventOrder { identity }.into());
+        }
+        self.last_reconstructed = Some(identity.clone());
+        increment_narrative_counter(
+            &mut self.result.events_reconstructed,
+            "reconstructed events",
+        )?;
+        hash_narrative_value(&mut self.reconstructed_hash, &(&identity, &record))?;
+        while self
+            .next_stored
+            .as_ref()
+            .is_some_and(|event| event.identity() < &identity)
+        {
+            if let Some(event) = self.take_stored()? {
+                self.unexpected(event)?;
+            }
+        }
+        if self
+            .next_stored
+            .as_ref()
+            .is_some_and(|event| event.identity() == &identity)
+        {
+            if let Some(event) = self.take_stored()? {
+                if let Some(field) = narrative_record_difference(&record, event.record())? {
+                    increment_narrative_counter(&mut self.result.events_changed, "changed events")?;
+                    self.difference(
+                        identity,
+                        NarrativeDifferenceKind::ChangedRecord,
+                        Some(field),
+                        Some(record),
+                        Some(event.into_parts().1),
+                    );
+                } else {
+                    increment_narrative_counter(&mut self.result.events_matched, "matched events")?;
+                }
+            }
+        } else {
+            increment_narrative_counter(&mut self.result.events_missing, "missing events")?;
+            self.difference(
+                identity,
+                NarrativeDifferenceKind::MissingStoredEvent,
+                None,
+                Some(record),
+                None,
+            );
+        }
+        increment_narrative_counter(&mut self.index, "comparison position")
+    }
+}
+
+fn increment_narrative_counter(
+    value: &mut u64,
+    counter: &'static str,
+) -> Result<(), AnalyticsError> {
+    *value = value
+        .checked_add(1)
+        .ok_or(NarrativeVerificationError::CounterOverflow { counter })?;
+    Ok(())
+}
+
+fn hash_narrative_value(
+    hash: &mut blake3::Hasher,
+    value: &impl Serialize,
+) -> Result<(), AnalyticsError> {
+    let bytes = serde_json::to_vec(value)?;
+    let length =
+        u64::try_from(bytes.len()).map_err(|_| NarrativeVerificationError::CounterOverflow {
+            counter: "encoded record bytes",
+        })?;
+    hash.update(&length.to_le_bytes());
+    hash.update(&bytes);
+    Ok(())
+}
+
+fn narrative_record_difference(
+    reconstructed: &EventRecord,
+    persisted: &EventRecord,
+) -> Result<Option<String>, AnalyticsError> {
+    let expected = serde_json::to_value(reconstructed)?;
+    let actual = serde_json::to_value(persisted)?;
+    // Compare serialized fields, including signed zero and optional subjects. A newly added
+    // record field participates automatically instead of silently escaping an old comparator.
+    let expected: BTreeMap<String, serde_json::Value> = serde_json::from_value(expected)?;
+    let actual: BTreeMap<String, serde_json::Value> = serde_json::from_value(actual)?;
+    for field in expected
+        .keys()
+        .chain(actual.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        if serde_json::to_vec(&expected.get(field))? != serde_json::to_vec(&actual.get(field))? {
+            return Ok(Some(field.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn verify_narrative_policy(record: NarrativeInputRecordV1) -> Result<(), AnalyticsError> {
+    for (resource, requested) in [
+        ("history capacity", record.history_capacity),
+        ("event-ring capacity", record.event_capacity),
+    ] {
+        if requested > NARRATIVE_VERIFICATION_CAPACITY {
+            return Err(NarrativeVerificationError::Capacity {
+                tick: record.input.tick.0,
+                resource,
+                requested,
+                maximum: NARRATIVE_VERIFICATION_CAPACITY,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Compare every saved event with an independent replay of every persisted detector input.
+///
+/// Uses one finished-reader lease, bounded input/event pages, the canonical detector, and
+/// an ordered merge. Detector outputs can refer to earlier ticks in their retained window,
+/// so only events older than its oldest remaining input are emitted into the merge. The
+/// final pending window is flushed at the terminal input. No output cap limits comparison.
+///
+/// # Errors
+///
+/// Refuses missing/corrupt inputs, unauthenticated policy changes, invalid event pages,
+/// non-default islands, and recorded capacities above [`NARRATIVE_VERIFICATION_CAPACITY`].
+/// Observed record differences return a complete result with `equivalent = false`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the independent complete-stream replay and canonical merge boundary together"
+)]
+pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV1, AnalyticsError> {
+    for island in reader.archipelago_islands()? {
+        if island.island_id != 0 {
+            return Err(NarrativeVerificationError::UnsupportedIsland {
+                island: island.island_id,
+            }
+            .into());
+        }
+    }
+    let mut page = reader.narrative_input_page_v1(None, NARRATIVE_RECONSTRUCT_PAGE_SIZE, 0)?;
+    let binding = page.binding.clone();
+    let first = page
+        .inputs
+        .first()
+        .ok_or(StorageError::NarrativeInputStream(
+            NarrativeInputStreamError::MissingEvidence {
+                first_offending_tick: binding.first_tick,
+            },
+        ))?;
+    verify_narrative_policy(*first)?;
+    let mut replay = NarrativeReplay::new(first.replay_policy()?)?;
+    let mut policy = NarrativeInputPolicyV1::from(*first);
+    let mut stored = StoredNarrativeEvents::new(reader, &binding)?;
+    let next_stored = stored.next()?;
+    let mut comparison = NarrativeComparison {
+        stored,
+        next_stored,
+        result: NarrativeVerificationV1 {
+            schema_version: NARRATIVE_VERIFICATION_SCHEMA_VERSION,
+            input_binding: binding.clone(),
+            inputs_replayed: 0,
+            input_pages: 0,
+            event_pages: 0,
+            events_reconstructed: 0,
+            events_persisted: 0,
+            events_matched: 0,
+            events_missing: 0,
+            events_unexpected: 0,
+            events_changed: 0,
+            policy_changes: 0,
+            peak_pending_events: 0,
+            input_digest: String::new(),
+            reconstructed_digest: String::new(),
+            persisted_digest: String::new(),
+            equivalent: false,
+            first_difference: None,
+        },
+        index: 0,
+        last_reconstructed: None,
+        reconstructed_hash: blake3::Hasher::new_derive_key("scriptbots.narrative.verify.v1.events"),
+        persisted_hash: blake3::Hasher::new_derive_key("scriptbots.narrative.verify.v1.events"),
+    };
+    let mut input_hash = blake3::Hasher::new_derive_key("scriptbots.narrative.verify.v1.inputs");
+    let mut pending = BTreeMap::new();
+    loop {
+        increment_narrative_counter(&mut comparison.result.input_pages, "input pages")?;
+        for record in page.inputs {
+            verify_narrative_policy(record)?;
+            replay_narrative_record(&mut replay, record)?;
+            hash_narrative_value(&mut input_hash, &record)?;
+            increment_narrative_counter(&mut comparison.result.inputs_replayed, "inputs")?;
+            let next_policy = NarrativeInputPolicyV1::from(record);
+            if next_policy != policy {
+                increment_narrative_counter(
+                    &mut comparison.result.policy_changes,
+                    "policy changes",
+                )?;
+                policy = next_policy;
+            }
+            let oldest = replay
+                .history()
+                .front()
+                .map_or(record.input.tick.0, |input| input.tick.0);
+            for event in replay.drain_pending_persistence() {
+                if event.tick.0 < oldest || event.tick > record.input.tick {
+                    return Err(NarrativeVerificationError::EventOutsideHistory {
+                        tick: event.tick.0,
+                        oldest,
+                        completed: record.input.tick.0,
+                    }
+                    .into());
+                }
+                let identity = RunEventIdentity::from_record(&event);
+                if pending.contains_key(&identity) {
+                    return Err(NarrativeVerificationError::EventOrder { identity }.into());
+                }
+                let requested = u64::try_from(pending.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
+                if requested > NARRATIVE_VERIFICATION_CAPACITY {
+                    return Err(NarrativeVerificationError::Capacity {
+                        tick: record.input.tick.0,
+                        resource: "pending canonical events",
+                        requested,
+                        maximum: NARRATIVE_VERIFICATION_CAPACITY,
+                    }
+                    .into());
+                }
+                comparison.result.peak_pending_events =
+                    comparison.result.peak_pending_events.max(requested);
+                pending.insert(identity, event);
+            }
+            while pending
+                .first_key_value()
+                .is_some_and(|(identity, _)| identity.tick().0 < oldest)
+            {
+                if let Some((identity, event)) = pending.pop_first() {
+                    comparison.reconstructed(identity, event)?;
+                }
+            }
+        }
+        let Some(cursor) = page.next_after else {
+            break;
+        };
+        page = reader.narrative_input_page_v1(Some(&cursor), NARRATIVE_RECONSTRUCT_PAGE_SIZE, 0)?;
+        if page.binding != binding {
+            return Err(NarrativeVerificationError::SourceBinding.into());
+        }
+    }
+    if comparison.result.inputs_replayed != binding.input_count {
+        return Err(NarrativeVerificationError::IncompleteInputs {
+            actual: comparison.result.inputs_replayed,
+            expected: binding.input_count,
+        }
+        .into());
+    }
+    for (identity, event) in pending {
+        comparison.reconstructed(identity, event)?;
+    }
+    while let Some(event) = comparison.take_stored()? {
+        comparison.unexpected(event)?;
+    }
+    comparison.result.event_pages = comparison.stored.pages;
+    comparison.result.input_digest = input_hash.finalize().to_hex().to_string();
+    comparison.result.reconstructed_digest = comparison
+        .reconstructed_hash
+        .finalize()
+        .to_hex()
+        .to_string();
+    comparison.result.persisted_digest = comparison.persisted_hash.finalize().to_hex().to_string();
+    comparison.result.equivalent = comparison.result.first_difference.is_none();
+    if comparison.result.equivalent {
+        comparison.result.require_equivalent()?;
+    }
+    Ok(comparison.result)
 }
 
 /// `narrative-reconstruct`: independently replay the complete persisted detector input stream.

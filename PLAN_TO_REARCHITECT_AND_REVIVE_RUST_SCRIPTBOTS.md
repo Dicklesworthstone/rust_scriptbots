@@ -2,6 +2,30 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Complete saved-narrative verification (2026-11-23):**
+[Implemented and independently source-reviewed — Codex; scoped contribution to
+`bd-16g.2.9.2` and `bd-16g.2.9.3`, original acceptance retained]
+
+Add `sb-analyze verify-narrative` to replay every canonical persisted detector
+input and compare every saved event field, independently of the display ring or
+newest-event query cap. A finished-reader lease binds both paged streams to one
+run/configuration/manifest. Exact payload-bound event cursors preserve canonical
+tick/kind/metric/island order; retrospective detector outputs wait until their
+ordering is settled. Reports retain complete counts, framed stream digests and
+the first typed missing, unexpected or changed record, and are written before a
+divergence exits unsuccessfully. Quiet complete evidence is distinct from missing
+inputs. Unsupported islands and excessive recorded capacities are refused rather
+than silently changing detector behavior.
+
+Authored regressions cover 4,099-event traversal, all canonical key dimensions,
+foreign/stale cursors, corrupt lookahead, three real 320-tick production seeds,
+display-ring eviction, quiet versus gapped evidence, old-output corruption,
+independent input changes, CLI failure artifacts and explicit run selection.
+These bounded controls do not establish the original 10,000-tick scenario budgets,
+crash-recovery qualification, cross-platform equivalence or the complete strict
+quality gate. Native validation remains in progress; no runtime pass is claimed
+by this implementation note. Record-count limits are not hard byte or time bounds.
+
 **Checkpoint-start replay preserves the exact owner cut (2026-11-23):**
 [Implemented and independently source-reviewed — Codex; scoped contribution to
 `bd-2z0.5.13`, original acceptance retained]

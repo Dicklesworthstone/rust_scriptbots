@@ -1533,6 +1533,33 @@ canonical detector inputs cannot use this report. Reconstruction uses the curren
 detector implementation and does not assert historical equality across source
 revisions. Saved narrative outputs never supply its reconstructed events.
 
+To compare the complete reconstructed stream with every saved narrative event,
+including events outside the timeline's newest-event limit, use:
+
+```bash
+sb-analyze runs/example.sqlite verify-narrative --json verification.json --md verification.md
+```
+
+The verifier holds a finished-run reader lease, independently pages canonical
+detector inputs and saved events, and compares complete records in
+tick/kind/metric/island order. It applies authenticated policy changes and retains
+retrospective detector outputs until their chronological position is established.
+The JSON result includes complete input/event counts, source binding, length-framed
+BLAKE3 digests, and the first missing, unexpected, or changed record with both
+versions. All output fields participate in comparison, including numeric evidence,
+subjects and deterministic prose. The CLI writes requested reports before returning
+a nonzero exit status on an observed difference. A quiet, complete input stream can
+verify with zero events; missing input evidence is a refusal.
+
+`--run-id` selects one run in a multi-run file. Verification currently requires a
+single-world input stream and refuses non-default islands. Input and event reads
+use 256-record pages; recorded history and event-ring capacities and pending sort
+entries are each limited to 65,536. Larger policies are refused rather than replayed
+with altered retention. These are record-count bounds, not a database-engine byte
+allocation or execution-time guarantee. Equality is an observed comparison with
+the current detector; it does not qualify scenario budgets, a historical source
+revision, or the full cross-platform narrative acceptance.
+
 ### Streaming demographic and metric summaries
 
 ```bash

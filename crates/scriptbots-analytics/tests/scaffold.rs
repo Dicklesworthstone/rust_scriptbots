@@ -12,7 +12,9 @@ use std::process::Command;
 
 use scriptbots_analytics::{
     AnalyticsError, NARRATIVE_RECONSTRUCT_SCHEMA_VERSION, NARRATIVE_TIMELINE_SCHEMA_VERSION,
-    REPLAY_TIMELINE_SCHEMA_VERSION, REPORT_SCHEMA_VERSION, ReaderCtx, Registry, ReportParams,
+    NARRATIVE_VERIFICATION_SCHEMA_VERSION, NarrativeDifferenceKind, NarrativeVerificationError,
+    NarrativeVerificationV1, REPLAY_TIMELINE_SCHEMA_VERSION, REPORT_SCHEMA_VERSION, ReaderCtx,
+    Registry, ReportParams, verify_narrative,
 };
 use scriptbots_core::narrative::{EventKind, EventRecord, NarrativeInputRecordV1, SubjectRef};
 use scriptbots_core::{
@@ -20,7 +22,8 @@ use scriptbots_core::{
     ReplayEvent, ReplayEventKind, ReplayRngScope, ScriptBotsConfig, Tick, TickSummary, WorldState,
 };
 use scriptbots_storage::{
-    Connection, NarrativeInputStreamError, Storage, StorageError, StoragePipeline,
+    Connection, NarrativeInputStreamError, RowExt, RunEventDecodeError, RunManifestRecord,
+    SqliteValue, Storage, StorageError, StoragePipeline,
 };
 use serde_json::json;
 
@@ -137,6 +140,10 @@ fn synth_db_with_events(
 
 /// A real production run whose complete input stream spans more than one report page.
 fn real_narrative_db(dir: &tempfile::TempDir) -> (String, u64) {
+    real_narrative_db_seeded(dir, 0x16_020_901)
+}
+
+fn real_narrative_db_seeded(dir: &tempfile::TempDir, seed: u64) -> (String, u64) {
     let path = dir.path().join("narrative.sqlite").display().to_string();
     let mut pipeline = StoragePipeline::create_unattributed_file(&path).expect("create run");
     let config = ScriptBotsConfig {
@@ -156,7 +163,7 @@ fn real_narrative_db(dir: &tempfile::TempDir) -> (String, u64) {
         narrative_interval: 16,
         history_capacity: 128,
         narrative_capacity: 1,
-        rng_seed: Some(0x16_020_901),
+        rng_seed: Some(seed),
         ..ScriptBotsConfig::default()
     };
     let (mut world, mut session) =
@@ -194,6 +201,10 @@ fn real_narrative_db(dir: &tempfile::TempDir) -> (String, u64) {
 }
 
 fn synth_narrative_input_db(dir: &tempfile::TempDir, interval: u32) -> String {
+    synth_narrative_input_db_ticks(dir, interval, 4)
+}
+
+fn synth_narrative_input_db_ticks(dir: &tempfile::TempDir, interval: u32, ticks: u64) -> String {
     let path = dir.path().join("inputs.sqlite").display().to_string();
     let mut storage = Storage::create_unattributed_file(&path).expect("create input run");
     let config = ScriptBotsConfig {
@@ -201,7 +212,7 @@ fn synth_narrative_input_db(dir: &tempfile::TempDir, interval: u32) -> String {
         history_capacity: 128,
         ..ScriptBotsConfig::default()
     };
-    for tick in 1..=4 {
+    for tick in 1..=ticks {
         let mut tick_batch = batch(tick, 10, 10.0);
         let record = NarrativeInputRecordV1::from_summary(&tick_batch.summary, 0, &config)
             .expect("canonical input");
@@ -216,6 +227,100 @@ fn synth_narrative_input_db(dir: &tempfile::TempDir, interval: u32) -> String {
     }
     storage.close().expect("close input run");
     path
+}
+
+/// Keep the independently maintained search projection consistent while changing only
+/// saved narrative output. Inputs, scientific rows, and manifests remain untouched.
+fn insert_verification_event(
+    connection: &Connection,
+    run_id: scriptbots_runtime::RunId,
+    event: &EventRecord,
+) {
+    let run_id = run_id.to_string();
+    let tick = i64::try_from(event.tick.0).expect("fixture tick");
+    let subject = event.subject.map(SubjectRef::to_db_string);
+    connection.execute("BEGIN").expect("begin event insertion");
+    connection
+        .execute_with_params(
+            "INSERT INTO run_events (
+                run_id, tick, kind, severity, magnitude, window_start, window_end,
+                metric, before_value, after_value, score, subject_ref, human_text,
+                schema_version, island_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
+            &[
+                run_id.as_str().into(),
+                tick.into(),
+                event.kind.as_str().into(),
+                f64::from(event.severity).into(),
+                event.magnitude.into(),
+                i64::try_from(event.window.0)
+                    .expect("fixture window")
+                    .into(),
+                i64::try_from(event.window.1)
+                    .expect("fixture window")
+                    .into(),
+                event.metric.as_str().into(),
+                event.before.into(),
+                event.after.into(),
+                event.score.into(),
+                subject.as_deref().map_or(SqliteValue::Null, Into::into),
+                event.human_text.as_str().into(),
+                i64::from(event.schema_version).into(),
+            ],
+        )
+        .expect("insert complete saved event");
+    connection
+        .execute_with_params(
+            "INSERT INTO run_events_fts (run_id, tick, kind, metric, human_text, island_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            &[
+                run_id.as_str().into(),
+                tick.into(),
+                event.kind.as_str().into(),
+                event.metric.as_str().into(),
+                event.human_text.as_str().into(),
+            ],
+        )
+        .expect("insert matching search projection");
+    connection
+        .execute("COMMIT")
+        .expect("commit event insertion");
+}
+
+fn remove_verification_event(
+    connection: &Connection,
+    run_id: scriptbots_runtime::RunId,
+    event: &EventRecord,
+) {
+    let run_id = run_id.to_string();
+    let parameters = [
+        run_id.as_str().into(),
+        i64::try_from(event.tick.0).expect("fixture tick").into(),
+        event.kind.as_str().into(),
+        event.metric.as_str().into(),
+    ];
+    connection.execute("BEGIN").expect("begin event removal");
+    assert_eq!(
+        connection
+            .execute_with_params(
+                "DELETE FROM run_events_fts WHERE run_id = ?1 AND CAST(tick AS INTEGER) = ?2
+                 AND kind = ?3 AND metric = ?4 AND CAST(island_id AS INTEGER) = 0",
+                &parameters,
+            )
+            .expect("remove exact search projection"),
+        1
+    );
+    assert_eq!(
+        connection
+            .execute_with_params(
+                "DELETE FROM run_events WHERE run_id = ?1 AND tick = ?2
+                 AND kind = ?3 AND metric = ?4 AND island_id = 0",
+                &parameters,
+            )
+            .expect("remove exact saved event"),
+        1
+    );
+    connection.execute("COMMIT").expect("commit event removal");
 }
 
 #[test]
@@ -1031,6 +1136,421 @@ fn narrative_reconstruct_distinguishes_quiet_inputs_from_missing_or_corrupt_evid
             Err(AnalyticsError::BadParam { .. })
         ));
     }
+}
+
+#[test]
+fn narrative_verification_matches_three_real_scoped_runs_after_display_ring_wrap() {
+    // These are bounded 320-tick integration controls, not the scenario budget suite.
+    for seed in [0x16_020_901, 0x16_020_902, 0x16_020_903] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, dropped_events) = real_narrative_db_seeded(&dir, seed);
+        let cx = ReaderCtx::open(&path).expect("finished real run");
+        let saved = cx
+            .reader
+            .run_event_page_v1(None, 4096)
+            .expect("complete event page");
+        assert!(
+            saved.next_after.is_none(),
+            "scoped fixture must fit one event page"
+        );
+        assert!(saved.events.len() > 1);
+        assert!(
+            saved
+                .events
+                .iter()
+                .any(|event| event.record().kind == EventKind::Extinction)
+        );
+        assert!(dropped_events > 0, "seed {seed}: display ring must wrap");
+
+        let report = verify_narrative(&cx.reader).expect("complete independent comparison");
+        report
+            .require_equivalent()
+            .expect("saved events equal reconstruction");
+        assert_eq!(report.schema_version, NARRATIVE_VERIFICATION_SCHEMA_VERSION);
+        assert!(report.equivalent);
+        assert!(report.first_difference.is_none());
+        assert_eq!(report.inputs_replayed, 320);
+        assert_eq!(report.input_pages, 2);
+        assert_eq!(report.input_binding.terminal_tick, 320);
+        assert_eq!(report.input_binding.policy.event_capacity, 1);
+        assert_eq!(report.events_reconstructed, saved.events.len() as u64);
+        assert_eq!(report.events_persisted, report.events_reconstructed);
+        assert_eq!(report.events_matched, report.events_persisted);
+        assert_eq!(
+            (
+                report.events_missing,
+                report.events_unexpected,
+                report.events_changed
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(report.reconstructed_digest, report.persisted_digest);
+        assert_eq!(report.input_digest.len(), 64);
+        let repeated = verify_narrative(&cx.reader).expect("repeat on the immutable source");
+        assert_eq!(
+            report, repeated,
+            "seed {seed}: verdict and digests must be deterministic"
+        );
+    }
+}
+
+#[test]
+fn narrative_verification_distinguishes_active_quiet_history_from_missing_inputs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = synth_narrative_input_db_ticks(&dir, 1, 320);
+    let cx = ReaderCtx::open(&path).expect("quiet complete input stream");
+    let report = verify_narrative(&cx.reader).expect("active detector on constant inputs");
+    report.require_equivalent().expect("true quiet equivalence");
+    assert_eq!(report.input_binding.policy.narrative_interval, 1);
+    assert_eq!(report.inputs_replayed, 320);
+    assert_eq!(report.input_pages, 2);
+    assert_eq!(report.event_pages, 1);
+    assert_eq!(
+        (report.events_reconstructed, report.events_persisted),
+        (0, 0)
+    );
+    assert_eq!(report.reconstructed_digest, report.persisted_digest);
+    assert!(report.first_difference.is_none());
+    drop(cx);
+
+    let connection = Connection::open_existing(&path).expect("open missing input control");
+    assert_eq!(
+        connection
+            .execute(
+                "DELETE FROM replay_events WHERE event_type = 'narrative_input_v1' AND tick = 3"
+            )
+            .expect("remove one exact input"),
+        1
+    );
+    connection.close().expect("close missing input control");
+    let cx = ReaderCtx::open(&path).expect("structurally valid finished source");
+    assert!(matches!(
+        verify_narrative(&cx.reader),
+        Err(AnalyticsError::Storage(StorageError::NarrativeInputStream(
+            NarrativeInputStreamError::TickGap {
+                expected: 3,
+                actual: 4,
+                ..
+            }
+        )))
+    ));
+    let missing_dir = tempfile::tempdir().expect("tempdir");
+    let missing = ReaderCtx::open(&synth_db(&missing_dir)).expect("legacy source without inputs");
+    assert!(matches!(
+        verify_narrative(&missing.reader),
+        Err(AnalyticsError::Storage(StorageError::NarrativeInputStream(
+            NarrativeInputStreamError::MissingEvidence {
+                first_offending_tick: 1
+            }
+        )))
+    ));
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one real run isolates missing, extra, changed, malformed output and exact-input controls without repeating production setup"
+)]
+fn narrative_verification_detects_old_output_divergence_and_independent_input_changes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, _) = real_narrative_db(&dir);
+    let cx = ReaderCtx::open(&path).expect("finished real run");
+    let baseline = verify_narrative(&cx.reader).expect("baseline comparison");
+    baseline.require_equivalent().expect("baseline parity");
+    let all = cx
+        .reader
+        .run_event_page_v1(None, 4096)
+        .expect("small complete fixture");
+    assert!(all.next_after.is_none());
+    let oldest = all.events.first().expect("old saved event").clone();
+    let newest = cx.reader.recent_run_events(1).expect("display tail");
+    assert_ne!(oldest.identity(), newest[0].identity());
+    let run_id = cx.reader.run_id();
+    drop(cx);
+
+    for (kind, field) in [
+        (NarrativeDifferenceKind::MissingStoredEvent, None),
+        (NarrativeDifferenceKind::UnexpectedStoredEvent, None),
+        (NarrativeDifferenceKind::ChangedRecord, Some("magnitude")),
+        (NarrativeDifferenceKind::ChangedRecord, Some("subject")),
+    ] {
+        let connection = Connection::open_existing(&path).expect("open output control");
+        let mut modified = oldest.record().clone();
+        match kind {
+            NarrativeDifferenceKind::MissingStoredEvent => {
+                remove_verification_event(&connection, run_id, oldest.record());
+            }
+            NarrativeDifferenceKind::UnexpectedStoredEvent => {
+                modified.metric = "!unexpected-old-event".to_owned();
+                insert_verification_event(&connection, run_id, &modified);
+            }
+            NarrativeDifferenceKind::ChangedRecord => {
+                if field == Some("subject") {
+                    assert!(modified.subject.is_none());
+                    modified.subject = Some(SubjectRef::Agent(AgentUid(9_007_199_254_740_993)));
+                } else {
+                    modified.magnitude += 1.0;
+                }
+                remove_verification_event(&connection, run_id, oldest.record());
+                insert_verification_event(&connection, run_id, &modified);
+            }
+        }
+        connection.close().expect("close output control");
+        let cx = ReaderCtx::open(&path).expect("input and search projections remain valid");
+        assert_eq!(
+            cx.reader
+                .recent_run_events(1)
+                .expect("unchanged display tail"),
+            newest
+        );
+        let report = verify_narrative(&cx.reader).expect("complete divergent comparison");
+        assert!(!report.equivalent);
+        assert_eq!(report.inputs_replayed, 320);
+        assert_eq!(report.input_digest, baseline.input_digest);
+        assert_eq!(report.reconstructed_digest, baseline.reconstructed_digest);
+        assert_ne!(report.persisted_digest, baseline.persisted_digest);
+        assert_eq!(report.events_reconstructed, baseline.events_reconstructed);
+        let difference = report.first_difference.as_ref().expect("first divergence");
+        assert_eq!(difference.index, 0);
+        assert_eq!(difference.kind, kind);
+        assert!(matches!(
+            report.require_equivalent(),
+            Err(NarrativeVerificationError::Diverged { index: 0, .. })
+        ));
+        match kind {
+            NarrativeDifferenceKind::MissingStoredEvent => {
+                assert_eq!(report.events_persisted + 1, baseline.events_persisted);
+                assert_eq!(report.events_matched + 1, baseline.events_matched);
+                assert_eq!(
+                    (
+                        report.events_missing,
+                        report.events_unexpected,
+                        report.events_changed
+                    ),
+                    (1, 0, 0)
+                );
+                assert_eq!(&difference.identity, oldest.identity());
+                assert_eq!(difference.reconstructed.as_ref(), Some(oldest.record()));
+                assert!(difference.persisted.is_none());
+                assert!(difference.field.is_none());
+            }
+            NarrativeDifferenceKind::UnexpectedStoredEvent => {
+                assert_eq!(report.events_persisted, baseline.events_persisted + 1);
+                assert_eq!(report.events_matched, baseline.events_matched);
+                assert_eq!(
+                    (
+                        report.events_missing,
+                        report.events_unexpected,
+                        report.events_changed
+                    ),
+                    (0, 1, 0)
+                );
+                assert_eq!(difference.identity.metric(), modified.metric);
+                assert!(difference.reconstructed.is_none());
+                assert_eq!(difference.persisted.as_ref(), Some(&modified));
+                assert!(difference.field.is_none());
+            }
+            NarrativeDifferenceKind::ChangedRecord => {
+                assert_eq!(report.events_persisted, baseline.events_persisted);
+                assert_eq!(report.events_matched + 1, baseline.events_matched);
+                assert_eq!(
+                    (
+                        report.events_missing,
+                        report.events_unexpected,
+                        report.events_changed
+                    ),
+                    (0, 0, 1)
+                );
+                assert_eq!(&difference.identity, oldest.identity());
+                assert_eq!(difference.field.as_deref(), field);
+                assert_eq!(difference.reconstructed.as_ref(), Some(oldest.record()));
+                assert_eq!(difference.persisted.as_ref(), Some(&modified));
+            }
+        }
+        drop(cx);
+        let connection = Connection::open_existing(&path).expect("restore output control");
+        if kind != NarrativeDifferenceKind::MissingStoredEvent {
+            remove_verification_event(&connection, run_id, &modified);
+        }
+        if kind != NarrativeDifferenceKind::UnexpectedStoredEvent {
+            insert_verification_event(&connection, run_id, oldest.record());
+        }
+        connection.close().expect("close restored output");
+    }
+
+    // Move the exact population-zero crossing by one tick while leaving saved output intact.
+    let connection = Connection::open_existing(&path).expect("open exact input control");
+    let original: String = connection.query_row(
+        "SELECT payload FROM replay_events WHERE event_type = 'narrative_input_v1' AND tick = 97"
+    ).expect("recorded extinction input").get_typed(0).expect("exact input payload");
+    let mut altered: serde_json::Value =
+        serde_json::from_str(&original).expect("input payload JSON");
+    assert_eq!(altered["agent_count_hex"], "0000000000000000");
+    altered["agent_count_hex"] = json!("000000000000000c");
+    connection.execute_with_params(
+        "UPDATE replay_events SET payload = ?1 WHERE event_type = 'narrative_input_v1' AND tick = 97",
+        &[serde_json::to_string(&altered).expect("changed input JSON").into()],
+    ).expect("write exact changed input");
+    connection.close().expect("close input control");
+    let cx = ReaderCtx::open(&path).expect("complete changed input stream");
+    let report = verify_narrative(&cx.reader).expect("independent input reconstruction");
+    assert!(!report.equivalent);
+    assert!(report.first_difference.is_some());
+    assert_eq!(report.inputs_replayed, 320);
+    assert_ne!(report.input_digest, baseline.input_digest);
+    assert_ne!(report.reconstructed_digest, baseline.reconstructed_digest);
+    assert_eq!(report.persisted_digest, baseline.persisted_digest);
+    drop(cx);
+
+    let connection = Connection::open_existing(&path).expect("open malformed row control");
+    connection.execute_with_params(
+        "UPDATE replay_events SET payload = ?1 WHERE event_type = 'narrative_input_v1' AND tick = 97",
+        &[original.into()],
+    ).expect("restore exact original input");
+    connection
+        .execute("UPDATE run_events SET schema_version = 999")
+        .expect("corrupt output schema");
+    connection.close().expect("close malformed row control");
+    let cx = ReaderCtx::open(&path).expect("structurally valid malformed output source");
+    assert!(matches!(
+        verify_narrative(&cx.reader),
+        Err(AnalyticsError::Storage(StorageError::RunEvent(
+            RunEventDecodeError::UnsupportedSchemaVersion { found: 999, .. }
+        )))
+    ));
+}
+
+#[test]
+fn narrative_verification_cli_writes_both_reports_before_failing_on_divergence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = synth_narrative_input_db(&dir, 1);
+    let executable = env!("CARGO_BIN_EXE_sb-analyze");
+    let json_path = dir.path().join("equivalent.json");
+    let md_path = dir.path().join("equivalent.md");
+    let run = Command::new(executable)
+        .args([&path, "verify-narrative", "--json"])
+        .arg(&json_path)
+        .arg("--md")
+        .arg(&md_path)
+        .output()
+        .expect("run equivalent verification CLI");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report: NarrativeVerificationV1 =
+        serde_json::from_slice(&std::fs::read(&json_path).expect("read equivalent JSON"))
+            .expect("parse typed verification report");
+    report.require_equivalent().expect("equivalent CLI report");
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Equivalent."));
+    assert_eq!(
+        std::fs::read_to_string(&md_path).expect("read equivalent markdown"),
+        report.markdown()
+    );
+
+    let connection = Connection::open_existing(&path).expect("open CLI divergence control");
+    let unexpected = narrative_event(1, EventKind::PopulationBoom, "population");
+    insert_verification_event(&connection, report.input_binding.run_id, &unexpected);
+    connection.close().expect("close CLI divergence control");
+    let json_path = dir.path().join("diverged.json");
+    let md_path = dir.path().join("diverged.md");
+    let run = Command::new(executable)
+        .args([&path, "verify-narrative", "--json"])
+        .arg(&json_path)
+        .arg("--md")
+        .arg(&md_path)
+        .output()
+        .expect("run divergent verification CLI");
+    assert_eq!(run.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Diverged."));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("saved narrative differs"));
+    let report: NarrativeVerificationV1 = serde_json::from_slice(
+        &std::fs::read(&json_path).expect("divergent JSON must exist before failure"),
+    )
+    .expect("parse divergent report");
+    assert!(!report.equivalent);
+    assert_eq!(report.inputs_replayed, 4);
+    assert_eq!(report.events_reconstructed, 0);
+    assert_eq!(report.events_persisted, 1);
+    assert_eq!(report.events_unexpected, 1);
+    let difference = report
+        .first_difference
+        .as_ref()
+        .expect("first extra saved event");
+    assert_eq!(
+        difference.kind,
+        NarrativeDifferenceKind::UnexpectedStoredEvent
+    );
+    assert_eq!(difference.persisted.as_ref(), Some(&unexpected));
+    assert_eq!(
+        std::fs::read_to_string(&md_path).expect("divergent markdown must exist before failure"),
+        report.markdown()
+    );
+}
+
+#[test]
+fn narrative_verification_isolates_explicitly_selected_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = synth_narrative_input_db(&dir, 1);
+    let first = ReaderCtx::open(&path).expect("first run");
+    let first_id = first.reader.run_id();
+    drop(first);
+    let second_id = scriptbots_runtime::RunId::new(0x16_020_999);
+    let mut storage = Storage::append_run(&path, RunManifestRecord::unattributed(second_id))
+        .expect("append second run");
+    let config = ScriptBotsConfig {
+        narrative_interval: 1,
+        history_capacity: 128,
+        ..ScriptBotsConfig::default()
+    };
+    let mut second_batch = batch(1, 10, 10.0);
+    let record = NarrativeInputRecordV1::from_summary(&second_batch.summary, 0, &config)
+        .expect("second run input");
+    second_batch.replay_events.push(ReplayEvent {
+        agent_uid: None,
+        position: None,
+        counterpart: None,
+        counterpart_position: None,
+        kind: ReplayEventKind::NarrativeInputV1 { record },
+    });
+    second_batch
+        .narrative_events
+        .push(narrative_event(1, EventKind::PopulationBoom, "population"));
+    storage.persist(&second_batch).expect("second run evidence");
+    storage.close().expect("close appended run");
+    assert!(matches!(
+        ReaderCtx::open(&path),
+        Err(AnalyticsError::Storage(StorageError::InvalidData {
+            context: "runs.run_id",
+            ..
+        }))
+    ));
+    let first = ReaderCtx::open_for_run(&path, first_id).expect("select first run");
+    let first_report = verify_narrative(&first.reader).expect("first selected comparison");
+    first_report
+        .require_equivalent()
+        .expect("second run output cannot contaminate first");
+    assert_eq!(first_report.inputs_replayed, 4);
+    drop(first);
+    let second = ReaderCtx::open_for_run(&path, second_id).expect("select second run");
+    let second_report = verify_narrative(&second.reader).expect("second selected comparison");
+    assert_eq!(second_report.input_binding.run_id, second_id);
+    assert_eq!(second_report.inputs_replayed, 1);
+    assert_eq!(second_report.events_unexpected, 1);
+    assert!(!second_report.equivalent);
+    drop(second);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_sb-analyze"))
+        .args([&path, "--run-id", &first_id.to_string(), "verify-narrative"])
+        .output()
+        .expect("CLI explicit run selection");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains(&first_id.to_string()));
 }
 
 #[test]
