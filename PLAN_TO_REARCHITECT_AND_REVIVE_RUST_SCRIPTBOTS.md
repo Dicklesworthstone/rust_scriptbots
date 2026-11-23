@@ -2,6 +2,19 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Checkpoint continuation and terminal scientific evidence (2026-11-23):**
+[Currently In Progress — Codex; scoped contributions to `bd-2z0.5.13`,
+`bd-2z0.12.2`, `bd-ywtv` and persistent-run reliability; original acceptance retained]
+
+Verify saved checkpoints against their complete catalog identity on warm retries
+as well as cold reads. Select browser continuation command namespaces from all
+retained owner authority, including rejected commands and lifecycle operations.
+Retain the final partial persistence batch and drain admitted journal evidence
+when a completed scientific tick faults, without advancing further science or
+replacing a journal failure with a weaker success or scientific-only diagnosis.
+Native execution qualification is being attempted through DSR; source changes
+and authored tests alone do not close the original acceptance.
+
 **Complete headless scenario horizons and usable map editing (2026-11-22):**
 [Implemented and independently reviewed; focused budget tests passed — Codex;
 scoped contributions to `bd-du9o`, `bd-pih9` and `bd-2z0.10.7`;

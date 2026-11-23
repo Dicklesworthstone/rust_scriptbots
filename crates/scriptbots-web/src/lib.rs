@@ -142,6 +142,17 @@ struct Simulation {
     environment_js: Option<(Arc<RemoteEnvironmentSnapshot>, JsValue)>,
 }
 
+#[derive(Debug)]
+struct BrowserHostFailure(scriptbots_runtime::HostFault);
+
+impl std::fmt::Display for BrowserHostFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "browser owner faulted: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for BrowserHostFailure {}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SnapshotFormat {
@@ -823,15 +834,13 @@ impl Simulation {
             None,
             ManualInstant::from_nanos(0),
         )?;
-        // Every browser continuation gets a new command namespace. Starting the
-        // old namespace at sequence one would replay an old Step or collide.
-        let namespace = core
-            .latest_snapshot()
-            .last_applied_command
-            .map_or(1, |id| {
-                u64::try_from(id.get() >> u64::BITS).expect("upper half fits u64")
-            })
-            .checked_add(1)
+        // Retained rejected and archived commands still own their identities,
+        // even when the last applied command came from another client or the
+        // host's reserved lifecycle namespace. The complete volatile owner has
+        // no additional durable command history outside this captured authority.
+        let namespace = checkpoint
+            .host_checkpoint()
+            .available_client_namespace()
             .context("browser checkpoint command namespace is exhausted")?;
         let controls = NullFrontend::new(core.local_port(), namespace);
         Ok(Self {
@@ -1030,8 +1039,13 @@ impl Simulation {
     fn tick(&mut self, steps: u32) -> Result<SimulationSnapshot> {
         let resume = !self.core.latest_snapshot().playback.paused;
         for step_index in 0..steps {
+            self.require_healthy_owner()?;
             let before = self.core.world_tick();
-            self.apply_command(HostCommand::Step).with_context(|| {
+            let applied = self.apply_command(HostCommand::Step);
+            // A completed tick may carry a scientific fault even though its Step
+            // receipt is Applied. Preserve that exact outcome before any later
+            // step or Resume can replace it with a secondary command refusal.
+            self.require_healthy_owner().and(applied).with_context(|| {
                 format!(
                     "HostCore failed during WASM step {} of {steps}",
                     step_index + 1
@@ -1048,6 +1062,13 @@ impl Simulation {
                 .context("failed to restore browser playback after manual stepping")?;
         }
         Ok(self.core.latest_snapshot().world.clone())
+    }
+
+    fn require_healthy_owner(&self) -> Result<()> {
+        if let Some(fault) = self.core.health().fault() {
+            return Err(BrowserHostFailure(fault.clone()).into());
+        }
+        Ok(())
     }
 
     fn snapshot(&self) -> SimulationSnapshot {
@@ -3667,6 +3688,198 @@ mod tests {
             assert_eq!(restored.snapshot().agents.len(), 3);
             restored.tick(1).unwrap();
         }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_commands_do_not_reuse_other_retained_client_namespaces() {
+        for rejected in [false, true] {
+            let mut original = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None);
+            original.set_speed(0.0).unwrap();
+            let prior_id = scriptbots_runtime::CommandId::from_client_sequence(2, 1);
+            let prior = original
+                .controls
+                .submit_envelope(scriptbots_runtime::CommandEnvelope::new(
+                    prior_id,
+                    if rejected {
+                        HostCommand::SetSpeed(-1.0)
+                    } else {
+                        HostCommand::Step
+                    },
+                ))
+                .unwrap();
+            if rejected {
+                assert!(matches!(prior.application(), ApplicationState::Rejected(_)));
+            }
+            original.core.drive(ManualInstant::from_nanos(0)).unwrap();
+            original.core.drive(ManualInstant::from_nanos(0)).unwrap();
+            let prior = original.controls.command_status(prior_id).unwrap().unwrap();
+            assert_eq!(
+                matches!(prior.application(), ApplicationState::Rejected(_)),
+                rejected
+            );
+            assert_eq!(
+                prior.journal(),
+                &scriptbots_runtime::JournalState::CommittedVolatile
+            );
+
+            // A later command from the original frontend makes last_applied's
+            // namespace smaller than a still-retained command authority.
+            original.set_speed(0.0).unwrap();
+            assert_eq!(
+                original
+                    .core
+                    .latest_snapshot()
+                    .last_applied_command
+                    .unwrap()
+                    .client_namespace(),
+                1
+            );
+            let mut restored =
+                Simulation::from_checkpoint(&original.checkpoint().unwrap()).unwrap();
+            let tick = restored.snapshot().tick;
+            restored.tick(1).unwrap();
+            original.tick(1).unwrap();
+            assert_eq!(restored.snapshot().tick, tick + 1);
+            assert_eq!(
+                restored.core.scientific_digest_v1().unwrap(),
+                original.core.scientific_digest_v1().unwrap()
+            );
+            assert_eq!(
+                restored.controls.command_status(prior_id).unwrap(),
+                Some(prior),
+                "continuation must preserve both applied and rejected prior receipts"
+            );
+            assert_eq!(
+                restored
+                    .core
+                    .latest_snapshot()
+                    .last_applied_command
+                    .unwrap()
+                    .client_namespace(),
+                3
+            );
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_checkpoint_can_continue_after_a_host_owned_persistence_flush() {
+        let mut original = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None);
+        original.tick(2).unwrap();
+        original.set_speed(0.0).unwrap();
+        let flush = original.core.request_persistence_flush().unwrap();
+        original.core.drive(ManualInstant::from_nanos(0)).unwrap();
+        original.core.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(flush.command_id().client_namespace(), u64::MAX);
+        let applied = original
+            .controls
+            .command_status(flush.command_id())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            applied.application(),
+            ApplicationState::Applied(_)
+        ));
+        assert_eq!(
+            original.core.latest_snapshot().last_applied_command,
+            Some(flush.command_id())
+        );
+        let mut restored = Simulation::from_checkpoint(&original.checkpoint().unwrap()).unwrap();
+        restored.tick(1).unwrap();
+        original.tick(1).unwrap();
+        assert_eq!(restored.snapshot().tick, 3);
+        assert_eq!(
+            restored.core.scientific_digest_v1().unwrap(),
+            original.core.scientific_digest_v1().unwrap()
+        );
+        assert_eq!(
+            restored
+                .controls
+                .command_status(flush.command_id())
+                .unwrap(),
+            Some(applied)
+        );
+        assert_eq!(
+            restored
+                .core
+                .latest_snapshot()
+                .last_applied_command
+                .unwrap()
+                .client_namespace(),
+            2
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn browser_final_completed_scientific_fault_refuses_a_successful_tick_result() {
+        for paused in [false, true] {
+            let mut spec = checkpoint_world(None, SeedStrategy::None).spec;
+            spec.initial_population = 0;
+            spec.preserve_population_config = true;
+            spec.base_config.population_minimum = 0;
+            spec.base_config.population_spawn_interval = 2;
+            spec.base_config.population_spawn_count = 1;
+            spec.base_config.closed = false;
+            let mut world = WorldState::new(spec.config()).unwrap();
+            world
+                .brain_registry_mut()
+                .unwrap()
+                .register("test.browser-final-fault", |_rng| {
+                    Err(scriptbots_core::BrainSpawnError::new(
+                        "test.browser-final-fault",
+                        std::io::Error::other("deliberate final browser tick failure"),
+                    ))
+                });
+            let mut simulation = owner_for_checkpoint_test(world, spec);
+            if paused {
+                simulation.set_speed(0.0).unwrap();
+            }
+
+            let error = simulation
+                .tick(2)
+                .expect_err("an Applied final Step cannot hide a completed scientific fault");
+            let publication = simulation.core.latest_snapshot();
+            let fault = publication.health.fault().unwrap().clone();
+            assert_eq!(publication.world.tick, 2);
+            assert!(publication.playback.paused);
+            assert!(matches!(
+                &fault,
+                scriptbots_runtime::HostFault::Scientific { tick, code, message }
+                    if tick.0 == 2
+                        && code == "brain_spawn"
+                        && message.contains("deliberate final browser tick failure")
+            ));
+            assert_eq!(error.downcast_ref::<BrowserHostFailure>().unwrap().0, fault);
+            let last_applied = publication.last_applied_command.unwrap();
+            let status = simulation
+                .controls
+                .command_status(last_applied)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(status.application(), ApplicationState::Applied(_)));
+
+            // An observed failure is stable on retry. No extra Step or automatic
+            // Resume is submitted, and read-only snapshot access remains possible.
+            let repeated = simulation.tick(1).unwrap_err();
+            assert_eq!(
+                repeated.downcast_ref::<BrowserHostFailure>().unwrap().0,
+                fault
+            );
+            assert_eq!(simulation.snapshot().tick, 2);
+            assert_eq!(
+                simulation.core.latest_snapshot().last_applied_command,
+                Some(last_applied)
+            );
+            assert_eq!(simulation.tick(0).unwrap().tick, 2);
+        }
+
+        // Ordinary paused stepping must continue to produce a successful result.
+        let mut healthy = checkpoint_world(Some(BrainPreset::Mlp), SeedStrategy::None);
+        healthy.set_speed(0.0).unwrap();
+        assert_eq!(healthy.tick(2).unwrap().tick, 2);
+        assert!(healthy.core.health().fault().is_none());
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]

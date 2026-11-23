@@ -575,6 +575,32 @@ impl HostCheckpointV1 {
         self.state.playback
     }
 
+    /// A nonzero frontend namespace unused by the retained command authority.
+    ///
+    /// Rejections and archived receipts reserve identities just like applied commands.
+    /// The last applied command is also retained independently of the bounded authority
+    /// maps, and the host's lifecycle namespace is never available to a frontend.
+    /// This observes the captured owner only: it does not reserve the namespace for
+    /// concurrent clients or inspect additional history in an external durable journal.
+    #[must_use]
+    pub fn available_client_namespace(&self) -> Option<u64> {
+        let occupied = self
+            .state
+            .commands
+            .iter()
+            .map(|entry| entry.status.command_id())
+            .chain(
+                self.state
+                    .archived
+                    .iter()
+                    .map(|entry| entry.status.command_id()),
+            )
+            .chain(self.state.last_applied.map(|(_, id)| id))
+            .map(CommandId::client_namespace)
+            .collect::<HashSet<_>>();
+        (1..LIFECYCLE_COMMAND_NAMESPACE).find(|namespace| !occupied.contains(namespace))
+    }
+
     /// Bind an exclusive caller's next command identity to the retained owner authority.
     pub(crate) fn matches_exclusive_command_cursor(&self, namespace: u64, next: u64) -> bool {
         if next == 0 || self.state.next_admission.get() != next {
@@ -4696,17 +4722,16 @@ impl HostCore {
                 HostDriveInterest::Draining
             };
         }
-        if let Some(HostFault::Scientific { tick, .. }) = &self.latched_fault
-            && self
-                .pending_journal_persistence
-                .as_ref()
-                .is_some_and(|pending| pending.batch.summary.tick == *tick)
+        if matches!(&self.latched_fault, Some(HostFault::Scientific { .. }))
+            && !self.inflight_journal.is_empty()
             && self.failed_journal_batches.is_empty()
         {
-            // The fault was discovered after a completed tick. Its exact persistence work
-            // still needs the qualifying receipt that synchronous admission used to await
-            // before surfacing the fault. Drain that obligation without allowing more science;
-            // a journal/protocol failure or its settlement restores the ordinary fault exit.
+            // A scientific fault does not cancel journal work already admitted by this owner.
+            // This includes the fault's event/command audit when persistence is disabled, an
+            // independent sink has already sealed the core batch, and earlier inflight work.
+            // Drain every admitted obligation to this journal's terminal commitment without
+            // allowing more science. Non-admission still requires the explicit retry path;
+            // a journal/protocol failure restores the ordinary terminal fault exit.
             return HostDriveInterest::Draining;
         }
         if self.health.fault().is_some() {
@@ -6151,7 +6176,20 @@ impl HostCore {
             scientific = scientific.with_fault(fault);
         }
         let scientific = Arc::new(scientific);
-        let persistence = persistence.into_batch();
+        let persistence = if completed_fault.is_some() {
+            // No later science tick can reach the next persistence cadence after this fault.
+            // Include the exact partial tail in the fault's own journal batch instead of
+            // leaving lifecycle, narrative, and replay records stranded in the stopped world.
+            self.persistence
+                .stage_final_batch(&mut self.world)
+                .map_err(|error| {
+                    protocol_violation(format!(
+                        "could not stage completed fault persistence: {error}"
+                    ))
+                })?
+        } else {
+            persistence.into_batch()
+        };
         let applied = AppliedCommand {
             tick,
             revisions: self.revisions,
@@ -6496,11 +6534,16 @@ impl HostCore {
         tick: Tick,
         fault: &ScientificBoundaryFault,
     ) -> Result<(), HostAccessError> {
-        self.latched_fault = Some(HostFault::Scientific {
-            tick,
-            code: fault.code().to_owned(),
-            message: fault.message().to_owned(),
-        });
+        // Admission can already have failed with a closed or identity-mismatched journal.
+        // Preserve that terminal diagnosis; the scientific boundary still carries its own
+        // fault record, but it must not hide the fact that its evidence was not admitted.
+        if self.latched_fault.is_none() {
+            self.latched_fault = Some(HostFault::Scientific {
+                tick,
+                code: fault.code().to_owned(),
+                message: fault.message().to_owned(),
+            });
+        }
         self.synchronize_health().map(|_| ())
     }
 
@@ -6574,7 +6617,17 @@ impl HostCore {
             scientific = scientific.with_fault(fault);
         }
         let scientific = Arc::new(scientific);
-        let persistence = persistence.into_batch();
+        let persistence = if completed_fault.is_some() {
+            self.persistence
+                .stage_final_batch(&mut self.world)
+                .map_err(|error| {
+                    protocol_violation(format!(
+                        "could not stage completed fault persistence: {error}"
+                    ))
+                })?
+        } else {
+            persistence.into_batch()
+        };
         let applied = AppliedCommand {
             tick,
             revisions: self.revisions,
@@ -13818,6 +13871,202 @@ mod tests {
                 assert!(core.capture_host_checkpoint_v1().is_err());
                 assert_eq!(*sink_calls.lock().unwrap(), 0);
             }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the real completed-fault matrix covers both drive paths, persistence cadences, sink ownership and commitment strengths"
+    )]
+    fn completed_fault_retains_partial_science_and_drains_every_admitted_journal() {
+        for persistence_interval in [0, 1, 7] {
+            for automatic in [false, true] {
+                for paired_sink in [false, true] {
+                    for requirement in [
+                        ShutdownCommitRequirement::CommittedVolatile,
+                        ShutdownCommitRequirement::Durable,
+                    ] {
+                        let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+                        let ReceiptPersistenceFixture {
+                            mut core,
+                            mut port,
+                            state,
+                            sink_calls,
+                        } = receipt_persistence_fixture(
+                            paired_sink.then_some(authority.clone()),
+                            paired_sink.then_some(authority),
+                            requirement,
+                            !automatic,
+                        );
+                        let config = ScriptBotsConfig {
+                            persistence_interval,
+                            population_minimum: 2,
+                            population_spawn_interval: 0,
+                            closed: false,
+                            ..core.world.config().clone()
+                        };
+                        core.world.apply_config_update(config).unwrap();
+                        let founder = core.world.try_spawn_agent(AgentData::default()).unwrap();
+                        let founder_uid = core.world.agent_uid(founder).unwrap();
+                        core.world.brain_registry_mut().unwrap().register(
+                            "test.fault-tail",
+                            |_rng| {
+                                Err(BrainSpawnError::new(
+                                    "test.fault-tail",
+                                    std::io::Error::other("deliberate population factory failure"),
+                                ))
+                            },
+                        );
+                        let at = if automatic {
+                            core.drive(ManualInstant::from_nanos(0)).unwrap();
+                            10
+                        } else {
+                            submit(&mut port, 1, HostCommand::Step);
+                            0
+                        };
+                        let completed = core.drive(ManualInstant::from_nanos(at)).unwrap();
+                        assert_eq!(completed.scientific_steps, 1);
+                        assert_eq!(core.world_tick(), Tick(1));
+                        assert!(matches!(
+                            core.health(),
+                            HostHealth::Faulted(HostFault::Scientific { tick: Tick(1), code, .. })
+                                if code == "brain_spawn"
+                        ));
+                        let batch = Arc::clone(&state.borrow().attempts[0]);
+                        assert!(batch.scientific().unwrap().fault().is_some());
+                        assert_eq!(batch.persistence().is_some(), persistence_interval != 0);
+                        if let Some(persistence) = batch.persistence() {
+                            assert_eq!(persistence.summary.tick, Tick(1));
+                            assert!(
+                                persistence
+                                    .births
+                                    .iter()
+                                    .any(|birth| birth.agent_uid == founder_uid)
+                            );
+                            assert!(!persistence.replay_events.is_empty());
+                        }
+                        assert_eq!(
+                            core.persistence.has_pending_batch(),
+                            paired_sink && persistence_interval != 0
+                        );
+                        // A disabled cadence or independent sink leaves no pending core
+                        // admission. Neither permits the owner to abandon its admitted audit.
+                        assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+                        assert_eq!(
+                            core.drive(ManualInstant::from_nanos(at + 1))
+                                .unwrap()
+                                .scientific_steps,
+                            0
+                        );
+                        assert_eq!(state.borrow().attempts.len(), 1);
+                        state.borrow_mut().receipts.push_back(JournalReceipt::new(
+                            batch.id(),
+                            JournalReceiptState::CommittedVolatile,
+                        ));
+                        core.drive(ManualInstant::from_nanos(at + 2)).unwrap();
+                        if requirement == ShutdownCommitRequirement::Durable {
+                            assert_eq!(core.drive_interest(), HostDriveInterest::Draining);
+                            state.borrow_mut().receipts.push_back(JournalReceipt::new(
+                                batch.id(),
+                                JournalReceiptState::Durable,
+                            ));
+                            core.drive(ManualInstant::from_nanos(at + 3)).unwrap();
+                        }
+                        assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+                        assert_eq!(core.world_tick(), Tick(1));
+                        assert!(!core.persistence.has_pending_batch());
+                        assert_eq!(
+                            core.persistence.last_admitted_tick(),
+                            (persistence_interval != 0).then_some(Tick(1))
+                        );
+                        assert_eq!(
+                            *sink_calls.lock().unwrap(),
+                            usize::from(!paired_sink && persistence_interval != 0)
+                        );
+                        if !automatic {
+                            assert_eq!(
+                                status(&mut port, 1).journal(),
+                                &if requirement == ShutdownCommitRequirement::Durable {
+                                    JournalState::Durable
+                                } else {
+                                    JournalState::CommittedVolatile
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_fault_does_not_hide_closed_journal_non_admission() {
+        for automatic in [false, true] {
+            let authority = PersistenceCommitAuthority::from_owner(Arc::new(()));
+            let ReceiptPersistenceFixture {
+                mut core,
+                mut port,
+                state,
+                sink_calls,
+            } = receipt_persistence_fixture(
+                Some(authority.clone()),
+                Some(authority),
+                ShutdownCommitRequirement::Durable,
+                !automatic,
+            );
+            let config = ScriptBotsConfig {
+                population_minimum: 1,
+                population_spawn_interval: 0,
+                closed: false,
+                ..core.world.config().clone()
+            };
+            core.world.apply_config_update(config).unwrap();
+            core.world
+                .brain_registry_mut()
+                .unwrap()
+                .register("test.closed-fault", |_rng| {
+                    Err(BrainSpawnError::new(
+                        "test.closed-fault",
+                        std::io::Error::other("deliberate completed population failure"),
+                    ))
+                });
+            state.borrow_mut().closed = true;
+            let at = if automatic {
+                core.drive(ManualInstant::from_nanos(0)).unwrap();
+                10
+            } else {
+                submit(&mut port, 1, HostCommand::Step);
+                0
+            };
+            assert_eq!(
+                core.drive(ManualInstant::from_nanos(at))
+                    .unwrap()
+                    .scientific_steps,
+                1
+            );
+            let retained = core.pending_journal_batch().unwrap();
+            assert!(retained.scientific().unwrap().fault().is_some());
+            assert!(core.world.brain_fault().is_some());
+            assert!(matches!(
+                core.health(),
+                HostHealth::Faulted(HostFault::Journal { batch_id, failure })
+                    if *batch_id == retained.id() && failure.code == "journal_closed"
+            ));
+            assert_eq!(core.latest_snapshot().health, *core.health());
+            assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+            assert_eq!(core.persistence.last_admitted_tick(), None);
+            assert_eq!(*sink_calls.lock().unwrap(), 0);
+            assert_eq!(
+                core.drive(ManualInstant::from_nanos(at + 1))
+                    .unwrap()
+                    .scientific_steps,
+                0
+            );
+            assert!(Arc::ptr_eq(
+                &retained,
+                &core.pending_journal_batch().unwrap()
+            ));
         }
     }
 
