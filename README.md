@@ -1266,17 +1266,50 @@ and health, extinction/recovery and available first-divergence evidence. These
 outcomes describe one saved founding seed. Fresh matched-seed experiments provide
 the independent founding-seed replication.
 
-Both native frontends share one bounded workflow model. Discarding a pending
-result keeps its worker slot occupied until the operation finishes; changing
-session, panel or selection invalidates its result. File reads and experiment
-verification run outside the render loop. Bevy retains at most one saved
-presentation and one newest live publication, and reuses a bounded pool of UI
-rows.
+From either **Experiments** or **Saved checkpoints**, open **Artifacts / export**
+to browse the application's retained artifacts in pages of twelve. Select a file
+to inspect its source path, creation time, byte count, BLAKE3 and SHA-256 checksums.
+The destination is displayed before **Export selected** becomes available.
+Export reads and verifies the retained file; it does not regenerate a report or
+change the live simulation.
+
+Each explicit export creates a new request folder containing the exact artifact
+and `export-manifest.json`. The versioned manifest records the complete catalog
+descriptor, original application session, request identity and output paths.
+Existing configuration and toolchain provenance inside a copied bundle is preserved
+with its bytes; the sidecar records the copy's source and checksums. Successful
+completion requires synced files, independent readback verification and matching
+file identities. Unix also syncs the created directory entries. This receipt is
+separate from host-journal durability or a fresh scientific validation of the
+artifact's contents.
+
+By default, exports go to `exports/` beneath the application's startup working
+directory. Set `SCRIPTBOTS_EXPORT_DIR` before launching to choose a destination;
+relative values resolve against that same working directory. The provider freezes
+this location once and shows its absolute path. Parent traversal, aliased
+directories and existing request folders are refused. Listing artifacts creates
+no export files. Artifacts larger than 64 MiB remain inspectable but cannot be
+exported through this pane.
+
+Both native frontends share one bounded workflow model. File reads, verification
+and writes run outside the render loop. Discarding a pending view keeps its worker
+slot occupied until the operation finishes. A file export may still complete
+after navigation, cancellation of the view, or a source-session change; its
+original source and observed outcome remain available under **Artifacts / export**.
+The pane distinguishes pending, verified, failed and unconfirmed outcomes. Failed
+exports preserve any partial files and do not retry automatically. A subsequent
+explicit export gets a fresh folder. The latest receipt is retained in memory;
+the exported manifest remains on disk. Ordinary inspection results still obey
+the existing session, panel and selection invalidation rules. Bevy retains at most
+one saved presentation and one newest live publication, and reuses a bounded pool
+of UI rows.
 
 These panes cover experiment creation/comparison, saved-checkpoint studies and
-review, and reconstruction at a selected narrative event tick under `bd-2z0.7.6.1`
-and `bd-ji3a`. General replay seeking, native artifact export and full native/GPU
-acceptance remain unfinished parts of those workflows.
+review, artifact export, and reconstruction at a selected narrative event tick
+under `bd-2z0.7.6.1` and `bd-ji3a`. General replay seeking and full native/GPU
+acceptance remain unfinished parts of those workflows. The new export reducer,
+filesystem/provider and GPUI/Bevy component regressions are authored; execution
+qualification remains pending.
 Normal simulation epoch progression preserves a saved view; a change of host
 session invalidates stale observations and results.
 

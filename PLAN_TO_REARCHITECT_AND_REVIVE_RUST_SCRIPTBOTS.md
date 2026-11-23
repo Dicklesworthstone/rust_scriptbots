@@ -13,7 +13,10 @@ write a versioned manifest with the original catalog metadata, source session an
 both checksums. Files are synced and independently read back; existing paths,
 changed sources and mismatched receipts are refused. Partial files remain
 inspectable, and navigation does not discard a pending export's eventual outcome.
-The GPUI and Bevy panes are the next commit in this scoped implementation.
+The existing GPUI and Bevy experiment/checkpoint panes expose bounded artifact
+pages, metadata and destination review, explicit export, and retained original-source
+completion/failure evidence. Copied bundles keep their embedded configuration and
+toolchain provenance; the sidecar describes the exact copied file.
 
 Reducer and real application/filesystem regressions are authored. The execution
 environment became unavailable during toolchain/DSR setup, so compilation,

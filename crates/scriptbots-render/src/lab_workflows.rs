@@ -5,10 +5,11 @@
 
 use super::*;
 use scriptbots_runtime::lab_workflows::{
-    LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction, LabBranchCreationState,
-    LabBranchTreatment, LabCheckpointSaveState, LabCheckpointView, LabExperimentCapabilities,
-    LabExperimentCreationState, LabExperimentDesign, LabExperimentTreatment, LabMetric, LabPanel,
-    VARIANTS_PER_PAGE, branch_report_lines, comparison_lines,
+    LAB_MAX_ARTIFACT_BYTES, LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction, LabArtifactExportState,
+    LabBranchCreationState, LabBranchTreatment, LabCheckpointSaveState, LabCheckpointView,
+    LabExperimentCapabilities, LabExperimentCreationState, LabExperimentDesign,
+    LabExperimentTreatment, LabMetric, LabPanel, VARIANTS_PER_PAGE, artifact_export_lines,
+    branch_report_lines, comparison_lines,
 };
 #[cfg(test)]
 use scriptbots_runtime::lab_workflows::{
@@ -695,12 +696,32 @@ impl SimulationView {
                     ))
                     .child(self.lab_button(
                         "lab-cancel-request".into(),
-                        "Discard pending result".into(),
+                        if self.lab_workflows.latest_artifact_export.as_ref().is_some_and(
+                            |export| matches!(&export.state, LabArtifactExportState::Pending),
+                        ) {
+                            "Leave pending view; export may still complete".into()
+                        } else {
+                            "Discard pending result".into()
+                        },
                         LabAction::CancelRequest,
                         !idle,
                         cx,
                     )),
             );
+        if !self.lab_workflows.viewing_artifacts {
+            header = header.child(self.lab_button(
+                "lab-artifacts-open".into(),
+                "Artifacts / export".into(),
+                LabAction::ArtifactsPage(None),
+                true,
+                cx,
+            ));
+            if self.lab_workflows.latest_artifact_export.is_some() {
+                header = header.child(div().text_xs().child(
+                    "A previous export request is retained. Open Artifacts / export to inspect its source, destination and outcome.",
+                ));
+            }
+        }
         if self.lab_workflows.submit.is_none() {
             header = header.child(
                 div()
@@ -1275,8 +1296,152 @@ impl SimulationView {
         )
     }
 
+    fn render_lab_artifacts(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.lab_workflows;
+        let session = self.host.snapshot_hub().latest().session_id;
+        let idle = !state.is_busy();
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.lab_panel_header("Artifacts / export", cx))
+            .child(self.lab_button(
+                "lab-artifacts-back".into(),
+                "Back to previous Lab view".into(),
+                LabAction::BackFromArtifacts,
+                true,
+                cx,
+            ))
+            .child(div().text_xs().child(
+                "All retained artifacts from this application source. Export copies one verified artifact and records its source and checksums without changing the live world.",
+            ));
+        if let Some(export) = &state.latest_artifact_export {
+            let mut evidence = div()
+                .id("lab-artifact-export-status")
+                .debug_selector(|| "lab-artifact-export-status".to_owned())
+                .flex()
+                .flex_col()
+                .gap_1();
+            if export.session_id != session {
+                evidence = evidence.child(div().text_xs().child(
+                    "Historical export: this request belongs to a previous application source.",
+                ));
+            }
+            for line in artifact_export_lines(export) {
+                evidence = evidence.child(div().text_xs().child(line));
+            }
+            panel = panel.child(evidence);
+        }
+        let Some(page) = &state.artifacts else {
+            return panel.child(
+                "No artifact page has been observed. Refresh when application services are available; retained export outcomes remain above.",
+            );
+        };
+        panel = panel
+            .child(div().text_xs().child(format!(
+                "{} retained artifacts · source session {}",
+                page.total,
+                session.get(),
+            )))
+            .child(div().text_xs().child(format!(
+                "Export directory on the application host: {}",
+                page.export_directory,
+            )));
+        for (index, artifact) in page.items.iter().take(LAB_PAGE_SIZE).enumerate() {
+            let selected = state.selected_artifact.as_ref() == Some(&artifact.artifact_id);
+            panel = panel.child(self.lab_button(
+                format!("lab-artifact-{index}"),
+                format!(
+                    "{}{} · {} · {} bytes",
+                    if selected { "Selected: " } else { "" },
+                    artifact.filename,
+                    artifact.artifact_id,
+                    artifact.byte_size,
+                ),
+                LabAction::SelectArtifact(artifact.artifact_id.clone()),
+                true,
+                cx,
+            ));
+        }
+        if page.items.is_empty() {
+            panel = panel.child("No retained artifacts are available from this source.");
+        }
+        if let Some(artifact) = state.selected_artifact_metadata() {
+            let mut metadata = div()
+                .id("lab-artifact-metadata")
+                .debug_selector(|| "lab-artifact-metadata".to_owned())
+                .flex()
+                .flex_col()
+                .gap_1();
+            for line in [
+                format!("Artifact: {} · {}", artifact.artifact_id, artifact.content_type),
+                format!("Source path: {}", artifact.relative_path),
+                format!("Created: {} · {} bytes", artifact.created_at_utc, artifact.byte_size),
+                format!("BLAKE3: {}", artifact.checksum_blake3),
+                format!("SHA-256: {}", artifact.checksum_sha256),
+                format!(
+                    "Destination: {}",
+                    std::path::Path::new(&page.export_directory)
+                        .join("<unique request ID>")
+                        .join(&artifact.filename)
+                        .display(),
+                ),
+                "A new request folder is assigned only when Export selected is pressed. It also contains export-manifest.json; existing paths are refused.".to_owned(),
+            ] {
+                metadata = metadata.child(div().text_xs().child(line));
+            }
+            panel = panel.child(metadata);
+            if let Some(action) = state.export_artifact_action() {
+                panel = panel.child(self.lab_button(
+                    "lab-artifact-export".into(),
+                    "Export selected".into(),
+                    action,
+                    state.can_export_artifact(),
+                    cx,
+                ));
+            } else if artifact.byte_size > LAB_MAX_ARTIFACT_BYTES as u64 {
+                panel = panel.child(div().text_xs().child(format!(
+                    "Export unavailable: {} bytes exceeds the {LAB_MAX_ARTIFACT_BYTES}-byte native export limit. Metadata remains inspectable.",
+                    artifact.byte_size,
+                )));
+            } else {
+                panel = panel.child(
+                    "Export unavailable until the current application source and its data services are available.",
+                );
+            }
+        } else {
+            panel = panel.child("Select a retained artifact to review its metadata and destination.");
+        }
+        panel.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(self.lab_button(
+                    "lab-artifacts-prev".into(),
+                    "Previous artifacts".into(),
+                    LabAction::ArtifactsPage(
+                        (page.offset > LAB_PAGE_SIZE)
+                            .then(|| (page.offset - LAB_PAGE_SIZE).to_string()),
+                    ),
+                    idle && page.offset > 0,
+                    cx,
+                ))
+                .child(self.lab_button(
+                    "lab-artifacts-next".into(),
+                    "Next artifacts".into(),
+                    LabAction::ArtifactsPage(page.next_cursor.clone()),
+                    idle && page.next_cursor.is_some(),
+                    cx,
+                )),
+        )
+    }
+
     pub(super) fn render_lab_experiments(&self, cx: &mut Context<Self>) -> Div {
         let state = &self.lab_workflows;
+        if state.viewing_artifacts {
+            return self.render_lab_artifacts(cx);
+        }
         let idle = !state.is_busy();
         let mut panel = div()
             .flex()
@@ -1962,6 +2127,9 @@ impl SimulationView {
 
     pub(super) fn render_lab_checkpoints(&self, cx: &mut Context<Self>) -> Div {
         let state = &self.lab_workflows;
+        if state.viewing_artifacts {
+            return self.render_lab_artifacts(cx);
+        }
         if state.checkpoint_view != LabCheckpointView::SavedCuts {
             return self.render_lab_checkpoint_studies(cx);
         }
@@ -2059,6 +2227,252 @@ impl SimulationView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpui_artifact_controls_review_frozen_metadata_and_report_export_outcomes() {
+        use scriptbots_runtime::lab_workflows::{
+            LabArtifact, LabArtifactExportReceipt, LabArtifactPage,
+        };
+
+        let host = TestHost::new(
+            WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                population_minimum: 0,
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+        );
+        let source = host.snapshot().session_id;
+        let before = host.port.scientific_digest_v1().unwrap();
+        let artifact = LabArtifact {
+            artifact_id: "saved-report".into(),
+            filename: "report.json".into(),
+            content_type: "application/json".into(),
+            byte_size: 3,
+            checksum_blake3: "a".repeat(64),
+            checksum_sha256: "b".repeat(64),
+            created_at_utc: "2026-11-23T00:00:00Z".into(),
+            relative_path: "run-42/report.json".into(),
+        };
+        let directory = std::env::temp_dir()
+            .join("scriptbots-gpui-artifact-ui-test")
+            .to_string_lossy()
+            .into_owned();
+        let page = LabArtifactPage {
+            items: vec![artifact.clone()],
+            total: 1,
+            offset: 0,
+            next_cursor: None,
+            export_directory: directory.clone(),
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| panic!("artifact export must not command the live owner")),
+        );
+        // Explicit application-service double: these are real GPUI controls and
+        // the shared worker, not a filesystem, native-window or GPU proof.
+        session.lab_submit = Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ListExperiments { .. } => {
+                    LabWorkflowResponse::Experiments(LabExperimentPage {
+                        items: Vec::new(),
+                        total: 0,
+                        offset: 0,
+                        next_cursor: None,
+                        reserved_run_slots: 0,
+                        max_run_slots: 1,
+                    })
+                }
+                LabWorkflowRequest::ListCheckpoints { .. } => {
+                    LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                        items: Vec::new(),
+                        total: 0,
+                        offset: 0,
+                        next_cursor: None,
+                        retained_bytes: 0,
+                        max_bytes: 10_000,
+                    })
+                }
+                LabWorkflowRequest::ListArtifacts { cursor } => {
+                    assert!(cursor.is_none());
+                    LabWorkflowResponse::Artifacts(page.clone())
+                }
+                request @ LabWorkflowRequest::ExportArtifact { .. } => {
+                    let count = {
+                        let mut requests = recorded.lock().unwrap();
+                        requests.push(request.clone());
+                        requests.len()
+                    };
+                    if count == 2 {
+                        return Err("destination readback verification failed".into());
+                    }
+                    let LabWorkflowRequest::ExportArtifact {
+                        request_id,
+                        session_id,
+                        artifact,
+                        export_directory,
+                    } = request
+                    else {
+                        unreachable!("matched export request")
+                    };
+                    assert_eq!(session_id, source);
+                    let capsule = std::path::Path::new(&export_directory).join(&request_id);
+                    LabWorkflowResponse::ArtifactExported(LabArtifactExportReceipt {
+                        output_path: capsule
+                            .join(&artifact.filename)
+                            .to_string_lossy()
+                            .into_owned(),
+                        manifest_path: capsule
+                            .join("export-manifest.json")
+                            .to_string_lossy()
+                            .into_owned(),
+                        request_id,
+                        session_id,
+                        artifact,
+                        export_directory,
+                    })
+                }
+                other => panic!("unexpected artifact UI request: {other:?}"),
+            })
+        }));
+        let context = gpui::TestAppContext::single();
+        let windows = context
+            .update(|app| Arc::new(session).install(app))
+            .unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(1_100.0), px(1_800.0)));
+        let draw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
+            draw(lab);
+            let bounds = lab.debug_bounds(selector).expect("visible artifact control");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        let wait = |lab: &mut gpui::VisualTestContext, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(lab);
+                if context.update(|app| ready(&hud.read(app).lab_workflows)) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "artifact UI response deadline");
+                std::thread::yield_now();
+            }
+        };
+        click(&mut lab, "dashboard-tab-experiments");
+        wait(&mut lab, &|model| model.experiments.is_some() && !model.is_busy());
+        click(&mut lab, "lab-artifacts-open");
+        wait(&mut lab, &|model| model.artifacts.is_some() && !model.is_busy());
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-artifact-export").is_none());
+        click(&mut lab, "lab-artifact-0");
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-artifact-metadata").is_some());
+        assert!(lab.debug_bounds("lab-artifact-export").is_some());
+        let stale_action = context.update(|app| {
+            hud.read(app).lab_workflows.export_artifact_action().unwrap()
+        });
+        assert_eq!(
+            stale_action,
+            LabAction::ExportArtifact {
+                session_id: source,
+                artifact: artifact.clone(),
+                export_directory: directory.clone(),
+            },
+        );
+        // A control captured before the displayed descriptor changes must not
+        // write either the old artifact or its replacement.
+        context.update(|app| {
+            hud.update(app, |view, cx| {
+                view.lab_workflows.artifacts.as_mut().unwrap().items[0].checksum_sha256 =
+                    "c".repeat(64);
+                view.lab_action(stale_action.clone(), cx);
+                assert!(!view.lab_workflows.is_busy());
+                assert!(view.lab_workflows.latest_artifact_export.is_none());
+            })
+        });
+        assert!(requests.lock().unwrap().is_empty());
+        click(&mut lab, "lab-refresh");
+        wait(&mut lab, &|model| {
+            !model.is_busy()
+                && model
+                    .artifacts
+                    .as_ref()
+                    .is_some_and(|page| page.items[0].checksum_sha256 == artifact.checksum_sha256)
+        });
+        click(&mut lab, "lab-artifact-0");
+        click(&mut lab, "lab-artifact-export");
+        wait(&mut lab, &|model| {
+            !model.is_busy()
+                && model.latest_artifact_export.as_ref().is_some_and(|export| {
+                    matches!(&export.state, LabArtifactExportState::Exported(_))
+                })
+        });
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-artifact-export-status").is_some());
+        context.update(|app| {
+            let model = &hud.read(app).lab_workflows;
+            let LabArtifactExportState::Exported(receipt) =
+                &model.latest_artifact_export.as_ref().unwrap().state
+            else {
+                panic!("matching service receipt is required");
+            };
+            assert_eq!(receipt.artifact, artifact);
+            assert_eq!(receipt.export_directory, directory);
+            let lines = artifact_export_lines(model.latest_artifact_export.as_ref().unwrap());
+            assert!(lines.iter().any(|line| line.contains(&receipt.output_path)));
+            assert!(lines.iter().any(|line| line.contains(&receipt.manifest_path)));
+        });
+        click(&mut lab, "lab-artifacts-back");
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-artifacts-open").is_some());
+        click(&mut lab, "dashboard-tab-checkpoints");
+        wait(&mut lab, &|model| model.checkpoints.is_some() && !model.is_busy());
+        click(&mut lab, "lab-artifacts-open");
+        wait(&mut lab, &|model| model.artifacts.is_some() && !model.is_busy());
+        click(&mut lab, "lab-artifact-0");
+        click(&mut lab, "lab-artifact-export");
+        wait(&mut lab, &|model| {
+            !model.is_busy()
+                && model.latest_artifact_export.as_ref().is_some_and(|export| {
+                    matches!(&export.state, LabArtifactExportState::Failed { .. })
+                })
+        });
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-artifact-export-status").is_some());
+        context.update(|app| {
+            let model = &hud.read(app).lab_workflows;
+            let export = model.latest_artifact_export.as_ref().unwrap();
+            assert!(artifact_export_lines(export).iter().any(|line| {
+                line.contains("destination readback verification failed")
+            }));
+        });
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_id = match &requests[0] {
+            LabWorkflowRequest::ExportArtifact { request_id, .. } => request_id,
+            other => panic!("unexpected recorded request: {other:?}"),
+        };
+        let second_id = match &requests[1] {
+            LabWorkflowRequest::ExportArtifact { request_id, .. } => request_id,
+            other => panic!("unexpected recorded request: {other:?}"),
+        };
+        assert_ne!(first_id, second_id, "new explicit exports use distinct destinations");
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+    }
 
     #[test]
     fn gpui_guide_observes_shared_owner_receipts_and_refuses_stale_actions() {

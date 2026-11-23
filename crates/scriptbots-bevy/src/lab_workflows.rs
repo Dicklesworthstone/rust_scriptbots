@@ -8,11 +8,12 @@ use super::*;
 use scriptbots_runtime::{
     HostSessionId,
     lab_workflows::{
-        LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction, LabBranchCreationState,
-        LabBranchTreatment, LabCheckpointSaveState, LabCheckpointView, LabEventIdentity,
-        LabEventReview, LabExperimentCapabilities, LabExperimentCreationState, LabExperimentDesign,
-        LabExperimentTreatment, LabMetric, LabPanel, LabWorkflowSubmit, LabWorkflows,
-        VARIANTS_PER_PAGE, branch_report_lines, comparison_lines,
+        LAB_MAX_ARTIFACT_BYTES, LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction,
+        LabArtifactExportState, LabBranchCreationState, LabBranchTreatment, LabCheckpointSaveState,
+        LabCheckpointView, LabEventIdentity, LabEventReview, LabExperimentCapabilities,
+        LabExperimentCreationState, LabExperimentDesign, LabExperimentTreatment, LabMetric, LabPanel,
+        LabWorkflowSubmit, LabWorkflows, VARIANTS_PER_PAGE, artifact_export_lines, branch_report_lines,
+        comparison_lines,
     },
 };
 
@@ -792,17 +793,32 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
         narrative_rows(model, presentation, &mut rows);
         return rows;
     }
+    if !model.viewing_artifacts {
+        rows.push(PanelRow::workflow(
+            if model.latest_artifact_export.is_some() {
+                "Artifacts / export (previous request retained)"
+            } else {
+                "Artifacts / export"
+            },
+            LabAction::ArtifactsPage(None),
+            true,
+        ));
+    }
     if model.submit.is_none() {
         rows.push(PanelRow::text(
             "Lab services are unavailable in this launch.",
         ));
-        return rows;
+        if !model.viewing_artifacts {
+            return rows;
+        }
     }
     if presentation.source.is_none() {
         rows.push(PanelRow::text(
             "Waiting for an identified host publication.",
         ));
-        return rows;
+        if !model.viewing_artifacts {
+            return rows;
+        }
     }
     let idle = !model.is_busy();
     rows.push(PanelRow::workflow(
@@ -816,7 +832,13 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
     ));
     if !idle {
         rows.push(PanelRow::workflow(
-            "Discard pending result",
+            if model.latest_artifact_export.as_ref().is_some_and(|export| {
+                matches!(&export.state, LabArtifactExportState::Pending)
+            }) {
+                "Leave pending view; export may still complete"
+            } else {
+                "Discard pending result"
+            },
             LabAction::CancelRequest,
             true,
         ));
@@ -824,10 +846,14 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
     if let Some(notice) = &model.notice {
         rows.push(PanelRow::text(notice.clone()));
     }
-    match presentation.panel {
-        LabPanel::Experiments => experiment_rows(model, presentation, idle, &mut rows),
-        LabPanel::Checkpoints => checkpoint_rows(model, presentation, idle, &mut rows),
-        LabPanel::Inactive | LabPanel::Narrative => {}
+    if model.viewing_artifacts {
+        artifact_rows(model, presentation, idle, &mut rows);
+    } else {
+        match presentation.panel {
+            LabPanel::Experiments => experiment_rows(model, presentation, idle, &mut rows),
+            LabPanel::Checkpoints => checkpoint_rows(model, presentation, idle, &mut rows),
+            LabPanel::Inactive | LabPanel::Narrative => {}
+        }
     }
     // Fail visibly if future extensions outgrow the widget pool; never silently
     // omit the end of a scientific comparison or its provenance.
@@ -839,6 +865,110 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
         rows.push(PanelRow::button("Close panel", PanelAction::Close, true));
     }
     rows
+}
+
+fn artifact_rows(
+    model: &LabWorkflows,
+    presentation: &LabPresentation,
+    idle: bool,
+    rows: &mut Vec<PanelRow>,
+) {
+    rows.push(PanelRow::text("ARTIFACTS / EXPORT"));
+    rows.push(PanelRow::workflow(
+        "Back to previous Lab view",
+        LabAction::BackFromArtifacts,
+        true,
+    ));
+    rows.push(PanelRow::text(
+        "All retained artifacts from this application source. Export copies one verified artifact and records its source and checksums without changing the live world.",
+    ));
+    if let Some(export) = &model.latest_artifact_export {
+        if presentation.source != Some(export.session_id) {
+            rows.push(PanelRow::text(
+                "Historical export: this request belongs to a previous application source.",
+            ));
+        }
+        rows.extend(artifact_export_lines(export).into_iter().map(PanelRow::text));
+    }
+    let Some(page) = &model.artifacts else {
+        rows.push(PanelRow::text(
+            "No artifact page has been observed. Refresh when application services are available; retained export outcomes remain above.",
+        ));
+        return;
+    };
+    rows.push(PanelRow::text(format!(
+        "{} retained artifacts | export directory on the application host: {}",
+        page.total, page.export_directory,
+    )));
+    if let Some(session) = presentation.source {
+        rows.push(PanelRow::text(format!("Source session: {}", session.get())));
+    }
+    for artifact in page.items.iter().take(LAB_PAGE_SIZE) {
+        let selected = model.selected_artifact.as_ref() == Some(&artifact.artifact_id);
+        rows.push(PanelRow::workflow(
+            format!(
+                "{}{} | {} | {} bytes",
+                if selected { "Selected: " } else { "" },
+                artifact.filename,
+                artifact.artifact_id,
+                artifact.byte_size,
+            ),
+            LabAction::SelectArtifact(artifact.artifact_id.clone()),
+            true,
+        ));
+    }
+    if page.items.is_empty() {
+        rows.push(PanelRow::text("No retained artifacts are available from this source."));
+    }
+    if let Some(artifact) = model.selected_artifact_metadata() {
+        for line in [
+            format!("Artifact: {} | {}", artifact.artifact_id, artifact.content_type),
+            format!("Source path: {}", artifact.relative_path),
+            format!("Created: {} | {} bytes", artifact.created_at_utc, artifact.byte_size),
+            format!("BLAKE3: {}", artifact.checksum_blake3),
+            format!("SHA-256: {}", artifact.checksum_sha256),
+            format!(
+                "Destination: {}",
+                std::path::Path::new(&page.export_directory)
+                    .join("<unique request ID>")
+                    .join(&artifact.filename)
+                    .display(),
+            ),
+            "A new request folder is assigned only when Export selected is pressed. It also contains export-manifest.json; existing paths are refused.".to_owned(),
+        ] {
+            rows.push(PanelRow::text(line));
+        }
+        if let Some(action) = model.export_artifact_action() {
+            rows.push(PanelRow::workflow(
+                "Export selected",
+                action,
+                model.can_export_artifact(),
+            ));
+        } else if artifact.byte_size > LAB_MAX_ARTIFACT_BYTES as u64 {
+            rows.push(PanelRow::text(format!(
+                "Export unavailable: {} bytes exceeds the {LAB_MAX_ARTIFACT_BYTES}-byte native export limit. Metadata remains inspectable.",
+                artifact.byte_size,
+            )));
+        } else {
+            rows.push(PanelRow::text(
+                "Export unavailable until the current application source and its data services are available.",
+            ));
+        }
+    } else {
+        rows.push(PanelRow::text(
+            "Select a retained artifact to review its metadata and destination.",
+        ));
+    }
+    rows.push(PanelRow::workflow(
+        "Previous artifacts",
+        LabAction::ArtifactsPage(previous_cursor(page.offset)),
+        idle && page.offset > 0,
+    ));
+    rows.push(PanelRow::workflow(
+        "Next artifacts",
+        LabAction::ArtifactsPage(page.next_cursor.clone()),
+        idle && page.next_cursor.is_some(),
+    ));
 }
 
 fn narrative_rows(model: &LabWorkflows, presentation: &LabPresentation, rows: &mut Vec<PanelRow>) {
@@ -869,7 +999,13 @@ fn narrative_rows(model: &LabWorkflows, presentation: &LabPresentation, rows: &m
     }
     if model.is_busy() {
         rows.push(PanelRow::workflow(
-            "Discard pending review result",
+            if model.latest_artifact_export.as_ref().is_some_and(|export| {
+                matches!(&export.state, LabArtifactExportState::Pending)
+            }) {
+                "Leave pending view; export may still complete"
+            } else {
+                "Discard pending review result"
+            },
             LabAction::CancelRequest,
             true,
         ));
@@ -2181,6 +2317,294 @@ mod tests {
         frame
     }
 
+    #[test]
+    fn artifact_panel_routes_frozen_exports_and_retains_late_historical_receipts() {
+        use scriptbots_runtime::lab_workflows::{
+            LabArtifact, LabArtifactExportReceipt, LabArtifactPage,
+        };
+        use std::time::{Duration, Instant};
+
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Experiments,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        presentation.receive_live(live_frame(12), &mut state, &mut motion);
+        presentation.source_changed = false;
+        let session = presentation.source.unwrap();
+        let directory = std::env::temp_dir()
+            .join("scriptbots-bevy-artifact-ui-test")
+            .to_string_lossy()
+            .into_owned();
+        let items = (0..LAB_PAGE_SIZE)
+            .map(|index| LabArtifact {
+                artifact_id: format!("artifact-{index}"),
+                filename: format!("report-{index}.json"),
+                content_type: "application/json".into(),
+                byte_size: if index + 1 == LAB_PAGE_SIZE {
+                    LAB_MAX_ARTIFACT_BYTES as u64 + 1
+                } else {
+                    3
+                },
+                checksum_blake3: "a".repeat(64),
+                checksum_sha256: "b".repeat(64),
+                created_at_utc: "2026-11-23T00:00:00Z".into(),
+                relative_path: format!("run-42/report-{index}.json"),
+            })
+            .collect::<Vec<_>>();
+        let expected = items[0].clone();
+        let page = LabArtifactPage {
+            items,
+            total: LAB_PAGE_SIZE + 1,
+            offset: 0,
+            next_cursor: Some(LAB_PAGE_SIZE.to_string()),
+            export_directory: directory.clone(),
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let (started, observed) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        // Explicit application-service double: this checks native UI routing and
+        // retained worker evidence, not filesystem durability or GPU rendering.
+        let mut model = consumer(Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ListExperiments { .. } => {
+                    LabWorkflowResponse::Experiments(LabExperimentPage {
+                        items: Vec::new(),
+                        total: 0,
+                        offset: 0,
+                        next_cursor: None,
+                        reserved_run_slots: 0,
+                        max_run_slots: 1,
+                    })
+                }
+                LabWorkflowRequest::ListArtifacts { cursor } => {
+                    assert!(cursor.is_none());
+                    LabWorkflowResponse::Artifacts(page.clone())
+                }
+                request @ LabWorkflowRequest::ExportArtifact { .. } => {
+                    recorded.lock().unwrap().push(request.clone());
+                    started.send(()).unwrap();
+                    match released.lock().unwrap().recv_timeout(Duration::from_secs(5)) {
+                        Ok(true) => {}
+                        Ok(false) => return Err("export readback checksum mismatch".into()),
+                        Err(error) => return Err(format!("test release unavailable: {error}")),
+                    }
+                    let LabWorkflowRequest::ExportArtifact {
+                        request_id,
+                        session_id,
+                        artifact,
+                        export_directory,
+                    } = request
+                    else {
+                        unreachable!("matched export request")
+                    };
+                    let capsule = std::path::Path::new(&export_directory).join(&request_id);
+                    LabWorkflowResponse::ArtifactExported(LabArtifactExportReceipt {
+                        output_path: capsule
+                            .join(&artifact.filename)
+                            .to_string_lossy()
+                            .into_owned(),
+                        manifest_path: capsule
+                            .join("export-manifest.json")
+                            .to_string_lossy()
+                            .into_owned(),
+                        request_id,
+                        session_id,
+                        artifact,
+                        export_directory,
+                    })
+                }
+                other => panic!("unexpected artifact UI request: {other:?}"),
+            })
+        })));
+        model.synchronize(session, LabPanel::Experiments);
+        let mut app = App::new();
+        app.insert_non_send_resource(model)
+            .insert_resource(presentation)
+            .insert_resource(state)
+            .insert_resource(motion)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<CameraRig>()
+            .add_systems(Update, update);
+        let button = app
+            .world_mut()
+            .spawn((LabRow::default(), Interaction::None))
+            .id();
+        let press = |app: &mut App, action: LabAction| {
+            let row = panel_rows(
+                app.world().non_send_resource::<LabWorkflows>(),
+                app.world().resource::<LabPresentation>(),
+            )
+            .into_iter()
+            .find(|row| row.action == Some(PanelAction::Workflow(action.clone())))
+            .expect("production artifact pane exposes the action");
+            let enabled = row.enabled;
+            app.world_mut().entity_mut(button).insert((
+                LabRow {
+                    index: 0,
+                    action: row.action,
+                    enabled,
+                },
+                Interaction::Pressed,
+            ));
+            app.update();
+            app.world_mut().entity_mut(button).insert(Interaction::None);
+            enabled
+        };
+        let wait = |app: &mut App, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                app.update();
+                let model = app.world().non_send_resource::<LabWorkflows>();
+                if ready(model) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "artifact worker deadline: {:?}",
+                    model.notice,
+                );
+                std::thread::yield_now();
+            }
+        };
+        wait(&mut app, &|model| model.experiments.is_some() && !model.is_busy());
+        assert!(press(&mut app, LabAction::ArtifactsPage(None)));
+        wait(&mut app, &|model| model.artifacts.is_some() && !model.is_busy());
+        assert!(press(
+            &mut app,
+            LabAction::SelectArtifact(format!("artifact-{}", LAB_PAGE_SIZE - 1)),
+        ));
+        let rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(rows.iter().any(|row| row.text.contains("exceeds the")));
+        assert!(!rows.iter().any(|row| matches!(
+            &row.action,
+            Some(PanelAction::Workflow(LabAction::ExportArtifact { .. })),
+        )));
+        assert!(press(
+            &mut app,
+            LabAction::SelectArtifact(expected.artifact_id.clone()),
+        ));
+        let model = app.world().non_send_resource::<LabWorkflows>();
+        let action = model.export_artifact_action().unwrap();
+        assert_eq!(
+            action,
+            LabAction::ExportArtifact {
+                session_id: session,
+                artifact: expected.clone(),
+                export_directory: directory.clone(),
+            },
+        );
+        let rows = panel_rows(model, app.world().resource::<LabPresentation>());
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(
+                    &row.action,
+                    Some(PanelAction::Workflow(LabAction::SelectArtifact(_))),
+                ))
+                .count(),
+            LAB_PAGE_SIZE,
+        );
+        let destination = rows
+            .iter()
+            .position(|row| row.text.starts_with("Destination:"))
+            .unwrap();
+        let export = rows.iter().position(|row| row.text == "Export selected").unwrap();
+        assert!(destination < export, "review destination before the write action");
+        assert!(rows[destination].text.contains(&directory));
+        assert!(rows.iter().any(|row| row.text.contains(&expected.relative_path)));
+        assert!(rows.iter().any(|row| row.text.contains(&expected.checksum_sha256)));
+        assert!(press(&mut app, action.clone()));
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            !press(&mut app, action.clone()),
+            "occupied worker disables another export",
+        );
+        release.send(false).unwrap();
+        wait(&mut app, &|model| !model.is_busy());
+        let rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(rows.iter().any(|row| row.text.contains("export readback checksum mismatch")));
+        assert!(matches!(
+            &app.world()
+                .non_send_resource::<LabWorkflows>()
+                .latest_artifact_export
+                .as_ref()
+                .unwrap()
+                .state,
+            LabArtifactExportState::Failed { .. },
+        ));
+        assert!(press(&mut app, action));
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let pending_rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(pending_rows.iter().any(|row| row.text.contains("export may still complete")));
+        app.world_mut().resource_mut::<LabPresentation>().panel = LabPanel::Narrative;
+        let narrative_rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(narrative_rows.iter().any(|row| {
+            row.action == Some(PanelAction::Workflow(LabAction::CancelRequest))
+                && row.text.contains("export may still complete")
+        }));
+        app.world_mut().resource_mut::<LabPresentation>().panel = LabPanel::Experiments;
+        assert!(press(&mut app, LabAction::CancelRequest));
+        assert!(app.world().non_send_resource::<LabWorkflows>().is_busy());
+        app.world_mut().resource_mut::<LabPresentation>().source = Some(HostSessionId::new(999));
+        app.update();
+        assert!(app.world().non_send_resource::<LabWorkflows>().is_busy());
+        release.send(true).unwrap();
+        wait(&mut app, &|model| !model.is_busy());
+        let receipt = {
+            let model = app.world().non_send_resource::<LabWorkflows>();
+            let LabArtifactExportState::Exported(receipt) =
+                &model.latest_artifact_export.as_ref().unwrap().state
+            else {
+                panic!("matching late export receipt must remain inspectable");
+            };
+            assert_eq!(receipt.session_id, session);
+            receipt.clone()
+        };
+        {
+            let mut model = app.world_mut().non_send_resource_mut::<LabWorkflows>();
+            // Reopen read-only history even after application services disappear.
+            model.submit = None;
+            model.dispatch(LabAction::ArtifactsPage(None));
+        }
+        let rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        );
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        for expected in ["Historical export", &receipt.output_path, &receipt.manifest_path] {
+            assert!(
+                rows.iter().any(|row| row.text.contains(expected)),
+                "missing {expected}",
+            );
+        }
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            12,
+        );
+    }
+
     fn saved_snapshot() -> Arc<RenderSnapshot> {
         let world = WorldState::new(scriptbots_core::ScriptBotsConfig {
             world_width: 80,
@@ -3293,6 +3717,28 @@ mod tests {
         assert!(model.is_busy());
         model.set_notice(
             "Refreshing current capabilities while the previous-source question remains frozen.",
+        );
+        // The worst-case composer must still fit with a retained export receipt.
+        // The receipt remains in its own view instead of consuming extra rows here.
+        model.latest_artifact_export = Some(
+            scriptbots_runtime::lab_workflows::LabArtifactExport {
+                request_id: "previous-export".into(),
+                session_id: HostSessionId::new(70),
+                artifact: scriptbots_runtime::lab_workflows::LabArtifact {
+                    artifact_id: "previous-report".into(),
+                    filename: "report.json".into(),
+                    content_type: "application/json".into(),
+                    byte_size: 3,
+                    checksum_blake3: "a".repeat(64),
+                    checksum_sha256: "b".repeat(64),
+                    created_at_utc: "2026-11-23T00:00:00Z".into(),
+                    relative_path: "run-42/report.json".into(),
+                },
+                export_directory: std::env::temp_dir().to_string_lossy().into_owned(),
+                state: LabArtifactExportState::Failed {
+                    reason: "Previous destination was unavailable.".into(),
+                },
+            },
         );
         let rows = panel_rows(&model, &presentation);
         assert!(rows.len() <= MAX_PANEL_ROWS);
