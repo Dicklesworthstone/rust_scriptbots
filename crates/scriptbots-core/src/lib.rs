@@ -34200,6 +34200,9 @@ impl WorldState {
     }
 
     /// Apply a selection update to highlight agents.
+    ///
+    /// In [`SelectionMode::Clear`], only an explicitly empty target list clears every
+    /// agent. A targeted clear whose agents have disappeared leaves other agents alone.
     #[must_use]
     pub fn apply_selection_update(&mut self, update: SelectionUpdate) -> SelectionResult {
         let mut cleared = 0usize;
@@ -34211,6 +34214,7 @@ impl WorldState {
             state,
         } = update;
 
+        let clear_all = agent_ids.is_empty();
         let targets: HashSet<AgentId> = agent_ids
             .into_iter()
             .map(Self::decode_agent_id)
@@ -34243,7 +34247,7 @@ impl WorldState {
                 }
             }
             SelectionMode::Clear => {
-                if targets.is_empty() {
+                if clear_all {
                     for runtime in self.runtime.values_mut() {
                         if !matches!(runtime.selection, SelectionState::None) {
                             runtime.selection = SelectionState::None;
@@ -52272,6 +52276,85 @@ mod tests {
         let round_trip = AgentId::from(KeyData::from_ffi(raw_b));
         assert!(world.agents().contains(round_trip));
         assert_eq!(round_trip.data().as_ffi(), raw_b);
+    }
+
+    #[test]
+    fn targeted_selection_clear_preserves_survivors_when_targets_disappear() {
+        let mut world = WorldState::new(ScriptBotsConfig::default()).expect("world");
+        let retired = world.spawn_agent(sample_agent(0));
+        let first = world.spawn_agent(sample_agent(1));
+        let second = world.spawn_agent(sample_agent(2));
+        let retired_raw = retired.data().as_ffi();
+        let selected = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Replace,
+            agent_ids: vec![retired_raw, first.data().as_ffi(), second.data().as_ffi()],
+            state: SelectionState::Selected,
+        });
+        assert_eq!(selected.remaining_selected, 3);
+
+        // The request names an actual former agent, not an arbitrary invalid number.
+        // A new occupant must retain its own selection even if the arena reuses the slot.
+        world
+            .remove_agent(retired)
+            .expect("target disappears before its queued clear");
+        let replacement = world.spawn_agent(sample_agent(3));
+        assert_ne!(replacement.data().as_ffi(), retired_raw);
+        assert!(!world.agents().contains(retired));
+        let selected = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Add,
+            agent_ids: vec![replacement.data().as_ffi()],
+            state: SelectionState::Selected,
+        });
+        assert_eq!(selected.remaining_selected, 3);
+
+        let stale = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: vec![retired_raw],
+            state: SelectionState::None,
+        });
+        assert_eq!(stale.applied, 0);
+        assert_eq!(stale.cleared, 0);
+        assert_eq!(stale.remaining_selected, 3);
+        for id in [first, second, replacement] {
+            assert_eq!(
+                world.agent_runtime(id).unwrap().selection,
+                SelectionState::Selected
+            );
+        }
+
+        let mixed = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: vec![retired_raw, first.data().as_ffi(), first.data().as_ffi()],
+            state: SelectionState::None,
+        });
+        assert_eq!(mixed.applied, 0);
+        assert_eq!(mixed.cleared, 1);
+        assert_eq!(mixed.remaining_selected, 2);
+        assert_eq!(
+            world.agent_runtime(first).unwrap().selection,
+            SelectionState::None
+        );
+        for id in [second, replacement] {
+            assert_eq!(
+                world.agent_runtime(id).unwrap().selection,
+                SelectionState::Selected
+            );
+        }
+
+        let all = world.apply_selection_update(SelectionUpdate {
+            mode: SelectionMode::Clear,
+            agent_ids: Vec::new(),
+            state: SelectionState::None,
+        });
+        assert_eq!(all.applied, 0);
+        assert_eq!(all.cleared, 2);
+        assert_eq!(all.remaining_selected, 0);
+        for id in [first, second, replacement] {
+            assert_eq!(
+                world.agent_runtime(id).unwrap().selection,
+                SelectionState::None
+            );
+        }
     }
 
     #[test]

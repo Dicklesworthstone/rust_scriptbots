@@ -8,8 +8,8 @@
 use scriptbots_core::{AgentUid, ControlCommand};
 
 use crate::lab_workflows::{
-    LabBranchReport, LabCheckpoint, LabCheckpointBranch, LabCheckpointSave,
-    LabCheckpointSaveState, branch_report_matches_receipt, checkpoint_receipt_is_bounded,
+    LabBranchReport, LabCheckpoint, LabCheckpointBranch, LabCheckpointSave, LabCheckpointSaveState,
+    branch_report_matches_receipt, checkpoint_receipt_is_bounded,
     checkpoint_request_identity_is_valid,
 };
 use crate::{
@@ -108,9 +108,7 @@ impl LabGuideStep {
             Self::Identify => {
                 "Read the live owner, resolved seed, tick, and population below, then continue."
             }
-            Self::Inspect => {
-                "Use the inspector to select one living organism by its stable UID."
-            }
+            Self::Inspect => "Use the inspector to select one living organism by its stable UID.",
             Self::Pause => {
                 "Use Pause. Wait for its applied receipt, committed journal, and paused publication."
             }
@@ -346,8 +344,8 @@ impl LabGuide {
         if self.generation == u64::MAX {
             self.started = false;
             self.available = false;
-            self.status = "Guide presentation identity exhausted; open a new application session."
-                .to_owned();
+            self.status =
+                "Guide presentation identity exhausted; open a new application session.".to_owned();
         }
     }
 
@@ -426,8 +424,8 @@ impl LabGuide {
         }
         if self.step == LabGuideStep::Outcome {
             self.finished = true;
-            self.status = "Guide complete. The comparison describes one seed and one saved cut."
-                .to_owned();
+            self.status =
+                "Guide complete. The comparison describes one seed and one saved cut.".to_owned();
             return true;
         }
         self.step = LabGuideStep::ALL[self.step.index() + 1];
@@ -479,8 +477,8 @@ impl LabGuide {
         self.available = snapshot.lifecycle == HostLifecycle::Running
             && matches!(&snapshot.health, HostHealth::Healthy);
         if !self.available {
-            self.status = "Live owner is blocked, faulted, or stopped. Resolve it to continue."
-                .to_owned();
+            self.status =
+                "Live owner is blocked, faulted, or stopped. Resolve it to continue.".to_owned();
             return true;
         }
         if !self.started || self.finished {
@@ -513,9 +511,8 @@ impl LabGuide {
                     .to_owned();
             }
             LabGuideStep::Inspect => {
-                let selected = selected_uid.filter(|uid| {
-                    snapshot.world.agents.iter().any(|agent| agent.uid == *uid)
-                });
+                let selected = selected_uid
+                    .filter(|uid| snapshot.world.agents.iter().any(|agent| agent.uid == *uid));
                 self.evidence_ready = selected.is_some();
                 if let Some(uid) = selected {
                     self.evidence = format!(
@@ -546,13 +543,60 @@ impl LabGuide {
         command_id: CommandId,
         before: &RenderSnapshot,
     ) -> bool {
+        if self.source != Some(LabGuideSource::from_snapshot(before)) {
+            return false;
+        }
+        self.record_command_from_source(command, command_id, before, None)
+    }
+
+    /// Register a real admission that returned after newer publications were observed.
+    ///
+    /// Capture the generation, step and complete proposal publication before dispatch.
+    /// A restart, different owner, retired step or regressing source refuses this late
+    /// result. The current source never moves backwards. A matching current publication
+    /// may supply observation evidence, but actual application and journal receipts are
+    /// still required before the step can complete.
+    pub fn record_deferred_command(
+        &mut self,
+        command: &ControlCommand,
+        command_id: CommandId,
+        before: &RenderSnapshot,
+        expected_generation: u64,
+        expected_step: LabGuideStep,
+    ) -> bool {
+        let source = LabGuideSource::from_snapshot(before);
+        let Some(current) = self.source else {
+            return false;
+        };
+        if self.generation == u64::MAX
+            || self.generation != expected_generation
+            || self.step != expected_step
+            || current.session_id != source.session_id
+            || current.revision < source.revision
+            || current.tick < source.tick
+            || current.revisions.control < source.revisions.control
+            || current.revisions.scientific < source.revisions.scientific
+            || current.revisions.config < source.revisions.config
+            || (current.revision == source.revision && current != source)
+        {
+            return false;
+        }
+        self.record_command_from_source(command, command_id, before, Some(current))
+    }
+
+    fn record_command_from_source(
+        &mut self,
+        command: &ControlCommand,
+        command_id: CommandId,
+        before: &RenderSnapshot,
+        observed: Option<LabGuideSource>,
+    ) -> bool {
         let source = LabGuideSource::from_snapshot(before);
         if !self.started
             || self.finished
             || !self.available
             || self.evidence_ready
             || self.pending.is_some()
-            || self.source != Some(source)
             || before.lifecycle != HostLifecycle::Running
             || !matches!(&before.health, HostHealth::Healthy)
             || command.validate().is_err()
@@ -593,24 +637,31 @@ impl LabGuide {
             }
             _ => return false,
         };
-        self.pending = Some(PendingCommand {
+        let mut pending = PendingCommand {
             id: command_id,
             command: kind,
             before: source,
             applied: None,
             commitment: None,
             observed: None,
-        });
+        };
+        pending.observed = observed.filter(|source| pending.matches_source(*source));
+        self.pending = Some(pending);
         self.evidence.clear();
-        self.status = "Submission attempted. Waiting for application, journal commitment, and publication."
-            .to_owned();
+        self.status =
+            "Submission attempted. Waiting for application, journal commitment, and publication."
+                .to_owned();
         true
     }
 
     /// Correlate both receipt axes with the tracked identity and observed owner.
     pub fn observe_status(&mut self, session_id: HostSessionId, status: &CommandStatus) -> bool {
-        if self.source.is_none_or(|source| source.session_id != session_id)
-            || self.pending.is_none_or(|pending| pending.id != status.command_id())
+        if self
+            .source
+            .is_none_or(|source| source.session_id != session_id)
+            || self
+                .pending
+                .is_none_or(|pending| pending.id != status.command_id())
             || status.validate().is_err()
         {
             return false;
@@ -633,8 +684,9 @@ impl LabGuide {
                 }
                 self.evidence_ready = false;
                 self.evidence.clear();
-                self.status = "Command rejected or failed. Refresh the live source and retry this step."
-                    .to_owned();
+                self.status =
+                    "Command rejected or failed. Refresh the live source and retry this step."
+                        .to_owned();
                 return true;
             }
             ApplicationState::Applied(applied) => {
@@ -657,8 +709,8 @@ impl LabGuide {
                     }
                     JournalState::Durable => {
                         pending.commitment = Some(Commitment::Durable);
-                        self.status = "Durable; waiting for the matching paused publication."
-                            .to_owned();
+                        self.status =
+                            "Durable; waiting for the matching paused publication.".to_owned();
                     }
                     JournalState::Pending if pending.commitment.is_none() => {
                         self.status = "Applied; journal commitment is still pending.".to_owned();
@@ -732,14 +784,16 @@ impl LabGuide {
                     request_id: save.request_id.clone(),
                     before: source,
                 });
-                self.status = "Checkpoint requested; waiting for this save identity to complete."
-                    .to_owned();
+                self.status =
+                    "Checkpoint requested; waiting for this save identity to complete.".to_owned();
                 true
             }
             LabCheckpointSaveState::Retryable { .. } => {
-                if self.save_request.as_ref().is_none_or(|pending| {
-                    pending.request_id != save.request_id
-                }) {
+                if self
+                    .save_request
+                    .as_ref()
+                    .is_none_or(|pending| pending.request_id != save.request_id)
+                {
                     return false;
                 }
                 // The native adapters may retry with a fresh request identity.
@@ -791,9 +845,11 @@ impl LabGuide {
         branch: &LabCheckpointBranch,
         report: &LabBranchReport,
     ) -> bool {
-        let (Some(source), Some(checkpoint), Some(treatment)) =
-            (self.source, self.checkpoint.as_ref(), report.treatment.as_ref())
-        else {
+        let (Some(source), Some(checkpoint), Some(treatment)) = (
+            self.source,
+            self.checkpoint.as_ref(),
+            report.treatment.as_ref(),
+        ) else {
             return false;
         };
         if !self.started
@@ -828,10 +884,7 @@ impl LabGuide {
         self.outcome = Some(summary);
         self.evidence = bounded_text(format!(
             "Completed branch {} | artifact {} | source digest {} | both arms reached tick {}.",
-            branch.branch_id,
-            report.artifact_id,
-            report.source_world_digest,
-            report.target_tick,
+            branch.branch_id, report.artifact_id, report.source_world_digest, report.target_tick,
         ));
         self.evidence_ready = true;
         self.status = "Completed control and intervention report matches the saved cut.".to_owned();
@@ -930,8 +983,13 @@ mod tests {
         assert!(guide.observe_status(before.session_id, &admitted));
         assert!(!guide.ready(), "admission is not completion");
         for _ in 0..4 {
-            owner.drive(ManualInstant::from_nanos(0)).expect("owner boundary");
-            let receipt = port.command_status(id).expect("status read").expect("known command");
+            owner
+                .drive(ManualInstant::from_nanos(0))
+                .expect("owner boundary");
+            let receipt = port
+                .command_status(id)
+                .expect("status read")
+                .expect("known command");
             guide.observe_status(before.session_id, &receipt);
             let frame = owner.snapshot_hub().latest();
             guide.observe_snapshot(&frame, frame.world.agents.first().map(|agent| agent.uid));
@@ -939,7 +997,10 @@ mod tests {
                 break;
             }
         }
-        assert!(guide.ready(), "actual command and volatile journal must settle");
+        assert!(
+            guide.ready(),
+            "actual command and volatile journal must settle"
+        );
         assert!(guide.evidence().contains("CommittedVolatile (memory only)"));
         assert!(guide.pending_command_id().is_none());
     }
@@ -966,7 +1027,12 @@ mod tests {
         let mut guide = at_configure(owner);
         let mut config = owner.snapshot_hub().latest().config.as_ref().clone();
         config.food_growth_rate = 0.075;
-        apply(owner, &mut guide, ControlCommand::UpdateConfig(Box::new(config)), 3);
+        apply(
+            owner,
+            &mut guide,
+            ControlCommand::UpdateConfig(Box::new(config)),
+            3,
+        );
         assert!(guide.advance());
         assert_eq!(guide.step(), LabGuideStep::Checkpoint);
         guide
@@ -1094,7 +1160,10 @@ mod tests {
         assert_eq!(guide.source().expect("source").population, 3);
         assert!(guide.advance());
         guide.observe_snapshot(&frame, Some(AgentUid(u64::MAX)));
-        assert!(!guide.ready(), "a missing stable UID is not an inspected organism");
+        assert!(
+            !guide.ready(),
+            "a missing stable UID is not an inspected organism"
+        );
         guide.observe_snapshot(&frame, Some(frame.world.agents[0].uid));
         assert!(guide.ready());
         let mut regressed = frame.as_ref().clone();
@@ -1125,39 +1194,304 @@ mod tests {
         after.revision = before.revision.checked_next().expect("next");
         after.revisions.control = before.revisions.control.checked_next().expect("next");
         after.playback.paused = true;
-        let applied = AppliedCommand { tick: Tick(after.world.tick), revisions: after.revisions };
-        let committed = status(id, ApplicationState::Applied(applied), JournalState::CommittedVolatile);
+        let applied = AppliedCommand {
+            tick: Tick(after.world.tick),
+            revisions: after.revisions,
+        };
+        let committed = status(
+            id,
+            ApplicationState::Applied(applied),
+            JournalState::CommittedVolatile,
+        );
         assert!(!guide.observe_status(HostSessionId::new(999), &committed));
-        assert!(!guide.observe_status(before.session_id, &status(
-            CommandId::new(92), ApplicationState::Applied(applied), JournalState::Durable,
-        )));
+        assert!(!guide.observe_status(
+            before.session_id,
+            &status(
+                CommandId::new(92),
+                ApplicationState::Applied(applied),
+                JournalState::Durable,
+            )
+        ));
         assert_eq!(guide.pending_command_id(), Some(id));
         assert!(guide.observe_status(before.session_id, &committed));
-        assert!(!guide.ready(), "a receipt alone is not a published observation");
+        assert!(
+            !guide.ready(),
+            "a receipt alone is not a published observation"
+        );
         let mut pending_only = at_pause(&before);
         assert!(pending_only.record_command(&ControlCommand::Pause, id, &before));
         assert!(pending_only.observe_snapshot(&after, None));
         for journal in [
             JournalState::NotRequired,
             JournalState::Pending,
-            JournalState::Failed(JournalFailure { code: "disk".into(), message: "unavailable".into() }),
+            JournalState::Failed(JournalFailure {
+                code: "disk".into(),
+                message: "unavailable".into(),
+            }),
         ] {
-            assert!(pending_only.observe_status(before.session_id, &status(
-                id, ApplicationState::Applied(applied), journal,
-            )));
+            assert!(pending_only.observe_status(
+                before.session_id,
+                &status(id, ApplicationState::Applied(applied), journal,)
+            ));
             assert!(!pending_only.ready());
             assert!(!pending_only.advance());
         }
-        assert!(pending_only.observe_status(before.session_id, &status(
-            id, ApplicationState::Applied(applied), JournalState::Durable,
-        )));
+        assert!(pending_only.observe_status(
+            before.session_id,
+            &status(
+                id,
+                ApplicationState::Applied(applied),
+                JournalState::Durable,
+            )
+        ));
         assert!(pending_only.ready());
         assert!(pending_only.evidence().contains("Durable"));
-        after.revisions.control = after.revisions.control.checked_next().expect("selection control");
+        after.revisions.control = after
+            .revisions
+            .control
+            .checked_next()
+            .expect("selection control");
         assert!(guide.observe_snapshot(&after, None));
-        assert!(guide.ready(), "later control-only observation still proves the boundary");
+        assert!(
+            guide.ready(),
+            "later control-only observation still proves the boundary"
+        );
         assert!(guide.evidence().contains("CommittedVolatile (memory only)"));
         assert!(!guide.evidence().contains("Durable"));
+    }
+
+    #[test]
+    fn deferred_commands_match_real_late_receipts_without_rewinding_the_source() {
+        for step in [
+            LabGuideStep::Pause,
+            LabGuideStep::Step,
+            LabGuideStep::Configure,
+        ] {
+            let mut owner = owner();
+            let mut guide = match step {
+                LabGuideStep::Pause => at_pause(&owner.snapshot_hub().latest()),
+                LabGuideStep::Step => at_step(&mut owner),
+                LabGuideStep::Configure => at_configure(&mut owner),
+                _ => unreachable!("command exercise"),
+            };
+            let before = owner.snapshot_hub().latest();
+            let generation = guide.generation();
+            let command = match step {
+                LabGuideStep::Pause => ControlCommand::Pause,
+                LabGuideStep::Step => ControlCommand::Step,
+                LabGuideStep::Configure => {
+                    let mut config = before.config.as_ref().clone();
+                    config.food_growth_rate = 0.075;
+                    ControlCommand::UpdateConfig(Box::new(config))
+                }
+                _ => unreachable!("command exercise"),
+            };
+            let id = CommandId::new(100);
+            let mut port = owner.local_port();
+            let admitted = port
+                .submit(CommandEnvelope::new(
+                    id,
+                    HostCommand::try_from(command.clone()).unwrap(),
+                ))
+                .unwrap();
+            owner.drive(ManualInstant::from_nanos(0)).unwrap();
+            let after = owner.snapshot_hub().latest();
+            assert!(after.revision > before.revision);
+            assert!(guide.observe_snapshot(&after, None));
+            let current_source = guide.source();
+            assert!(
+                !guide.record_command(&command, id, &before),
+                "synchronous source gate stays strict"
+            );
+            assert!(guide.record_deferred_command(&command, id, &before, generation, step));
+            assert_eq!(guide.source(), current_source);
+            assert_eq!(guide.pending_command_id(), Some(id));
+            assert!(
+                !guide.ready(),
+                "a published change does not supply a receipt"
+            );
+            assert!(guide.observe_status(before.session_id, &admitted));
+            assert!(!guide.ready(), "actual admission alone is insufficient");
+            let applied = port.command_status(id).unwrap().unwrap();
+            assert!(matches!(
+                applied.application(),
+                ApplicationState::Applied(_)
+            ));
+            assert_eq!(applied.journal(), &JournalState::Pending);
+            assert!(guide.observe_status(before.session_id, &applied));
+            assert!(!guide.ready(), "application must still commit");
+            owner.drive(ManualInstant::from_nanos(0)).unwrap();
+            let committed = port.command_status(id).unwrap().unwrap();
+            assert_eq!(committed.journal(), &JournalState::CommittedVolatile);
+            assert!(guide.observe_status(before.session_id, &committed));
+            assert!(guide.ready());
+            assert!(guide.evidence().contains("CommittedVolatile (memory only)"));
+            assert!(!guide.record_deferred_command(&command, id, &before, generation, step));
+            assert!(guide.advance());
+            assert!(!guide.record_deferred_command(&command, id, &before, generation, step));
+        }
+    }
+
+    #[test]
+    fn deferred_commands_refuse_retired_busy_and_inconsistent_sources() {
+        let owner = owner();
+        let before = owner.snapshot_hub().latest();
+        let baseline = at_pause(&before);
+        let generation = baseline.generation();
+        let rejects = |mut guide: LabGuide, source: &RenderSnapshot, token, step| {
+            let current = guide.source();
+            let pending = guide.pending_command_id();
+            let evidence = guide.evidence().to_owned();
+            assert!(!guide.record_deferred_command(
+                &ControlCommand::Pause,
+                CommandId::new(101),
+                source,
+                token,
+                step,
+            ));
+            assert_eq!(guide.source(), current);
+            assert_eq!(guide.pending_command_id(), pending);
+            assert_eq!(guide.evidence(), evidence);
+        };
+        rejects(
+            LabGuide::default(),
+            &before,
+            generation,
+            LabGuideStep::Pause,
+        );
+        rejects(
+            baseline.clone(),
+            &before,
+            generation + 1,
+            LabGuideStep::Pause,
+        );
+        rejects(baseline.clone(), &before, generation, LabGuideStep::Step);
+        let mut restarted = baseline.clone();
+        restarted.restart();
+        assert!(restarted.observe_snapshot(&before, None));
+        assert!(restarted.advance());
+        assert!(restarted.observe_snapshot(&before, Some(before.world.agents[0].uid)));
+        assert!(restarted.advance());
+        assert_eq!(restarted.step(), LabGuideStep::Pause);
+        rejects(restarted, &before, generation, LabGuideStep::Pause);
+        let mut replacement = before.as_ref().clone();
+        replacement.session_id = HostSessionId::new(before.session_id.get() + 1);
+        rejects(
+            at_pause(&replacement),
+            &before,
+            generation,
+            LabGuideStep::Pause,
+        );
+        let mut exhausted = baseline.clone();
+        exhausted.generation = u64::MAX - 1;
+        exhausted.restart();
+        rejects(exhausted, &before, u64::MAX, LabGuideStep::Identify);
+        let mut unavailable = baseline.clone();
+        unavailable.observe_unavailable();
+        rejects(unavailable, &before, generation, LabGuideStep::Pause);
+        let mut busy = baseline.clone();
+        assert!(busy.record_command(&ControlCommand::Pause, CommandId::new(102), &before));
+        rejects(busy, &before, generation, LabGuideStep::Pause);
+
+        let mut observed = before.as_ref().clone();
+        observed.revision = before.revision.checked_next().unwrap();
+        let mut current = baseline;
+        assert!(current.observe_snapshot(&observed, None));
+        let mut invalid_sources = Vec::new();
+        let mut future = before.as_ref().clone();
+        future.revision = observed.revision.checked_next().unwrap();
+        invalid_sources.push(future);
+        let mut future = before.as_ref().clone();
+        future.world.tick += 1;
+        invalid_sources.push(future);
+        let mut future = before.as_ref().clone();
+        future.revisions.control = future.revisions.control.checked_next().unwrap();
+        invalid_sources.push(future);
+        let mut future = before.as_ref().clone();
+        future.revisions.scientific = future.revisions.scientific.checked_next().unwrap();
+        invalid_sources.push(future);
+        let mut future = before.as_ref().clone();
+        future.revisions.config = future.revisions.config.checked_next().unwrap();
+        invalid_sources.push(future);
+        let mut inconsistent = observed;
+        inconsistent.playback.paused = !inconsistent.playback.paused;
+        invalid_sources.push(inconsistent);
+        for invalid in invalid_sources {
+            rejects(current.clone(), &invalid, generation, LabGuideStep::Pause);
+        }
+    }
+
+    #[test]
+    fn deferred_step_does_not_use_a_later_scientific_tick_as_completion_evidence() {
+        let mut owner = owner();
+        let mut guide = at_step(&mut owner);
+        let before = owner.snapshot_hub().latest();
+        let generation = guide.generation();
+        let id = CommandId::new(103);
+        let mut port = owner.local_port();
+        for command_id in [id, CommandId::new(104)] {
+            port.submit(CommandEnvelope::new(command_id, HostCommand::Step))
+                .unwrap();
+            owner.drive(ManualInstant::from_nanos(0)).unwrap();
+            owner.drive(ManualInstant::from_nanos(0)).unwrap();
+        }
+        let after = owner.snapshot_hub().latest();
+        assert_eq!(after.world.tick, before.world.tick + 2);
+        assert!(guide.observe_snapshot(&after, None));
+        assert!(guide.record_deferred_command(
+            &ControlCommand::Step,
+            id,
+            &before,
+            generation,
+            LabGuideStep::Step,
+        ));
+        let receipt = port.command_status(id).unwrap().unwrap();
+        assert_eq!(receipt.journal(), &JournalState::CommittedVolatile);
+        assert!(guide.observe_status(before.session_id, &receipt));
+        assert!(
+            !guide.ready(),
+            "a later tick cannot witness the requested one-tick boundary"
+        );
+        assert!(!guide.advance());
+        assert_eq!(guide.pending_command_id(), Some(id));
+        assert_eq!(guide.source().unwrap().tick, after.world.tick);
+    }
+
+    #[test]
+    fn deferred_real_rejection_never_counts_as_a_completed_step() {
+        let mut owner = owner();
+        let before = owner.snapshot_hub().latest();
+        let mut guide = at_pause(&before);
+        let generation = guide.generation();
+        let id = CommandId::new(105);
+        let mut port = owner.local_port();
+        port.submit(
+            CommandEnvelope::new(id, HostCommand::Pause)
+                .expecting_scientific_revision(before.revisions.scientific.checked_next().unwrap()),
+        )
+        .unwrap();
+        owner.drive(ManualInstant::from_nanos(0)).unwrap();
+        owner.drive(ManualInstant::from_nanos(0)).unwrap();
+        let after = owner.snapshot_hub().latest();
+        assert!(guide.observe_snapshot(&after, None));
+        assert!(guide.record_deferred_command(
+            &ControlCommand::Pause,
+            id,
+            &before,
+            generation,
+            LabGuideStep::Pause,
+        ));
+        let receipt = port.command_status(id).unwrap().unwrap();
+        assert!(matches!(
+            receipt.application(),
+            ApplicationState::Rejected(_)
+        ));
+        assert_eq!(receipt.journal(), &JournalState::CommittedVolatile);
+        assert!(guide.observe_status(before.session_id, &receipt));
+        assert!(guide.pending_command_id().is_none());
+        assert!(!guide.ready());
+        assert!(!guide.advance());
+        assert_eq!(guide.source(), Some(LabGuideSource::from_snapshot(&after)));
     }
 
     #[test]
@@ -1182,18 +1516,26 @@ mod tests {
                 config: before.revisions.config,
             },
         };
-        assert!(!tracked.observe_status(before.session_id, &status(
-            id, ApplicationState::Applied(wrong), JournalState::Durable,
-        )));
+        assert!(!tracked.observe_status(
+            before.session_id,
+            &status(id, ApplicationState::Applied(wrong), JournalState::Durable,)
+        ));
         wrong.tick = Tick(before.world.tick + 1);
         wrong.revisions.scientific = before.revisions.scientific;
-        assert!(!tracked.observe_status(before.session_id, &status(
-            id, ApplicationState::Applied(wrong), JournalState::Durable,
-        )));
+        assert!(!tracked.observe_status(
+            before.session_id,
+            &status(id, ApplicationState::Applied(wrong), JournalState::Durable,)
+        ));
         assert!(!tracked.advance());
-        assert!(!tracked.record_command(&ControlCommand::UpdateSimulation(SimulationCommand {
-            paused: Some(false), speed_multiplier: None, step_once: true,
-        }), CommandId::new(71), &before));
+        assert!(!tracked.record_command(
+            &ControlCommand::UpdateSimulation(SimulationCommand {
+                paused: Some(false),
+                speed_multiplier: None,
+                step_once: true,
+            }),
+            CommandId::new(71),
+            &before
+        ));
     }
 
     #[test]
@@ -1203,21 +1545,37 @@ mod tests {
         let before = owner.snapshot_hub().latest();
         let id = CommandId::new(80);
         let original = before.config.as_ref().clone();
-        assert!(!guide.record_command(&ControlCommand::UpdateConfig(Box::new(original.clone())), id, &before));
+        assert!(!guide.record_command(
+            &ControlCommand::UpdateConfig(Box::new(original.clone())),
+            id,
+            &before
+        ));
         let mut wrong = original.clone();
         wrong.food_growth_rate = 0.075;
         wrong.food_decay_rate += 0.001;
         assert!(!guide.record_command(&ControlCommand::UpdateConfig(Box::new(wrong)), id, &before));
         let mut invalid = original.clone();
         invalid.food_growth_rate = f32::NAN;
-        assert!(!guide.record_command(&ControlCommand::UpdateConfig(Box::new(invalid)), id, &before));
+        assert!(!guide.record_command(
+            &ControlCommand::UpdateConfig(Box::new(invalid)),
+            id,
+            &before
+        ));
         let mut right = original;
         right.food_growth_rate = 0.075;
-        apply(&mut owner, &mut guide, ControlCommand::UpdateConfig(Box::new(right)), 80);
+        apply(
+            &mut owner,
+            &mut guide,
+            ControlCommand::UpdateConfig(Box::new(right)),
+            80,
+        );
         assert_eq!(owner.world_tick().0, before.world.tick);
         let after = owner.snapshot_hub().latest();
         assert_eq!(after.revisions.scientific, before.revisions.scientific);
-        assert_eq!(Some(after.revisions.config), before.revisions.config.checked_next());
+        assert_eq!(
+            Some(after.revisions.config),
+            before.revisions.config.checked_next()
+        );
         assert_eq!(after.config.food_growth_rate.to_bits(), 0.075_f32.to_bits());
     }
 
@@ -1241,11 +1599,17 @@ mod tests {
         assert!(guide.pending_command_id().is_none());
         let id = CommandId::new(84);
         assert!(guide.record_command(&ControlCommand::Pause, id, &before));
-        assert!(guide.observe_status(before.session_id, &status(
-            id,
-            ApplicationState::Failed(ApplicationFailure { code: "owner".into(), message: "failure".into() }),
-            JournalState::Durable,
-        )));
+        assert!(guide.observe_status(
+            before.session_id,
+            &status(
+                id,
+                ApplicationState::Failed(ApplicationFailure {
+                    code: "owner".into(),
+                    message: "failure".into()
+                }),
+                JournalState::Durable,
+            )
+        ));
         assert!(guide.pending_command_id().is_none());
         guide.observe_unavailable();
         assert!(!guide.ready());
@@ -1263,7 +1627,10 @@ mod tests {
         let mut owner = owner();
         let mut guide = at_checkpoint(&mut owner);
         let (pending, saved) = save_pair(&guide);
-        assert!(!guide.observe_checkpoint_save(&saved), "an old catalog receipt cannot count");
+        assert!(
+            !guide.observe_checkpoint_save(&saved),
+            "an old catalog receipt cannot count"
+        );
         let mut foreign = pending.clone();
         foreign.session_id = HostSessionId::new(99);
         assert!(!guide.observe_checkpoint_save(&foreign));
@@ -1295,7 +1662,10 @@ mod tests {
             ..pending.clone()
         };
         assert!(guide.observe_checkpoint_save(&retryable));
-        assert!(!guide.observe_checkpoint_save(&saved), "late failed-try result needs a fresh Pending");
+        assert!(
+            !guide.observe_checkpoint_save(&saved),
+            "late failed-try result needs a fresh Pending"
+        );
         let mut next_pending = pending;
         next_pending.request_id = "guide-save-retry".to_owned();
         let mut next_saved = saved;
@@ -1315,7 +1685,11 @@ mod tests {
         single_arm.treatment = None;
         assert!(!guide.observe_branch_report(session, &branch, &single_arm));
         let mut missing_intervention = report.clone();
-        missing_intervention.treatment.as_mut().expect("treatment").command_applied_tick = None;
+        missing_intervention
+            .treatment
+            .as_mut()
+            .expect("treatment")
+            .command_applied_tick = None;
         assert!(!guide.observe_branch_report(session, &branch, &missing_intervention));
         let mut wrong_source = report.clone();
         wrong_source.source_byte_size += 1;
@@ -1366,7 +1740,10 @@ mod tests {
         assert!(guide.saved_checkpoint().is_none());
         assert!(guide.pending_command_id().is_none());
         assert!(!guide.finished());
-        assert_eq!(guide.source().expect("new owner").session_id, replacement.session_id);
+        assert_eq!(
+            guide.source().expect("new owner").session_id,
+            replacement.session_id
+        );
         guide.observe_unavailable();
         assert!(!guide.advance());
         guide.observe_snapshot(&replacement, None);
