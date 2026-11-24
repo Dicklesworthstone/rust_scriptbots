@@ -11252,13 +11252,8 @@ activation = "Sigmoid"
             .get_mut(&1)
             .unwrap()
             .swap(1, 2);
-        let reordered = run_headless_simulation_from_checkpoint(
-            &source,
-            &config,
-            2,
-            &[],
-            &wrong_order,
-        )?;
+        let reordered =
+            run_headless_simulation_from_checkpoint(&source, &config, 2, &[], &wrong_order)?;
         assert_ne!(reordered.final_digest, final_digest);
         assert_ne!(reordered.events, recorded);
 
@@ -11294,7 +11289,9 @@ activation = "Sigmoid"
         use scriptbots_runtime::{CommandId, HostCommand};
 
         let directory = tempdir()?;
-        let database = directory.path().join("recorded-cadence-and-schedule.sqlite");
+        let database = directory
+            .path()
+            .join("recorded-cadence-and-schedule.sqlite");
         let path = database.to_str().expect("temporary UTF-8 path");
         let mut pipeline = StoragePipeline::create_unattributed_file(path)?;
         let (mut config, _) = replay_culling_fixture();
@@ -11340,11 +11337,7 @@ activation = "Sigmoid"
         )?;
         let mut port = host.port();
         submit_durable_replay_command(&mut port, CommandId::new(1), HostCommand::Step)?;
-        submit_durable_replay_command(
-            &mut port,
-            CommandId::new(2),
-            HostCommand::FlushPersistence,
-        )?;
+        submit_durable_replay_command(&mut port, CommandId::new(2), HostCommand::FlushPersistence)?;
         let mut operator_config = config.clone();
         operator_config.food_growth_rate = 0.2;
         submit_durable_replay_command(
@@ -11356,7 +11349,10 @@ activation = "Sigmoid"
         // persistence binding made from the caller's launch settings.
         let checkpoint = port.capture_host_checkpoint_v1()?;
         assert_eq!(checkpoint.config().persistence_interval, 3);
-        assert_eq!(checkpoint.world_checkpoint().config().persistence_interval, 0);
+        assert_eq!(
+            checkpoint.world_checkpoint().config().persistence_interval,
+            0
+        );
         assert_eq!(
             checkpoint.persistence_last_admitted_tick(),
             Some(scriptbots_core::Tick(1))
@@ -11367,11 +11363,7 @@ activation = "Sigmoid"
             &serde_json::json!({"source": "recorded-native-replay-regression"}),
         )?;
         // An immediate repeated flush must retain the already-admitted cut.
-        submit_durable_replay_command(
-            &mut port,
-            CommandId::new(4),
-            HostCommand::FlushPersistence,
-        )?;
+        submit_durable_replay_command(&mut port, CommandId::new(4), HostCommand::FlushPersistence)?;
         for tick in 2_u64..=4 {
             port.request_replay_world_digest()?;
             submit_durable_replay_command(
@@ -11462,13 +11454,8 @@ activation = "Sigmoid"
             .operator_commands,
         };
         reader.close()?;
-        let resumed = run_headless_simulation_from_checkpoint(
-            &source,
-            &conflicting_launch,
-            4,
-            &[],
-            &mirror,
-        )?;
+        let resumed =
+            run_headless_simulation_from_checkpoint(&source, &conflicting_launch, 4, &[], &mirror)?;
         assert_eq!(resumed.final_digest, final_digest);
         assert_eq!(
             resumed.events,
@@ -11593,7 +11580,10 @@ activation = "Sigmoid"
         pipeline.shutdown()?;
         let reader = StorageReader::open_finished(path)?;
         let history = recorded_input_history(&reader, None)?;
-        assert!(history.has_host_journal, "a journal also owns an empty schedule");
+        assert!(
+            history.has_host_journal,
+            "a journal also owns an empty schedule"
+        );
         let operator_commands = history.operator_commands;
         assert_eq!(
             operator_commands[&1],

@@ -633,7 +633,9 @@ impl HostCheckpointV1 {
     ///
     /// Checking the component alone cannot detect history retained after its feature
     /// was disabled. Catalogs use this paired check before choosing the raw format.
-    pub fn validate_standalone_projection(&self) -> Result<(), scriptbots_core::WorldCheckpointError> {
+    pub fn validate_standalone_projection(
+        &self,
+    ) -> Result<(), scriptbots_core::WorldCheckpointError> {
         self.state
             .continuity
             .validate_standalone_projection(&self.world)

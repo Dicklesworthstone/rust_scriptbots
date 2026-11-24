@@ -2,6 +2,36 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Independent futures from complete saved owners (2026-11-24):**
+[Currently In Progress — Codex; scoped contributions to `bd-2z0.12.2` and
+the Phase 4 intervention-study runner; original complete acceptance retained]
+
+The shared checkpoint-branch service and offline study runner accept complete
+host envelopes as scientific sources. Each branch restores map scalars,
+selection/archive history and communication scrambling state into an independent
+world with recording disabled. The saved owner's session, journal authority and
+pending schedule are not adopted. Raw sources and seeded studies retain their
+standalone-state restrictions; archive-spawn treatments remain explicitly refused.
+
+Source-specific restoration and treatment validation run before output reservation.
+Existing workload, geometry, population and history limits, cancellation and exact
+idempotency remain enforced. The complete canonical envelope is retained at the
+study root; its checksum participates in source provenance and branch run identity.
+Retained plans reproduce through the same offline entry point. Cold catalog
+recovery validates completed receipts without starting a new scientific worker.
+
+Authored coverage compares a complete-source control with an independently evolved
+world, checks selection treatments and unchanged source bytes, and reproduces
+terminal samples and run IDs offline. The actual catalog fixture includes imported
+map state, a pending source schedule, a different owner during cold recovery, and
+tampered retained-source refusal. Raw projections, mismatched source/config/seed,
+corrupt files, excessive treatments and pre-cancelled work still refuse before
+output. Independent source review completed; the runner/control candidates passed
+pinned DSR parsing. Formatter findings were applied manually, but a further executor
+failure prevented their final gate rerun. The companion core, runtime and native
+replay formatting corrections passed their final DSR gate on the exact retained
+blobs. Native compilation, Clippy and executable tests remain unverified.
+
 **Recorded input authority for native replay (2026-11-24):**
 [Currently In Progress — Codex; scoped contribution to `bd-2z0.5.13`;
 original ownership and complete acceptance retained]
@@ -24,8 +54,10 @@ mutation before an off-cadence flush, and noncommuting config/schedule inputs.
 It checks complete events and final digests, conflicting launch settings and
 brain presets, ignored invented recipe inputs, and reordered-input divergence.
 A no-journal recording retains its explicit legacy-input classification.
-Compilation, Clippy and executable tests remain unverified: executor resets
-interrupted the pinned DSR tooling restoration before source gates could run.
+Independent source review and pinned DSR parsing passed after tooling recovery.
+The final native replay and shared interpreter blobs also passed DSR formatting.
+Compilation, Clippy and executable tests remain unverified; these source checks
+do not exercise the real recording or native dependency graph.
 These changes do not close the original native acceptance.
 
 **Save and review complete owner checkpoints (2026-11-24):**

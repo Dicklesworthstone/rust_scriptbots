@@ -209,9 +209,10 @@ pub fn recorded_input_history(
         // Scheduled patches are separate journal records, not operator commands.
         // Their actual position relative to same-tick commands is authoritative.
         let mut after = checkpoint.and_then(|(_, cut)| {
-            (cut.last_journal_sequence != 0).then_some(
-                scriptbots_runtime::JournalBatchId::new(cut.session_id, cut.last_journal_sequence),
-            )
+            (cut.last_journal_sequence != 0).then_some(scriptbots_runtime::JournalBatchId::new(
+                cut.session_id,
+                cut.last_journal_sequence,
+            ))
         });
         let minimum_tick = checkpoint.map_or(0, |(tick, _)| tick);
         let mut session_range: Option<(u64, u64)> = None;

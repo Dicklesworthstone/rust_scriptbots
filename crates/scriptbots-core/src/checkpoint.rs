@@ -3992,7 +3992,12 @@ mod tests {
         let mut restored_session = restored
             .bind_persistence(Box::new(crate::NullPersistence))
             .unwrap();
-        for world in [&mut original, &mut restored, &mut projected, &mut archive_loss] {
+        for world in [
+            &mut original,
+            &mut restored,
+            &mut projected,
+            &mut archive_loss,
+        ] {
             world
                 .enqueue_intervention(Intervention::SpawnFromArchive {
                     selector: crate::CellSelector::TopKByQuality(1),

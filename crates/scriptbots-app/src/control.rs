@@ -1932,6 +1932,9 @@ impl CheckpointBranchDefinitionV1 {
                 "admission version, request, plan or source identity mismatch",
             ));
         }
+        // Recovery never executes a future. Admission already validated the exact
+        // envelope bound by source_checksum_blake3, including its continuity policy.
+        // Apply universal limits here so complete-source receipts remain discoverable.
         crate::branch_study::validate_study_config(&self.plan.config)
             .map_err(|error| checkpoint_branch_catalog_error(directory, error))?;
         Ok(())
@@ -2353,7 +2356,7 @@ impl CheckpointBranchJob {
     fn start(
         &mut self,
         runner: crate::branch_study::BranchStudyOrchestrator,
-        checkpoint: scriptbots_core::WorldCheckpointV1,
+        checkpoint: CatalogCheckpoint,
         artifact_root: PathBuf,
         artifacts: Arc<Mutex<BTreeMap<String, RetainedArtifact>>>,
         reservation: ExperimentExecutionReservation,
@@ -2368,7 +2371,14 @@ impl CheckpointBranchJob {
             .stack_size(32 * 1024 * 1024)
             .spawn(move || {
                 let _reservation = reservation;
-                let result = runner.execute_from_checkpoint(&checkpoint, Some(&cancel));
+                let result = match &checkpoint {
+                    CatalogCheckpoint::Science(checkpoint) => {
+                        runner.execute_from_checkpoint(checkpoint, Some(&cancel))
+                    }
+                    CatalogCheckpoint::Host(checkpoint) => {
+                        runner.execute_from_host_checkpoint(checkpoint, Some(&cancel))
+                    }
+                };
                 let result = match result {
                     Ok(report) => stage_checkpoint_branch_artifacts(
                         &artifact_root,
@@ -2979,7 +2989,8 @@ impl CatalogCheckpoint {
         }
     }
 
-    /// Independent branch studies retain their explicit standalone-science contract.
+    /// Explicitly extracting the raw component must not discard retained auxiliary science.
+    #[cfg(test)]
     fn standalone_science(&self) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
         match self {
             Self::Science(checkpoint) => checkpoint.validate_standalone_restore(),
@@ -5959,19 +5970,19 @@ impl ControlHandle {
                 captured.scheduled_input_count,
             ),
             Err(_) => {
-                let captured = self
-                    .host
-                    .capture_host_checkpoint_v1()
-                    .map_err(|error| match error {
-                        scriptbots_runtime::HostCheckpointError::Host(error) => {
-                            ControlError::Host(error)
-                        }
-                        other => ControlError::Host(
-                            scriptbots_runtime::HostAccessError::ProtocolViolation {
-                                message: other.to_string(),
-                            },
-                        ),
-                    })?;
+                let captured =
+                    self.host
+                        .capture_host_checkpoint_v1()
+                        .map_err(|error| match error {
+                            scriptbots_runtime::HostCheckpointError::Host(error) => {
+                                ControlError::Host(error)
+                            }
+                            other => ControlError::Host(
+                                scriptbots_runtime::HostAccessError::ProtocolViolation {
+                                    message: other.to_string(),
+                                },
+                            ),
+                        })?;
                 let source_session = captured.session_id();
                 let source_scientific_revision = captured.scientific_revision();
                 let source_config_revision = captured.config_revision();
@@ -5979,16 +5990,17 @@ impl ControlHandle {
                 let source_scheduled_input_count = captured
                     .remaining_schedule()
                     .and_then(|remaining| remaining.last())
-                    .map_or(captured.completed_schedule_sequence().unwrap_or(0), |patch| {
-                        patch.sequence
-                    });
+                    .map_or(
+                        captured.completed_schedule_sequence().unwrap_or(0),
+                        |patch| patch.sequence,
+                    );
                 let source = match captured.validate_standalone_projection() {
                     Ok(()) => {
                         CatalogCheckpoint::Science(Box::new(captured.world_checkpoint().clone()))
                     }
-                    Err(scriptbots_core::WorldCheckpointError::RequiresHostContinuity { .. }) => {
-                        CatalogCheckpoint::Host(Box::new(captured))
-                    }
+                    Err(scriptbots_core::WorldCheckpointError::RequiresHostContinuity {
+                        ..
+                    }) => CatalogCheckpoint::Host(Box::new(captured)),
                     Err(error) => return Err(ControlError::Serialization(error.to_string())),
                 };
                 (
@@ -6695,16 +6707,17 @@ impl ControlHandle {
                 "retained checkpoint branches reached {MAX_RETAINED_CHECKPOINT_BRANCHES}; existing identities and artifacts are preserved"
             )));
         }
-        let checkpoint = self.verified_canvas_checkpoint(&request.checkpoint_id)?;
-        crate::branch_study::validate_study_config(checkpoint.config())
+        let checkpoint = self.verified_canvas_source(&request.checkpoint_id)?;
+        let science = checkpoint.science();
+        crate::branch_study::validate_study_config(science.config())
             .map_err(|error| ControlError::BadRequest(error.to_string()))?;
-        if checkpoint.agent_count() as u64 > crate::branch_study::MAX_STUDY_POPULATION {
+        if science.agent_count() as u64 > crate::branch_study::MAX_STUDY_POPULATION {
             return Err(ControlError::PayloadTooLarge(format!(
                 "checkpoint population exceeds branch-study limit {}",
                 crate::branch_study::MAX_STUDY_POPULATION,
             )));
         }
-        let (width, height) = checkpoint
+        let (width, height) = science
             .config()
             .food_dimensions()
             .map_err(|error| ControlError::BadRequest(error.to_string()))?;
@@ -6713,8 +6726,8 @@ impl ControlHandle {
             1,
             u64::from(width) * u64::from(height),
         )?;
-        let (world, preset) = Self::restore_canvas_world_and_preset(&checkpoint, None)?;
-        let preset = preset.ok_or_else(|| {
+        let world = Self::restore_catalog_world(&checkpoint)?;
+        let preset = crate::brains::checkpoint_brain_preset(science).ok_or_else(|| {
             ControlError::BadRequest(
                 "checkpoint branching requires a versioned compiled application brain preset"
                     .to_owned(),
@@ -6722,7 +6735,7 @@ impl ControlHandle {
         })?;
         let base_seed = world.agent_substream_protocol_v1().root_seed();
         drop(world);
-        let source_tick = checkpoint.tick().0;
+        let source_tick = science.tick().0;
         let target_tick = source_tick.checked_add(request.ticks).ok_or_else(|| {
             ControlError::BadRequest("checkpoint branch target tick overflows".to_owned())
         })?;
@@ -6741,17 +6754,19 @@ impl ControlHandle {
                 checkpoint_tick: source_tick,
                 horizon_ticks: request.ticks,
                 brain_preset: preset,
-                config: checkpoint.config().clone(),
+                config: science.config().clone(),
                 source_checkpoint: None,
                 branches,
             },
             output.clone(),
         );
-        // Reuse the runner's exact raw-cut restrictions, supported adapters and
-        // work accounting. No reconstructed world survives this preflight.
-        let source = runner
-            .validate_from_checkpoint(&checkpoint)
-            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        // Reuse the runner's source-specific restrictions, supported adapters and
+        // treatment/work bounds. No reconstructed world survives this preflight.
+        let source = match &checkpoint {
+            CatalogCheckpoint::Science(checkpoint) => runner.validate_from_checkpoint(checkpoint),
+            CatalogCheckpoint::Host(checkpoint) => runner.validate_from_host_checkpoint(checkpoint),
+        }
+        .map_err(|error| ControlError::BadRequest(error.to_string()))?;
         let mut retained_plan = runner.plan.clone();
         retained_plan.source_checkpoint = Some(output.join("source_checkpoint.bin"));
         let definition = CheckpointBranchDefinitionV1 {
@@ -6761,7 +6776,7 @@ impl ControlHandle {
             request_hash,
             source_tick,
             target_tick,
-            world_digest_v1: checkpoint.source_digest().overall.clone(),
+            world_digest_v1: science.source_digest().overall.clone(),
             source_byte_size: source.len() as u64,
             source_checksum_blake3: compute_blake3(&source),
             plan: retained_plan,
@@ -7153,8 +7168,9 @@ impl ControlHandle {
         Ok(())
     }
 
-    /// Independent branch studies require a source that can stand alone without
-    /// retained owner-only science. They do not adopt the captured owner's session.
+    /// Read the raw science component only when it can stand alone without
+    /// dropping auxiliary state retained by a complete source.
+    #[cfg(test)]
     fn verified_canvas_checkpoint(
         &self,
         checkpoint_id: &str,
@@ -17045,7 +17061,11 @@ pub(crate) mod tests {
                     ..scriptbots_core::AgentData::default()
                 })
                 .unwrap();
-            assert!(world.bind_agent_brain(agent, brains.population()[0]).unwrap());
+            assert!(
+                world
+                    .bind_agent_brain(agent, brains.population()[0])
+                    .unwrap()
+            );
         }
         let host = TestHost::spawn_with_schedule(
             world,
@@ -17170,17 +17190,92 @@ pub(crate) mod tests {
         let mut false_schema = saved.clone();
         false_schema.schema = scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA.to_owned();
         assert!(ControlHandle::decode_canvas_checkpoint(&false_schema, &artifact, &bytes).is_err());
-        assert!(matches!(
-            handle.create_checkpoint_branch(checkpoint_branch_request(
-                &saved.checkpoint_id,
-                "full-source-independent-branch"
-            )),
-            Err(ControlError::BadRequest(_))
-        ));
-        assert!(!directory.join("branches").exists());
+        let branch_request =
+            checkpoint_branch_request(&saved.checkpoint_id, "full-source-independent-branch");
+        let admitted = handle
+            .create_checkpoint_branch(branch_request.clone())
+            .unwrap();
+        let completed = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        assert_eq!(completed.source_tick, saved.tick);
+        assert_eq!(completed.target_tick, saved.tick + branch_request.ticks);
+        let (_, report_bytes) = handle
+            .read_artifact_bytes(completed.artifact_id.as_deref().unwrap())
+            .unwrap();
+        let report: crate::branch_study::BranchStudyReport =
+            serde_json::from_slice(&report_bytes).unwrap();
+        assert_eq!(report.pre_intervention_digest, saved.world_digest_v1);
+        assert!(report.pre_intervention_digest_verified_for_all_branches);
+        assert_eq!(report.branch_reports.len(), 1);
+        let mut future = ControlHandle::restore_catalog_world(&source).unwrap();
+        for _ in 0..branch_request.ticks {
+            future.step().unwrap();
+        }
+        assert_eq!(
+            report.branch_reports[0].final_digest,
+            future.world_digest_v1().unwrap().overall
+        );
+        assert_ne!(
+            report.branch_reports[0].final_digest, live.digest.overall,
+            "the original owner's pending schedule must not become a fork treatment"
+        );
+        let study_output = directory
+            .join("branches")
+            .join(&admitted.branch_id)
+            .join("study");
+        let retained_source = study_output.join("source_checkpoint.bin");
+        assert_eq!(fs::read(&retained_source).unwrap(), bytes);
+        assert_eq!(
+            report.source,
+            crate::branch_study::BranchStudySource::SavedCheckpoint {
+                artifact_path: "source_checkpoint.bin".to_owned(),
+                byte_size: bytes.len() as u64,
+                checksum_blake3: compute_blake3(&bytes),
+            }
+        );
+        let retained_plan: crate::branch_study::BranchStudyPlan =
+            serde_json::from_slice(&fs::read(study_output.join("study_plan.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            retained_plan.source_checkpoint.as_ref(),
+            Some(&retained_source)
+        );
+        let offline_output = directory.join("full-source-offline-reproduced");
+        let runner = crate::branch_study::BranchStudyOrchestrator::new(
+            retained_plan,
+            offline_output.clone(),
+        );
+        let reproduced = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || runner.execute_study(None))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reproduced.source, report.source);
+        assert_eq!(
+            reproduced.branch_reports[0].terminal_sample,
+            report.branch_reports[0].terminal_sample
+        );
+        assert_eq!(
+            fs::read(offline_output.join("source_checkpoint.bin")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            handle
+                .create_checkpoint_branch(branch_request.clone())
+                .unwrap(),
+            completed
+        );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), live.digest);
-        assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &publication));
-        assert_eq!(handle.read_artifact_bytes(&saved.checkpoint_id).unwrap().1, bytes);
+        assert!(Arc::ptr_eq(
+            &host.port.snapshot_hub().latest(),
+            &publication
+        ));
+        assert_eq!(
+            handle.read_artifact_bytes(&saved.checkpoint_id).unwrap().1,
+            bytes
+        );
         drop(handle);
         drop(host);
 
@@ -17204,8 +17299,46 @@ pub(crate) mod tests {
         let cold_digest = cold_owner.port.scientific_digest_v1().unwrap();
         let cold_publication = cold_owner.port.snapshot_hub().latest();
         assert_eq!(cold.create_checkpoint(request).unwrap(), saved);
-        assert_eq!(cold.read_artifact_bytes(&saved.checkpoint_id).unwrap().1, bytes);
-        let (reopened, view) = cold.checkpoint_canvas_bounded(&saved.checkpoint_id).unwrap();
+        assert_eq!(
+            cold.read_artifact_bytes(&saved.checkpoint_id).unwrap().1,
+            bytes
+        );
+        assert_eq!(
+            cold.get_checkpoint_branch(&admitted.branch_id).unwrap(),
+            completed
+        );
+        assert_eq!(
+            cold.create_checkpoint_branch(branch_request).unwrap(),
+            completed
+        );
+        assert_eq!(
+            cold.read_artifact_bytes(completed.artifact_id.as_deref().unwrap())
+                .unwrap()
+                .1,
+            report_bytes
+        );
+        assert_eq!(
+            cold.data_services
+                .execution_capacity
+                .lock()
+                .unwrap()
+                .reserved_run_slots,
+            0,
+            "cold receipt recovery must never launch scientific work"
+        );
+        assert!(
+            cold.data_services
+                .checkpoint_branches
+                .lock()
+                .unwrap()
+                .get(&admitted.branch_id)
+                .unwrap()
+                .worker
+                .is_none()
+        );
+        let (reopened, view) = cold
+            .checkpoint_canvas_bounded(&saved.checkpoint_id)
+            .unwrap();
         assert_eq!(reopened, saved);
         assert_eq!(
             logical(serde_json::to_value(&view.world).unwrap()),
@@ -17229,6 +17362,31 @@ pub(crate) mod tests {
             &cold_owner.port.snapshot_hub().latest(),
             &cold_publication
         ));
+        let branch_source_artifact = cold
+            .list_artifacts(Some(100), None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|artifact| artifact.filename == "source_checkpoint.bin")
+            .unwrap();
+        assert_eq!(
+            cold.read_artifact_bytes(&branch_source_artifact.artifact_id)
+                .unwrap()
+                .1,
+            bytes
+        );
+        let mut corrupted_source = bytes.clone();
+        *corrupted_source.last_mut().unwrap() ^= 1;
+        fs::write(&retained_source, &corrupted_source).unwrap();
+        assert!(
+            cold.read_artifact_bytes(&branch_source_artifact.artifact_id)
+                .is_err()
+        );
+        assert_eq!(
+            cold.read_artifact_bytes(&saved.checkpoint_id).unwrap().1,
+            bytes
+        );
+        assert_eq!(cold_owner.port.scientific_digest_v1().unwrap(), cold_digest);
     }
 
     #[test]
@@ -17255,7 +17413,11 @@ pub(crate) mod tests {
         let agent = world
             .try_spawn_agent(scriptbots_core::AgentData::default())
             .unwrap();
-        assert!(world.bind_agent_brain(agent, brains.population()[0]).unwrap());
+        assert!(
+            world
+                .bind_agent_brain(agent, brains.population()[0])
+                .unwrap()
+        );
         world.step().unwrap();
         world.step().unwrap();
         assert!(world.archive().unwrap().coverage_count() > 0);
@@ -17284,12 +17446,17 @@ pub(crate) mod tests {
             assert_eq!(owner.config().archive_enabled, enabled);
             assert!(matches!(
                 owner.validate_standalone_projection(),
-                Err(scriptbots_core::WorldCheckpointError::RequiresHostContinuity {
-                    feature: "quality-diversity history"
-                })
+                Err(
+                    scriptbots_core::WorldCheckpointError::RequiresHostContinuity {
+                        feature: "quality-diversity history"
+                    }
+                )
             ));
             if !enabled {
-                owner.world_checkpoint().validate_standalone_restore().unwrap();
+                owner
+                    .world_checkpoint()
+                    .validate_standalone_restore()
+                    .unwrap();
             }
             let source = CatalogCheckpoint::decode(&saved.schema, &bytes).unwrap();
             let restored = ControlHandle::restore_catalog_world(&source).unwrap();
@@ -17364,7 +17531,10 @@ pub(crate) mod tests {
             assert_eq!(usage.pending_entries, 0);
             assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
             assert!(fs::read_dir(&directory).unwrap().next().is_none());
-            assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &publication));
+            assert!(Arc::ptr_eq(
+                &host.port.snapshot_hub().latest(),
+                &publication
+            ));
         }
     }
 
@@ -17503,7 +17673,10 @@ pub(crate) mod tests {
         assert_eq!(usage.sql_count, Some(1));
         assert_eq!(usage.pending_entries, 0);
         drop(handle);
-        port.submit(CommandEnvelope::new(CommandId::new(4), HostCommand::Shutdown))?;
+        port.submit(CommandEnvelope::new(
+            CommandId::new(4),
+            HostCommand::Shutdown,
+        ))?;
         drop(port);
         let receipt = host.join()?;
         assert_eq!(receipt.final_digest?, live);
@@ -17518,7 +17691,10 @@ pub(crate) mod tests {
         assert_eq!(row.checkpoint_ordinal, 0);
         assert_eq!(row.tick, saved.tick);
         assert_eq!(row.format, format!("{}+postcard_hex", saved.schema));
-        assert_eq!(row.payload_digest, format!("blake3:{}", saved.checksum_blake3));
+        assert_eq!(
+            row.payload_digest,
+            format!("blake3:{}", saved.checksum_blake3)
+        );
         assert_eq!(row.host_checkpoint()?.encode()?, bytes);
         let metadata: serde_json::Value = serde_json::from_str(&row.metadata_json)?;
         assert_eq!(metadata["source"], "control_api");
