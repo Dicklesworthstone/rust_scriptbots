@@ -38,8 +38,9 @@
 //! Complete host checkpoints restore auxiliary scientific state into independent futures,
 //! including selection history, imported map temperature and the scrambling RNG. Their saved
 //! session, schedules, journal and recording ownership are not adopted. Raw scientific cuts
-//! and seeded checkpoint studies retain their standalone-state restrictions; archive-dependent
-//! spawning treatments remain unsupported for every source.
+//! and seeded checkpoint studies retain their standalone-state restrictions. Archive resurrection
+//! treatments require a complete source and respect its retained archive, cohort headroom and
+//! the study population limit at the actual intervention boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -133,7 +134,7 @@ pub enum StudyIntervention {
     },
     /// Cooperation economics parameter adjustments.
     Cooperation(CooperationParams),
-    /// Direct core intervention command; archive-dependent spawning is unsupported.
+    /// Direct core intervention command; archive resurrection requires a complete host source.
     Core(Intervention),
     /// Arbitrary configuration patch resolved via pure precedence.
     ConfigPatch(serde_json::Value),
@@ -405,12 +406,6 @@ impl StudyIntervention {
                 }
             }
             Self::Core(intervention) => {
-                if matches!(intervention, Intervention::SpawnFromArchive { .. }) {
-                    return Err(BranchStudyError::InvalidIntervention {
-                        branch_id: "core".to_string(),
-                        reason: "archive-dependent SpawnFromArchive is not supported by checkpoint branch studies".to_owned(),
-                    });
-                }
                 intervention
                     .validate_for_world(world_width, world_height)
                     .map_err(|e| BranchStudyError::InvalidIntervention {
@@ -1108,6 +1103,35 @@ fn enforce_study_population(world: &WorldState) -> Result<(), BranchStudyError> 
     )
 }
 
+fn validate_study_archive_spawn(
+    world: &WorldState,
+    intervention: &Intervention,
+) -> Result<(), BranchStudyError> {
+    let Intervention::SpawnFromArchive {
+        selector, headroom, ..
+    } = intervention
+    else {
+        return Ok(());
+    };
+    let archive = world
+        .archive()
+        .ok_or_else(|| BranchStudyError::InvalidIntervention {
+            branch_id: "core".to_owned(),
+            reason: "archive resurrection requires a retained behavioral archive".to_owned(),
+        })?;
+    let selected = archive.select_cells(selector).len() as u64;
+    enforce_study_limit(
+        "archive resurrection count",
+        selected,
+        u64::from(headroom.unwrap_or(scriptbots_core::MAX_COHORT_INJECTION)),
+    )?;
+    enforce_study_limit(
+        "live population after archive resurrection",
+        (world.agent_count() as u64).saturating_add(selected),
+        MAX_STUDY_POPULATION,
+    )
+}
+
 fn read_study_checkpoint(path: &Path) -> Result<Vec<u8>, BranchStudyError> {
     let maximum = scriptbots_core::MAX_WORLD_CHECKPOINT_BYTES
         .max(scriptbots_runtime::MAX_HOST_CHECKPOINT_BYTES) as u64;
@@ -1542,6 +1566,17 @@ impl BranchStudyOrchestrator {
                         branch.branch_id, self.plan.checkpoint_tick
                     )));
                 }
+                if !has_continuity
+                    && matches!(
+                        intervention,
+                        StudyIntervention::Core(Intervention::SpawnFromArchive { .. })
+                    )
+                {
+                    return Err(BranchStudyError::InvalidIntervention {
+                        branch_id: branch.branch_id.clone(),
+                        reason: "raw checkpoints omit the behavioral archive required by SpawnFromArchive".to_owned(),
+                    });
+                }
                 intervention
                     .validate(self.plan.config.world_width, self.plan.config.world_height)?;
                 if let StudyIntervention::ConfigPatch(patch) = intervention {
@@ -1812,7 +1847,24 @@ impl BranchStudyOrchestrator {
         // every source byte. Restore checks family codecs, supported state and the complete
         // science digest before output is claimed; the preflight owner never takes a step.
         let source_bytes = source.encode()?;
-        drop(self.restore_study_checkpoint(source)?);
+        let world = self.restore_study_checkpoint(source)?;
+        for branch in &self.plan.branches {
+            if let Some(StudyIntervention::Core(
+                intervention @ Intervention::SpawnFromArchive { .. },
+            )) = &branch.intervention
+            {
+                if world.archive().is_none() {
+                    return Err(BranchStudyError::InvalidIntervention {
+                        branch_id: branch.branch_id.clone(),
+                        reason: "archive resurrection requires a retained behavioral archive"
+                            .to_owned(),
+                    });
+                }
+                if branch.scheduled_tick.unwrap_or(checkpoint.tick().0) == checkpoint.tick().0 {
+                    validate_study_archive_spawn(&world, intervention)?;
+                }
+            }
+        }
         Ok(source_bytes)
     }
 
@@ -2425,6 +2477,9 @@ impl BranchStudyOrchestrator {
                     .map_err(BranchStudyError::WorldState)?;
             }
             StudyIntervention::Core(it) => {
+                // A delayed treatment selects the archive as it exists at this boundary.
+                // Refuse overflow before any genomes are injected or science advances.
+                validate_study_archive_spawn(world, it)?;
                 world
                     .enqueue_intervention(it.clone())
                     .map_err(BranchStudyError::WorldState)?;
@@ -3439,6 +3494,176 @@ mod tests {
     }
 
     #[test]
+    fn complete_checkpoint_archive_treatments_match_real_resurrection_at_the_due_boundary() {
+        let directory = tempdir().unwrap();
+        for delay in [0, 1] {
+            let (mut plan, checkpoint, mut oracle) = complete_study_fixture();
+            let original = checkpoint.encode().unwrap();
+            let due = plan.checkpoint_tick + delay;
+            plan.horizon_ticks = 3;
+            let intervention = Intervention::SpawnFromArchive {
+                selector: scriptbots_core::CellSelector::TopKByQuality(1),
+                placement: scriptbots_core::Placement::Seeded {
+                    region: Region::All,
+                    seed: 1111,
+                },
+                headroom: Some(1),
+                herbivore_tendency: Some(0.7),
+            };
+            plan.branches[1].intervention = Some(StudyIntervention::Core(intervention.clone()));
+            plan.branches[1].scheduled_tick = Some(due);
+            let original_uids = oracle
+                .agents()
+                .iter_handles()
+                .map(|id| oracle.agent_uid(id).unwrap())
+                .collect::<BTreeSet<_>>();
+            let mut resurrected_genome = None;
+            for _ in 0..plan.horizon_ticks {
+                if oracle.tick().0 == due {
+                    let entries = oracle
+                        .archive()
+                        .unwrap()
+                        .select_entries(&scriptbots_core::CellSelector::TopKByQuality(1));
+                    assert_eq!(entries.len(), 1, "the source must retain a real elite");
+                    resurrected_genome = Some(entries[0].genome.clone());
+                    oracle.enqueue_intervention(intervention.clone()).unwrap();
+                }
+                oracle.step().unwrap();
+            }
+            let newcomers = oracle
+                .agents()
+                .iter_handles()
+                .filter(|id| !original_uids.contains(&oracle.agent_uid(*id).unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(newcomers.len(), 1);
+            assert_eq!(
+                oracle.agent_brain_genome(newcomers[0]),
+                resurrected_genome.as_ref(),
+                "the oracle must inject the actual selected archived genome"
+            );
+            let output = directory.path().join(format!("archive-delay-{delay}"));
+            let report = BranchStudyOrchestrator::new(plan, output.clone())
+                .execute_from_host_checkpoint(&checkpoint, None)
+                .unwrap();
+            let control = &report.branch_reports[0];
+            let treatment = &report.branch_reports[1];
+            assert_eq!(
+                treatment.final_digest,
+                oracle.world_digest_v1().unwrap().overall
+            );
+            assert_eq!(
+                treatment.terminal_sample.population,
+                control.terminal_sample.population + 1
+            );
+            assert_eq!(treatment.command_applied_tick, Some(due));
+            assert_eq!(treatment.first_divergence.as_ref().unwrap().tick, due + 1);
+            assert_ne!(treatment.final_digest, control.final_digest);
+            assert_ne!(exported_run_id(treatment), exported_run_id(control));
+            assert_eq!(
+                fs::read(output.join(SOURCE_CHECKPOINT_ARTIFACT)).unwrap(),
+                original
+            );
+            assert_eq!(checkpoint.encode().unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn archive_treatments_enforce_actual_cohort_and_population_bounds_before_injection() {
+        let directory = tempdir().unwrap();
+        let (plan, checkpoint, oracle) = complete_study_fixture();
+        let original = checkpoint.encode().unwrap();
+        let cell = oracle.archive().unwrap().cell_ids_sorted()[0];
+        let over_population = usize::try_from(MAX_STUDY_POPULATION).unwrap();
+        for (name, count, headroom, expected_resource) in [
+            ("cohort", 2, 1, "archive resurrection count"),
+            (
+                "population",
+                over_population,
+                u32::try_from(MAX_STUDY_POPULATION).unwrap(),
+                "live population after archive resurrection",
+            ),
+        ] {
+            let intervention = StudyIntervention::Core(Intervention::SpawnFromArchive {
+                selector: scriptbots_core::CellSelector::Explicit(vec![cell; count]),
+                placement: scriptbots_core::Placement::Seeded {
+                    region: Region::All,
+                    seed: 1111,
+                },
+                headroom: Some(headroom),
+                herbivore_tendency: None,
+            });
+            let mut immediate = plan.clone();
+            immediate.branches[1].intervention = Some(intervention.clone());
+            immediate.branches[1].scheduled_tick = Some(plan.checkpoint_tick);
+            let output = directory.path().join(format!("immediate-{name}"));
+            assert!(matches!(
+                BranchStudyOrchestrator::new(immediate, output.clone())
+                    .execute_from_host_checkpoint(&checkpoint, None),
+                Err(BranchStudyError::CapacityExceeded { resource, .. })
+                    if resource == expected_resource
+            ));
+            assert!(!output.exists(), "an invalid immediate cohort reserves no output");
+
+            let mut delayed = plan.clone();
+            delayed.branches[1].intervention = Some(intervention);
+            delayed.branches[1].scheduled_tick = Some(plan.checkpoint_tick + 1);
+            let output = directory.path().join(format!("delayed-{name}"));
+            assert!(matches!(
+                BranchStudyOrchestrator::new(delayed, output.clone())
+                    .execute_from_host_checkpoint(&checkpoint, None),
+                Err(BranchStudyError::CapacityExceeded { resource, .. })
+                    if resource == expected_resource
+            ));
+            assert!(output.join("bundle_control").is_dir());
+            assert!(!output.join("bundle_resource_shock").exists());
+            assert!(!output.join("study_report.json").exists());
+            assert_eq!(
+                fs::read(output.join(SOURCE_CHECKPOINT_ARTIFACT)).unwrap(),
+                original
+            );
+        }
+        assert_eq!(checkpoint.encode().unwrap(), original);
+    }
+
+    #[test]
+    fn archive_treatments_require_an_actual_retained_archive_even_in_a_full_source() {
+        let directory = tempdir().unwrap();
+        let mut plan = replicated_fixture().study;
+        let owner = scriptbots_runtime::HostCore::new(
+            scriptbots_runtime::HostSessionId::new(0xfb02),
+            world_at_checkpoint(&plan),
+            scriptbots_runtime::HostCoreOptions {
+                initial_playback: scriptbots_runtime::PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..scriptbots_runtime::HostCoreOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(owner.world().archive().is_none());
+        let checkpoint = owner.capture_host_checkpoint_v1().unwrap();
+        plan.branches[1].intervention =
+            Some(StudyIntervention::Core(Intervention::SpawnFromArchive {
+                selector: scriptbots_core::CellSelector::TopKByQuality(1),
+                placement: scriptbots_core::Placement::Seeded {
+                    region: Region::All,
+                    seed: 1111,
+                },
+                headroom: None,
+                herbivore_tendency: None,
+            }));
+        let output = directory.path().join("missing-archive");
+        assert!(matches!(
+            BranchStudyOrchestrator::new(plan, output.clone())
+                .execute_from_host_checkpoint(&checkpoint, None),
+            Err(BranchStudyError::InvalidIntervention { ref reason, .. })
+                if reason.contains("retained behavioral archive")
+        ));
+        assert!(!output.exists());
+    }
+
+    #[test]
     fn complete_checkpoint_studies_refuse_mismatches_tampering_and_unsafe_treatments() {
         let directory = tempdir().unwrap();
         let (plan, checkpoint, _) = complete_study_fixture();
@@ -3480,26 +3705,6 @@ mod tests {
             );
             assert!(!output.exists());
         }
-        let mut archive_treatment = plan.clone();
-        archive_treatment.branches[1].intervention =
-            Some(StudyIntervention::Core(Intervention::SpawnFromArchive {
-                selector: scriptbots_core::CellSelector::TopKByQuality(1),
-                placement: scriptbots_core::Placement::Seeded {
-                    region: Region::All,
-                    seed: 1111,
-                },
-                headroom: None,
-                herbivore_tendency: None,
-            }));
-        let output = directory.path().join("archive-treatment");
-        assert!(matches!(
-            BranchStudyOrchestrator::new(archive_treatment, output.clone())
-                .execute_from_host_checkpoint(&checkpoint, None),
-            Err(BranchStudyError::InvalidIntervention { ref reason, .. })
-                if reason.contains("archive")
-        ));
-        assert!(!output.exists());
-
         let mut corrupt = original.clone();
         *corrupt.last_mut().unwrap() ^= 1;
         for (index, bytes) in [&corrupt[..], &original[..original.len() - 1]]

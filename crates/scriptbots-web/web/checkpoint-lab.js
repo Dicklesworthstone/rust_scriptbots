@@ -163,7 +163,16 @@ export function validateLabCheckpointPage(page, cursor = null) {
   return page;
 }
 
-/** The browser offers explicit scalar treatments; the application validates the saved world too. */
+/** Build the bounded archive treatment offered by the saved-world form. */
+export function archiveStudyTreatment(count, seed) {
+  return validateLabIntervention({ type: "Core", params: {
+    kind: "spawn_from_archive", selector: { TopKByQuality: count },
+    placement: { placement: "seeded", region: { shape: "all" }, seed },
+    headroom: count, herbivore_tendency: null,
+  } });
+}
+
+/** The application also validates source capabilities and the actual saved population. */
 export function validateLabIntervention(value) {
   if (value === null) return value;
   if (!keys(value, ["type", "params"])) throw new Error("Choose a supported checkpoint treatment");
@@ -180,10 +189,21 @@ export function validateLabIntervention(value) {
     }
   } else if (value.type === "ClosedWorld" && keys(p, ["closed"]) && typeof p.closed === "boolean") {
     return value;
+  } else if (value.type === "Core" && p?.kind === "spawn_from_archive") {
+    if (!keys(p, ["kind", "selector", "placement", "headroom", "herbivore_tendency"])
+        || !keys(p.selector, ["TopKByQuality"]) || !integer(p.selector.TopKByQuality, 1, 1000)
+        || !keys(p.placement, ["placement", "region", "seed"]) || p.placement.placement !== "seeded"
+        || !keys(p.placement.region, ["shape"]) || p.placement.region.shape !== "all"
+        || !integer(p.placement.seed, 0, 0xffff_ffff)
+        || !integer(p.headroom, p.selector.TopKByQuality, 1000)
+        || (p.herbivore_tendency !== null && (!scalar(p.herbivore_tendency)
+          || p.herbivore_tendency < 0 || p.herbivore_tendency > 1))) {
+      throw new Error("Archive studies need 1–1000 top occupied cells, a whole-world placement seed from 0 through 4294967295, and sufficient population headroom");
+    }
   } else if (value.type === "Core") {
     validateInterventionAction(p);
   } else {
-    throw new Error("Choose a supported scalar checkpoint treatment without extra fields");
+    throw new Error("Choose a supported checkpoint treatment without extra fields");
   }
   return value;
 }
@@ -627,6 +647,10 @@ export class CheckpointLabController {
       if (typeof branchName !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(branchName)) throw new Error("Study name needs 1–64 letters, digits, underscores or hyphens");
       if (!integer(ticks, 1, MAX_BRANCH_TICKS) || !integer(this.selected.tick + ticks)) throw new Error("Choose 1–10,000 future ticks within the exact browser integer range");
       validateLabIntervention(intervention);
+      if (intervention?.type === "Core" && intervention.params.kind === "spawn_from_archive"
+          && this.selected.schema !== HOST_CHECKPOINT_SCHEMA) {
+        throw new Error("Archive resurrection requires a complete checkpoint with a retained behavioral archive");
+      }
       const key = this.id();
       if (!text(key, 1024) || !key.trim()) throw new Error("A stable study retry identity is unavailable");
       const request = copy({ sessionId: this.source.sessionId, checkpoint_id: this.selected.checkpoint_id,

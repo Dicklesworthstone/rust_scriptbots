@@ -10,7 +10,7 @@ import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource }
 import { InterventionController, renderInterventions, validateInterventionAction } from "./interventions.js";
 import { NarrativeController, renderNarrative, renderNarrativeSource } from "./narrative.js";
 import { validateContinuationBrains, validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
-import { CheckpointLabController, renderCheckpointLab } from "./checkpoint-lab.js";
+import { CheckpointLabController, renderCheckpointLab, archiveStudyTreatment } from "./checkpoint-lab.js";
 import { ExperimentController } from "./experiments.js";
 import { readExperimentForm, renderExperimentLab, experimentObservationExport } from "./experiment-view.js";
 import { renderStudyReport } from "./study-report.js";
@@ -433,6 +433,7 @@ function readLabTreatment() {
     case "closed_world": return { type: "ClosedWorld", params: {
       closed: document.getElementById("lab-closed").value === "true",
     } };
+    case "archive": return archiveStudyTreatment(number("lab-archive-count"), number("lab-archive-seed"));
     default: throw new Error("Choose a supported study treatment");
   }
 }

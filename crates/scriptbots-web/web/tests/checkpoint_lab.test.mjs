@@ -5,7 +5,7 @@ import {
   CHECKPOINT_LAB_PAGE_SIZE, MAX_LAB_ARTIFACT_BYTES, CheckpointLabController,
   renderCheckpointLab, validateLabArtifact, validateLabArtifactPage, validateLabBranchObservation, validateLabBranchPage, validateLabBranchStatus,
   validateLabCheckpoint, validateLabCheckpointPage, validateLabIntervention, validateCheckpointCanvas,
-  parseReplayTarget, validateCheckpointReplay,
+  parseReplayTarget, validateCheckpointReplay, archiveStudyTreatment,
 } from "../checkpoint-lab.js";
 import { RemoteOwnerHttpError, RemoteStreamClient } from "../remote.js";
 import { MAX_STUDY_REPORT_BYTES } from "../study-report.js";
@@ -459,6 +459,69 @@ test("study treatments match real PascalCase server enums and reject silent subs
     { type: "Core", params: { kind: "spawn_from_archive" } },
     { type: "ConfigPatch", params: { uncontrolled: true } },
   ]) assert.throws(() => validateLabIntervention(value));
+});
+
+test("archive study treatments preserve the native wire format and bounded population request", () => {
+  assert.deepEqual(archiveStudyTreatment(2, 42), { type: "Core", params: {
+    kind: "spawn_from_archive", selector: { TopKByQuality: 2 },
+    placement: { placement: "seeded", region: { shape: "all" }, seed: 42 },
+    headroom: 2, herbivore_tendency: null,
+  } });
+  assert.equal(archiveStudyTreatment(1000, 0xffff_ffff).params.headroom, 1000);
+  for (const change of [
+    (p) => { p.selector.TopKByQuality = 0; },
+    (p) => { p.selector.TopKByQuality = 1001; },
+    (p) => { p.selector.TopKByQuality = 1.5; },
+    (p) => { p.selector = "All"; },
+    (p) => { p.selector.All = true; },
+    (p) => { p.placement = { kind: "seeded", region: { shape: "all" }, seed: 42 }; },
+    (p) => { p.placement.region.shape = "disc"; },
+    (p) => { p.placement.seed = 0x1_0000_0000; },
+    (p) => { p.placement.seed = -1; },
+    (p) => { p.placement.seed = "42"; },
+    (p) => { p.headroom = 0; },
+    (p) => { p.headroom = 1001; },
+    (p) => { p.herbivore_tendency = Infinity; },
+    (p) => { p.herbivore_tendency = -0.1; },
+    (p) => { p.ignored = true; },
+  ]) {
+    const value = archiveStudyTreatment(1, 42);
+    change(value.params);
+    assert.throws(() => validateLabIntervention(value), /Archive studies/);
+  }
+  assert.throws(() => archiveStudyTreatment(2, NaN), /Archive studies/);
+});
+
+test("archive studies require a complete source and retain the exact request across uncertain admission", async () => {
+  const h = await harness();
+  const treatment = archiveStudyTreatment(1, 42);
+  assert.equal(await h.controller.launch({ branchName: "archive", ticks: 3, intervention: treatment }), null);
+  assert.equal(h.queues.launch.length, 0);
+  assert.equal(h.identities(), 0, "raw checkpoint refusal happens before a new retry identity");
+  assert.match(h.controller.notice, /complete checkpoint.*behavioral archive/);
+
+  const source = checkpoint({ checkpoint_id: "archive-owner", schema: "scriptbots.host-checkpoint.v1" });
+  h.controller.services.list = async () => page([checkpoint(), source]);
+  await h.controller.refresh(true);
+  h.controller.select(source.checkpoint_id);
+  const pending = h.controller.launch({ branchName: "archive", ticks: 3, intervention: treatment });
+  const request = h.queues.launch[0].request;
+  assert.equal(request.checkpoint_id, source.checkpoint_id);
+  assert.deepEqual(request.intervention, archiveStudyTreatment(1, 42));
+  treatment.params.selector.TopKByQuality = 999;
+  treatment.params.placement.seed = 7;
+  assert.deepEqual(request.intervention, archiveStudyTreatment(1, 42));
+  assert.equal(Object.isFrozen(request.intervention.params.placement), true);
+  h.queues.launch[0].reject(new Error("connection lost before admission was observed"));
+  await pending;
+  assert.equal(h.controller.branchState, "unconfirmed");
+  h.controller.select(checkpoint().checkpoint_id);
+  const retry = h.controller.retryLaunch();
+  assert.equal(h.queues.launch[1].request, request, "retry uses the original complete source and treatment");
+  h.queues.launch[1].resolve(status(request, source));
+  await retry;
+  assert.equal(h.controller.branch.status.status, "running");
+  assert.equal(h.controller.branch.checkpoint.checkpoint_id, source.checkpoint_id);
 });
 
 test("branch observations bind the saved digest and horizon and cannot regress a terminal state", () => {

@@ -809,6 +809,7 @@
                             <option value="resource_shock">Food shock versus unchanged control</option>
                             <option value="temperature">Temperature stress versus unchanged control</option>
                             <option value="closed_world">Population injection policy versus control</option>
+                            <option value="archive">Archived genomes versus unchanged control</option>
                         </select>
                     </label>
                     <fieldset data-lab-kinds="drought" hidden disabled>
@@ -846,6 +847,17 @@
                                 <option value="false">Open — permit configured population injection</option>
                             </select>
                         </label>
+                    </fieldset>
+                    <fieldset data-lab-kinds="archive" hidden disabled>
+                        <legend>Restore archived genomes</legend>
+                        <p>Requires a complete checkpoint with an active behavioral archive. The treatment restores genomes from up to the requested number of highest-quality occupied cells; the control starts from the same saved state without resurrection.</p>
+                        <label for="lab-archive-count">Maximum archived cells to restore (1–1000)
+                            <input id="lab-archive-count" type="number" min="1" max="1000" step="1" value="1" required />
+                        </label>
+                        <label for="lab-archive-seed">Placement seed
+                            <input id="lab-archive-seed" type="number" min="0" max="4294967295" step="1" value="42" required />
+                        </label>
+                        <p>The seed determines positions across the saved world. The host checks the archive and population limits before accepting the study.</p>
                     </fieldset>
                     <button id="lab-branch-launch" type="submit" disabled>Run study from selected checkpoint</button>
                     <p id="lab-form-error" role="status"></p>

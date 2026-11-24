@@ -2,6 +2,34 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Archive-resurrection studies and persistence progress (2026-11-24):**
+[Currently In Progress — Codex; scoped contributions to `bd-2z0.12.2`,
+`bd-16g.6.3`, `bd-16g.5`, `bd-kgob` and `bd-w1oi`;
+original complete acceptance retained]
+
+Complete-source studies can compare archive resurrection with an unchanged
+control. Raw sources still refuse this treatment. Preflight requires a retained
+archive and checks immediate selected-cohort headroom and projected population;
+delayed treatments repeat those checks at the actual due boundary. The browser
+offers highest-quality archived cells with explicit count and placement seed,
+requires the complete source format, and preserves the exact request on retries.
+
+Archipelago pressure retries retain their admitted Step command and original
+tick until the common barrier completes. Storage byte-budget refusals request
+one nonblocking, coalesced drain of an older admitted batch through the existing
+outbox/finalization protocol; the rejected payload still requires exact retry.
+A full command queue leaves the notification retryable and does not weaken
+durability or make SQL execution bounded.
+
+Authored regressions cover real archived-genome injection, immediate/delayed
+bounds, absent archives, independent controls, source integrity and browser
+request identity. DSR passed all 61 checkpoint browser tests including archive
+requests, and parsed the archive runner. The preceding runtime/storage increments
+also passed scoped parsing. Independent source reviews are complete. Native
+compilation and execution of the new Rust regressions remain required; these
+increments do not close the original gates.
+
+
 **Working storage-backed reels and paged replay inputs (2026-11-24):**
 [Currently In Progress — Codex; corrective contribution to `bd-16g.9.2`;
 original replay-integrity and long-run acceptance retained]
@@ -46,7 +74,8 @@ host envelopes as scientific sources. Each branch restores map scalars,
 selection/archive history and communication scrambling state into an independent
 world with recording disabled. The saved owner's session, journal authority and
 pending schedule are not adopted. Raw sources and seeded studies retain their
-standalone-state restrictions; archive-spawn treatments remain explicitly refused.
+standalone-state restrictions; archive-spawn treatments require a complete source
+with its retained behavioral archive, as described above.
 
 Source-specific restoration and treatment validation run before output reservation.
 Existing workload, geometry, population and history limits, cancellation and exact
