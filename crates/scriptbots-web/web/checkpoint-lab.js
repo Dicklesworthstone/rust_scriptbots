@@ -52,7 +52,7 @@ export function validateLabCheckpoint(value) {
 }
 
 function sameCheckpoint(left, right) {
-  return ["checkpoint_id", "tick", "agent_count", "byte_size", "world_digest_v1", "checksum_blake3", "checksum_sha256", "schema"]
+  return ["checkpoint_id", "tick", "agent_count", "byte_size", "world_digest_v1", "checksum_blake3", "checksum_sha256", "schema", "created_at_utc", "description"]
     .every((key) => left[key] === right[key]);
 }
 
@@ -74,6 +74,59 @@ export function validateCheckpointCanvas(value, { sessionId, checkpoint }) {
       || snapshot.agents.length !== checkpoint.agent_count || frame.playback?.paused !== true
       || frame.playback.speedMultiplier !== 1 || !object(frame.environment)) {
     throw new Error("The reconstructed canvas disagrees with its saved scientific cut");
+  }
+  return value;
+}
+
+/** Preserve decimal targets exactly; the current browser snapshot uses safe Numbers. */
+export function parseReplayTarget(value) {
+  try { exactIdentity(value); }
+  catch (_) { throw new Error("Enter a whole target tick using decimal digits without signs, spaces, exponents or leading zeroes"); }
+  const tick = BigInt(value);
+  if (tick > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("The browser cannot display ticks above 9007199254740991 exactly; use a native replay client for larger ticks");
+  }
+  return tick;
+}
+
+/** A replay carries the selected source and the actual scope of its digest check. */
+export function validateCheckpointReplay(value, { sessionId, checkpoint, targetTick }) {
+  validateLabCheckpoint(checkpoint);
+  validateLabCheckpoint(value?.checkpoint);
+  exactIdentity(sessionId, 128);
+  const target = parseReplayTarget(targetTick), source = BigInt(checkpoint.tick);
+  if (value?.schema !== "scriptbots.checkpoint-replay.v1"
+      || value.sourceSessionId !== sessionId || !sameCheckpoint(value.checkpoint, checkpoint)
+      || value.targetTick !== targetTick || target < source) {
+    throw new Error("The historical replay does not match its selected checkpoint, target and host");
+  }
+  const bound = BigInt(exactIdentity(value.maxVerificationTicks));
+  if (bound === 0n) throw new Error("The replay verification bound is invalid");
+  const verification = value.verification;
+  if (target === source) {
+    if (!keys(verification, ["kind"]) || verification.kind !== "saved_cut") {
+      throw new Error("A saved-cut review requires saved-cut verification");
+    }
+  } else {
+    if (!keys(verification, ["kind", "verifiedThroughTick", "capturedCurrentDigest"])
+        || verification.kind !== "captured_interval" || !worldDigest(verification.capturedCurrentDigest)) {
+      throw new Error("Historical replay requires captured-current interval verification");
+    }
+    const endpoint = BigInt(exactIdentity(verification.verifiedThroughTick));
+    if (endpoint < target || endpoint - source > bound) {
+      throw new Error("The complete replay verification interval is outside its observed bounds");
+    }
+  }
+  const frame = value.frame, identity = frame?.identity, snapshot = frame?.snapshot;
+  for (const field of ["sessionId", "publicationRevision", "scientificRevision",
+    "controlRevision", "configRevision", "tick"]) exactIdentity(identity?.[field], field === "sessionId" ? 128 : 64);
+  if (frame?.schema !== "scriptbots.browser-frame.v1" || identity.sessionId !== sessionId
+      || identity.tick !== targetTick || snapshot?.tick !== Number(target)
+      || !integer(snapshot.summary?.agentCount) || !Array.isArray(snapshot.agents)
+      || snapshot.agents.length !== snapshot.summary.agentCount
+      || (target === source && snapshot.agents.length !== checkpoint.agent_count)
+      || frame.playback?.paused !== true || frame.playback.speedMultiplier !== 1 || !object(frame.environment)) {
+    throw new Error("The reconstructed canvas disagrees with its verified historical target");
   }
   return value;
 }
@@ -204,9 +257,9 @@ function validateDownload(result, artifactId, expected, branchId) {
 
 /** One bounded request slot, with explicit retries for potentially admitted mutations. */
 export class CheckpointLabController {
-  constructor({ list, listStudies, save, review, launch, status, cancel, artifacts, download, onChange = () => {},
+  constructor({ list, listStudies, save, review, replay, launch, status, cancel, artifacts, download, onChange = () => {},
     id = interventionRequestId, now = () => performance.now(), parseReport = parseSavedStudyReport }) {
-    this.services = { list, listStudies, save, review, launch, status, cancel, artifacts, download };
+    this.services = { list, listStudies, save, review, replay, launch, status, cancel, artifacts, download };
     this.onChange = onChange;
     this.id = id;
     this.now = now;
@@ -224,6 +277,7 @@ export class CheckpointLabController {
     this.cursor = null;
     this.selected = null;
     this.canvasPreview = null;
+    this.replayTickText = "";
     this.saveRequest = null;
     this.saveReceipt = null;
     this.saveState = "idle";
@@ -246,6 +300,15 @@ export class CheckpointLabController {
   get canOperate() { return this.enabled && this.source !== null && !this.busy; }
   get canSave() { return this.canOperate && this.ownerWritable && this.canvasPreview === null && this.saveState !== "unconfirmed"; }
   get canReview() { return this.canOperate && this.selected !== null && typeof this.services.review === "function"; }
+  get reviewPending() { return ["Saved-world review unavailable", "Historical replay unavailable"].includes(this.operation?.kind); }
+  get canEditReplay() { return this.enabled && this.source !== null && this.selected !== null && (!this.busy || this.reviewPending); }
+  get replayTarget() {
+    try {
+      const tick = parseReplayTarget(this.replayTickText);
+      return this.selected && tick >= BigInt(this.selected.tick) ? String(tick) : null;
+    } catch (_) { return null; }
+  }
+  get canSeekReplay() { return this.canOperate && this.replayTarget !== null && typeof this.services.replay === "function"; }
   get canSelectStudy() { return this.canOperate && this.branchState !== "unconfirmed"; }
   get canLaunch() { return this.canOperate && this.canvasPreview === null && this.selected !== null
     && (!this.branch || this.branchState === "refused" || TERMINAL.has(this.branch.status?.status)); }
@@ -369,9 +432,55 @@ export class CheckpointLabController {
     const selected = this.page?.items.find((row) => row.checkpoint_id === checkpointId)
       ?? (this.saveReceipt?.checkpoint_id === checkpointId ? this.saveReceipt : null);
     if (!selected) return;
-    if (!this.selected || !sameCheckpoint(this.selected, selected)) this.canvasPreview = null;
+    if (!this.selected || !sameCheckpoint(this.selected, selected)) {
+      this.canvasPreview = null;
+      this.replayTickText = String(selected.tick);
+    }
     this.selected = copy(selected);
     this.emit();
+  }
+
+  /** An edit supersedes pending viewing intent without releasing its occupied worker. */
+  editReplayTick(value) {
+    if (!this.canEditReplay || typeof value !== "string" || value === this.replayTickText) return;
+    if (this.reviewPending) this.invalidate();
+    // An overlong paste remains invalid instead of truncating to an admissible tick.
+    this.replayTickText = value.slice(0, 64);
+    try {
+      const target = parseReplayTarget(this.replayTickText);
+      if (target < BigInt(this.selected.tick)) throw new Error("The replay target precedes the selected checkpoint");
+      this.notice = `Target tick ${target}; seek explicitly to reconstruct it. The displayed world is unchanged.`;
+    } catch (error) { this.notice = errorText(error); }
+    this.emit();
+  }
+
+  stepReplayTick(delta) {
+    if (!this.canEditReplay || ![-10, -1, 1, 10].includes(delta)) return;
+    try {
+      const next = parseReplayTarget(this.replayTickText) + BigInt(delta);
+      if (next < BigInt(this.selected.tick) || next > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error("The stepped target is outside the selected checkpoint and exact browser tick range");
+      }
+      this.editReplayTick(String(next));
+    } catch (error) { this.notice = errorText(error); this.emit(); }
+  }
+
+  /** Verify the selected source through the captured current endpoint before displaying a target. */
+  seekReplay() {
+    if (!this.canSeekReplay) return Promise.resolve(null);
+    const request = copy({ sessionId: this.source.sessionId, checkpoint: this.selected, targetTick: this.replayTarget });
+    this.notice = `Reconstructing tick ${request.targetTick} from the selected checkpoint; the live server continues independently.`;
+    return this.run("Historical replay unavailable", (signal) => this.services.replay(request, signal), (value) => {
+      validateCheckpointReplay(value, request);
+      if (!this.selected || !sameCheckpoint(this.selected, request.checkpoint) || this.replayTarget !== request.targetTick) {
+        throw new Error("The selected replay source or target changed while reconstruction was loading");
+      }
+      this.canvasPreview = freeze(value);
+      this.notice = value.verification.kind === "saved_cut"
+        ? `Saved cut verified at tick ${value.targetTick}. The live owner is unchanged.`
+        : `Historical tick ${value.targetTick} ready; the complete interval was checked through captured current tick ${value.verification.verifiedThroughTick}, digest ${value.verification.capturedCurrentDigest}. This is not a separate target digest.`;
+      return this.canvasPreview;
+    });
   }
 
   /** One explicit background reconstruction, through the existing bounded request slot. */
@@ -392,7 +501,7 @@ export class CheckpointLabController {
 
   /** Leaving a preview cancels a pending replacement; its late result cannot replace live. */
   returnToLive() {
-    const pending = this.operation?.kind === "Saved-world review unavailable";
+    const pending = this.reviewPending;
     if (pending) this.invalidate();
     if (this.canvasPreview === null && !pending) { this.emit(); return; }
     this.canvasPreview = null;
@@ -496,6 +605,7 @@ export class CheckpointLabController {
       validateLabCheckpoint(value);
       this.saveReceipt = copy(value);
       this.selected = this.saveReceipt;
+      this.replayTickText = String(value.tick);
       this.saveState = "saved";
       this.page = null;
       this.cursor = null;
@@ -736,6 +846,16 @@ export function renderCheckpointLab(panel, controller) {
   disable("lab-checkpoint-next", !ready || !controller.page?.next_cursor);
   disable("lab-checkpoint-download", !ready || !selected);
   disable("lab-checkpoint-review", !controller.canReview);
+  const targetInput = find("lab-replay-tick");
+  if (targetInput && targetInput.value !== controller.replayTickText) targetInput.value = controller.replayTickText;
+  disable("lab-replay-tick", !controller.canEditReplay);
+  disable("lab-replay-seek", !controller.canSeekReplay);
+  for (const [id, delta] of [["lab-replay-back-ten", -10], ["lab-replay-back-one", -1],
+    ["lab-replay-forward-one", 1], ["lab-replay-forward-ten", 10]]) {
+    const target = controller.replayTarget === null ? null : BigInt(controller.replayTarget) + BigInt(delta);
+    disable(id, !controller.canEditReplay || target === null || target < BigInt(selected?.tick ?? 0)
+      || target > BigInt(Number.MAX_SAFE_INTEGER));
+  }
   disable("lab-checkpoint-local", !ready || !selected);
   disable("lab-branch-launch", !controller.canLaunch);
   disable("lab-branch-retry", !ready || controller.canvasPreview !== null || controller.branchState !== "unconfirmed");
