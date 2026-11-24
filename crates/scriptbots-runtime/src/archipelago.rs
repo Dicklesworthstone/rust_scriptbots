@@ -1311,6 +1311,48 @@ impl Island {
     }
 }
 
+/// One frozen migration epoch. Retaining this state never duplicates an organism: the
+/// payload remains in its source outbound slot, destination staging slot, or live world.
+#[derive(Debug)]
+struct PendingMigration {
+    epoch: u64,
+    barrier_tick: Tick,
+    policy: ArchipelagoMigration,
+    records: Vec<EmigrantRecord>,
+    pop_before: BTreeMap<IslandId, u32>,
+    census_before: BTreeSet<OrganismId>,
+    moves: Vec<AppliedMigration>,
+    transfer: Option<PendingMigrationTransfer>,
+}
+
+#[derive(Debug)]
+struct PendingMigrationTransfer {
+    from_index: usize,
+    to_index: usize,
+    phase: MigrationTransferPhase,
+}
+
+#[derive(Debug)]
+enum MigrationTransferPhase {
+    Departing(CommandEnvelope),
+    Arriving(MigrationArrivalCommand),
+}
+
+#[derive(Debug)]
+struct MigrationArrivalCommand {
+    envelope: CommandEnvelope,
+    previous_arrival: Option<MigrationArrival>,
+}
+
+impl PendingMigrationTransfer {
+    const fn active_island_index(&self) -> usize {
+        match self.phase {
+            MigrationTransferPhase::Departing(_) => self.from_index,
+            MigrationTransferPhase::Arriving(_) => self.to_index,
+        }
+    }
+}
+
 /// `N` sole-owner islands stepped to common-tick barriers.
 ///
 /// See the module documentation for the ownership, topology, journal, and
@@ -1325,6 +1367,7 @@ pub struct Archipelago {
     epoch: u64,
     latched: Option<String>,
     migration: Option<ArchipelagoMigration>,
+    pending_migration: Option<PendingMigration>,
 }
 
 impl Archipelago {
@@ -1476,6 +1519,7 @@ impl Archipelago {
             epoch: metadata.epoch,
             latched: None,
             migration: metadata.migration.clone(),
+            pending_migration: None,
         })
     }
 
@@ -1753,6 +1797,7 @@ impl Archipelago {
             epoch: 0,
             latched: None,
             migration,
+            pending_migration: None,
         })
     }
 
@@ -1914,6 +1959,16 @@ impl Archipelago {
         if let Some(blocked) = self.islands.iter().find_map(Self::journal_full_error) {
             return Err(blocked);
         }
+        if let Some(pending) = &self.pending_migration {
+            let index = pending
+                .transfer
+                .as_ref()
+                .map_or(0, PendingMigrationTransfer::active_island_index);
+            return Err(ArchipelagoError::JournalBlocked {
+                island: self.islands[index].meta.id,
+                detail: "migration has not completed the retained barrier".to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -1946,8 +2001,11 @@ impl Archipelago {
     /// method returns. Transient journal-capacity backpressure keeps the
     /// barrier tick unchanged and the exact pending batch private; the next
     /// explicit call retries that batch once and resumes the same target
-    /// without duplicating science. Any terminal island fault latches the
-    /// archipelago, and every later call returns [`ArchipelagoError::Latched`].
+    /// without duplicating science. During migration, the selected organisms,
+    /// completed moves and exact departure or arrival command remain frozen;
+    /// resumption does not step islands or select migrants again. Any terminal
+    /// island fault latches the archipelago, and every later call returns
+    /// [`ArchipelagoError::Latched`].
     ///
     /// # Errors
     ///
@@ -1981,7 +2039,14 @@ impl Archipelago {
                 .ok_or(ArchipelagoError::TickOverflow)?,
         );
 
-        for &index in order {
+        // A retained migration already stepped every island to this target. Driving the
+        // ordinary step path again could apply a queued transfer before its phase observes it.
+        let step_order = if self.pending_migration.is_some() {
+            &[][..]
+        } else {
+            order
+        };
+        for &index in step_order {
             if let Err(error) = Self::step_island_to(&mut self.islands[index], target) {
                 let island = &self.islands[index];
                 if matches!(
@@ -2023,6 +2088,14 @@ impl Archipelago {
             .ok_or(ArchipelagoError::TickOverflow)?;
         let migration = match self.migrate_at_barrier(epoch, target) {
             Ok(report) => report,
+            Err(error) if self.pending_migration.is_some() => {
+                tracing::warn!(
+                    barrier_tick = target.0,
+                    error = %error,
+                    "migration barrier paused by retryable journal backpressure"
+                );
+                return Err(error);
+            }
             Err(error) => {
                 tracing::error!(
                     barrier_tick = target.0,
@@ -2094,6 +2167,38 @@ impl Archipelago {
         epoch: u64,
         barrier_tick: Tick,
     ) -> Result<Option<MigrationBarrierReport>, ArchipelagoError> {
+        let (mut pending, retry_retained) = match self.pending_migration.take() {
+            Some(pending) => (pending, true),
+            None => match self.prepare_migration(epoch, barrier_tick)? {
+                Some(pending) => (pending, false),
+                None => return Ok(None),
+            },
+        };
+        if pending.epoch != epoch || pending.barrier_tick != barrier_tick {
+            return Err(ArchipelagoError::CommandRejected {
+                island: self.islands[0].meta.id,
+                detail: "retained migration does not match the requested barrier".to_owned(),
+            });
+        }
+        if let Err(error) = self.apply_migration_plan(&mut pending, retry_retained) {
+            if pending.transfer.as_ref().is_some_and(|transfer| {
+                Self::retryable_journal_pressure(
+                    &self.islands[transfer.active_island_index()],
+                    &error,
+                )
+            }) {
+                self.pending_migration = Some(pending);
+            }
+            return Err(error);
+        }
+        self.complete_migration(pending).map(Some)
+    }
+
+    fn prepare_migration(
+        &self,
+        epoch: u64,
+        barrier_tick: Tick,
+    ) -> Result<Option<PendingMigration>, ArchipelagoError> {
         let Some(policy) = self.migration.clone() else {
             return Ok(None);
         };
@@ -2119,7 +2224,6 @@ impl Archipelago {
                 .iter()
                 .map(|(&island, list)| (island, list.len())),
         )?;
-        let total_before = total_population(&pop_before);
         // The identity census taken from the SAME frozen snapshot selection
         // reads, so the proof at the end compares like with like.
         let census_before: BTreeSet<OrganismId> = candidates
@@ -2134,8 +2238,30 @@ impl Archipelago {
         let plan = select_emigrants(&candidates, &config, self.master_seed, epoch)
             .map_err(|source| ArchipelagoError::MigrationSelection { source })?;
 
-        // PHASE 3 — apply in the plan's canonical (to, from, uid) order.
-        let moves = self.apply_migration_plan(&plan.moves, barrier_tick)?;
+        Ok(Some(PendingMigration {
+            epoch,
+            barrier_tick,
+            policy,
+            moves: Vec::with_capacity(plan.moves.len()),
+            records: plan.moves,
+            pop_before,
+            census_before,
+            transfer: None,
+        }))
+    }
+
+    fn complete_migration(
+        &self,
+        pending: PendingMigration,
+    ) -> Result<MigrationBarrierReport, ArchipelagoError> {
+        let PendingMigration {
+            barrier_tick,
+            policy,
+            pop_before,
+            census_before,
+            moves,
+            ..
+        } = pending;
 
         let pop_after = migration_population_counts(self.islands.iter().map(|island| {
             (
@@ -2143,6 +2269,7 @@ impl Archipelago {
                 island.core.with_world(WorldState::agent_count),
             )
         }))?;
+        let total_before = total_population(&pop_before);
         let total_after = total_population(&pop_after);
         if total_before != total_after {
             return Err(ArchipelagoError::MigrationNotConserved {
@@ -2178,8 +2305,8 @@ impl Archipelago {
         }
         tracing::info!(
             barrier_tick = barrier_tick.0,
-            rule = ?config.selection_rule,
-            interval = config.interval_ticks,
+            rule = ?policy.selection_rule,
+            interval = policy.interval_ticks,
             total_moves = moves.len(),
             total_before,
             total_after,
@@ -2187,50 +2314,87 @@ impl Archipelago {
             "migration barrier complete"
         );
 
-        Ok(Some(MigrationBarrierReport {
+        Ok(MigrationBarrierReport {
             barrier_tick,
-            rule: config.selection_rule,
+            rule: policy.selection_rule,
             moves,
             pop_before,
             pop_after,
             census_before,
             census_after,
-        }))
+        })
     }
 
     /// Apply the already-selected records in their canonical order, preserving sole ownership.
     fn apply_migration_plan(
         &mut self,
-        records: &[EmigrantRecord],
-        barrier_tick: Tick,
-    ) -> Result<Vec<AppliedMigration>, ArchipelagoError> {
-        let mut moves = Vec::with_capacity(records.len());
-        for record in records {
+        pending: &mut PendingMigration,
+        mut retry_retained: bool,
+    ) -> Result<(), ArchipelagoError> {
+        while pending.moves.len() < pending.records.len() {
+            let record = &pending.records[pending.moves.len()];
             let from = record.from_island;
             let to = record.to_island;
             let uid = AgentUid(record.agent_uid);
-            let from_index = self
-                .island_index(from)
-                .ok_or(ArchipelagoError::UnknownIsland { island: from })?;
-            let to_index = self
-                .island_index(to)
-                .ok_or(ArchipelagoError::UnknownIsland { island: to })?;
-
-            Self::apply_island_command(
-                &mut self.islands[from_index],
-                HostCommand::Emigrate { agent_uid: uid },
-            )?;
-            let migrant = self.islands[from_index]
-                .core
-                .take_outbound_migrant()
-                .ok_or(ArchipelagoError::MigrationOrganismMissing {
-                    island: from,
-                    agent_uid: record.agent_uid,
-                })?;
-
-            let arrival = self.deliver_migrant(to_index, from_index, from, uid, migrant)?;
+            if pending.transfer.is_none() {
+                let from_index = self
+                    .island_index(from)
+                    .ok_or(ArchipelagoError::UnknownIsland { island: from })?;
+                let to_index = self
+                    .island_index(to)
+                    .ok_or(ArchipelagoError::UnknownIsland { island: to })?;
+                let command_id = self.islands[from_index].next_command_id()?;
+                pending.transfer = Some(PendingMigrationTransfer {
+                    from_index,
+                    to_index,
+                    phase: MigrationTransferPhase::Departing(CommandEnvelope::new(
+                        command_id,
+                        HostCommand::Emigrate { agent_uid: uid },
+                    )),
+                });
+            }
+            let transfer = pending
+                .transfer
+                .as_mut()
+                .expect("current transfer was prepared");
+            let retry = std::mem::take(&mut retry_retained);
+            let arrival = match &transfer.phase {
+                MigrationTransferPhase::Departing(envelope) => {
+                    Self::apply_island_envelope(
+                        &mut self.islands[transfer.from_index],
+                        envelope,
+                        retry,
+                    )?;
+                    let migrant = self.islands[transfer.from_index]
+                        .core
+                        .take_outbound_migrant()
+                        .ok_or(ArchipelagoError::MigrationOrganismMissing {
+                            island: from,
+                            agent_uid: record.agent_uid,
+                        })?;
+                    // Staging takes ownership before allocating or submitting the arrival.
+                    // Every refusal returns it home or retains its exact payload in the error.
+                    let command = self.stage_migrant(
+                        transfer.to_index,
+                        transfer.from_index,
+                        from,
+                        uid,
+                        migrant,
+                    )?;
+                    transfer.phase = MigrationTransferPhase::Arriving(command);
+                    continue;
+                }
+                MigrationTransferPhase::Arriving(command) => self.deliver_migrant(
+                    transfer.to_index,
+                    transfer.from_index,
+                    from,
+                    uid,
+                    command,
+                    retry,
+                )?,
+            };
             tracing::info!(
-                barrier_tick = barrier_tick.0,
+                barrier_tick = pending.barrier_tick.0,
                 from = %from,
                 to = %to,
                 origin_uid = uid.get(),
@@ -2240,15 +2404,16 @@ impl Archipelago {
                 key_value = record.key_value,
                 "migrated one organism"
             );
-            moves.push(AppliedMigration {
+            pending.moves.push(AppliedMigration {
                 from: OrganismId::new(from, uid),
                 to: OrganismId::new(to, arrival),
                 rule: record.selection_rule,
                 rank: record.rank,
                 key_value: record.key_value,
             });
+            pending.transfer = None;
         }
-        Ok(moves)
+        Ok(())
     }
 
     /// Per-island emigration candidates in ascending `AgentUid` order.
@@ -2290,59 +2455,110 @@ impl Archipelago {
             .collect()
     }
 
-    /// Stage and admit one organism at its destination, returning it home if the
-    /// destination refuses.
-    ///
-    /// Application can succeed before journaling fails. Observe a new matching
-    /// live arrival before classifying an error, and retain an unadmitted payload
-    /// if its source also refuses it.
-    fn deliver_migrant(
+    /// Stage ownership before fallible arrival command work. Every refusal returns the
+    /// organism home or retains it in the error rather than dropping a local payload.
+    fn stage_migrant(
         &mut self,
         to_index: usize,
         from_index: usize,
         from: IslandId,
         uid: AgentUid,
         migrant: MigratingAgent,
-    ) -> Result<AgentUid, ArchipelagoError> {
+    ) -> Result<MigrationArrivalCommand, ArchipelagoError> {
         let to = self.islands[to_index].meta.id;
-        let origin = OrganismId::new(from, uid);
         if let Err(returned) = self.islands[to_index].core.stage_immigrant(migrant) {
             let detail = "destination already holds a staged organism".to_owned();
             return Err(self.return_migrant_home(from_index, from, uid, to, *returned, detail));
         }
-        let command = HostCommand::Immigrate {
-            origin_island: from,
-            origin_uid: uid,
-        };
         let previous_arrival = self.islands[to_index].core.last_arrival();
-        let result = Self::apply_island_command(&mut self.islands[to_index], command);
-        let observed = Self::observed_arrival(&self.islands[to_index], previous_arrival, origin);
-        if let Err(error) = result {
-            let detail = error.to_string();
-            if let Some(observed) = observed {
-                return Err(ArchipelagoError::MigrationInterrupted {
-                    origin,
-                    destination: to,
-                    observed,
-                    detail,
-                });
+        let command_id = match self.islands[to_index].next_command_id() {
+            Ok(command_id) => command_id,
+            Err(error) => {
+                return Err(self.failed_migrant_arrival(
+                    to_index,
+                    from_index,
+                    OrganismId::new(from, uid),
+                    previous_arrival,
+                    error.to_string(),
+                ));
             }
-            let Some(returned) = self.islands[to_index].core.unstage_immigrant() else {
-                return Err(ArchipelagoError::MigrationOwnershipUnconfirmed {
-                    origin,
-                    destination: to,
-                    detail,
-                });
-            };
-            return Err(self.return_migrant_home(from_index, from, uid, to, returned, detail));
+        };
+        Ok(MigrationArrivalCommand {
+            envelope: CommandEnvelope::new(
+                command_id,
+                HostCommand::Immigrate {
+                    origin_island: from,
+                    origin_uid: uid,
+                },
+            ),
+            previous_arrival,
+        })
+    }
+
+    /// Finish the exact staged arrival. Capacity pressure preserves this phase and its
+    /// original witness even when the organism has already entered the live world.
+    fn deliver_migrant(
+        &mut self,
+        to_index: usize,
+        from_index: usize,
+        from: IslandId,
+        uid: AgentUid,
+        command: &MigrationArrivalCommand,
+        retry_retained: bool,
+    ) -> Result<AgentUid, ArchipelagoError> {
+        let origin = OrganismId::new(from, uid);
+        if let Err(error) = Self::apply_island_envelope(
+            &mut self.islands[to_index],
+            &command.envelope,
+            retry_retained,
+        ) {
+            if Self::retryable_journal_pressure(&self.islands[to_index], &error) {
+                return Err(error);
+            }
+            return Err(self.failed_migrant_arrival(
+                to_index,
+                from_index,
+                origin,
+                command.previous_arrival,
+                error.to_string(),
+            ));
         }
-        observed.map(|arrival| arrival.uid).ok_or_else(|| {
-            ArchipelagoError::MigrationOwnershipUnconfirmed {
+        Self::observed_arrival(&self.islands[to_index], command.previous_arrival, origin)
+            .map(|arrival| arrival.uid)
+            .ok_or_else(|| ArchipelagoError::MigrationOwnershipUnconfirmed {
+                origin,
+                destination: self.islands[to_index].meta.id,
+                detail: "command completed without a new matching live arrival".to_owned(),
+            })
+    }
+
+    fn failed_migrant_arrival(
+        &mut self,
+        to_index: usize,
+        from_index: usize,
+        origin: OrganismId,
+        previous_arrival: Option<MigrationArrival>,
+        detail: String,
+    ) -> ArchipelagoError {
+        let to = self.islands[to_index].meta.id;
+        if let Some(observed) =
+            Self::observed_arrival(&self.islands[to_index], previous_arrival, origin)
+        {
+            return ArchipelagoError::MigrationInterrupted {
                 origin,
                 destination: to,
-                detail: "command completed without a new matching live arrival".to_owned(),
-            }
-        })
+                observed,
+                detail,
+            };
+        }
+        let Some(returned) = self.islands[to_index].core.unstage_immigrant() else {
+            return ArchipelagoError::MigrationOwnershipUnconfirmed {
+                origin,
+                destination: to,
+                detail,
+            };
+        };
+        self.return_migrant_home(from_index, origin.island, origin.uid, to, returned, detail)
     }
 
     fn observed_arrival(
@@ -2434,11 +2650,32 @@ impl Archipelago {
         island: &mut Island,
         command: HostCommand,
     ) -> Result<(), ArchipelagoError> {
-        let island_id = island.meta.id;
         let command_id = island.next_command_id()?;
         let envelope = CommandEnvelope::new(command_id, command);
+        Self::apply_island_envelope(island, &envelope, false)
+    }
+
+    fn apply_island_envelope(
+        island: &mut Island,
+        envelope: &CommandEnvelope,
+        retry_retained: bool,
+    ) -> Result<(), ArchipelagoError> {
+        let island_id = island.meta.id;
+        let command_id = envelope.command_id;
+        if retry_retained && island.core.journal_full_retry_needed() {
+            island
+                .core
+                .retry_retained_journal()
+                .map_err(|source| ArchipelagoError::Access {
+                    island: island_id,
+                    source,
+                })?;
+            if let Some(blocked) = Self::journal_full_error(island) {
+                return Err(blocked);
+            }
+        }
         let mut port = island.core.local_port();
-        let submitted = Self::submit_step_with_authority(island_id, &mut port, &envelope)?;
+        let submitted = Self::submit_step_with_authority(island_id, &mut port, envelope)?;
         let mut applied = Self::step_status_applied(island, &submitted)?;
         for _attempt in 0..STEP_DRIVE_ATTEMPTS {
             if applied {
@@ -2463,6 +2700,9 @@ impl Archipelago {
                     detail: "migration command status was not retained".to_owned(),
                 })?;
             applied = Self::step_status_applied(island, &status)?;
+            if let Some(blocked) = Self::journal_full_error(island) {
+                return Err(blocked);
+            }
         }
         Self::verify_island_health(island)?;
         if !applied {
@@ -2660,6 +2900,14 @@ impl Archipelago {
             }
             HostHealth::Healthy | HostHealth::Blocked(_) | HostHealth::Faulted(_) => None,
         }
+    }
+
+    fn retryable_journal_pressure(island: &Island, error: &ArchipelagoError) -> bool {
+        matches!(
+            error,
+            ArchipelagoError::JournalBlocked { island: blocked, .. } if *blocked == island.meta.id
+        ) && Self::journal_full_error(island).is_some()
+            && island.core.journal_full_retry_needed()
     }
 
     fn island_index(&self, island: IslandId) -> Option<usize> {
@@ -3161,7 +3409,7 @@ mod tests {
         let origin = OrganismId::new(IslandId(0), migrant.origin_uid());
         archipelago.islands[1].next_command_sequence = u64::MAX;
         let error = archipelago
-            .deliver_migrant(1, 0, origin.island, origin.uid, migrant)
+            .stage_migrant(1, 0, origin.island, origin.uid, migrant)
             .expect_err("destination command ID exhaustion fails the barrier");
         let ArchipelagoError::MigrationInterrupted { observed, .. } = error else {
             panic!("a returned organism must have an observed live identity: {error:?}");
@@ -3205,7 +3453,7 @@ mod tests {
         archipelago.islands[0].next_command_sequence = u64::MAX;
         archipelago.islands[1].next_command_sequence = u64::MAX;
         let error = archipelago
-            .deliver_migrant(1, 0, IslandId(0), uid, migrant)
+            .stage_migrant(1, 0, IslandId(0), uid, migrant)
             .expect_err("neither host can allocate its next command identity");
         let ArchipelagoError::MigrationRetained { migrant, .. } = error else {
             panic!("unadmitted organism must remain owned by the error: {error:?}");
@@ -3260,7 +3508,7 @@ mod tests {
             .expect("existing staged occupant");
         archipelago.islands[1].next_command_sequence = u64::MAX;
         let error = archipelago
-            .deliver_migrant(1, 0, IslandId(0), first_uid, returning)
+            .stage_migrant(1, 0, IslandId(0), first_uid, returning)
             .expect_err("source staging slot is already occupied");
         let ArchipelagoError::MigrationRetained { migrant, .. } = error else {
             panic!("the rejected payload must not be dropped: {error:?}");
@@ -3282,12 +3530,25 @@ mod tests {
         let before = archipelago.organism_census().expect("before census");
         let migrant = take_recovery_migrant(&mut archipelago);
         let origin = OrganismId::new(IslandId(0), migrant.origin_uid());
+        let command = archipelago
+            .stage_migrant(1, 0, origin.island, origin.uid, migrant)
+            .expect("exact organism is staged before arrival admission");
         let error = archipelago
-            .deliver_migrant(1, 0, origin.island, origin.uid, migrant)
+            .deliver_migrant(1, 0, origin.island, origin.uid, &command, false)
             .expect_err("arrival journal cannot admit a batch");
-        let ArchipelagoError::MigrationInterrupted { observed, .. } = error else {
-            panic!("application before journal refusal must remain visible: {error:?}");
-        };
+        assert!(matches!(
+            error,
+            ArchipelagoError::JournalBlocked {
+                island: IslandId(1),
+                ..
+            }
+        ));
+        let observed = Archipelago::observed_arrival(
+            &archipelago.islands[1],
+            command.previous_arrival,
+            origin,
+        )
+        .expect("applied arrival stays visible while its exact journal batch is retained");
         assert_eq!(observed.island, IslandId(1));
         assert!(matches!(
             archipelago.organism_census(),
@@ -3791,6 +4052,542 @@ mod tests {
         fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
             ShutdownCommitRequirement::CommittedVolatile
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MigrationPressurePoint {
+        Departure,
+        Arrival,
+        RejectedAudit,
+    }
+
+    impl MigrationPressurePoint {
+        fn matches(self, batch: &JournalBatch) -> bool {
+            match self {
+                Self::Departure => batch.command().is_some_and(|envelope| {
+                    matches!(envelope.command, HostCommand::Emigrate { .. })
+                }),
+                Self::Arrival => batch.command().is_some_and(|envelope| {
+                    matches!(envelope.command, HostCommand::Immigrate { .. })
+                }),
+                Self::RejectedAudit => batch.uses_ingress_audit_slot(),
+            }
+        }
+    }
+
+    struct MigrationPressureState {
+        point: MigrationPressurePoint,
+        target_ordinal: usize,
+        matching_seen: usize,
+        remaining_full: usize,
+        close_on_retry: bool,
+        blocked: Option<Arc<JournalBatch>>,
+        attempts: Vec<Arc<JournalBatch>>,
+        accepted: Vec<Arc<JournalBatch>>,
+    }
+
+    impl MigrationPressureState {
+        const fn new(point: MigrationPressurePoint, target_ordinal: usize) -> Self {
+            Self {
+                point,
+                target_ordinal,
+                matching_seen: 0,
+                remaining_full: 2,
+                close_on_retry: false,
+                blocked: None,
+                attempts: Vec::new(),
+                accepted: Vec::new(),
+            }
+        }
+
+        fn blocked_attempts(&self) -> usize {
+            let blocked = self.blocked.as_ref().expect("pressure has been reached");
+            self.attempts
+                .iter()
+                .filter(|batch| batch.id() == blocked.id())
+                .count()
+        }
+    }
+
+    /// Real volatile commitment and event retention with a controlled admission refusal.
+    struct MigrationPressureJournal {
+        inner: crate::VolatileJournal,
+        state: Rc<RefCell<MigrationPressureState>>,
+    }
+
+    impl JournalPort for MigrationPressureJournal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            let mut state = self.state.borrow_mut();
+            state.attempts.push(Arc::clone(batch));
+            if state.blocked.is_none() && state.point.matches(batch) {
+                state.matching_seen += 1;
+                if state.matching_seen == state.target_ordinal {
+                    state.blocked = Some(Arc::clone(batch));
+                }
+            }
+            if state
+                .blocked
+                .as_ref()
+                .is_some_and(|blocked| blocked.id() == batch.id())
+            {
+                if state.remaining_full > 0 {
+                    state.remaining_full -= 1;
+                    return JournalAdmission::Full {
+                        batch_id: batch.id(),
+                        capacity: 64,
+                    };
+                }
+                if state.close_on_retry {
+                    return JournalAdmission::Closed {
+                        batch_id: batch.id(),
+                    };
+                }
+            }
+            let admission = self.inner.try_admit(batch);
+            if matches!(admission, JournalAdmission::Accepted { .. }) {
+                state.accepted.push(Arc::clone(batch));
+            }
+            admission
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            self.inner.poll_receipts(limit)
+        }
+
+        fn event_reader(&self, session_id: HostSessionId) -> Option<Arc<dyn EventJournalReader>> {
+            self.inner.event_reader(session_id)
+        }
+
+        fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+            self.inner.shutdown_commit_requirement()
+        }
+    }
+
+    fn pressured_migration_archipelago(
+        pressure: Option<Rc<RefCell<MigrationPressureState>>>,
+    ) -> Archipelago {
+        let islands = (0..3).map(|id| spec(id, populated_config(None))).collect();
+        Archipelago::with_factories(
+            migrating_config(islands, 1, EmigrantSelectionRule::Random, 1),
+            |meta| {
+                let mut world = populated_world_factory(meta)?;
+                for _ in 0..5 {
+                    world.step().expect("populate actual executable organisms");
+                }
+                assert!(world.agent_count() >= 2);
+                Ok(world)
+            },
+            move |_| {
+                pressure.as_ref().map(|state| {
+                    Box::new(MigrationPressureJournal {
+                        inner: crate::VolatileJournal::with_capacity(64),
+                        state: Rc::clone(state),
+                    }) as Box<dyn JournalPort>
+                })
+            },
+        )
+        .expect("three real migration owners")
+    }
+
+    fn assert_pending_migration_stays_private(archipelago: &mut Archipelago) {
+        assert_eq!(archipelago.barrier_tick(), Tick(5));
+        assert_eq!(archipelago.epoch(), 0);
+        assert!(archipelago.latched().is_none());
+        assert!(archipelago.pending_migration.is_some());
+        for id in [IslandId(0), IslandId(1), IslandId(2)] {
+            assert_eq!(archipelago.island_snapshot(id).unwrap().world.tick, 5);
+            assert!(matches!(
+                archipelago.island_digest(id),
+                Err(ArchipelagoError::JournalBlocked { .. })
+            ));
+            let mut called = false;
+            assert!(matches!(
+                archipelago.with_island_world(id, |_| called = true),
+                Err(ArchipelagoError::JournalBlocked { .. })
+            ));
+            assert!(
+                !called,
+                "an incomplete migration cannot expose live science"
+            );
+        }
+        assert!(matches!(
+            archipelago.organism_census(),
+            Err(ArchipelagoError::JournalBlocked { .. })
+        ));
+        assert!(matches!(
+            archipelago.checkpoint_v1(),
+            Err(ArchipelagoError::JournalBlocked { .. })
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one real-owner retry matrix checks frozen selection, ownership, receipts and future science"
+    )]
+    fn migration_journal_full_resumes_frozen_plan_without_duplicate_organisms() {
+        for point in [
+            MigrationPressurePoint::Departure,
+            MigrationPressurePoint::Arrival,
+        ] {
+            for ordinal in [1, 3] {
+                let state = Rc::new(RefCell::new(MigrationPressureState::new(point, ordinal)));
+                let mut archipelago = pressured_migration_archipelago(Some(Rc::clone(&state)));
+                let mut uninterrupted = pressured_migration_archipelago(None);
+                let snapshots: Vec<_> = archipelago
+                    .islands
+                    .iter()
+                    .map(|island| Arc::clone(&island.committed_snapshot))
+                    .collect();
+                assert!(matches!(
+                    archipelago.step_to_barrier(),
+                    Err(ArchipelagoError::JournalBlocked { .. })
+                ));
+                assert_pending_migration_stays_private(&mut archipelago);
+                let pending = archipelago.pending_migration.as_ref().unwrap();
+                assert_eq!(pending.epoch, 1);
+                assert_eq!(pending.barrier_tick, Tick(6));
+                assert_eq!(pending.moves.len(), ordinal - 1);
+                let records = pending.records.clone();
+                let completed = pending.moves.clone();
+                let census = pending.census_before.clone();
+                let population = pending.pop_before.clone();
+                let transfer = pending.transfer.as_ref().unwrap();
+                let active = transfer.active_island_index();
+                let record = &records[completed.len()];
+                let origin = OrganismId::new(record.from_island, AgentUid(record.agent_uid));
+                let envelope = match &transfer.phase {
+                    MigrationTransferPhase::Departing(envelope) => {
+                        assert_eq!(
+                            archipelago.current_organism_census().unwrap().len() + 1,
+                            census.len()
+                        );
+                        envelope.clone()
+                    }
+                    MigrationTransferPhase::Arriving(command) => {
+                        assert_eq!(
+                            archipelago.current_organism_census().unwrap().len(),
+                            census.len()
+                        );
+                        assert!(
+                            Archipelago::observed_arrival(
+                                &archipelago.islands[active],
+                                command.previous_arrival,
+                                origin
+                            )
+                            .is_some()
+                        );
+                        assert!(!archipelago.islands[active].core.has_staged_immigrant());
+                        command.envelope.clone()
+                    }
+                };
+                assert!(matches!(
+                    archipelago.islands[active]
+                        .core
+                        .local_port()
+                        .command_status(envelope.command_id)
+                        .unwrap()
+                        .unwrap()
+                        .application(),
+                    ApplicationState::Applied(_)
+                ));
+                let cursors: Vec<_> = archipelago
+                    .islands
+                    .iter()
+                    .map(|island| {
+                        (
+                            island.next_command_sequence,
+                            island.time_cursor,
+                            island.core.world_tick(),
+                        )
+                    })
+                    .collect();
+                assert!(cursors.iter().all(|(_, _, tick)| *tick == Tick(6)));
+                let blocked = Arc::clone(state.borrow().blocked.as_ref().unwrap());
+                assert!(blocked.command_lifecycle().unwrap().was_applied());
+                assert_eq!(state.borrow().blocked_attempts(), 1);
+
+                assert!(matches!(
+                    archipelago.step_to_barrier(),
+                    Err(ArchipelagoError::JournalBlocked { .. })
+                ));
+                assert_eq!(
+                    state.borrow().blocked_attempts(),
+                    2,
+                    "one retry per explicit call"
+                );
+                assert_pending_migration_stays_private(&mut archipelago);
+                let pending = archipelago.pending_migration.as_ref().unwrap();
+                assert_eq!(pending.records, records);
+                assert_eq!(pending.moves, completed);
+                assert_eq!(pending.census_before, census);
+                assert_eq!(pending.pop_before, population);
+                for ((island, cursor), snapshot) in
+                    archipelago.islands.iter().zip(&cursors).zip(&snapshots)
+                {
+                    assert_eq!(
+                        (
+                            island.next_command_sequence,
+                            island.time_cursor,
+                            island.core.world_tick()
+                        ),
+                        *cursor
+                    );
+                    assert!(Arc::ptr_eq(&island.committed_snapshot, snapshot));
+                }
+
+                let report = archipelago.step_to_barrier().expect("capacity recovered");
+                let reference = uninterrupted.step_to_barrier().unwrap();
+                assert_eq!(report.migration, reference.migration);
+                let migration = report.migration.unwrap();
+                assert_eq!(migration.census_before, census);
+                assert_eq!(migration.pop_before, population);
+                assert_eq!(&migration.moves[..completed.len()], completed.as_slice());
+                assert!(archipelago.pending_migration.is_none());
+                assert_same_checkpoint_science(&archipelago, &uninterrupted);
+                for (actual, expected) in archipelago.islands.iter().zip(&uninterrupted.islands) {
+                    assert_eq!(actual.next_command_sequence, expected.next_command_sequence);
+                    assert!(!actual.core.has_staged_immigrant());
+                }
+                {
+                    let journal = state.borrow();
+                    assert_eq!(journal.blocked_attempts(), 3);
+                    for attempt in journal
+                        .attempts
+                        .iter()
+                        .filter(|batch| batch.id() == blocked.id())
+                    {
+                        assert!(
+                            Arc::ptr_eq(attempt, &blocked),
+                            "retry the same immutable batch"
+                        );
+                    }
+                    let accepted_ids: BTreeSet<_> =
+                        journal.accepted.iter().map(|batch| batch.id()).collect();
+                    assert_eq!(
+                        accepted_ids.len(),
+                        journal.accepted.len(),
+                        "each batch is accepted once"
+                    );
+                    let commands: Vec<_> = journal
+                        .accepted
+                        .iter()
+                        .filter(|batch| {
+                            MigrationPressurePoint::Departure.matches(batch)
+                                || MigrationPressurePoint::Arrival.matches(batch)
+                        })
+                        .map(|batch| (batch.id().session_id(), batch.command_id().unwrap()))
+                        .collect();
+                    assert_eq!(commands.len(), migration.moves.len() * 2);
+                    assert_eq!(
+                        commands.iter().copied().collect::<BTreeSet<_>>().len(),
+                        commands.len()
+                    );
+                }
+                let next = archipelago.step_to_barrier().unwrap();
+                let reference_next = uninterrupted.step_to_barrier().unwrap();
+                assert_eq!(next.migration, reference_next.migration);
+                assert_same_checkpoint_science(&archipelago, &uninterrupted);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_migration_refuses_reads_after_owner_pressure_has_cleared() {
+        let state = Rc::new(RefCell::new(MigrationPressureState::new(
+            MigrationPressurePoint::Arrival,
+            3,
+        )));
+        let mut archipelago = pressured_migration_archipelago(Some(Rc::clone(&state)));
+        let mut uninterrupted = pressured_migration_archipelago(None);
+        assert!(archipelago.step_to_barrier().is_err());
+        let active = archipelago
+            .pending_migration
+            .as_ref()
+            .unwrap()
+            .transfer
+            .as_ref()
+            .unwrap()
+            .active_island_index();
+        state.borrow_mut().remaining_full = 0;
+        archipelago.islands[active]
+            .core
+            .retry_retained_journal()
+            .unwrap();
+        assert!(Archipelago::journal_full_error(&archipelago.islands[active]).is_none());
+        assert_pending_migration_stays_private(&mut archipelago);
+        let attempts = state.borrow().blocked_attempts();
+        let report = archipelago.step_to_barrier().unwrap();
+        let reference = uninterrupted.step_to_barrier().unwrap();
+        assert_eq!(report.migration, reference.migration);
+        assert_eq!(
+            state.borrow().blocked_attempts(),
+            attempts,
+            "a settled batch needs no second retry"
+        );
+        assert_same_checkpoint_science(&archipelago, &uninterrupted);
+    }
+
+    #[test]
+    fn terminal_migration_journal_refusal_latches_without_losing_the_owned_organism() {
+        for point in [
+            MigrationPressurePoint::Departure,
+            MigrationPressurePoint::Arrival,
+        ] {
+            let mut pressure = MigrationPressureState::new(point, 3);
+            pressure.remaining_full = 1;
+            pressure.close_on_retry = true;
+            let state = Rc::new(RefCell::new(pressure));
+            let mut archipelago = pressured_migration_archipelago(Some(Rc::clone(&state)));
+            assert!(matches!(
+                archipelago.step_to_barrier(),
+                Err(ArchipelagoError::JournalBlocked { .. })
+            ));
+            let pending = archipelago.pending_migration.as_ref().unwrap();
+            let record = &pending.records[pending.moves.len()];
+            let origin = OrganismId::new(record.from_island, AgentUid(record.agent_uid));
+            let count = pending.census_before.len();
+            let transfer = pending.transfer.as_ref().unwrap();
+            let from_index = transfer.from_index;
+            let to_index = transfer.to_index;
+            let failure = archipelago
+                .step_to_barrier()
+                .expect_err("closed journal is terminal");
+            match point {
+                MigrationPressurePoint::Departure => {
+                    assert!(matches!(failure, ArchipelagoError::IslandFault { .. }));
+                    let owned = archipelago.islands[from_index]
+                        .core
+                        .take_outbound_migrant()
+                        .expect("the exact departed organism remains source-owned");
+                    assert_eq!(owned.origin_uid(), origin.uid);
+                    assert_eq!(owned.brain_kind(), Some(TEST_BRAIN_KIND));
+                    assert_eq!(
+                        archipelago.current_organism_census().unwrap().len() + 1,
+                        count
+                    );
+                }
+                MigrationPressurePoint::Arrival => {
+                    let ArchipelagoError::MigrationInterrupted { observed, .. } = failure else {
+                        panic!("an applied arrival must retain its live witness: {failure:?}");
+                    };
+                    assert_eq!(observed.island, archipelago.islands[to_index].meta.id);
+                    let census = archipelago.current_organism_census().unwrap();
+                    assert_eq!(census.len(), count);
+                    assert!(census.contains(&observed));
+                    assert!(!archipelago.islands[to_index].core.has_staged_immigrant());
+                }
+                MigrationPressurePoint::RejectedAudit => {
+                    unreachable!("only actual transfer phases are closed")
+                }
+            }
+            assert!(archipelago.pending_migration.is_none());
+            assert!(archipelago.latched().is_some());
+            assert_eq!(archipelago.barrier_tick(), Tick(5));
+            assert_eq!(archipelago.epoch(), 0);
+            let attempts = state.borrow().attempts.len();
+            assert!(matches!(
+                archipelago.step_to_barrier(),
+                Err(ArchipelagoError::Latched { .. })
+            ));
+            assert_eq!(state.borrow().attempts.len(), attempts);
+            assert!(matches!(
+                archipelago.organism_census(),
+                Err(ArchipelagoError::Latched { .. })
+            ));
+            for island in &archipelago.islands {
+                assert_eq!(island.committed_snapshot.world.tick, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn migration_retries_queued_departure_after_a_prior_rejection_audit_blocks() {
+        let mut pressure = MigrationPressureState::new(MigrationPressurePoint::RejectedAudit, 1);
+        pressure.remaining_full = 1;
+        let state = Rc::new(RefCell::new(pressure));
+        let mut archipelago = pressured_migration_archipelago(Some(Rc::clone(&state)));
+        let mut uninterrupted = pressured_migration_archipelago(None);
+        // Reach the real pre-migration cut, then enqueue an actual rejected input audit.
+        // Its pressure stops the subsequent departure before application, not after it.
+        for island in &mut archipelago.islands {
+            Archipelago::step_island_to(island, Tick(6)).unwrap();
+        }
+        let plan = archipelago.prepare_migration(1, Tick(6)).unwrap().unwrap();
+        let source = archipelago
+            .island_index(plan.records[0].from_island)
+            .unwrap();
+        let rejected = archipelago.islands[source]
+            .core
+            .local_port()
+            .submit(CommandEnvelope::new(
+                CommandId::new(u128::MAX),
+                HostCommand::SetSpeed(-1.0),
+            ))
+            .unwrap();
+        assert!(matches!(
+            rejected.application(),
+            ApplicationState::Rejected(_)
+        ));
+        assert!(matches!(
+            archipelago.migrate_at_barrier(1, Tick(6)),
+            Err(ArchipelagoError::JournalBlocked { .. })
+        ));
+        assert_pending_migration_stays_private(&mut archipelago);
+        let pending = archipelago.pending_migration.as_ref().unwrap();
+        assert_eq!(pending.records, plan.records);
+        assert!(pending.moves.is_empty());
+        let MigrationTransferPhase::Departing(envelope) = &pending.transfer.as_ref().unwrap().phase
+        else {
+            panic!("departure must remain queued behind the rejected-input audit");
+        };
+        let command_id = envelope.command_id;
+        let session_id = archipelago.islands[source].committed_snapshot.session_id;
+        assert_eq!(
+            archipelago.islands[source]
+                .core
+                .local_port()
+                .command_status(command_id)
+                .unwrap()
+                .unwrap()
+                .application(),
+            &ApplicationState::Admitted
+        );
+        assert_eq!(
+            archipelago.current_organism_census().unwrap(),
+            plan.census_before
+        );
+        assert!(
+            archipelago.islands[source]
+                .core
+                .take_outbound_migrant()
+                .is_none()
+        );
+        let report = archipelago.step_to_barrier().unwrap();
+        let reference = uninterrupted.step_to_barrier().unwrap();
+        assert_eq!(report.migration, reference.migration);
+        assert_same_checkpoint_science(&archipelago, &uninterrupted);
+        assert_eq!(state.borrow().blocked_attempts(), 2);
+        let journal = state.borrow();
+        let blocked = journal.blocked.as_ref().unwrap();
+        assert!(blocked.uses_ingress_audit_slot());
+        for attempt in journal
+            .attempts
+            .iter()
+            .filter(|batch| batch.id() == blocked.id())
+        {
+            assert!(Arc::ptr_eq(attempt, blocked));
+        }
+        assert_eq!(
+            journal
+                .accepted
+                .iter()
+                .filter(|batch| {
+                    batch.id().session_id() == session_id && batch.command_id() == Some(command_id)
+                })
+                .count(),
+            1
+        );
     }
 
     fn assert_partial_barrier_stays_private(archipelago: &Archipelago) {

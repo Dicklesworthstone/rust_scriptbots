@@ -709,6 +709,15 @@ cargo build -p scriptbots-brain-ml --features candle # library tensor inference;
    to 256 MiB and 64 islands, with at most 10 million aggregate island transitions
    per invocation. Deterministic comparisons remain within the same executable lane.
 
+   At the runtime API, transient journal-capacity pressure during a migration
+   preserves the frozen plan, completed transfers and current command identity.
+   A later explicit `Archipelago::step_to_barrier` call retries the retained owner
+   batch once and continues that same migration. Selection and scientific stepping
+   are not repeated, and the last complete barrier remains the published view.
+   World, digest, census and checkpoint reads refuse the incomplete barrier until
+   transfer and conservation checks settle. Terminal journal or scientific failures
+   remain latched with their actual organism-ownership evidence.
+
  - `--set PATH=VALUE`: dotted-path configuration override in TOML syntax, repeatable (e.g., `--set world_width=800 --set neuroflow.enabled=true`; string values use TOML quotes). Configuration layers apply defaults → `--config` files (in order) → environment → CLI; every applied layer appends a kind-tagged content digest to the run manifest's `scenario.ordered_config_layer_digests`, and any field where one explicit layer displaced another is recorded in the manifest's `config_overrides`.
 - `--quality TIER`: visual quality shortcut for `--set render.quality=TIER`, validated at parse time (`auto|potato|low|medium|high|ultra`). The unified `render.*` settings (quality tier, post stack bloom/vignette/fog/AA, day/night cycle, TUI theme, accessibility palette) are consumed by every frontend; `None` values defer to per-tier frontend defaults.
  - `--dump-png FILE` + `--png-size WxH` (GUI builds): write an offscreen PNG and exit.

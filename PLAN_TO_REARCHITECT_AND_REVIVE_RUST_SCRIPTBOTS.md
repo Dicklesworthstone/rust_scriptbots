@@ -22,18 +22,40 @@ review and scoped DSR rustfmt/parse checking are complete. App compilation and
 test execution remain unverified: bounded dependency hydration did not complete
 the locked workspace graph. The original full terminal/native acceptance stays open.
 
+**Keep GPUI controls responsive during owner admission (2026-11-23):**
+[Currently In Progress — Codex; scoped contribution to `bd-2z0.7.8.7`;
+original ownership and complete native acceptance retained]
+
+Move ordinary GPUI control submission off the UI event thread through a bounded
+admission worker. Preserve canonical command identity and order, revision checks,
+and the distinction between a queued request, observed admission and application.
+Selection and other control interactions must remain responsive during a slow
+owner response, and completed or refused work must retain its actual receipt.
+
 **Resume archipelago migration under journal pressure (2026-11-23):**
 [Currently In Progress — Codex; scoped contribution to `bd-16g.5`;
 original ownership and complete archipelago acceptance retained]
 
-Keep a frozen migration plan and its exact command/transfer phase across an
-ordinary bounded-journal refusal. A later explicit barrier call must retry the
-retained owner work and finish each departure and arrival exactly once, including
-pressure after an arrival has already applied. Preserve the last published barrier
-until the complete migration and conservation checks settle. Terminal journal
-failures still latch with their actual organism ownership evidence. Cover real
-multi-island journeys against an uninterrupted oracle, including pressure before
-and after transfer, later moves, and terminal failures.
+Implemented retention of the frozen migration plan, population/identity census,
+completed moves and exact departure or arrival envelope across retryable journal
+capacity pressure. A later explicit barrier call retries the retained owner batch
+once and resumes the same transfer without reselecting organisms or stepping the
+islands again. Organisms stay in the existing source outbound slot, destination
+staging slot or destination live world. Published snapshots remain at the prior
+complete barrier; public world/digest/census/checkpoint reads refuse the pending
+migration even after owner pressure clears. Terminal failures still latch with
+their observed ownership or retained executable payload.
+
+Four authored actual-owner regressions cover repeated pressure on the first and
+third departure or arrival, unchanged batch identity and frozen selection, a
+queued departure blocked by an actual rejected-input audit, independently cleared
+owner pressure, and terminal Closed-on-retry. Successful continuation is compared
+with uninterrupted migration reports, scientific digests, census, command counters
+and the next barrier. Independent source review and scoped DSR rustfmt/parse
+checking passed. Runtime compilation and these tests remain unexecuted because
+bounded dependency hydration did not finish the locked graph. The original full
+archipelago acceptance remains open; this does not qualify parallel scaling,
+native presentation or interrupted-migration serialization.
 
 **Selected-checkpoint native replay (2026-11-23):**
 [Currently In Progress — Codex; scoped contribution to `bd-2z0.7.6.1`;
