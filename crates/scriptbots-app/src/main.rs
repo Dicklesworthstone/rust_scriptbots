@@ -5584,29 +5584,31 @@ fn run_replay_cli(
                 "--checkpoint-start requested, but database contains no valid checkpoint in {db_display}"
             )
         })?;
-        let (world, cut) = if record.format
+        let source = if record.format
             == format!(
                 "{}+postcard_hex",
                 scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA
             ) {
-            let host = record.host_checkpoint()?;
-            (host.world_checkpoint().clone(), Some(host.journal_cut()))
+            ReplayCheckpointSource::Host(Box::new(record.host_checkpoint()?))
         } else {
-            (record.world_checkpoint()?, None)
+            ReplayCheckpointSource::Science(Box::new(record.world_checkpoint()?))
         };
+        let world = source.world_checkpoint();
         if world.tick().0 >= tick_limit {
             bail!(
                 "checkpoint tick {} is already at or past requested tick limit {tick_limit}",
                 world.tick().0
             );
         }
-        Some((world, cut))
+        Some(source)
     } else {
         None
     };
-    let checkpoint_cut = replay_checkpoint
-        .as_ref()
-        .and_then(|(world, cut)| cut.map(|cut| (world.tick().0, cut)));
+    let checkpoint_cut = replay_checkpoint.as_ref().and_then(|source| {
+        source
+            .journal_cut()
+            .map(|cut| (source.world_checkpoint().tick().0, cut))
+    });
     let operator_commands = recorded_operator_commands(&storage, checkpoint_cut)
         .with_context(|| format!("failed to read the command journal of {db_display}"))?;
     storage.close()?;
@@ -5619,8 +5621,8 @@ fn run_replay_cli(
         );
     }
 
-    let (replay_run, start_tick) = if let Some((cp, cut)) = replay_checkpoint {
-        let cp_tick = cp.tick().0;
+    let (replay_run, start_tick) = if let Some(source) = replay_checkpoint {
+        let cp_tick = source.world_checkpoint().tick().0;
         info!(
             checkpoint_id = %latest_checkpoint.as_ref().expect("selected checkpoint").checkpoint_id,
             checkpoint_tick = cp_tick,
@@ -5630,7 +5632,7 @@ fn run_replay_cli(
         persisted_events.retain(|e| e.tick > cp_tick && e.tick <= tick_limit);
         let digest_ticks = recorded_digest_ticks(&persisted_events, tick_limit);
         let mut operator_commands = operator_commands;
-        if cut.is_none() {
+        if source.journal_cut().is_none() {
             // A science-only artifact has no owner journal cursor. Preserve its conservative
             // boundary: same-tick commands remain ambiguous and any mismatch must diverge.
             operator_commands.retain(|&tick, _| tick > cp_tick);
@@ -5641,7 +5643,7 @@ fn run_replay_cli(
             operator_commands,
         };
         let run = run_headless_simulation_from_checkpoint(
-            &cp,
+            &source,
             config,
             tick_limit,
             cli.brain,
@@ -6234,21 +6236,22 @@ fn recorded_digest_ticks(events: &[PersistedReplayEvent], tick_limit: u64) -> BT
         .collect()
 }
 
-/// A science command or persistence cut retained in its actual journal order.
+/// A science command, scheduled patch or persistence cut in its actual journal order.
 #[derive(Debug, Clone, PartialEq)]
 enum ReplayOperatorCommand {
     World(scriptbots_core::ControlCommand),
     FlushPersistence,
+    ScheduledConfigPatch(ScheduledConfigPatch),
 }
 
 /// What replay reproduces from the recording beyond the scenario itself.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ReplayMirror {
     /// Ticks whose batch carries a canonical world digest (`None`: the final tick only).
     digest_ticks: Option<BTreeSet<u64>>,
     /// Off-cadence batch boundaries; see [`recorded_flush_ticks`].
     flush_ticks: BTreeSet<u64>,
-    /// Operator commands and explicit flushes in their journal order at each world tick.
+    /// Operator commands, checkpoint schedule patches and explicit flushes in journal order.
     operator_commands: BTreeMap<u64, Vec<ReplayOperatorCommand>>,
 }
 
@@ -6258,7 +6261,12 @@ struct ReplayMirror {
 /// re-apply only the scenario's own interventions, so the first REST intervention, config patch
 /// or spawn made the replay diverge. Flushes preserve the cut relative to science commands
 /// at the same tick. Playback-only commands (pause, speed, steps, shutdown) are skipped;
-/// migrations need an archipelago and are refused.
+/// migrations need an archipelago and are refused. Full checkpoint replay also joins
+/// applied scheduled patches by their journal identity, preserving same-tick input order.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one journal read preserves the exact checkpoint cut, command outcomes, scheduled input order and durable boundary refusals"
+)]
 fn recorded_operator_commands(
     storage: &StorageReader,
     checkpoint: Option<(u64, scriptbots_runtime::HostJournalCutV1)>,
@@ -6298,7 +6306,7 @@ fn recorded_operator_commands(
             bail!("checkpoint replay journal cut differs from the recorded durable boundary");
         }
     }
-    let mut commands: BTreeMap<u64, Vec<ReplayOperatorCommand>> = BTreeMap::new();
+    let mut commands: BTreeMap<u64, Vec<(u64, ReplayOperatorCommand)>> = BTreeMap::new();
     for session in sessions {
         let mut after = None;
         loop {
@@ -6363,7 +6371,10 @@ fn recorded_operator_commands(
                         commands
                             .entry(record.terminal_boundary.tick.0)
                             .or_default()
-                            .push(ReplayOperatorCommand::FlushPersistence);
+                            .push((
+                                record.batch_id.sequence(),
+                                ReplayOperatorCommand::FlushPersistence,
+                            ));
                         continue;
                     }
                     HostCommand::Emigrate { .. } | HostCommand::Immigrate { .. } => bail!(
@@ -6381,7 +6392,10 @@ fn recorded_operator_commands(
                 commands
                     .entry(record.terminal_boundary.tick.0)
                     .or_default()
-                    .push(ReplayOperatorCommand::World(command));
+                    .push((
+                        record.batch_id.sequence(),
+                        ReplayOperatorCommand::World(command),
+                    ));
             }
             match page.next_after {
                 Some(cursor) => after = Some(cursor),
@@ -6389,7 +6403,60 @@ fn recorded_operator_commands(
             }
         }
     }
-    Ok(commands)
+    if let Some((tick, cut)) = checkpoint {
+        // Scheduled patches are separate journal records, not operator commands.
+        // Their actual position relative to same-tick commands is authoritative.
+        let mut after = (cut.last_journal_sequence != 0).then_some(
+            scriptbots_runtime::JournalBatchId::new(cut.session_id, cut.last_journal_sequence),
+        );
+        loop {
+            let page = storage.host_journal_session_conformance_page(
+                cut.session_id,
+                after,
+                1024,
+                scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
+            )?;
+            for record in page.records {
+                let Some(evidence) = record.scheduled_patch else {
+                    continue;
+                };
+                if record.state != scriptbots_storage::HostJournalRecordState::Durable
+                    || record.applied.tick.0 < tick
+                    || evidence.scheduled.due_tick != record.applied.tick
+                {
+                    bail!("checkpoint replay schedule differs from its durable journal boundary");
+                }
+                if matches!(
+                    evidence.outcome,
+                    scriptbots_runtime::ScheduledPatchOutcome::Applied { .. }
+                ) {
+                    commands.entry(record.applied.tick.0).or_default().push((
+                        record.batch_id.sequence(),
+                        ReplayOperatorCommand::ScheduledConfigPatch(evidence.scheduled),
+                    ));
+                }
+            }
+            match page.next_after {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        // A checkpoint requires one exact session, so its journal sequence orders
+        // every command and schedule action. Legacy multi-session iteration stays
+        // unchanged for tick-zero replay.
+        for actions in commands.values_mut() {
+            actions.sort_by_key(|(sequence, _)| *sequence);
+        }
+    }
+    Ok(commands
+        .into_iter()
+        .map(|(tick, actions)| {
+            (
+                tick,
+                actions.into_iter().map(|(_, action)| action).collect(),
+            )
+        })
+        .collect())
 }
 
 /// Re-apply the operator commands the host applied at `tick`, in journal order, through the
@@ -6414,6 +6481,20 @@ fn apply_recorded_operator_commands(
             ReplayOperatorCommand::FlushPersistence => {
                 persistence.finalize(world).with_context(|| {
                     format!("failed to re-apply a recorded persistence flush at tick {tick}")
+                })?;
+            }
+            ReplayOperatorCommand::ScheduledConfigPatch(statement) => {
+                if statement.due_tick.0 != tick {
+                    bail!("recorded schedule patch is attached to the wrong replay tick");
+                }
+                let patch = statement.decode_patch().map_err(anyhow::Error::msg)?;
+                let config = scriptbots_app::resolve_scheduled_config_patch(world.config(), &patch)
+                    .map_err(anyhow::Error::msg)?;
+                world.apply_config_update(config).with_context(|| {
+                    format!(
+                        "failed to re-apply recorded schedule patch {} at tick {tick}",
+                        statement.sequence
+                    )
                 })?;
             }
         }
@@ -6474,14 +6555,79 @@ fn digest_due(digest_ticks: Option<&BTreeSet<u64>>, completed_tick: u64, final_t
     })
 }
 
+/// A full owner source must retain the auxiliary science absent from its inner cut.
+enum ReplayCheckpointSource {
+    Science(Box<WorldCheckpointV1>),
+    Host(Box<scriptbots_runtime::HostCheckpointV1>),
+}
+
+impl ReplayCheckpointSource {
+    fn world_checkpoint(&self) -> &WorldCheckpointV1 {
+        match self {
+            Self::Science(checkpoint) => checkpoint,
+            Self::Host(checkpoint) => checkpoint.world_checkpoint(),
+        }
+    }
+
+    fn journal_cut(&self) -> Option<scriptbots_runtime::HostJournalCutV1> {
+        match self {
+            Self::Science(_) => None,
+            Self::Host(checkpoint) => Some(checkpoint.journal_cut()),
+        }
+    }
+
+    fn restore_world(&self, registry: scriptbots_core::BrainRegistry) -> Result<WorldState> {
+        match self {
+            Self::Science(checkpoint) => WorldState::restore_checkpoint_v1(checkpoint, registry)
+                .context(
+                    "failed to restore scientific checkpoint; auxiliary state requires a full owner checkpoint",
+                ),
+            Self::Host(checkpoint) => checkpoint
+                .restore_world(registry)
+                .context("failed to restore complete checkpoint science and continuity"),
+        }
+    }
+
+    fn validate_recorded_schedule(&self, mirror: &ReplayMirror, tick_limit: u64) -> Result<()> {
+        let Self::Host(checkpoint) = self else {
+            return Ok(());
+        };
+        let mut pending = checkpoint.remaining_schedule().unwrap_or_default().iter();
+        for (&tick, actions) in &mirror.operator_commands {
+            for action in actions {
+                if let ReplayOperatorCommand::ScheduledConfigPatch(statement) = action {
+                    let expected = pending.next().context(
+                        "recorded schedule has an action absent from the checkpoint's pending suffix",
+                    )?;
+                    if statement != expected || statement.due_tick.0 != tick {
+                        bail!(
+                            "recorded schedule differs from the checkpoint's exact pending suffix"
+                        );
+                    }
+                }
+            }
+        }
+        if pending
+            .next()
+            .is_some_and(|statement| statement.due_tick.0 < tick_limit)
+        {
+            bail!(
+                "checkpoint replay would cross a due schedule patch without its applied journal record"
+            );
+        }
+        Ok(())
+    }
+}
+
 fn run_headless_simulation_from_checkpoint(
-    checkpoint: &WorldCheckpointV1,
+    source: &ReplayCheckpointSource,
     config: &ScriptBotsConfig,
     tick_limit: u64,
     brain_preset: BrainPreset,
     interventions: &[ScenarioInterventionV1],
     mirror: &ReplayMirror,
 ) -> Result<ReplayRun> {
+    let checkpoint = source.world_checkpoint();
     let start_tick = checkpoint.tick().0;
     if start_tick >= tick_limit {
         bail!(
@@ -6494,8 +6640,16 @@ fn run_headless_simulation_from_checkpoint(
     let (collector, handle) = ReplayCollector::with_capacity(remaining_ticks as usize);
     let registry = create_brain_registry_for_config(brain_preset, checkpoint.config())
         .context("failed to create brain registry for checkpoint restore")?;
-    let mut world = WorldState::restore_checkpoint_v1(checkpoint, registry)
-        .context("failed to restore world state from checkpoint")?;
+    let mut world = source.restore_world(registry)?;
+    // The full owner supplies the exact pending suffix; the journal supplies
+    // which patches actually applied and their order relative to operator inputs.
+    // A launch recipe could repeat completed inputs or invent unadmitted ones.
+    source.validate_recorded_schedule(mirror, tick_limit)?;
+    let interventions = if matches!(source, ReplayCheckpointSource::Host(_)) {
+        &[]
+    } else {
+        interventions
+    };
     let persistence_interval = if config.persistence_interval == 0 {
         1
     } else {
@@ -11215,15 +11369,52 @@ activation = "Sigmoid"
         let mut pipeline = StoragePipeline::create_unattributed_file(path)?;
         let (mut config, _) = replay_culling_fixture();
         config.persistence_interval = 1;
+        config.archive_enabled = true;
+        config.archive_interval = 1;
+        config.archive_min_lifetime_ticks = 1;
+        config.selection_mode = scriptbots_core::EvolutionSelectionMode::Novelty;
+        config.communication_scramble = true;
+        config.communication_scramble_seed = Some(0x6370_7265);
         let (mut world, persistence) =
             WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
+        let width = world.terrain().width();
+        let height = world.terrain().height();
+        let cells = world.terrain().tiles().len();
+        let map = MapArtifact::new(
+            world.terrain().clone(),
+            Some(scriptbots_core::ScalarField::new(
+                width,
+                height,
+                vec![0.25; cells],
+            )?),
+            Some(scriptbots_core::ScalarField::new(
+                width,
+                height,
+                vec![0.9; cells],
+            )?),
+            None,
+            None,
+            scriptbots_core::MapArtifactMetadata {
+                generator: scriptbots_core::MapGeneratorKind::RuleBased,
+                tileset_id: "checkpoint-replay-auxiliary-science".to_owned(),
+                tileset_hash: 1,
+                seed: 42,
+                width,
+                height,
+                attempt_count: 1,
+                succeeded_on: 1,
+                generated_at_epoch_ms: 0,
+            },
+        )?;
+        world.apply_map_artifact(&map)?;
         let brains = install_brains(&mut world, BrainPreset::Mlp)?.population;
         seed_agents(&mut world, &brains, FounderRecipe::CornerGrid)?;
         let agent = world.agents().iter().next().expect("nonempty MLP world").0;
         let agent_uid = world.agent_uid(agent).expect("stable founder identity");
         let session = HostSessionId::new(0x6370_7265);
         let journal = pipeline.journal_port(session, Default::default())?;
-        let host = HostThread::spawn(
+        let pending_patch = serde_json::json!({"food_growth_rate": 0.03});
+        let host = HostThread::spawn_with_bootstrap(
             session,
             world,
             persistence,
@@ -11236,6 +11427,19 @@ activation = "Sigmoid"
                 ..HostCoreOptions::default()
             },
             ChannelHostOptions::default(),
+            HostBootstrap {
+                schedule: vec![
+                    ScheduledConfigPatch::new(
+                        1,
+                        scriptbots_core::Tick::zero(),
+                        serde_json::json!({"food_growth_rate": 0.1}),
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                    ScheduledConfigPatch::new(2, scriptbots_core::Tick(1), pending_patch.clone())
+                        .map_err(anyhow::Error::msg)?,
+                ],
+                ..HostBootstrap::default()
+            },
         )?;
         let mut port = host.port();
         submit_durable_replay_command(&mut port, CommandId::new(1), HostCommand::Step)?;
@@ -11252,6 +11456,14 @@ activation = "Sigmoid"
         let checkpoint = port.capture_host_checkpoint_v1()?;
         assert_eq!(checkpoint.tick().0, 1);
         assert!(checkpoint.world_checkpoint().agent_count() > 0);
+        let pending_statement =
+            ScheduledConfigPatch::new(2, scriptbots_core::Tick(1), pending_patch)
+                .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            checkpoint.remaining_schedule(),
+            Some(std::slice::from_ref(&pending_statement)),
+            "the saved owner retains only its unapplied scheduled suffix"
+        );
         pipeline.checkpoint_writer().record_host(
             "before-same-tick-command",
             &checkpoint,
@@ -11281,10 +11493,18 @@ activation = "Sigmoid"
             CommandId::new(3),
             HostCommand::try_from(after.clone())?,
         )?;
+        let mut operator_config = config.clone();
+        operator_config.food_growth_rate = 0.2;
+        let config_command = ControlCommand::UpdateConfig(Box::new(operator_config));
+        submit_durable_replay_command(
+            &mut port,
+            CommandId::new(4),
+            HostCommand::try_from(config_command.clone())?,
+        )?;
         assert_eq!(port.snapshot_after(None)?.unwrap().world.tick, 1);
         port.request_replay_world_digest()?;
-        submit_durable_replay_command(&mut port, CommandId::new(4), HostCommand::Step)?;
-        submit_durable_replay_command(&mut port, CommandId::new(5), HostCommand::Shutdown)?;
+        submit_durable_replay_command(&mut port, CommandId::new(5), HostCommand::Step)?;
+        submit_durable_replay_command(&mut port, CommandId::new(6), HostCommand::Shutdown)?;
         drop(port);
         let observed = host.join()?;
         assert_eq!(observed.snapshot.lifecycle, HostLifecycle::Stopped);
@@ -11302,11 +11522,20 @@ activation = "Sigmoid"
             [
                 ReplayOperatorCommand::World(before),
                 ReplayOperatorCommand::World(after.clone()),
+                ReplayOperatorCommand::World(config_command.clone()),
             ]
         );
         let cut = checkpoint.journal_cut();
         let commands = recorded_operator_commands(&reader, Some((1, cut)))?;
-        assert_eq!(commands[&1], [ReplayOperatorCommand::World(after)]);
+        assert_eq!(
+            commands[&1],
+            [
+                ReplayOperatorCommand::World(after),
+                ReplayOperatorCommand::World(config_command),
+                ReplayOperatorCommand::ScheduledConfigPatch(pending_statement.clone()),
+            ],
+            "same-tick operator config applies before the scheduled patch at the next Step"
+        );
 
         let progress = reader
             .host_journal_session_conformance_page(
@@ -11367,12 +11596,40 @@ activation = "Sigmoid"
             flush_ticks: recorded_flush_ticks(&batch_ticks, &config, 2),
             operator_commands: commands,
         };
+        let source = ReplayCheckpointSource::Host(Box::new(checkpoint.clone()));
+        let mut missing_schedule = mirror.clone();
+        missing_schedule
+            .operator_commands
+            .get_mut(&1)
+            .unwrap()
+            .retain(|action| !matches!(action, ReplayOperatorCommand::ScheduledConfigPatch(_)));
+        assert!(
+            source
+                .validate_recorded_schedule(&missing_schedule, 2)
+                .is_err(),
+            "an unapplied recorded suffix cannot silently cross a due schedule boundary"
+        );
+        let mut forged_schedule = mirror.clone();
+        for action in forged_schedule.operator_commands.get_mut(&1).unwrap() {
+            if let ReplayOperatorCommand::ScheduledConfigPatch(statement) = action {
+                statement.sequence += 1;
+            }
+        }
+        assert!(
+            source
+                .validate_recorded_schedule(&forged_schedule, 2)
+                .is_err(),
+            "equal patch contents do not excuse a different scheduled identity"
+        );
         let replay = run_headless_simulation_from_checkpoint(
-            checkpoint.world_checkpoint(),
+            &source,
             &config,
             2,
             BrainPreset::Mlp,
-            &[],
+            &[ScenarioInterventionV1 {
+                tick: 1,
+                set: serde_json::json!({"food_growth_rate": 0.9}),
+            }],
             &mirror,
         )?;
         assert_eq!(replay.simulated_ticks, 1);
@@ -11380,11 +11637,38 @@ activation = "Sigmoid"
         assert_eq!(replay.events, recorded);
         run_replay_cli(&cli, &config, FounderRecipe::CornerGrid, &[])?;
 
-        // Reproduce the original tick-only selection: the post-capture mutation
-        // disappears even though its completed tick equals the checkpoint tick.
-        mirror.operator_commands.retain(|&tick, _| tick > 1);
+        // Swapping the actual config/schedule journal order changes the future.
+        // This negative control does not commute as a mutation-only fixture would.
+        let mut wrong_order = mirror.clone();
+        wrong_order
+            .operator_commands
+            .get_mut(&1)
+            .unwrap()
+            .swap(1, 2);
+        let reordered = run_headless_simulation_from_checkpoint(
+            &source,
+            &config,
+            2,
+            BrainPreset::Mlp,
+            &[],
+            &wrong_order,
+        )?;
+        assert_ne!(reordered.final_digest, final_digest);
+        assert_ne!(reordered.events, recorded);
+
+        // Omitting only the post-capture mutation still changes the observed future.
+        mirror
+            .operator_commands
+            .get_mut(&1)
+            .unwrap()
+            .retain(|action| {
+                !matches!(
+                    action,
+                    ReplayOperatorCommand::World(ControlCommand::AdjustAgentMutationRates { .. })
+                )
+            });
         let missing_command = run_headless_simulation_from_checkpoint(
-            checkpoint.world_checkpoint(),
+            &ReplayCheckpointSource::Host(Box::new(checkpoint.clone())),
             &config,
             2,
             BrainPreset::Mlp,
@@ -11546,7 +11830,7 @@ activation = "Sigmoid"
                 recording.step(&mut oracle).unwrap();
             }
             let resumed = run_headless_simulation_from_checkpoint(
-                &checkpoint,
+                &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
                 &config,
                 horizon,
                 BrainPreset::Mlp,
@@ -11562,7 +11846,7 @@ activation = "Sigmoid"
                 ..ReplayMirror::default()
             };
             let refused = run_headless_simulation_from_checkpoint(
-                &checkpoint,
+                &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
                 &config,
                 horizon,
                 BrainPreset::Mlp,
@@ -11617,7 +11901,7 @@ activation = "Sigmoid"
 
         // 3. Resume from tick 10 up to tick 20.
         let resumed = run_headless_simulation_from_checkpoint(
-            &checkpoint,
+            &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
             &config,
             20,
             BrainPreset::Mlp,
@@ -11653,7 +11937,7 @@ activation = "Sigmoid"
         // Negative controls:
         // A. Attempting to resume when checkpoint is already at tick_limit must fail.
         let err_equal = run_headless_simulation_from_checkpoint(
-            &checkpoint,
+            &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
             &config,
             10,
             BrainPreset::Mlp,
@@ -11670,7 +11954,7 @@ activation = "Sigmoid"
 
         // B. Attempting to resume when checkpoint is past tick_limit must fail.
         let err_past = run_headless_simulation_from_checkpoint(
-            &checkpoint,
+            &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
             &config,
             5,
             BrainPreset::Mlp,
