@@ -1188,6 +1188,11 @@ pub(super) fn render_live_replay_screen(
         area.height.saturating_sub(3 + SHELL_FOOTER_ROWS),
     );
     frame.render_widget(Clear, body);
+    if workflows.viewing_artifacts {
+        let lines = terminal_artifact_lines(lab);
+        render_live_replay_lines(frame, body, lines, style, lab.scroll);
+        return;
+    }
     if workflows.viewing_replay {
         let mut lines = vec![
             "EXACT-TICK CHECKPOINT REPLAY".to_owned(),
@@ -1252,7 +1257,7 @@ pub(super) fn render_live_replay_screen(
     }
     let mut lines = vec![
         "SAVED CHECKPOINTS & BRANCH STUDIES".to_owned(),
-        "Up/Down select · R refresh · PgUp/PgDn scroll · G live canvas".into(),
+        "Up/Down select · R refresh · F2 retained files · PgUp/PgDn scroll · G live canvas".into(),
         format!("Observed live tick: {live_tick}. Browsing leaves the live owner unchanged."),
     ];
     if let Some(study) = active_study {
@@ -1414,6 +1419,80 @@ pub(super) fn render_live_replay_screen(
         lines.extend(replay_summary_lines(summary));
     }
     render_live_replay_lines(frame, body, lines, style, lab.scroll);
+}
+
+fn terminal_artifact_lines(lab: &super::TerminalReplayLab) -> Vec<String> {
+    use scriptbots_runtime::lab_workflows::{
+        LAB_MAX_ARTIFACT_BYTES, LabAction, artifact_export_lines,
+    };
+
+    let workflows = &lab.workflows;
+    let mut lines = vec!["RETAINED FILES".to_owned()];
+    if let Some(LabAction::ExportArtifact {
+        session_id,
+        artifact,
+        export_directory,
+    }) = &lab.export_draft
+    {
+        lines.extend([
+            "Enter exports this file into a new request directory · Esc cancels".into(),
+            "Up/Down scroll one row · PgUp/PgDn scroll six rows".into(),
+            format!("Source {} · {}", session_id.get(), artifact.artifact_id),
+            format!("File: {} · {} bytes", artifact.filename, artifact.byte_size),
+            format!("Destination: {export_directory}"),
+            format!("SHA-256: {}", artifact.checksum_sha256),
+            format!("BLAKE3: {}", artifact.checksum_blake3),
+        ]);
+        return lines;
+    }
+    lines.extend([
+        "Up/Down select · E review export · Esc back · PgUp/PgDn scroll".into(),
+        "[ first page · ] next page · R refresh".into(),
+    ]);
+    if let Some(page) = &workflows.artifacts {
+        lines.push(format!("Destination: {}", page.export_directory));
+        if let Some(selected) = workflows.selected_artifact_metadata() {
+            lines.push(format!(
+                "Selected: {} · {} bytes",
+                selected.filename, selected.byte_size
+            ));
+            if selected.byte_size > LAB_MAX_ARTIFACT_BYTES as u64 {
+                lines.push(format!(
+                    "Exceeds the {LAB_MAX_ARTIFACT_BYTES}-byte export limit."
+                ));
+            }
+        }
+        if page.items.is_empty() {
+            lines.push("No retained files on this page.".into());
+        } else {
+            lines.push(format!(
+                "Files {}–{} of {}",
+                page.offset + 1,
+                page.offset + page.items.len(),
+                page.total
+            ));
+            for row in &page.items {
+                let marker = if workflows.selected_artifact.as_ref() == Some(&row.artifact_id) {
+                    ">"
+                } else {
+                    " "
+                };
+                lines.push(format!("{marker} {} · {}", row.filename, row.artifact_id));
+            }
+        }
+    } else {
+        lines.push("Artifact catalog unavailable. R requests a page.".into());
+    }
+    if workflows.is_busy() {
+        lines.push("Waiting for the file service…".into());
+    }
+    if let Some(notice) = &workflows.notice {
+        lines.push(notice.clone());
+    }
+    if let Some(export) = &workflows.latest_artifact_export {
+        lines.extend(artifact_export_lines(export));
+    }
+    lines
 }
 
 fn render_live_replay_lines(

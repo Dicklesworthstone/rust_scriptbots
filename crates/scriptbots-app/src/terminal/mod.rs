@@ -372,6 +372,7 @@ impl CanvasReviewTarget {
             Self::Checkpoint(id) => {
                 app.frankentui.route == frankentui_shell::ShellRoute::Replay
                     && !app.replay_lab.workflows.viewing_replay
+                    && !app.replay_lab.workflows.viewing_artifacts
                     && app.selected_checkpoint_id() == Some(id.as_str())
             }
             Self::Narrative { route, event } => {
@@ -416,6 +417,8 @@ struct TerminalReplayLab {
     selected_row: Option<String>,
     scroll: u16,
     refresh_saved: bool,
+    /// Exact catalog observation and destination awaiting explicit confirmation.
+    export_draft: Option<LabAction>,
 }
 
 impl TerminalReplayLab {
@@ -447,6 +450,9 @@ impl TerminalReplayLab {
     }
 
     fn reconcile_selection(&mut self) {
+        if self.workflows.viewing_artifacts {
+            return;
+        }
         let rows = self.rows();
         if self
             .selected_row
@@ -488,6 +494,9 @@ impl TerminalReplayLab {
         if self.workflows.viewing_replay {
             return self.handle_replay_key(key);
         }
+        if self.workflows.viewing_artifacts {
+            return self.handle_artifact_key(key);
+        }
         let view = self.workflows.checkpoint_view;
         let action = match key {
             K::Up | K::Down => {
@@ -503,6 +512,7 @@ impl TerminalReplayLab {
                 return true;
             }
             K::Char('r' | 'R') => LabAction::Refresh,
+            K::F(2) => LabAction::ArtifactsPage(None),
             K::Char('t' | 'T') if view == LabCheckpointView::SavedCuts => LabAction::OpenReplay,
             K::Char('b' | 'B') => LabAction::CheckpointBranchesPage(None),
             K::Char('a' | 'A') => LabAction::BackToCheckpoints,
@@ -562,6 +572,90 @@ impl TerminalReplayLab {
         };
         self.workflows.dispatch(action);
         self.reconcile_selection();
+        self.scroll = 0;
+        true
+    }
+
+    fn handle_artifact_key(&mut self, key: ftui::core::event::KeyCode) -> bool {
+        use ftui::core::event::KeyCode as K;
+        let action = match key {
+            K::Up | K::Down if self.export_draft.is_some() => {
+                self.scroll = if key == K::Up {
+                    self.scroll.saturating_sub(1)
+                } else {
+                    self.scroll.saturating_add(1)
+                };
+                return true;
+            }
+            K::PageUp | K::PageDown => {
+                self.scroll = if key == K::PageUp {
+                    self.scroll.saturating_sub(6)
+                } else {
+                    self.scroll.saturating_add(6)
+                };
+                return true;
+            }
+            K::Up | K::Down => {
+                let Some(page) = &self.workflows.artifacts else {
+                    return true;
+                };
+                let index = page.items.iter().position(|row| {
+                    self.workflows.selected_artifact.as_ref() == Some(&row.artifact_id)
+                });
+                let index = match (index, key) {
+                    (Some(i), K::Down) => (i + 1).min(page.items.len().saturating_sub(1)),
+                    (Some(i), _) => i.saturating_sub(1),
+                    (None, _) => 0,
+                };
+                let Some(row) = page.items.get(index) else {
+                    return true;
+                };
+                LabAction::SelectArtifact(row.artifact_id.clone())
+            }
+            K::Char('[') => LabAction::ArtifactsPage(None),
+            K::Char(']') => {
+                let Some(cursor) = self
+                    .workflows
+                    .artifacts
+                    .as_ref()
+                    .and_then(|p| p.next_cursor.clone())
+                else {
+                    self.workflows
+                        .set_notice("No next artifact page is available.");
+                    return true;
+                };
+                LabAction::ArtifactsPage(Some(cursor))
+            }
+            K::Char('r' | 'R') => LabAction::Refresh,
+            K::Char('e' | 'E') => {
+                self.export_draft = self.workflows.export_artifact_action();
+                if self.export_draft.is_none() || self.workflows.is_busy() {
+                    self.export_draft = None;
+                    self.workflows.set_notice(
+                        "Select an exportable file and wait for the current request to finish.",
+                    );
+                }
+                self.scroll = 0;
+                return true;
+            }
+            K::Enter => {
+                let Some(action) = self.export_draft.take() else {
+                    return true;
+                };
+                // The shared reducer compares the whole staged descriptor, owner and
+                // destination against the current page before it admits any file I/O.
+                action
+            }
+            K::Escape if self.export_draft.take().is_some() => return true,
+            K::Escape => LabAction::BackFromArtifacts,
+            K::Char('1'..='9' | 'q' | 'Q' | '?' | ':' | 'h') => {
+                self.export_draft = None;
+                return false;
+            }
+            _ => return true,
+        };
+        self.export_draft = None;
+        self.workflows.dispatch(action);
         self.scroll = 0;
         true
     }
@@ -5267,6 +5361,7 @@ impl<'a> TerminalApp<'a> {
                     && (key.modifiers == Modifiers::NONE || key.modifiers == Modifiers::SHIFT)
                     && self.handle_guide_input(key.code)
                 {
+                    self.replay_lab.export_draft = None;
                     return Ok(false);
                 }
                 if self.frankentui.guide.visible && !self.palette_open {
@@ -5278,6 +5373,21 @@ impl<'a> TerminalApp<'a> {
                 {
                     self.frankentui.update(ShellMessage::Event(E::Key(key)));
                     return Ok(false);
+                }
+                if self.replay_lab.workflows.viewing_artifacts
+                    && !self.palette_open
+                    && !self.help_visible
+                    && key.modifiers != Modifiers::NONE
+                    && key.modifiers != Modifiers::SHIFT
+                {
+                    if key.modifiers == Modifiers::CTRL
+                        && matches!(key.code, K::Char('p' | 'P' | 'c'))
+                    {
+                        self.replay_lab.export_draft = None;
+                    } else {
+                        // Modified live controls must not reach the owner underneath this pane.
+                        return Ok(false);
+                    }
                 }
                 if !self.palette_open
                     && !self.help_visible
@@ -5385,6 +5495,21 @@ impl<'a> TerminalApp<'a> {
                 if self.frankentui.branch_draft.is_some() || self.frankentui.guide.visible {
                     return Ok(false);
                 }
+                if self.replay_lab.workflows.viewing_artifacts
+                    && !self.palette_open
+                    && !self.help_visible
+                {
+                    match terminal_mouse(mouse).kind {
+                        MouseEventKind::ScrollUp => {
+                            self.replay_lab.scroll = self.replay_lab.scroll.saturating_sub(1)
+                        }
+                        MouseEventKind::ScrollDown => {
+                            self.replay_lab.scroll = self.replay_lab.scroll.saturating_add(1)
+                        }
+                        _ => {}
+                    }
+                    return Ok(false);
+                }
                 self.handle_mouse(terminal_mouse(mouse))?;
                 Ok(false)
             }
@@ -5441,6 +5566,9 @@ impl<'a> TerminalApp<'a> {
             },
         );
         let reviewed = self.replay_lab.workflows.poll();
+        if !self.replay_lab.workflows.viewing_artifacts {
+            self.replay_lab.export_draft = None;
+        }
         if let (Some(branch), Some(report)) = (
             self.replay_lab.workflows.branch.as_ref(),
             self.replay_lab.workflows.branch_report.as_ref(),
@@ -5454,6 +5582,7 @@ impl<'a> TerminalApp<'a> {
             && self.replay_lab.refresh_saved
             && self.replay_lab.workflows.checkpoint_view == LabCheckpointView::SavedCuts
             && !self.replay_lab.workflows.viewing_replay
+            && !self.replay_lab.workflows.viewing_artifacts
             && !self.replay_lab.workflows.is_busy()
         {
             self.replay_lab.refresh_saved = false;
@@ -5518,7 +5647,9 @@ impl<'a> TerminalApp<'a> {
     fn project_replay_catalog(&mut self) {
         use science_screens::{CheckpointViewEntry, ReplayViewData, ScreenDataState};
         let lab = &self.replay_lab;
-        let data = if lab.workflows.checkpoint_view == LabCheckpointView::SavedCuts {
+        let data = if lab.workflows.viewing_artifacts {
+            ScreenDataState::empty("Return from retained files to select a checkpoint.")
+        } else if lab.workflows.checkpoint_view == LabCheckpointView::SavedCuts {
             lab.workflows.checkpoints.as_ref().map_or_else(
                 || ScreenDataState::empty("No saved checkpoint page is loaded; R refreshes."),
                 |page| {
@@ -23288,6 +23419,156 @@ for case in ('panic', 'subscription', 'renderer'):
         );
         assert_eq!(host.port().scientific_digest_v1().unwrap(), before);
         assert!(Arc::ptr_eq(&retained, &host.port().snapshot_hub().latest()));
+    }
+
+    #[test]
+    fn live_terminal_exports_selected_retained_file_across_pages() {
+        use ftui::core::event::KeyCode as K;
+        use scriptbots_runtime::lab_workflows::{LAB_PAGE_SIZE, LabArtifactExportState};
+
+        let (host, runtime, handle, _, directory) = checkpoint_branch_terminal_fixture();
+        for _ in 0..LAB_PAGE_SIZE {
+            handle.create_checkpoint(Default::default()).unwrap();
+        }
+        let session = handle.session_id();
+        let digest = host.port().scientific_digest_v1().unwrap();
+        let destination = directory.canonicalize().unwrap().join("terminal-exports");
+        let destination_text = destination.to_str().unwrap().to_owned();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(frankentui_shell::ShellRoute::Replay);
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        model.app.borrow_mut().replay_lab.workflows.submit =
+            Some(crate::renderer::lab_workflow_submit_with_export_directory(
+                handle.clone(),
+                Ok(destination_text.clone()),
+            ));
+        finish_terminal_replay_read(&mut model);
+        let saved = model
+            .app
+            .borrow()
+            .selected_checkpoint_id()
+            .unwrap()
+            .to_owned();
+        terminal_lab_key(&mut model, K::F(2));
+        finish_terminal_replay_read(&mut model);
+        assert!(model.app.borrow().selected_checkpoint_id().is_none());
+        assert_eq!(
+            model
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .artifacts
+                .as_ref()
+                .unwrap()
+                .total,
+            LAB_PAGE_SIZE + 1
+        );
+        let _ = model.update(checkpoint_branch_terminal_key(
+            K::Char(' '),
+            ftui::core::event::Modifiers::CTRL,
+        ));
+        assert!(
+            model.app.borrow().unpresented_commands.is_empty(),
+            "Modified space cannot queue playback behind Files"
+        );
+        terminal_lab_key(&mut model, K::Down);
+        terminal_lab_key(&mut model, K::Char('E'));
+        assert!(model.app.borrow().replay_lab.export_draft.is_some());
+        terminal_lab_key(&mut model, K::Char('1'));
+        terminal_lab_key(&mut model, K::Char('7'));
+        finish_terminal_replay_read(&mut model);
+        terminal_lab_key(&mut model, K::F(2));
+        finish_terminal_replay_read(&mut model);
+        terminal_lab_key(&mut model, K::Enter);
+        assert!(
+            model
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .latest_artifact_export
+                .is_none()
+        );
+        terminal_lab_key(&mut model, K::Down);
+        terminal_lab_key(&mut model, K::Char('E'));
+        terminal_lab_key(&mut model, K::Char(']'));
+        finish_terminal_replay_read(&mut model);
+        terminal_lab_key(&mut model, K::Enter);
+        assert!(
+            !destination.exists(),
+            "Changing pages discards a staged file export"
+        );
+        terminal_lab_key(&mut model, K::Down);
+        let selected = {
+            let app = model.app.borrow();
+            let workflows = &app.replay_lab.workflows;
+            assert_eq!(workflows.artifacts.as_ref().unwrap().offset, LAB_PAGE_SIZE);
+            workflows.selected_artifact_metadata().unwrap().clone()
+        };
+        let (_, bytes) = handle.read_artifact_bytes(&selected.artifact_id).unwrap();
+        terminal_lab_key(&mut model, K::Char('E'));
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+        let frame = frankentui_shell::buffer_to_string(simulator.capture_frame(160, 30));
+        assert!(frame.contains(&selected.filename));
+        assert!(frame.contains(&destination_text));
+        assert!(frame.contains(&selected.checksum_sha256));
+        // At this size only three wrapped body rows fit. Walk the first visible
+        // row through the confirmation and reconstruct its actual destination.
+        let mut visible = String::new();
+        let expected: String = destination_text
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        for _ in 0..(32 + destination_text.len()) {
+            let frame = frankentui_shell::buffer_to_string(simulator.capture_frame(36, 8));
+            visible.extend(
+                frame
+                    .lines()
+                    .nth(3)
+                    .unwrap()
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace()),
+            );
+            if visible.contains(&expected) {
+                break;
+            }
+            terminal_lab_key(simulator.model_mut(), K::Down);
+        }
+        assert!(
+            visible.contains(&expected),
+            "complete destination in scrolled cells: {visible}"
+        );
+        assert!(!destination.exists(), "Preview reads metadata only");
+        terminal_lab_key(simulator.model_mut(), K::Enter);
+        terminal_lab_key(simulator.model_mut(), K::Escape);
+        finish_terminal_replay_read(simulator.model_mut());
+        {
+            let app = simulator.model().app.borrow();
+            assert_eq!(app.selected_checkpoint_id(), Some(saved.as_str()));
+            let export = app
+                .replay_lab
+                .workflows
+                .latest_artifact_export
+                .as_ref()
+                .unwrap();
+            let LabArtifactExportState::Exported(receipt) = &export.state else {
+                panic!("expected verified filesystem receipt: {:?}", export.state);
+            };
+            assert_eq!(receipt.session_id, session);
+            assert_eq!(receipt.artifact, selected);
+            assert_eq!(receipt.export_directory, destination_text);
+            assert_eq!(fs::read(&receipt.output_path).unwrap(), bytes);
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(&receipt.manifest_path).unwrap()).unwrap();
+            assert_eq!(
+                manifest["artifact"]["checksum_sha256"],
+                selected.checksum_sha256
+            );
+        }
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 1);
+        assert_eq!(host.port().scientific_digest_v1().unwrap(), digest);
     }
 
     fn terminal_replay_fixture_report(

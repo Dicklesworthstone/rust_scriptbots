@@ -4176,7 +4176,7 @@ pub mod renderer {
 
     // Resolve configuration once per provider. A later environment or working
     // directory change cannot redirect an export after the UI displays its path.
-    fn lab_workflow_submit_with_export_directory(
+    pub(super) fn lab_workflow_submit_with_export_directory(
         control: crate::control::ControlHandle,
         export_directory: Result<String, String>,
     ) -> scriptbots_runtime::lab_workflows::LabWorkflowSubmit {
