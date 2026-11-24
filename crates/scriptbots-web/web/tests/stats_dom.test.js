@@ -1725,12 +1725,108 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     if (await page.evaluate(() => document.getElementById("renderer-status").dataset.snapshotTick) !== String(saved.tick)) {
       throw new Error("Incoming live frame replaced the saved canvas");
     }
+    // Retain a real intermediate publication, then let the owner advance once
+    // more. Seeking must reconstruct that interior tick while verifying all
+    // the way through the independently captured current endpoint.
+    const targetFrame = await page.evaluate(() => window.__remoteWire.frames.canvas);
+    const endpointStep = await request("/api/control/step", { method: "POST" });
+    await until(() => request(`/api/control/status/${endpointStep.command_id}`),
+      (receipt) => receipt.application_state === "applied" && receipt.journal_state === "durable", "replay verification endpoint");
+    const replayEndpoint = await request("/api/status");
+    await page.waitForFunction((tick) => window.__remoteWire.frames.canvas.identity.tick === String(tick), replayEndpoint.tick);
+    if (targetFrame.identity.tick !== String(advanced.tick) || replayEndpoint.tick <= advanced.tick) {
+      throw new Error("Historical replay test did not retain a genuine interior publication");
+    }
+    if (await page.inputValue("#lab-replay-tick") !== String(saved.tick)) {
+      throw new Error("Saving a checkpoint did not initialize its historical target");
+    }
+    await page.fill("#lab-replay-tick", String(advanced.tick));
+    await page.click("#lab-replay-forward-one");
+    await page.click("#lab-replay-back-one");
+    if (await page.inputValue("#lab-replay-tick") !== String(advanced.tick)) {
+      throw new Error("Historical target step controls changed the exact target");
+    }
+    const [replayResponse] = await Promise.all([
+      page.waitForResponse((response) => new URL(response.url()).pathname === `/api/v1/checkpoints/${saved.checkpoint_id}/replay`),
+      page.click("#lab-replay-seek"),
+    ]);
+    if (!replayResponse.ok()) throw new Error("The native historical replay was refused");
+    const replayEnvelope = await replayResponse.json();
+    const replayed = await page.evaluate(async ({ moduleFile, encoded }) => {
+      const { decode_remote_frame_binary: decode } = await import(`/pkg/${moduleFile}`);
+      return decode(Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0)));
+    }, { moduleFile: packageInfo.moduleFile, encoded: replayEnvelope.frameBase64 });
+    if (replayEnvelope.schema !== "scriptbots.checkpoint-replay.v1"
+        || replayEnvelope.targetTick !== String(advanced.tick)
+        || replayEnvelope.verification.kind !== "captured_interval"
+        || replayEnvelope.verification.verifiedThroughTick !== String(replayEndpoint.tick)
+        || !/^[0-9a-f]{16}$/.test(replayEnvelope.verification.capturedCurrentDigest)
+        || BigInt(replayEndpoint.tick) - BigInt(saved.tick) > BigInt(replayEnvelope.maxVerificationTicks)
+        || replayed.identity.sessionId !== expectedPng.sessionId || replayed.identity.tick !== String(advanced.tick)
+        || !replayed.playback.paused || replayed.playback.speedMultiplier !== 1
+        || JSON.stringify(savedAgents(replayed.payload)) !== JSON.stringify(savedAgents(targetFrame.payload))
+        || JSON.stringify(savedEnvironment(replayed.environment)) !== JSON.stringify(savedEnvironment(targetFrame.environment))) {
+      throw new Error("Historical replay disagreed with its real interior population, environment or verification interval");
+    }
+    await page.waitForFunction((tick) => document.getElementById("checkpoint-view-status").dataset.state === "ready"
+      && document.getElementById("renderer-status").dataset.view === "checkpoint"
+      && document.getElementById("renderer-status").dataset.snapshotTick === String(tick), advanced.tick);
+    const replayUi = await page.evaluate(() => ({
+      status: { ...document.getElementById("checkpoint-view-status").dataset },
+      renderer: { ...document.getElementById("renderer-status").dataset },
+      tick: document.getElementById("metric-tick").textContent,
+      births: document.getElementById("metric-births").textContent,
+      deaths: document.getElementById("metric-deaths").textContent,
+      tps: document.getElementById("metric-tps").textContent,
+      blocked: ["remote-pause", "remote-step", "remote-resume", "inspector-uid", "lab-checkpoint-save", "lab-branch-launch"]
+        .every((id) => document.getElementById(id).disabled),
+    }));
+    for (const provenance of [replayUi.status, replayUi.renderer]) {
+      if (provenance.targetTick !== String(advanced.tick) || provenance.sourceTick !== String(saved.tick)
+          || provenance.sourceWorldDigestV1 !== saved.world_digest_v1 || provenance.worldDigestV1 !== ""
+          || provenance.verificationKind !== "captured_interval"
+          || provenance.verifiedThroughTick !== String(replayEndpoint.tick)
+          || provenance.capturedCurrentDigest !== replayEnvelope.verification.capturedCurrentDigest) {
+        throw new Error("Historical presentation mislabeled a source or endpoint digest as the target digest");
+      }
+    }
+    if (!replayUi.blocked || replayUi.tick !== advanced.tick.toLocaleString()
+        || [replayUi.births, replayUi.deaths, replayUi.tps].some((value) => value !== "—")) {
+      throw new Error("Historical replay exposed live controls or claimed original per-tick counters");
+    }
+    observations.checkpointReplay = { targetTick: String(advanced.tick), verification: replayEnvelope.verification, png: {} };
+    for (const backend of ["canvas", "webgpu"]) {
+      await page.selectOption("#renderer", backend);
+      await page.waitForFunction((backend) => document.getElementById("renderer-status").dataset.renderer === backend, backend);
+      const [download] = await Promise.all([page.waitForEvent("download"), page.click("#capture-btn")]);
+      await download.saveAs(path.join(proof, `replay-${backend}.png`));
+      if (await download.failure()) throw new Error("Historical PNG download failed");
+      await page.waitForFunction(() => document.getElementById("capture-status").dataset.state === "ready");
+      const exported = await page.evaluate(() => ({ ...document.getElementById("capture-status").dataset }));
+      const expected = `scriptbots-replay-${saved.checkpoint_id}-from${saved.tick}-t${advanced.tick}-${backend}.png`;
+      if (exported.view !== "checkpoint" || exported.checkpointId !== saved.checkpoint_id
+          || exported.tick !== String(advanced.tick) || exported.sourceTick !== String(saved.tick)
+          || exported.sourceWorldDigestV1 !== saved.world_digest_v1 || exported.worldDigestV1 !== ""
+          || exported.verificationKind !== "captured_interval"
+          || exported.verifiedThroughTick !== String(replayEndpoint.tick)
+          || exported.capturedCurrentDigest !== replayEnvelope.verification.capturedCurrentDigest
+          || download.suggestedFilename() !== expected) throw new Error("Historical PNG lost its source, target or verification scope");
+      observations.checkpointReplay.png[backend] = exported;
+    }
+    const afterReplay = await request("/api/status");
+    for (const field of ["tick", "scientific_revision", "control_revision", "config_revision", "paused"]) {
+      if (afterReplay[field] !== replayEndpoint[field]) throw new Error("Historical replay mutated the live owner");
+    }
+    if (await page.evaluate(() => window.__remoteWire.sent.filter(
+      (message) => ["pause", "resume", "step", "speed"].includes(message.command)).length) !== controlsBeforeReview) {
+      throw new Error("Historical seek or PNG export submitted a live playback command");
+    }
     await page.click("#checkpoint-return-live");
     await page.waitForFunction((tick) => document.getElementById("renderer-status").dataset.view === "live"
       && document.getElementById("renderer-status").dataset.snapshotTick === String(tick)
       && !document.getElementById("remote-step").disabled
-      && document.getElementById("checkpoint-view").hidden, advanced.tick);
-    observations.checkpointReview.returnedLiveTick = advanced.tick;
+      && document.getElementById("checkpoint-view").hidden, replayEndpoint.tick);
+    observations.checkpointReview.returnedLiveTick = replayEndpoint.tick;
     observations.resume = await control("#remote-resume", "resume");
     await until(() => request("/api/status"), (status) => !status.paused && status.tick > observations.afterStep.tick, "remote science after Resume");
     await control("#remote-pause", "pause");
