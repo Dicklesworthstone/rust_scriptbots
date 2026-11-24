@@ -6,16 +6,27 @@
 
 use scriptbots_core::narrative::EventRecord;
 use scriptbots_core::reel::{Clip, SelectionConfig, select_clips};
-use scriptbots_core::{TerrainKind, WorldCheckpointV1, WorldState};
+use scriptbots_core::{
+    PersistenceAdmissionSession, ReplayEventKind, TerrainKind, WorldCheckpointV1, WorldPersistence,
+    WorldState,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 use tracing::{error, info};
+
+use crate::persisted_replay::{
+    ReplayCheckpointSource, ReplayMirror, apply_recorded_operator_commands, digest_due,
+    mirror_recorded_flush, recorded_flush_ticks, recorded_operator_commands,
+};
 
 /// Supported export formats for highlight reels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +114,9 @@ pub enum ReelReplayError {
     /// Serialization failure.
     #[error("serialization error: {0}")]
     Serialization(String),
+    /// Invalid clip interval or encoder dimensions.
+    #[error("invalid montage options: {0}")]
+    InvalidOptions(String),
 }
 
 /// Parameters for montage encoding.
@@ -175,6 +189,352 @@ pub trait ReplayProvider {
 
     /// Maximum tick reachable by this replay provider.
     fn max_tick(&self) -> u64;
+
+    /// Complete any verification horizon beyond the last visual frame.
+    ///
+    /// The encoder calls this before publishing the completed artifact. Fixture
+    /// providers need no persisted evidence; a journal-backed provider must verify
+    /// its covering digest again during this rendering pass.
+    fn finish_replay(&mut self) -> Result<(), ReelReplayError> {
+        Ok(())
+    }
+}
+
+type DigestAnchors = VecDeque<(u64, String)>;
+
+/// Verify digests where the original persistence boundary emitted them. Comparing
+/// `world_digest_v1()` after same-tick commands would observe a different cut.
+struct DigestVerifier {
+    remaining: Arc<Mutex<DigestAnchors>>,
+}
+
+impl WorldPersistence for DigestVerifier {
+    fn on_tick(
+        &mut self,
+        payload: &scriptbots_core::PersistenceBatch,
+    ) -> Result<(), scriptbots_core::PersistenceAdmissionError> {
+        let tick = payload.summary.tick.0;
+        let mut remaining = self.remaining.lock().map_err(|error| {
+            scriptbots_core::PersistenceAdmissionError::new(
+                tick,
+                format!("montage digest verifier poisoned: {error}"),
+            )
+        })?;
+        for event in &payload.replay_events {
+            if let ReplayEventKind::WorldDigest { overall } = &event.kind {
+                let expected = remaining.front();
+                if !expected.is_some_and(|(expected_tick, digest)| {
+                    *expected_tick == tick && digest == overall
+                }) {
+                    return Err(scriptbots_core::PersistenceAdmissionError::new(
+                        tick,
+                        format!(
+                            "montage replay digest diverged: expected {expected:?}, observed ({tick}, {overall})"
+                        ),
+                    ));
+                }
+                remaining.pop_front();
+            }
+        }
+        Ok(())
+    }
+}
+
+struct JournalReplayWorld {
+    world: WorldState,
+    persistence: PersistenceAdmissionSession,
+    current_config: serde_json::Value,
+    remaining: Arc<Mutex<DigestAnchors>>,
+}
+
+impl JournalReplayWorld {
+    fn restore(source: &ReplayCheckpointSource, expected: &DigestAnchors) -> anyhow::Result<Self> {
+        let ReplayCheckpointSource::Host(owner) = source else {
+            anyhow::bail!("persisted montage requires complete owner recording continuity");
+        };
+        let checkpoint = source.world_checkpoint();
+        let registry = crate::brains::create_brain_registry_for_checkpoint(checkpoint)?;
+        let world = source.restore_world(registry)?;
+        let remaining = Arc::new(Mutex::new(expected.clone()));
+        // Full restoration already supplied the raw recording cadence, cap and
+        // disabled-boundary marker. The inner science checkpoint normalizes its
+        // cadence to zero; rebinding from that config would invent batch cuts.
+        let mut persistence = world.bind_persistence(Box::new(DigestVerifier {
+            remaining: Arc::clone(&remaining),
+        }))?;
+        persistence.restore_admission_cursor(&world, owner.persistence_last_admitted_tick())?;
+        let current_config = serde_json::to_value(world.config())?;
+        Ok(Self {
+            world,
+            persistence,
+            current_config,
+            remaining,
+        })
+    }
+
+    fn advance_to(&mut self, target: u64, mirror: &ReplayMirror, limit: u64) -> anyhow::Result<()> {
+        while self.world.tick().0 < target {
+            let tick = self.world.tick().0;
+            mirror_recorded_flush(&mut self.world, &mut self.persistence, mirror)?;
+            apply_recorded_operator_commands(
+                &mut self.world,
+                &mut self.persistence,
+                &mut self.current_config,
+                mirror,
+                tick,
+            )?;
+            if digest_due(mirror.digest_ticks.as_ref(), tick + 1, limit) {
+                self.world.request_replay_world_digest();
+            }
+            self.persistence.step(&mut self.world)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, mirror: &ReplayMirror, limit: u64) -> anyhow::Result<()> {
+        self.advance_to(limit, mirror, limit)?;
+        apply_recorded_operator_commands(
+            &mut self.world,
+            &mut self.persistence,
+            &mut self.current_config,
+            mirror,
+            limit,
+        )?;
+        self.persistence.finalize(&mut self.world)?;
+        let remaining = self
+            .remaining
+            .lock()
+            .map_err(|error| anyhow::anyhow!("montage digest verifier poisoned: {error}"))?;
+        anyhow::ensure!(
+            remaining.is_empty(),
+            "montage replay is missing recorded digest anchors: {remaining:?}"
+        );
+        Ok(())
+    }
+}
+
+/// Frozen full-owner source plus its exact durable journal suffix. One world is
+/// replayed through the covering anchor before encoding, then restored for a
+/// second streaming pass which must independently satisfy the same anchors.
+/// The borrowed reader retains the finished-run lease through publication.
+struct PersistedReplaySeeker<'a> {
+    _storage: &'a scriptbots_storage::StorageReader,
+    source: ReplayCheckpointSource,
+    mirror: ReplayMirror,
+    expected: DigestAnchors,
+    current: JournalReplayWorld,
+    anchor_tick: u64,
+    last_frame: u64,
+}
+
+impl<'a> PersistedReplaySeeker<'a> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one immutable input load binds the selected full checkpoint, exact journal and covering digest sequence"
+    )]
+    fn from_storage(
+        storage: &'a scriptbots_storage::StorageReader,
+        first_frame: u64,
+        last_frame: u64,
+    ) -> anyhow::Result<Self> {
+        // This is also the lease check for direct library callers, who may have
+        // opened a live reader instead of entering through the reel CLI.
+        storage.select_finished_run(Some(storage.run_id()))?;
+        anyhow::ensure!(first_frame <= last_frame, "montage frame range is reversed");
+        anyhow::ensure!(
+            storage
+                .archipelago_islands()?
+                .iter()
+                .all(|island| island.island_id == 0),
+            "offline montage requires a single-world run; migration barriers are unsupported"
+        );
+        let terminal_tick = storage.max_tick()?.unwrap_or(0);
+        anyhow::ensure!(
+            last_frame <= terminal_tick,
+            "montage target exceeds the recorded run"
+        );
+        let record = storage
+            .load_latest_checkpoint_before(first_frame.saturating_add(1))?
+            .ok_or_else(|| anyhow::anyhow!("no checkpoint can reach the first montage frame"))?;
+        // A raw checkpoint has no exact host cursor or schedule authority. Its
+        // explicitly intervention-free fixture API remains separate below.
+        let checkpoint = record.host_checkpoint()?;
+        let recording_config = checkpoint.config().clone();
+        let source = ReplayCheckpointSource::Host(Box::new(checkpoint));
+        let start_tick = source.world_checkpoint().tick().0;
+        let mut events = storage.load_replay_events()?;
+        anyhow::ensure!(
+            events
+                .iter()
+                .all(|event| event.island_id == scriptbots_core::rng_domains::IslandId(0)),
+            "offline montage replay contains another island's evidence"
+        );
+        events.sort_by_key(|event| (event.tick, event.seq));
+        anyhow::ensure!(
+            !events
+                .windows(2)
+                .any(|pair| (pair[0].tick, pair[0].seq) == (pair[1].tick, pair[1].seq)),
+            "offline montage replay contains duplicate event identities"
+        );
+        let anchor_tick = events
+            .iter()
+            .find(|event| {
+                event.tick > start_tick
+                    && event.tick >= last_frame
+                    && matches!(event.event.kind, ReplayEventKind::WorldDigest { .. })
+            })
+            .map(|event| event.tick)
+            .ok_or_else(|| {
+                anyhow::anyhow!("montage requires a recorded digest anchor covering every frame")
+            })?;
+        anyhow::ensure!(
+            anchor_tick <= terminal_tick,
+            "montage digest exceeds the recorded run"
+        );
+        let mut expected = DigestAnchors::new();
+        for entry in events
+            .iter()
+            .filter(|event| event.tick > start_tick && event.tick <= anchor_tick)
+        {
+            if let ReplayEventKind::WorldDigest { overall } = &entry.event.kind {
+                anyhow::ensure!(
+                    entry.seq < scriptbots_storage::NARRATIVE_INPUT_REPLAY_SEQ
+                        && entry.event.agent_uid.is_none()
+                        && entry.event.position.is_none()
+                        && entry.event.counterpart.is_none()
+                        && entry.event.counterpart_position.is_none()
+                        && overall.len() == 64
+                        && overall
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                    "montage world-digest identity or encoding is invalid"
+                );
+                expected.push_back((entry.tick, overall.clone()));
+            }
+        }
+        let mirror = ReplayMirror {
+            digest_ticks: Some(
+                expected
+                    .iter()
+                    .map(|(tick, _)| *tick)
+                    .collect::<BTreeSet<_>>(),
+            ),
+            flush_ticks: recorded_flush_ticks(
+                &storage.summary_ticks()?,
+                &recording_config,
+                anchor_tick,
+            ),
+            operator_commands: recorded_operator_commands(
+                storage,
+                source.journal_cut().map(|cut| (start_tick, cut)),
+            )?,
+        };
+        source.validate_recorded_schedule(&mirror, anchor_tick)?;
+        let mut verification = JournalReplayWorld::restore(&source, &expected)?;
+        verification.finish(&mirror, anchor_tick)?;
+        drop(verification);
+        let current = JournalReplayWorld::restore(&source, &expected)?;
+        Ok(Self {
+            _storage: storage,
+            source,
+            mirror,
+            expected,
+            current,
+            anchor_tick,
+            last_frame,
+        })
+    }
+}
+
+impl ReplayProvider for PersistedReplaySeeker<'_> {
+    fn seek_to_exact(&mut self, target_tick: u64) -> Result<&WorldState, ReelReplayError> {
+        let start_tick = self.source.world_checkpoint().tick().0;
+        if target_tick < start_tick || target_tick > self.last_frame {
+            return Err(ReelReplayError::UnreachableSeek {
+                target_tick,
+                nearest_checkpoint: start_tick,
+            });
+        }
+        if self.current.world.tick().0 > target_tick {
+            self.current = JournalReplayWorld::restore(&self.source, &self.expected)
+                .map_err(replay_storage_error)?;
+        }
+        self.current
+            .advance_to(target_tick, &self.mirror, self.anchor_tick)
+            .map_err(replay_storage_error)?;
+        // Frames observe completed steps before the next boundary's inputs.
+        // At the source tick the frame observes the exact captured owner cut.
+        Ok(&self.current.world)
+    }
+
+    fn max_tick(&self) -> u64 {
+        self.last_frame
+    }
+
+    fn finish_replay(&mut self) -> Result<(), ReelReplayError> {
+        self.current
+            .finish(&self.mirror, self.anchor_tick)
+            .map_err(replay_storage_error)
+    }
+}
+
+fn replay_storage_error(error: anyhow::Error) -> ReelReplayError {
+    ReelReplayError::Storage(format!("{error:#}"))
+}
+
+/// A private staging file is retained on error. Only a completely encoded,
+/// verified and synced artifact acquires the requested destination name. The
+/// exclusive hard link also preserves any existing destination byte-for-byte.
+struct OutputStage {
+    path: PathBuf,
+    file: File,
+}
+
+impl OutputStage {
+    fn create(destination: &Path) -> Result<Self, ReelReplayError> {
+        static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        for _ in 0..128 {
+            let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                ".scriptbots-reel-{}-{sequence}.pending",
+                std::process::id()
+            ));
+            if path.file_name() == destination.file_name() {
+                continue;
+            }
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(ReelReplayError::Io(error.to_string())),
+            }
+        }
+        Err(ReelReplayError::Io(
+            "could not reserve a private montage staging path".to_owned(),
+        ))
+    }
+
+    fn publish(&self, destination: &Path) -> Result<u64, ReelReplayError> {
+        self.file
+            .sync_all()
+            .map_err(|error| ReelReplayError::Io(error.to_string()))?;
+        let bytes = self
+            .file
+            .metadata()
+            .map_err(|error| ReelReplayError::Io(error.to_string()))?
+            .len();
+        std::fs::hard_link(&self.path, destination).map_err(|error| {
+            ReelReplayError::Io(format!(
+                "could not publish montage without replacing {} (staging retained at {}): {error}",
+                destination.display(),
+                self.path.display()
+            ))
+        })?;
+        Ok(bytes)
+    }
 }
 
 /// Replay seeker backed by a chronological sequence of [`WorldCheckpointV1`].
@@ -561,8 +921,42 @@ pub fn encode_montage_clips_with_seeker<R: ReplayProvider>(
         });
     }
 
-    // Verify caption-frame alignment for all events within each clip
+    // Refuse invalid intervals and dimensions before creating a staging file.
+    let width = if options.width > 0 {
+        options.width
+    } else if options.format == ReelFormat::Ascii {
+        80
+    } else {
+        160
+    };
+    let height = if options.height > 0 {
+        options.height
+    } else if options.format == ReelFormat::Ascii {
+        24
+    } else {
+        120
+    };
+    if width.checked_mul(height).is_none()
+        || (options.format == ReelFormat::Gif
+            && (u16::try_from(width).is_err() || u16::try_from(height).is_err()))
+    {
+        return Err(ReelReplayError::InvalidOptions(
+            "frame dimensions exceed the encoder's representable range".to_owned(),
+        ));
+    }
     for clip in clips {
+        if clip.start > clip.end {
+            return Err(ReelReplayError::InvalidOptions(format!(
+                "clip {} has a reversed tick range",
+                clip.rank
+            )));
+        }
+        if clip.end > seeker.max_tick() {
+            return Err(ReelReplayError::UnreachableSeek {
+                target_tick: clip.end,
+                nearest_checkpoint: seeker.max_tick(),
+            });
+        }
         for ev in &clip.events {
             if ev.tick < clip.start || ev.tick > clip.end {
                 return Err(ReelReplayError::CaptionFrameMismatch {
@@ -576,27 +970,18 @@ pub fn encode_montage_clips_with_seeker<R: ReplayProvider>(
 
     let start_time = Instant::now();
     let mut total_frames = 0;
-    let mut total_bytes = 0u64;
     let mut peak_in_flight = 0usize;
     let stride = options.stride.max(1);
+    let mut stage = OutputStage::create(&options.output_path)?;
 
     match options.format {
         ReelFormat::Ascii => {
-            let width = if options.width > 0 { options.width } else { 80 };
-            let height = if options.height > 0 {
-                options.height
-            } else {
-                24
-            };
-
-            let mut file = File::create(&options.output_path)
-                .map_err(|e| ReelReplayError::Io(e.to_string()))?;
+            let file = &mut stage.file;
             let header = format!(
                 "{{\"version\": 2, \"width\": {width}, \"height\": {height}, \"timestamp\": 0, \"title\": \"ScriptBots Reel\"}}\n"
             );
             file.write_all(header.as_bytes())
                 .map_err(|e| ReelReplayError::Io(e.to_string()))?;
-            total_bytes += header.len() as u64;
 
             let mut time_offset = 0.0f64;
             for clip in clips {
@@ -654,9 +1039,11 @@ pub fn encode_montage_clips_with_seeker<R: ReplayProvider>(
                     clip_frames += 1;
                     total_frames += 1;
                     time_offset += 0.1;
-                    tick += stride;
+                    let Some(next_tick) = tick.checked_add(stride) else {
+                        break;
+                    };
+                    tick = next_tick;
                 }
-                total_bytes += clip_bytes;
 
                 let clip_elapsed_ms = clip_start_time.elapsed().as_millis();
                 info!(
@@ -675,22 +1062,13 @@ pub fn encode_montage_clips_with_seeker<R: ReplayProvider>(
             }
         }
         ReelFormat::Gif => {
-            let width = if options.width > 0 {
-                options.width
-            } else {
-                160
-            };
-            let height = if options.height > 0 {
-                options.height
-            } else {
-                120
-            };
-
-            let mut file = File::create(&options.output_path)
-                .map_err(|e| ReelReplayError::Io(e.to_string()))?;
-            let mut encoder =
-                gif::Encoder::new(&mut file, width as u16, height as u16, &PINNED_GIF_PALETTE)
-                    .map_err(|e| ReelReplayError::Io(e.to_string()))?;
+            let mut encoder = gif::Encoder::new(
+                &mut stage.file,
+                width as u16,
+                height as u16,
+                &PINNED_GIF_PALETTE,
+            )
+            .map_err(|e| ReelReplayError::Io(e.to_string()))?;
             encoder
                 .set_repeat(gif::Repeat::Infinite)
                 .map_err(|e| ReelReplayError::Io(e.to_string()))?;
@@ -747,7 +1125,10 @@ pub fn encode_montage_clips_with_seeker<R: ReplayProvider>(
 
                     clip_frames += 1;
                     total_frames += 1;
-                    tick += stride;
+                    let Some(next_tick) = tick.checked_add(stride) else {
+                        break;
+                    };
+                    tick = next_tick;
                 }
 
                 let clip_elapsed_ms = clip_start_time.elapsed().as_millis();
@@ -765,14 +1146,15 @@ pub fn encode_montage_clips_with_seeker<R: ReplayProvider>(
                     "clip encoded"
                 );
             }
-            drop(encoder);
-            drop(file);
-            total_bytes = std::fs::metadata(&options.output_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            encoder
+                .into_inner()
+                .map_err(|error| ReelReplayError::Io(error.to_string()))?;
         }
         ReelFormat::Mp4 => unreachable!(),
     }
+
+    seeker.finish_replay()?;
+    let total_bytes = stage.publish(&options.output_path)?;
 
     let total_elapsed_ms = start_time.elapsed().as_millis();
     info!(
@@ -817,21 +1199,22 @@ pub fn encode_montage(
     encode_montage_with_seeker(&mut seeker, events, last_tick, options)
 }
 
-/// Encode a montage reel from persisted FrankenSQLite storage.
+/// Encode a montage reel from a finished, single-world run with full owner checkpoints.
+///
+/// Selection considers the newest 100,000 narrative events. The recorded terminal
+/// tick determines post-roll; every selected frame must be covered by a later or
+/// same-tick recorded digest. The exact checkpoint, journal suffix and anchors are
+/// frozen and verified before encoding, and checked again before publication.
 pub fn encode_montage_from_storage(
     storage: &scriptbots_storage::StorageReader,
     options: &MontageOptions,
 ) -> Result<MontageSummary, ReelReplayError> {
-    let records = storage
-        .load_checkpoints()
-        .map_err(|e| ReelReplayError::Storage(e.to_string()))?;
-    let mut checkpoints = Vec::with_capacity(records.len());
-    for rec in records {
-        let cp = rec
-            .world_checkpoint()
-            .map_err(|e| ReelReplayError::Storage(e.to_string()))?;
-        checkpoints.push(cp);
+    if options.format == ReelFormat::Mp4 {
+        return Err(ReelReplayError::Mp4Unavailable);
     }
+    storage
+        .select_finished_run(Some(storage.run_id()))
+        .map_err(|error| ReelReplayError::Storage(error.to_string()))?;
 
     let run_events = storage
         .recent_run_events(100_000)
@@ -841,13 +1224,30 @@ pub fn encode_montage_from_storage(
         .map(|pe| pe.record().clone())
         .collect();
 
-    let max_tick = checkpoints
-        .last()
-        .map_or(0, |c| c.tick().0)
-        .max(events.last().map_or(0, |e| e.tick.0));
-
-    let mut seeker = CheckpointReplaySeeker::new(checkpoints, max_tick);
-    encode_montage_with_seeker(&mut seeker, &events, max_tick, options)
+    let max_tick = storage
+        .max_tick()
+        .map_err(|error| ReelReplayError::Storage(error.to_string()))?
+        .unwrap_or(0);
+    let mut clips = select_clips(&events, max_tick, &options.selection)?;
+    clips.sort_by_key(|clip| clip.start);
+    let Some(first) = clips.first() else {
+        return Ok(MontageSummary {
+            output_path: options.output_path.clone(),
+            format: options.format,
+            clips_count: 0,
+            total_frames: 0,
+            bytes_written: 0,
+            peak_frames_in_flight: 0,
+        });
+    };
+    let last = clips
+        .iter()
+        .map(|clip| clip.end)
+        .max()
+        .unwrap_or(first.start);
+    let mut seeker = PersistedReplaySeeker::from_storage(storage, first.start, last)
+        .map_err(replay_storage_error)?;
+    encode_montage_clips_with_seeker(&mut seeker, &clips, options)
 }
 
 #[cfg(test)]
@@ -855,7 +1255,6 @@ mod tests {
     use super::*;
     use scriptbots_core::narrative::EventKind;
     use scriptbots_core::{AgentData, Position, ScriptBotsConfig, Tick};
-    use tempfile::NamedTempFile;
 
     fn sample_event(tick: u64, kind: EventKind, mag: f64) -> EventRecord {
         EventRecord {
@@ -909,6 +1308,508 @@ mod tests {
             world.step().unwrap();
         }
         world
+    }
+
+    fn submit_durable(
+        port: &mut impl scriptbots_runtime::HostPort,
+        id: u64,
+        command: scriptbots_runtime::HostCommand,
+    ) -> anyhow::Result<()> {
+        use scriptbots_runtime::{ApplicationState, CommandEnvelope, CommandId, JournalState};
+        use std::time::Duration;
+
+        let id = CommandId::new(id);
+        port.submit(CommandEnvelope::new(id, command))?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = port
+                .command_status(id)?
+                .expect("submitted montage fixture command");
+            if status.journal() == &JournalState::Durable {
+                anyhow::ensure!(
+                    matches!(status.application(), ApplicationState::Applied(_)),
+                    "fixture command did not apply: {status:?}"
+                );
+                return Ok(());
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "fixture command did not settle: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real file-backed owner supplies auxiliary state, same-tick input order and independently observed frame digests"
+    )]
+    fn recorded_montage_fixture(
+        path: &Path,
+        record_digests: bool,
+        persistence_interval: u32,
+    ) -> anyhow::Result<Vec<scriptbots_core::WorldDigestV1>> {
+        use crate::host_thread::{HostBootstrap, HostThread};
+        use scriptbots_runtime::{
+            HostCommand, HostCoreOptions, HostSessionId, PlaybackSnapshot, ScheduledConfigPatch,
+            channel::ChannelHostOptions,
+        };
+        use scriptbots_storage::StoragePipeline;
+
+        let mut pipeline = StoragePipeline::create_unattributed_file(path.to_str().unwrap())?;
+        let config = ScriptBotsConfig {
+            rng_seed: Some(42_103),
+            persistence_interval,
+            replay_event_tick_cap: if record_digests { 128 } else { 0 },
+            world_width: 200,
+            world_height: 200,
+            food_cell_size: 20,
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            reproduction_rate_herbivore: 0.0,
+            reproduction_rate_carnivore: 0.0,
+            spike_damage: 0.0,
+            archive_enabled: true,
+            archive_interval: 1,
+            archive_min_lifetime_ticks: 1,
+            selection_mode: scriptbots_core::EvolutionSelectionMode::Novelty,
+            communication_scramble: true,
+            communication_scramble_seed: Some(0x7265_656c),
+            ..ScriptBotsConfig::default()
+        };
+        let (mut world, persistence) =
+            WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
+        let width = world.terrain().width();
+        let height = world.terrain().height();
+        let map = scriptbots_core::MapArtifact::new(
+            world.terrain().clone(),
+            Some(scriptbots_core::ScalarField::new(
+                width,
+                height,
+                vec![0.25; world.terrain().tiles().len()],
+            )?),
+            Some(scriptbots_core::ScalarField::new(
+                width,
+                height,
+                vec![0.9; world.terrain().tiles().len()],
+            )?),
+            None,
+            None,
+            scriptbots_core::MapArtifactMetadata {
+                generator: scriptbots_core::MapGeneratorKind::RuleBased,
+                tileset_id: "recorded-montage-auxiliary-science".to_owned(),
+                tileset_hash: 1,
+                seed: 42_103,
+                width,
+                height,
+                attempt_count: 1,
+                succeeded_on: 1,
+                generated_at_epoch_ms: 0,
+            },
+        )?;
+        world.apply_map_artifact(&map)?;
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)?;
+        let agent = world.try_spawn_agent(AgentData {
+            position: Position::new(50.0, 50.0),
+            ..AgentData::default()
+        })?;
+        assert!(world.bind_agent_brain(agent, brains.population()[0])?);
+        let agent_uid = world.agent_uid(agent).expect("stable fixture identity");
+        let session = HostSessionId::new(0x7265_656c);
+        let journal = pipeline.journal_port(session, Default::default())?;
+        let host = HostThread::spawn_with_bootstrap(
+            session,
+            world,
+            persistence,
+            Box::new(journal),
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            ChannelHostOptions::default(),
+            HostBootstrap {
+                schedule: vec![
+                    ScheduledConfigPatch::new(
+                        1,
+                        Tick(1),
+                        serde_json::json!({"food_growth_rate": 0.03}),
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                ],
+                ..HostBootstrap::default()
+            },
+        )?;
+        let mut port = host.port();
+        submit_durable(&mut port, 1, HostCommand::Step)?;
+        let mut next_id = 2;
+        if persistence_interval > 1 {
+            submit_durable(&mut port, next_id, HostCommand::FlushPersistence)?;
+            next_id += 1;
+        }
+        let before_inputs = if persistence_interval == 1 {
+            Some((
+                port.capture_host_checkpoint_v1()?,
+                port.scientific_digest_v1()?,
+            ))
+        } else {
+            None
+        };
+        submit_durable(
+            &mut port,
+            next_id,
+            HostCommand::AdjustAgentMutationRates {
+                agent_uid,
+                delta_primary: 0.03,
+                delta_secondary: 0.04,
+            },
+        )?;
+        next_id += 1;
+        let mut operator_config = config;
+        operator_config.food_growth_rate = 0.2;
+        submit_durable(
+            &mut port,
+            next_id,
+            HostCommand::UpdateConfig(Box::new(operator_config)),
+        )?;
+        next_id += 1;
+        // A non-unit recording captures after the operator config, so replay
+        // cannot accidentally repair an invented cadence through UpdateConfig.
+        let (checkpoint, first_digest) = match before_inputs {
+            Some(captured) => captured,
+            None => (
+                port.capture_host_checkpoint_v1()?,
+                port.scientific_digest_v1()?,
+            ),
+        };
+        pipeline.checkpoint_writer().record_host(
+            "montage-source",
+            &checkpoint,
+            &serde_json::json!({"source": "persisted-montage-regression"}),
+        )?;
+        let mut observed = vec![first_digest];
+        for tick in 2..=4 {
+            if record_digests {
+                port.request_replay_world_digest()?;
+            }
+            submit_durable(&mut port, next_id, HostCommand::Step)?;
+            next_id += 1;
+            observed.push(port.scientific_digest_v1()?);
+            if persistence_interval > 1 && tick == 2 {
+                // This mutation occurs after the frame's completed step, before
+                // its off-cadence batch. A forced cadence of one emits the digest
+                // too early and therefore cannot match this recorded anchor.
+                submit_durable(
+                    &mut port,
+                    next_id,
+                    HostCommand::AdjustAgentMutationRates {
+                        agent_uid,
+                        delta_primary: 0.07,
+                        delta_secondary: 0.08,
+                    },
+                )?;
+                next_id += 1;
+                submit_durable(&mut port, next_id, HostCommand::FlushPersistence)?;
+                next_id += 1;
+            }
+        }
+        submit_durable(&mut port, next_id, HostCommand::Shutdown)?;
+        drop(port);
+        let receipt = host.join()?;
+        assert_eq!(receipt.final_digest?, *observed.last().unwrap());
+        pipeline.shutdown()?;
+        Ok(observed)
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the real recording proves observed world equality, exact journal order, reproducible encoders and late verification refusal together"
+    )]
+    fn persisted_montage_replays_real_owner_inputs_and_verifies_both_passes() -> anyhow::Result<()>
+    {
+        use crate::persisted_replay::ReplayOperatorCommand;
+        use scriptbots_storage::StorageReader;
+
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("montage.sqlite");
+        let expected = recorded_montage_fixture(&database, true, 1)?;
+        let live_reader = StorageReader::open(database.to_str().unwrap())?;
+        assert!(PersistedReplaySeeker::from_storage(&live_reader, 1, 3).is_err());
+        live_reader.close()?;
+        let reader = StorageReader::open_finished(database.to_str().unwrap())?;
+        let mut seeker = PersistedReplaySeeker::from_storage(&reader, 1, 4)?;
+        assert!(matches!(
+            seeker.mirror.operator_commands[&1].as_slice(),
+            [
+                ReplayOperatorCommand::World(_),
+                ReplayOperatorCommand::World(_),
+                ReplayOperatorCommand::ScheduledConfigPatch(_)
+            ]
+        ));
+        for tick in [1, 2, 4, 3, 2] {
+            assert_eq!(
+                seeker.seek_to_exact(tick)?.world_digest_v1()?,
+                expected[(tick - 1) as usize],
+                "frame must reproduce the independently observed owner at tick {tick}"
+            );
+        }
+        seeker.finish_replay()?;
+        assert!(PersistedReplaySeeker::from_storage(&reader, 1, 5).is_err());
+
+        let events = [sample_event(2, EventKind::PopulationBoom, 30.0)];
+        let selection = SelectionConfig {
+            pre_window_ticks: 1,
+            post_window_ticks: 1,
+            ..SelectionConfig::default()
+        };
+        for format in [ReelFormat::Ascii, ReelFormat::Gif] {
+            let mut outputs = Vec::new();
+            for repetition in 0..2 {
+                let options = MontageOptions {
+                    format,
+                    output_path: directory
+                        .path()
+                        .join(format!("recorded-{format}-{repetition}")),
+                    stride: 1,
+                    selection: selection.clone(),
+                    width: 16,
+                    height: 8,
+                };
+                let mut seeker = PersistedReplaySeeker::from_storage(&reader, 1, 3)?;
+                let summary = encode_montage_with_seeker(&mut seeker, &events, 4, &options)?;
+                assert_eq!(summary.total_frames, 3);
+                assert_eq!(summary.peak_frames_in_flight, 1);
+                let bytes = std::fs::read(&options.output_path)?;
+                assert_eq!(summary.bytes_written, bytes.len() as u64);
+                assert!(!bytes.is_empty());
+                if format == ReelFormat::Ascii {
+                    let text = std::str::from_utf8(&bytes)?;
+                    for tick in 1..=3 {
+                        assert!(text.contains(&format!("[t={tick} rank=1]")));
+                    }
+                    assert!(text.contains("PopulationBoom at tick 2"));
+                } else {
+                    assert_eq!(bytes.last(), Some(&0x3b), "GIF trailer must be finalized");
+                }
+                outputs.push(bytes);
+            }
+            assert_eq!(outputs[0], outputs[1]);
+        }
+
+        // Render only the source frame: the changed journal order is encountered
+        // later, in finish_replay. Even that late failure cannot publish a reel.
+        for fault in ["wrong-order", "missing-input"] {
+            let mut altered = PersistedReplaySeeker::from_storage(&reader, 1, 3)?;
+            let actions = altered.mirror.operator_commands.get_mut(&1).unwrap();
+            if fault == "wrong-order" {
+                actions.swap(1, 2);
+            } else {
+                actions.remove(0);
+            }
+            let options = MontageOptions {
+                output_path: directory.path().join(format!("{fault}.cast")),
+                stride: 1,
+                selection: SelectionConfig {
+                    pre_window_ticks: 0,
+                    post_window_ticks: 0,
+                    ..SelectionConfig::default()
+                },
+                ..MontageOptions::default()
+            };
+            let failure = encode_montage_with_seeker(
+                &mut altered,
+                &[sample_event(1, EventKind::PopulationBoom, 30.0)],
+                4,
+                &options,
+            )
+            .expect_err("changed input must diverge after the last visible frame");
+            assert!(failure.to_string().contains("digest diverged"));
+            assert!(!options.output_path.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_montage_refuses_missing_covering_digest() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("unanchored.sqlite");
+        recorded_montage_fixture(&database, false, 1)?;
+        let reader = scriptbots_storage::StorageReader::open_finished(database.to_str().unwrap())?;
+        let error = match PersistedReplaySeeker::from_storage(&reader, 1, 3) {
+            Ok(_) => anyhow::bail!("unverified frames must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("digest anchor covering every frame")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_montage_preserves_nonunit_cadence_and_same_tick_flush_cut() -> anyhow::Result<()> {
+        use scriptbots_storage::StorageReader;
+
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("cadence-three.sqlite");
+        let observed = recorded_montage_fixture(&database, true, 3)?;
+        let reader = StorageReader::open_finished(database.to_str().unwrap())?;
+        let record = reader.load_checkpoint("montage-source")?.unwrap();
+        let owner = record.host_checkpoint()?;
+        assert_eq!(owner.config().persistence_interval, 3);
+        assert_eq!(owner.world_checkpoint().config().persistence_interval, 0);
+        assert_eq!(owner.config().replay_event_tick_cap, 128);
+        let mut seeker = PersistedReplaySeeker::from_storage(&reader, 1, 4)?;
+        assert!(seeker.mirror.flush_ticks.contains(&2));
+        assert_eq!(
+            seeker
+                .expected
+                .iter()
+                .map(|(tick, _)| *tick)
+                .collect::<Vec<_>>(),
+            [2, 3, 4],
+            "off-cadence flush, normal cadence and final tail each retain their own anchor"
+        );
+        assert_ne!(
+            seeker.expected.front().unwrap().1,
+            observed[1].overall,
+            "the tick-2 digest belongs after the same-tick mutation, not at the frame cut"
+        );
+        assert_eq!(
+            seeker.current.persistence.last_admitted_tick(),
+            Some(Tick(1))
+        );
+        for tick in [1, 2, 4, 3] {
+            let frame = seeker.seek_to_exact(tick)?;
+            assert_eq!(frame.config().persistence_interval, 3);
+            assert_eq!(frame.config().replay_event_tick_cap, 128);
+            assert_eq!(frame.world_digest_v1()?, observed[(tick - 1) as usize]);
+        }
+        seeker.finish_replay()?;
+
+        // Reproduce the former binding bug as a negative control. With cadence
+        // one the tick-2 step emits its digest before the recorded mutation and
+        // explicit flush; correct journal application cannot repair that cut.
+        let mut wrong_world =
+            seeker
+                .source
+                .restore_world(crate::brains::create_brain_registry_for_checkpoint(
+                    owner.world_checkpoint(),
+                )?)?;
+        let remaining = Arc::new(Mutex::new(seeker.expected.clone()));
+        let persistence = wrong_world.bind_continuation_persistence(
+            Box::new(DigestVerifier {
+                remaining: Arc::clone(&remaining),
+            }),
+            1,
+            owner.config().replay_event_tick_cap,
+        )?;
+        let current_config = serde_json::to_value(wrong_world.config())?;
+        let mut wrong = JournalReplayWorld {
+            world: wrong_world,
+            persistence,
+            current_config,
+            remaining,
+        };
+        let error = wrong
+            .advance_to(2, &seeker.mirror, seeker.anchor_tick)
+            .expect_err("an invented cadence emits the off-cadence digest too early");
+        assert!(format!("{error:#}").contains("digest diverged"));
+
+        let options = MontageOptions {
+            output_path: directory.path().join("cadence-three.cast"),
+            stride: 1,
+            selection: SelectionConfig {
+                pre_window_ticks: 0,
+                post_window_ticks: 0,
+                ..SelectionConfig::default()
+            },
+            width: 16,
+            height: 8,
+            ..MontageOptions::default()
+        };
+        let mut seeker = PersistedReplaySeeker::from_storage(&reader, 1, 4)?;
+        let summary = encode_montage_with_seeker(
+            &mut seeker,
+            &[sample_event(2, EventKind::PopulationBoom, 30.0)],
+            4,
+            &options,
+        )?;
+        assert_eq!(summary.total_frames, 1);
+        assert!(std::fs::read_to_string(&options.output_path)?.contains("[t=2 rank=1]"));
+        Ok(())
+    }
+
+    struct FailAfterFirstFrame {
+        world: WorldState,
+        calls: usize,
+    }
+
+    impl ReplayProvider for FailAfterFirstFrame {
+        fn seek_to_exact(&mut self, target_tick: u64) -> Result<&WorldState, ReelReplayError> {
+            self.calls += 1;
+            if self.calls > 1 {
+                return Err(ReelReplayError::Storage(
+                    "injected later frame failure".to_owned(),
+                ));
+            }
+            assert_eq!(target_tick, self.world.tick().0);
+            Ok(&self.world)
+        }
+
+        fn max_tick(&self) -> u64 {
+            5
+        }
+    }
+
+    #[test]
+    fn incomplete_reels_are_not_published_and_existing_destinations_are_preserved()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let world = checkpoint_world(Some(crate::BrainPreset::Mlp));
+        let events = [sample_event(4, EventKind::PopulationBoom, 30.0)];
+        for format in [ReelFormat::Ascii, ReelFormat::Gif] {
+            let options = MontageOptions {
+                format,
+                output_path: directory.path().join(format!("failed-{format}")),
+                stride: 1,
+                selection: SelectionConfig {
+                    pre_window_ticks: 1,
+                    post_window_ticks: 1,
+                    ..SelectionConfig::default()
+                },
+                width: 16,
+                height: 8,
+            };
+            let mut failing = FailAfterFirstFrame {
+                world: checkpoint_world(Some(crate::BrainPreset::Mlp)),
+                calls: 0,
+            };
+            let error = encode_montage_with_seeker(&mut failing, &events, 5, &options)
+                .expect_err("the second frame fails after a valid frame was encoded");
+            assert!(error.to_string().contains("injected later frame failure"));
+            assert_eq!(failing.calls, 2);
+            assert!(!options.output_path.exists());
+
+            std::fs::write(&options.output_path, b"preserve existing reel")?;
+            let error = encode_montage(&world, &events, 5, &options)
+                .expect_err("an existing destination must refuse publication");
+            assert!(matches!(
+                error,
+                ReelReplayError::Io(reason) if reason.contains("could not publish montage")
+            ));
+            assert_eq!(
+                std::fs::read(&options.output_path)?,
+                b"preserve existing reel"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -1146,13 +2047,13 @@ mod tests {
     fn test_caption_frame_offset_mismatch_detected() {
         let config = ScriptBotsConfig::default();
         let world = WorldState::new(config).expect("world");
-        let temp = NamedTempFile::new().expect("temp file");
+        let temp = tempfile::tempdir().expect("temp directory");
 
         let event = sample_event(50, EventKind::PopulationCrash, 20.0);
 
         let opts = MontageOptions {
             format: ReelFormat::Ascii,
-            output_path: temp.path().to_path_buf(),
+            output_path: temp.path().join("offset.cast"),
             stride: 5,
             selection: SelectionConfig {
                 pre_window_ticks: 10,
@@ -1172,6 +2073,7 @@ mod tests {
                 event_tick: 40,
             })
         ));
+        assert!(!opts.output_path.exists());
     }
 
     #[test]
@@ -1188,10 +2090,10 @@ mod tests {
             .expect("spawn agent");
 
         let events = vec![sample_event(50, EventKind::PopulationBoom, 30.0)];
-        let temp = NamedTempFile::new().expect("temp file");
+        let temp = tempfile::tempdir().expect("temp directory");
         let opts = MontageOptions {
             format: ReelFormat::Ascii,
-            output_path: temp.path().to_path_buf(),
+            output_path: temp.path().join("bounded.cast"),
             stride: 5,
             selection: SelectionConfig {
                 pre_window_ticks: 20,
@@ -1217,12 +2119,11 @@ mod tests {
             sample_event(150, EventKind::Extinction, 80.0),
         ];
 
-        let temp1 = NamedTempFile::new().expect("temp 1");
-        let temp2 = NamedTempFile::new().expect("temp 2");
+        let directory = tempfile::tempdir().expect("temp directory");
 
         let opts1 = MontageOptions {
             format: ReelFormat::Ascii,
-            output_path: temp1.path().to_path_buf(),
+            output_path: directory.path().join("first.cast"),
             stride: 5,
             selection: SelectionConfig {
                 pre_window_ticks: 15,
@@ -1232,7 +2133,7 @@ mod tests {
             ..Default::default()
         };
         let opts2 = MontageOptions {
-            output_path: temp2.path().to_path_buf(),
+            output_path: directory.path().join("second.cast"),
             ..opts1.clone()
         };
 
@@ -1246,8 +2147,8 @@ mod tests {
         encode_montage(&world1, &events, 300, &opts1).expect("run 1");
         encode_montage(&world2, &events, 300, &opts2).expect("run 2");
 
-        let bytes1 = std::fs::read(temp1.path()).expect("read 1");
-        let bytes2 = std::fs::read(temp2.path()).expect("read 2");
+        let bytes1 = std::fs::read(&opts1.output_path).expect("read 1");
+        let bytes2 = std::fs::read(&opts2.output_path).expect("read 2");
 
         assert!(!bytes1.is_empty(), "output must not be empty");
         assert_eq!(
@@ -1263,12 +2164,11 @@ mod tests {
             sample_event(120, EventKind::CombatSurge, 40.0),
         ];
 
-        let temp1 = NamedTempFile::new().expect("temp 1");
-        let temp2 = NamedTempFile::new().expect("temp 2");
+        let directory = tempfile::tempdir().expect("temp directory");
 
         let opts1 = MontageOptions {
             format: ReelFormat::Gif,
-            output_path: temp1.path().to_path_buf(),
+            output_path: directory.path().join("first.gif"),
             stride: 10,
             selection: SelectionConfig {
                 pre_window_ticks: 10,
@@ -1279,7 +2179,7 @@ mod tests {
             height: 60,
         };
         let opts2 = MontageOptions {
-            output_path: temp2.path().to_path_buf(),
+            output_path: directory.path().join("second.gif"),
             ..opts1.clone()
         };
 
@@ -1293,8 +2193,8 @@ mod tests {
         encode_montage(&world1, &events, 200, &opts1).expect("run 1");
         encode_montage(&world2, &events, 200, &opts2).expect("run 2");
 
-        let bytes1 = std::fs::read(temp1.path()).expect("read 1");
-        let bytes2 = std::fs::read(temp2.path()).expect("read 2");
+        let bytes1 = std::fs::read(&opts1.output_path).expect("read 1");
+        let bytes2 = std::fs::read(&opts2.output_path).expect("read 2");
 
         assert!(!bytes1.is_empty(), "GIF output must not be empty");
         assert_eq!(
@@ -1309,14 +2209,14 @@ mod tests {
     #[test]
     fn test_exact_frame_count_formula() {
         let events = vec![sample_event(100, EventKind::PopulationCrash, 50.0)];
-        let temp = NamedTempFile::new().expect("temp file");
+        let temp = tempfile::tempdir().expect("temp directory");
         let stride = 5;
         let pre = 20;
         let post = 30;
 
         let opts = MontageOptions {
             format: ReelFormat::Ascii,
-            output_path: temp.path().to_path_buf(),
+            output_path: temp.path().join("count.cast"),
             stride,
             selection: SelectionConfig {
                 pre_window_ticks: pre,

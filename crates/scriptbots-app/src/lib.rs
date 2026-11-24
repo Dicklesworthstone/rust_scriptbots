@@ -32,6 +32,7 @@ pub mod experiment_runner;
 pub mod host_thread;
 pub mod lab_assistant;
 pub mod montage;
+pub mod persisted_replay;
 pub mod render_audio;
 pub mod tournament;
 

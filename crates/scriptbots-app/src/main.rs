@@ -8,6 +8,12 @@ use scriptbots_app::economy_audit::{self, EconomyAuditArgs};
 use scriptbots_app::host_thread::{
     HostBootstrap, HostThread, HostThreadFaultError, HostThreadReceipt,
 };
+#[cfg(test)]
+use scriptbots_app::persisted_replay::ReplayOperatorCommand;
+use scriptbots_app::persisted_replay::{
+    ReplayCheckpointSource, ReplayMirror, apply_recorded_operator_commands, digest_due,
+    mirror_recorded_flush, recorded_digest_ticks, recorded_flush_ticks, recorded_operator_commands,
+};
 #[cfg(feature = "neuro")]
 use scriptbots_app::validated_neuroflow_config;
 use scriptbots_app::{
@@ -33,8 +39,8 @@ use scriptbots_core::sense_fixed::SenseProvider;
 use scriptbots_core::{
     LEGACY_RENDER_ENV_NAMES, MapArtifact, NeuroflowActivationKind, NullPersistence,
     PersistenceAdmissionSession, RenderQuality, RenderTonemapMode, ReplayEventKind,
-    ReplayInteractionKind, RuleBasedMapGenerator, ScriptBotsConfig, TickSummary, WorldCheckpointV1,
-    WorldDigestV1, WorldPersistence, WorldState, default_tileset_spec, map_legacy_render_env,
+    ReplayInteractionKind, RuleBasedMapGenerator, ScriptBotsConfig, TickSummary, WorldDigestV1,
+    WorldPersistence, WorldState, default_tileset_spec, map_legacy_render_env,
     parse_render_quality,
 };
 #[cfg(feature = "gui")]
@@ -53,9 +59,11 @@ use scriptbots_world_gfx::sense_parity::{
 };
 use scriptbots_world_gfx::wgpu;
 use serde_json::{self, Value as JsonValue};
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     env, fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -4248,8 +4256,9 @@ fn run_reel_subcommand(args: &ReelArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("reel.{default_ext}")));
 
-    let storage = StorageReader::open(args.db.to_str().context("invalid utf-8 in db path")?)
-        .context("failed to open run database for reel export")?;
+    let storage =
+        StorageReader::open_finished(args.db.to_str().context("invalid utf-8 in db path")?)
+            .context("reel export requires an immutable finished run")?;
 
     let options = scriptbots_app::montage::MontageOptions {
         format,
@@ -6222,401 +6231,6 @@ fn run_headless_simulation(
         simulated_ticks: tick_limit,
         final_digest,
     })
-}
-
-/// Ticks at which a recorded replay stream carries a canonical world digest, up to `tick_limit`.
-fn recorded_digest_ticks(events: &[PersistedReplayEvent], tick_limit: u64) -> BTreeSet<u64> {
-    events
-        .iter()
-        .filter(|entry| {
-            entry.tick <= tick_limit
-                && matches!(entry.event.kind, ReplayEventKind::WorldDigest { .. })
-        })
-        .map(|entry| entry.tick)
-        .collect()
-}
-
-/// A science command, scheduled patch or persistence cut in its actual journal order.
-#[derive(Debug, Clone, PartialEq)]
-enum ReplayOperatorCommand {
-    World(scriptbots_core::ControlCommand),
-    FlushPersistence,
-    ScheduledConfigPatch(ScheduledConfigPatch),
-}
-
-/// What replay reproduces from the recording beyond the scenario itself.
-#[derive(Debug, Clone, Default)]
-struct ReplayMirror {
-    /// Ticks whose batch carries a canonical world digest (`None`: the final tick only).
-    digest_ticks: Option<BTreeSet<u64>>,
-    /// Off-cadence batch boundaries; see [`recorded_flush_ticks`].
-    flush_ticks: BTreeSet<u64>,
-    /// Operator commands, checkpoint schedule patches and explicit flushes in journal order.
-    operator_commands: BTreeMap<u64, Vec<ReplayOperatorCommand>>,
-}
-
-/// Every science-changing operator command a recorded host applied, by applied tick (bd-1leq).
-///
-/// A server or interactive run journals each command it applies. Replay from tick zero used to
-/// re-apply only the scenario's own interventions, so the first REST intervention, config patch
-/// or spawn made the replay diverge. Flushes preserve the cut relative to science commands
-/// at the same tick. Playback-only commands (pause, speed, steps, shutdown) are skipped;
-/// migrations need an archipelago and are refused. Full checkpoint replay also joins
-/// applied scheduled patches by their journal identity, preserving same-tick input order.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one journal read preserves the exact checkpoint cut, command outcomes, scheduled input order and durable boundary refusals"
-)]
-fn recorded_operator_commands(
-    storage: &StorageReader,
-    checkpoint: Option<(u64, scriptbots_runtime::HostJournalCutV1)>,
-) -> Result<BTreeMap<u64, Vec<ReplayOperatorCommand>>> {
-    use scriptbots_core::ControlCommand;
-    use scriptbots_runtime::{ApplicationState, HostCommand};
-
-    let sessions = storage.host_journal_sessions()?;
-    if let Some((tick, cut)) = checkpoint {
-        if !matches!(sessions.as_slice(), [session] if *session == cut.session_id) {
-            bail!("checkpoint replay requires its exact recorded host session");
-        }
-        let after = cut
-            .last_journal_sequence
-            .checked_sub(1)
-            .filter(|sequence| *sequence != 0)
-            .map(|sequence| scriptbots_runtime::JournalBatchId::new(cut.session_id, sequence));
-        let page = storage.host_journal_session_conformance_page(
-            cut.session_id,
-            after,
-            1,
-            scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
-        )?;
-        let boundary_matches = if cut.last_journal_sequence == 0 {
-            tick == 0 && cut.last_scientific_event_sequence == 0
-        } else {
-            page.records.first().is_some_and(|record| {
-                record.batch_id.sequence() == cut.last_journal_sequence
-                    && record.applied.tick.0 == tick
-            })
-        };
-        if !boundary_matches
-            || cut.commitment_requirement != scriptbots_runtime::ShutdownCommitRequirement::Durable
-            || cut.last_journal_sequence > page.progress.journal.durable
-            || cut.last_scientific_event_sequence > page.progress.events.durable
-        {
-            bail!("checkpoint replay journal cut differs from the recorded durable boundary");
-        }
-    }
-    let mut commands: BTreeMap<u64, Vec<(u64, ReplayOperatorCommand)>> = BTreeMap::new();
-    for session in sessions {
-        let mut after = None;
-        loop {
-            let page = storage
-                .command_journal_page(
-                    session,
-                    after,
-                    1024,
-                    scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to read the commands of host session {}",
-                        session.get()
-                    )
-                })?;
-            for record in page.commands {
-                if let Some((tick, cut)) = checkpoint {
-                    if record.batch_id.sequence() <= cut.last_journal_sequence {
-                        if record.terminal_boundary.tick.0 > tick {
-                            bail!("checkpoint journal prefix contains a later command boundary");
-                        }
-                        continue;
-                    }
-                    if record.terminal_boundary.tick.0 < tick {
-                        bail!("checkpoint journal suffix contains an earlier command boundary");
-                    }
-                }
-                let applied = record.lifecycle.terminal().is_some_and(|transition| {
-                    matches!(transition.application(), ApplicationState::Applied(_))
-                });
-                if !applied {
-                    continue;
-                }
-                let command = match record.lifecycle.envelope().command.clone() {
-                    HostCommand::Intervention(command) => ControlCommand::Intervention(command),
-                    HostCommand::UpdateConfig(config) => ControlCommand::UpdateConfig(config),
-                    HostCommand::UpdateSelection(update) => ControlCommand::UpdateSelection(update),
-                    HostCommand::AdjustAgentMutationRates {
-                        agent_uid,
-                        delta_primary,
-                        delta_secondary,
-                    } => ControlCommand::AdjustAgentMutationRates {
-                        agent_uid,
-                        delta_primary,
-                        delta_secondary,
-                    },
-                    HostCommand::SpawnAgent { herbivore_tendency } => {
-                        ControlCommand::SpawnAgent { herbivore_tendency }
-                    }
-                    HostCommand::SpawnCrossover { parent_a, parent_b } => {
-                        ControlCommand::SpawnCrossover { parent_a, parent_b }
-                    }
-                    HostCommand::ApplyMap {
-                        artifact,
-                        existing_agent_policy,
-                    } => ControlCommand::ApplyMap {
-                        artifact,
-                        existing_agent_policy,
-                    },
-                    HostCommand::FlushPersistence => {
-                        commands
-                            .entry(record.terminal_boundary.tick.0)
-                            .or_default()
-                            .push((
-                                record.batch_id.sequence(),
-                                ReplayOperatorCommand::FlushPersistence,
-                            ));
-                        continue;
-                    }
-                    HostCommand::Emigrate { .. } | HostCommand::Immigrate { .. } => bail!(
-                        "the recording migrated agents between islands at tick {}; replaying an \
-                         archipelago run is not supported by --replay-db",
-                        record.terminal_boundary.tick.0
-                    ),
-                    HostCommand::Pause
-                    | HostCommand::Resume
-                    | HostCommand::SetSpeed(_)
-                    | HostCommand::Step
-                    | HostCommand::UpdateSimulation(_)
-                    | HostCommand::Shutdown => continue,
-                };
-                commands
-                    .entry(record.terminal_boundary.tick.0)
-                    .or_default()
-                    .push((
-                        record.batch_id.sequence(),
-                        ReplayOperatorCommand::World(command),
-                    ));
-            }
-            match page.next_after {
-                Some(cursor) => after = Some(cursor),
-                None => break,
-            }
-        }
-    }
-    if let Some((tick, cut)) = checkpoint {
-        // Scheduled patches are separate journal records, not operator commands.
-        // Their actual position relative to same-tick commands is authoritative.
-        let mut after = (cut.last_journal_sequence != 0).then_some(
-            scriptbots_runtime::JournalBatchId::new(cut.session_id, cut.last_journal_sequence),
-        );
-        loop {
-            let page = storage.host_journal_session_conformance_page(
-                cut.session_id,
-                after,
-                1024,
-                scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
-            )?;
-            for record in page.records {
-                let Some(evidence) = record.scheduled_patch else {
-                    continue;
-                };
-                if record.state != scriptbots_storage::HostJournalRecordState::Durable
-                    || record.applied.tick.0 < tick
-                    || evidence.scheduled.due_tick != record.applied.tick
-                {
-                    bail!("checkpoint replay schedule differs from its durable journal boundary");
-                }
-                if matches!(
-                    evidence.outcome,
-                    scriptbots_runtime::ScheduledPatchOutcome::Applied { .. }
-                ) {
-                    commands.entry(record.applied.tick.0).or_default().push((
-                        record.batch_id.sequence(),
-                        ReplayOperatorCommand::ScheduledConfigPatch(evidence.scheduled),
-                    ));
-                }
-            }
-            match page.next_after {
-                Some(cursor) => after = Some(cursor),
-                None => break,
-            }
-        }
-        // A checkpoint requires one exact session, so its journal sequence orders
-        // every command and schedule action. Legacy multi-session iteration stays
-        // unchanged for tick-zero replay.
-        for actions in commands.values_mut() {
-            actions.sort_by_key(|(sequence, _)| *sequence);
-        }
-    }
-    Ok(commands
-        .into_iter()
-        .map(|(tick, actions)| {
-            (
-                tick,
-                actions.into_iter().map(|(_, action)| action).collect(),
-            )
-        })
-        .collect())
-}
-
-/// Re-apply the operator commands the host applied at `tick`, in journal order, through the
-/// same core entry point the host uses.
-fn apply_recorded_operator_commands(
-    world: &mut WorldState,
-    persistence: &mut PersistenceAdmissionSession,
-    current_config: &mut serde_json::Value,
-    mirror: &ReplayMirror,
-    tick: u64,
-) -> Result<()> {
-    let Some(commands) = mirror.operator_commands.get(&tick) else {
-        return Ok(());
-    };
-    for command in commands {
-        match command {
-            ReplayOperatorCommand::World(command) => {
-                scriptbots_core::apply_control_command(world, command.clone()).with_context(
-                    || format!("failed to re-apply a recorded operator command at tick {tick}"),
-                )?;
-            }
-            ReplayOperatorCommand::FlushPersistence => {
-                persistence.finalize(world).with_context(|| {
-                    format!("failed to re-apply a recorded persistence flush at tick {tick}")
-                })?;
-            }
-            ReplayOperatorCommand::ScheduledConfigPatch(statement) => {
-                if statement.due_tick.0 != tick {
-                    bail!("recorded schedule patch is attached to the wrong replay tick");
-                }
-                let patch = statement.decode_patch().map_err(anyhow::Error::msg)?;
-                let config = scriptbots_app::resolve_scheduled_config_patch(world.config(), &patch)
-                    .map_err(anyhow::Error::msg)?;
-                world.apply_config_update(config).with_context(|| {
-                    format!(
-                        "failed to re-apply recorded schedule patch {} at tick {tick}",
-                        statement.sequence
-                    )
-                })?;
-            }
-        }
-    }
-    // Scenario patches are merged onto this snapshot; an operator config change must not be
-    // reverted by the next one.
-    *current_config = serde_json::to_value(world.config())?;
-    Ok(())
-}
-
-/// Recorded batch boundaries that the cadence alone would not produce, before `tick_limit`.
-///
-/// A paused-server checkpoint flushes a partial batch between persistence ticks (bd-2mpi).
-/// Replay event ordinals are batch-relative, so verification must cut its batches at the
-/// same ticks; the final partial batch at `tick_limit` is the simulation's own finalize.
-fn recorded_flush_ticks(
-    batch_ticks: &[u64],
-    config: &ScriptBotsConfig,
-    tick_limit: u64,
-) -> BTreeSet<u64> {
-    let interval = u64::from(config.persistence_interval.max(1));
-    batch_ticks
-        .iter()
-        .copied()
-        .filter(|&tick| tick > 0 && tick < tick_limit && !tick.is_multiple_of(interval))
-        .collect()
-}
-
-/// Cut a partial batch without an explicit journaled flush. An explicit flush is replayed
-/// in journal order, because world commands can occur on either side of the same-tick cut.
-fn mirror_recorded_flush(
-    world: &mut WorldState,
-    persistence: &mut PersistenceAdmissionSession,
-    mirror: &ReplayMirror,
-) -> Result<()> {
-    let tick = world.tick().0;
-    let ordered_flush = mirror.operator_commands.get(&tick).is_some_and(|commands| {
-        commands
-            .iter()
-            .any(|command| matches!(command, ReplayOperatorCommand::FlushPersistence))
-    });
-    if mirror.flush_ticks.contains(&tick) && !ordered_flush {
-        persistence
-            .finalize(world)
-            .context("failed to mirror a recorded off-cadence persistence batch")?;
-    }
-    Ok(())
-}
-
-/// Whether the batch completing `completed_tick` must carry a canonical world digest.
-///
-/// `None` keeps the headless default of one digest on the final tick. A replay passes the
-/// exact ticks at which the recording carries digests, so an interactive run (which records
-/// them at checkpoint cadence rather than at an end it could not know) stays aligned.
-fn digest_due(digest_ticks: Option<&BTreeSet<u64>>, completed_tick: u64, final_tick: u64) -> bool {
-    digest_ticks.map_or(completed_tick == final_tick, |ticks| {
-        ticks.contains(&completed_tick)
-    })
-}
-
-/// A full owner source must retain the auxiliary science absent from its inner cut.
-enum ReplayCheckpointSource {
-    Science(Box<WorldCheckpointV1>),
-    Host(Box<scriptbots_runtime::HostCheckpointV1>),
-}
-
-impl ReplayCheckpointSource {
-    fn world_checkpoint(&self) -> &WorldCheckpointV1 {
-        match self {
-            Self::Science(checkpoint) => checkpoint,
-            Self::Host(checkpoint) => checkpoint.world_checkpoint(),
-        }
-    }
-
-    fn journal_cut(&self) -> Option<scriptbots_runtime::HostJournalCutV1> {
-        match self {
-            Self::Science(_) => None,
-            Self::Host(checkpoint) => Some(checkpoint.journal_cut()),
-        }
-    }
-
-    fn restore_world(&self, registry: scriptbots_core::BrainRegistry) -> Result<WorldState> {
-        match self {
-            Self::Science(checkpoint) => WorldState::restore_checkpoint_v1(checkpoint, registry)
-                .context(
-                    "failed to restore scientific checkpoint; auxiliary state requires a full owner checkpoint",
-                ),
-            Self::Host(checkpoint) => checkpoint
-                .restore_world(registry)
-                .context("failed to restore complete checkpoint science and continuity"),
-        }
-    }
-
-    fn validate_recorded_schedule(&self, mirror: &ReplayMirror, tick_limit: u64) -> Result<()> {
-        let Self::Host(checkpoint) = self else {
-            return Ok(());
-        };
-        let mut pending = checkpoint.remaining_schedule().unwrap_or_default().iter();
-        for (&tick, actions) in &mirror.operator_commands {
-            for action in actions {
-                if let ReplayOperatorCommand::ScheduledConfigPatch(statement) = action {
-                    let expected = pending.next().context(
-                        "recorded schedule has an action absent from the checkpoint's pending suffix",
-                    )?;
-                    if statement != expected || statement.due_tick.0 != tick {
-                        bail!(
-                            "recorded schedule differs from the checkpoint's exact pending suffix"
-                        );
-                    }
-                }
-            }
-        }
-        if pending
-            .next()
-            .is_some_and(|statement| statement.due_tick.0 < tick_limit)
-        {
-            bail!(
-                "checkpoint replay would cross a due schedule patch without its applied journal record"
-            );
-        }
-        Ok(())
-    }
 }
 
 fn run_headless_simulation_from_checkpoint(

@@ -6,10 +6,30 @@
 [Currently In Progress — Codex; corrective follow-up to `bd-16g.9.2`;
 original exact-replay, output-integrity and long-run acceptance retained]
 
-Connect persisted-run montage frames to complete owner checkpoints, their exact
-journal cut and ordered recorded inputs. Share the native replay interpreter,
-verify recorded digest anchors before publication, and refuse missing history or
-divergence without replacing an existing output or publishing a partial reel.
+Implemented finished-run montage replay from one complete owner checkpoint and
+its exact durable journal suffix. Native verification and montage now share the
+recorded-input interpreter, preserving operator/schedule order and explicit
+flushes. Full owner recording cadence, replay caps and admission cursors survive
+restoration. Frames observe completed steps before the next boundary's inputs.
+
+Recorded digest anchors must cover every selected frame. A preflight replay and
+the rendering pass both verify the frozen evidence through the covering anchor,
+including inputs after the final visual frame. ASCII/GIF exports publish only
+after encoder finalization, replay verification and file synchronization. An
+existing destination is preserved; incomplete staging files are retained, and no
+partial reel receives the requested destination name.
+
+Authored real file-owner regressions compare independently observed frame digests
+with map scalars, Novelty selection, scrambling and noncommuting recorded inputs.
+They cover backward seeks, repeatable ASCII/GIF bytes, late divergence, missing
+anchors, live-reader refusal and publication failures. A separate interval-three
+case distinguishes completed-step frames from same-tick mutation/flush anchors
+and rejects the former cadence-one reconstruction. Independent source review and
+scoped DSR parse/format checks passed. Native compilation and tests remain
+unverified: the bounded canonical DSR online core check stopped while fetching
+the pinned FrankenSQLite source with an index-pack transport failure. This does
+not qualify all-history memory bounds, multi-island replay or long-run export
+performance; original acceptance stays open.
 
 **Full checkpoint science and ordered native replay (2026-11-24):**
 [Currently In Progress — Codex; scoped contribution to `bd-2z0.5.13`;
