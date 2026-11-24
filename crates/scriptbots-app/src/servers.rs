@@ -117,6 +117,7 @@ static WS_PROJECTION_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_WS_PROJECTIONS)));
 const LAB_SESSION_HEADER: &str = "x-scriptbots-session";
 const CHECKPOINT_CANVAS_SCHEMA: &str = "scriptbots.checkpoint-canvas.v1";
+const CHECKPOINT_REPLAY_SCHEMA: &str = "scriptbots.checkpoint-replay.v1";
 const MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
 const CHECKPOINT_CANVAS_TIMEOUT: Duration = Duration::from_secs(30);
 // Reconstruction owns a separate world and can outlive a disconnected HTTP
@@ -1735,6 +1736,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
         get_v1_checkpoints,
         get_v1_checkpoint_by_id,
         get_v1_checkpoint_canvas,
+        get_v1_checkpoint_replay,
         post_v1_checkpoint_branches,
         get_v1_checkpoint_branches,
         get_v1_checkpoint_branch,
@@ -1798,6 +1800,8 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
             CheckpointCreateRequest,
             CheckpointMetadataDto,
             CheckpointCanvasResponse,
+            CheckpointReplayResponse,
+            CheckpointReplayVerification,
             CheckpointRetentionDto,
             CheckpointBranchRequest,
             CheckpointBranchStatusDto,
@@ -4767,17 +4771,26 @@ struct CheckpointCanvasQuery {
 
 impl CheckpointCanvasQuery {
     fn session(&self) -> Result<scriptbots_runtime::HostSessionId, AppError> {
-        self.session_id
-            .parse::<u64>()
-            .ok()
-            .filter(|value| value.to_string() == self.session_id)
+        checkpoint_query_decimal(&self.session_id, "checkpoint canvas session_id")
             .map(scriptbots_runtime::HostSessionId::new)
-            .ok_or_else(|| {
-                AppError::bad_request(
-                    "checkpoint canvas session_id must be a canonical u64 decimal string",
-                )
-            })
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointReplayQuery {
+    session_id: String,
+    target_tick: String,
+}
+
+fn checkpoint_query_decimal(value: &str, field: &str) -> Result<u64, AppError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| parsed.to_string() == value)
+        .ok_or_else(|| {
+            AppError::bad_request(format!("{field} must be a canonical u64 decimal string"))
+        })
 }
 
 /// A verified saved scientific cut, distinct from a live owner publication.
@@ -4789,6 +4802,31 @@ struct CheckpointCanvasResponse {
     schema: String,
     source_session_id: String,
     checkpoint: CheckpointMetadataDto,
+    frame_base64: String,
+}
+
+/// Evidence for the returned target, without claiming an unobserved target digest.
+#[derive(Debug, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CheckpointReplayVerification {
+    SavedCut,
+    CapturedInterval {
+        #[serde(rename = "verifiedThroughTick")]
+        verified_through_tick: String,
+        #[serde(rename = "capturedCurrentDigest")]
+        captured_current_digest: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CheckpointReplayResponse {
+    schema: String,
+    source_session_id: String,
+    checkpoint: CheckpointMetadataDto,
+    target_tick: String,
+    max_verification_ticks: String,
+    verification: CheckpointReplayVerification,
     frame_base64: String,
 }
 
@@ -4810,8 +4848,6 @@ fn checkpoint_canvas_response(
     checkpoint_id: &str,
     expected_session: scriptbots_runtime::HostSessionId,
 ) -> Result<CheckpointCanvasResponse, AppError> {
-    use scriptbots_runtime::remote::{RemoteEnvironmentSnapshot, RemoteFramePayload};
-
     if handle.session_id() != expected_session {
         return Err(AppError::conflict(
             "checkpoint canvas host session changed; reconnect before reviewing saved worlds",
@@ -4828,16 +4864,7 @@ fn checkpoint_canvas_response(
             "checkpoint canvas does not match its requested owner and saved scientific cut",
         ));
     }
-    let environment =
-        RemoteEnvironmentSnapshot::capture(&snapshot).map_err(checkpoint_canvas_protocol_error)?;
-    let frame = RemoteFrame {
-        identity: snapshot.as_ref().into(),
-        playback: snapshot.playback,
-        coalesced_publications: 0,
-        environment: Some(Arc::new(environment)),
-        payload: RemoteFramePayload::Canvas(snapshot.world.clone()),
-    };
-    let bytes = encode_remote_frame(&frame).map_err(checkpoint_canvas_protocol_error)?;
+    let frame_base64 = encode_checkpoint_canvas(&snapshot)?;
     if handle.session_id() != expected_session {
         return Err(AppError::conflict(
             "checkpoint canvas host session changed during reconstruction",
@@ -4847,7 +4874,70 @@ fn checkpoint_canvas_response(
         schema: CHECKPOINT_CANVAS_SCHEMA.to_owned(),
         source_session_id: expected_session.get().to_string(),
         checkpoint,
-        frame_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        frame_base64,
+    })
+}
+
+fn encode_checkpoint_canvas(snapshot: &RenderSnapshot) -> Result<String, AppError> {
+    use scriptbots_runtime::remote::{RemoteEnvironmentSnapshot, RemoteFramePayload};
+
+    let environment =
+        RemoteEnvironmentSnapshot::capture(snapshot).map_err(checkpoint_canvas_protocol_error)?;
+    let frame = RemoteFrame {
+        identity: snapshot.into(),
+        playback: snapshot.playback,
+        coalesced_publications: 0,
+        environment: Some(Arc::new(environment)),
+        payload: RemoteFramePayload::Canvas(snapshot.world.clone()),
+    };
+    let bytes = encode_remote_frame(&frame).map_err(checkpoint_canvas_protocol_error)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn checkpoint_replay_response(
+    handle: &ControlHandle,
+    checkpoint_id: &str,
+    expected_session: scriptbots_runtime::HostSessionId,
+    target_tick: u64,
+) -> Result<CheckpointReplayResponse, AppError> {
+    use scriptbots_runtime::lab_workflows::LabReplayVerification;
+
+    let (checkpoint, review) = handle
+        .replay_canvas_from_checkpoint_bounded(expected_session, checkpoint_id, target_tick)
+        .map_err(AppError::from)?;
+    if review.snapshot.session_id != expected_session
+        || review.snapshot.world.tick != target_tick
+        || review.checkpoint_id != checkpoint_id
+        || review.base_tick != checkpoint.tick
+    {
+        return Err(AppError::conflict(
+            "checkpoint replay differs from its selected source or requested target",
+        ));
+    }
+    let verification = match review.verification {
+        LabReplayVerification::SavedCut => CheckpointReplayVerification::SavedCut,
+        LabReplayVerification::CapturedInterval {
+            verified_through_tick,
+            captured_current_digest,
+        } => CheckpointReplayVerification::CapturedInterval {
+            verified_through_tick: verified_through_tick.to_string(),
+            captured_current_digest,
+        },
+    };
+    let frame_base64 = encode_checkpoint_canvas(&review.snapshot)?;
+    if handle.session_id() != expected_session {
+        return Err(AppError::conflict(
+            "checkpoint replay host session changed during reconstruction",
+        ));
+    }
+    Ok(CheckpointReplayResponse {
+        schema: CHECKPOINT_REPLAY_SCHEMA.to_owned(),
+        source_session_id: expected_session.get().to_string(),
+        checkpoint,
+        target_tick: target_tick.to_string(),
+        max_verification_ticks: crate::control::MAX_EVENT_REVIEW_TICKS.to_string(),
+        verification,
+        frame_base64,
     })
 }
 
@@ -4881,6 +4971,62 @@ async fn get_v1_checkpoint_canvas(
             "checkpoint canvas host session changed; reconnect before reviewing saved worlds",
         ));
     }
+    reconstruct_checkpoint_canvas(move || {
+        checkpoint_canvas_response(&state.handle, &checkpoint_id, expected_session)
+    })
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/checkpoints/{checkpoint_id}/replay",
+    tag = "checkpoints",
+    params(
+        ("checkpoint_id" = String, Path, description = "Explicitly selected saved checkpoint; a newer source is never substituted"),
+        ("session_id" = String, Query, description = "Required canonical decimal session of the connected owner"),
+        ("target_tick" = String, Query, description = "Required canonical decimal u64 target at or after the saved cut"),
+        ("X-ScriptBots-Session" = Option<String>, Header, description = "Exact host session negotiated by the remote stream")
+    ),
+    responses(
+        (status = 200, description = "Historical canvas with source metadata and saved-cut or captured-current interval verification; the live owner is unchanged", body = CheckpointReplayResponse),
+        (status = 400, description = "Invalid target, unavailable input history, corrupt source or verification interval too long"),
+        (status = 404, description = "Checkpoint unavailable"),
+        (status = 409, description = "Owner or saved-source identity changed"),
+        (status = 413, description = "Source, reconstructed world or response exceeds its admission bound"),
+        (status = 500, description = "Historical science could not be projected or encoded"),
+        (status = 503, description = "Shared reconstruction capacity or deadline unavailable")
+    )
+)]
+async fn get_v1_checkpoint_replay(
+    State(state): State<ApiState>,
+    axum::extract::Path(checkpoint_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<CheckpointReplayQuery>,
+) -> Result<Response, AppError> {
+    let expected_session = scriptbots_runtime::HostSessionId::new(checkpoint_query_decimal(
+        &query.session_id,
+        "checkpoint replay session_id",
+    )?);
+    let target_tick =
+        checkpoint_query_decimal(&query.target_tick, "checkpoint replay target_tick")?;
+    if state.handle.session_id() != expected_session {
+        return Err(AppError::conflict(
+            "checkpoint replay host session changed; reconnect before reviewing history",
+        ));
+    }
+    reconstruct_checkpoint_canvas(move || {
+        checkpoint_replay_response(&state.handle, &checkpoint_id, expected_session, target_tick)
+    })
+    .await
+}
+
+/// Saved-cut and interval reads share one worker/byte/deadline budget. A caller
+/// disappearing cannot admit another reconstruction while this one still runs.
+async fn reconstruct_checkpoint_canvas<T>(
+    reconstruct: impl FnOnce() -> Result<T, AppError> + Send + 'static,
+) -> Result<Response, AppError>
+where
+    T: Serialize + Send + 'static,
+{
     // Reject overload before queueing a blocking task. A cancelled request must
     // not release capacity while its non-cancellable reconstruction still runs.
     let permit = CHECKPOINT_CANVAS_SLOTS.try_acquire().map_err(|_| {
@@ -4890,7 +5036,7 @@ async fn get_v1_checkpoint_canvas(
     })?;
     let mut reconstruction = AbortOnDrop(tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let response = checkpoint_canvas_response(&state.handle, &checkpoint_id, expected_session)?;
+        let response = reconstruct()?;
         let bytes = serde_json::to_vec(&response)
             .map_err(|error| AppError::internal(format!("checkpoint canvas encoding: {error}")))?;
         if bytes.len() > MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES {
@@ -5198,6 +5344,10 @@ fn prepare_rest_server(
         .route(
             "/api/v1/checkpoints/{checkpoint_id}/canvas",
             get(get_v1_checkpoint_canvas),
+        )
+        .route(
+            "/api/v1/checkpoints/{checkpoint_id}/replay",
+            get(get_v1_checkpoint_replay),
         )
         .route(
             "/api/v1/checkpoints/branches",
@@ -8108,6 +8258,221 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial(checkpoint_canvas)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "real selected-source replay crosses HTTP, binary decoding and independent live-state oracles"
+    )]
+    async fn checkpoint_replay_http_preserves_selected_source_target_and_live_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 80,
+            world_height: 80,
+            food_cell_size: 10,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+        for _ in 0..2 {
+            let id = world
+                .try_spawn_agent(scriptbots_core::AgentData::default())
+                .unwrap();
+            assert!(world.bind_agent_brain(id, brains.population()[0]).unwrap());
+        }
+        let host = crate::control::tests::TestHost::spawn(world);
+        let handle = host
+            .handle()
+            .with_artifacts_dir(directory.path().join("artifacts"))
+            .unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest {
+                description: Some("explicit older replay source".into()),
+                idempotency_key: Some("replay-source".into()),
+            })
+            .unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let newer = handle
+            .create_checkpoint(CheckpointCreateRequest {
+                description: None,
+                idempotency_key: Some("newer-replay-source".into()),
+            })
+            .unwrap();
+        host.wait_applied(&handle.step().unwrap());
+        let target = host.port.snapshot_hub().latest();
+        host.wait_applied(&handle.step().unwrap());
+        let live = host.port.snapshot_hub().latest();
+        let live_digest = host.port.scientific_digest_v1().unwrap();
+        assert!(saved.tick < newer.tick && newer.tick < target.world.tick);
+        assert!(target.world.tick < live.world.tick);
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let query = |tick: u64| {
+            axum::extract::Query(CheckpointReplayQuery {
+                session_id: handle.session_id().get().to_string(),
+                target_tick: tick.to_string(),
+            })
+        };
+        let response = get_v1_checkpoint_replay(
+            State(state.clone()),
+            axum::extract::Path(saved.checkpoint_id.clone()),
+            query(target.world.tick),
+        )
+        .await
+        .expect("selected older source replays the complete verified interval");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let response: CheckpointReplayResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.schema, CHECKPOINT_REPLAY_SCHEMA);
+        assert_eq!(response.checkpoint, saved);
+        assert_eq!(response.target_tick, target.world.tick.to_string());
+        assert_eq!(
+            response.source_session_id,
+            handle.session_id().get().to_string()
+        );
+        assert_eq!(
+            response.max_verification_ticks,
+            crate::control::MAX_EVENT_REVIEW_TICKS.to_string()
+        );
+        assert_eq!(
+            response.verification,
+            CheckpointReplayVerification::CapturedInterval {
+                verified_through_tick: live_digest.tick.0.to_string(),
+                captured_current_digest: live_digest.overall.clone(),
+            }
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&response.frame_base64)
+            .unwrap();
+        let frame = scriptbots_runtime::remote::decode_remote_frame(&bytes).unwrap();
+        assert_eq!(
+            frame.identity.session_id,
+            u128::from(handle.session_id().get())
+        );
+        assert_eq!(frame.identity.tick, target.world.tick);
+        assert!(frame.playback.paused);
+        assert_eq!(frame.coalesced_publications, 0);
+        let expected_environment =
+            scriptbots_runtime::remote::RemoteEnvironmentSnapshot::capture(&target).unwrap();
+        assert_eq!(
+            frame.environment.as_ref().unwrap().cells,
+            expected_environment.cells
+        );
+        let scriptbots_runtime::remote::RemoteFramePayload::Canvas(canvas) = frame.payload else {
+            panic!("historical replay must return an actual canvas");
+        };
+        let logical = |mut value: Value| {
+            for agent in value["agents"].as_array_mut().unwrap() {
+                agent.as_object_mut().unwrap().remove("id").unwrap();
+            }
+            value["summary"]
+                .as_object_mut()
+                .unwrap()
+                .remove("deaths")
+                .unwrap();
+            value
+        };
+        assert_eq!(
+            logical(serde_json::to_value(&canvas).unwrap()),
+            logical(serde_json::to_value(&target.world).unwrap())
+        );
+
+        let response = get_v1_checkpoint_replay(
+            State(state.clone()),
+            axum::extract::Path(saved.checkpoint_id.clone()),
+            query(saved.tick),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), MAX_CHECKPOINT_CANVAS_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let response: CheckpointReplayResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            response.verification,
+            CheckpointReplayVerification::SavedCut
+        );
+        assert_eq!(response.checkpoint, saved);
+        assert_eq!(response.target_tick, saved.tick.to_string());
+        for tick in [saved.tick - 1, live.world.tick + 1] {
+            let error = get_v1_checkpoint_replay(
+                State(state.clone()),
+                axum::extract::Path(saved.checkpoint_id.clone()),
+                query(tick),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+        assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &live));
+    }
+
+    #[tokio::test]
+    #[serial(checkpoint_canvas)]
+    async fn checkpoint_replay_refuses_invalid_queries_and_shares_saved_cut_capacity() {
+        let host = test_host();
+        let handle = host.handle();
+        let before = host.port.scientific_digest_v1().unwrap();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let session = handle.session_id().get().to_string();
+        let permit = CHECKPOINT_CANVAS_SLOTS.acquire().await.unwrap();
+        for (source, target, expected) in [
+            ("01".to_owned(), "0", StatusCode::BAD_REQUEST),
+            (session.clone(), "01", StatusCode::BAD_REQUEST),
+            (session.clone(), "-1", StatusCode::BAD_REQUEST),
+            (
+                session.clone(),
+                "18446744073709551616",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                handle.session_id().get().wrapping_add(1).to_string(),
+                "0",
+                StatusCode::CONFLICT,
+            ),
+            (session, "0", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let error = get_v1_checkpoint_replay(
+                State(state.clone()),
+                axum::extract::Path("missing-checkpoint".into()),
+                axum::extract::Query(CheckpointReplayQuery {
+                    session_id: source,
+                    target_tick: target.to_owned(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, expected);
+        }
+        drop(permit);
+        assert_eq!(
+            checkpoint_query_decimal(&u64::MAX.to_string(), "target").unwrap(),
+            u64::MAX
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+    }
+
     #[test]
     fn lab_session_header_requires_one_exact_canonical_owner_identity() {
         let session = scriptbots_runtime::HostSessionId::new(u64::MAX);
@@ -8203,6 +8568,10 @@ mod tests {
             (
                 reqwest::Method::GET,
                 "/api/v1/checkpoints/missing/canvas?session_id=0",
+            ),
+            (
+                reqwest::Method::GET,
+                "/api/v1/checkpoints/missing/replay?session_id=0&target_tick=0",
             ),
             (reqwest::Method::POST, "/api/v1/checkpoints/branches"),
             (reqwest::Method::GET, "/api/v1/checkpoints/branches"),
