@@ -92,7 +92,8 @@ use crate::{
     host_core::{HostCore, HostCoreBuildError, HostCoreOptions, MigrationArrival},
     migrator::{
         CandidateAgent, EmigrantRecord, EmigrantSelectionRule, MigrationConfig, MigrationError,
-        MigrationTopology, checked_island_population, select_emigrants, total_population,
+        MigrationProtocol, MigrationTopology, checked_island_population,
+        select_emigrants_with_protocol, total_population,
     },
 };
 use scriptbots_core::{
@@ -338,7 +339,8 @@ impl ArchipelagoConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchipelagoMigration {
     /// Ticks between migration barriers, measured from the common starting
-    /// tick of the islands. Restoring a checkpoint preserves this phase.
+    /// tick of the islands. Untagged historical checkpoints retain their
+    /// original absolute-tick schedule when restored.
     ///
     /// Must be a nonzero multiple of [`ArchipelagoConfig::barrier_interval`].
     /// Migration is only physically possible at a barrier — that is the only
@@ -393,6 +395,8 @@ struct ArchipelagoCheckpointMetadataV1 {
     barrier_tick: Tick,
     epoch: u64,
     migration: Option<ArchipelagoMigration>,
+    #[serde(default, skip_serializing_if = "MigrationProtocol::is_legacy")]
+    migration_protocol: MigrationProtocol,
 }
 
 /// One settled archipelago barrier, including every complete owner and retained volatile journal.
@@ -1368,6 +1372,7 @@ pub struct Archipelago {
     epoch: u64,
     latched: Option<String>,
     migration: Option<ArchipelagoMigration>,
+    migration_protocol: MigrationProtocol,
     pending_migration: Option<PendingMigration>,
 }
 
@@ -1452,6 +1457,7 @@ impl Archipelago {
                 barrier_tick: self.barrier_tick,
                 epoch: self.epoch,
                 migration: self.migration.clone(),
+                migration_protocol: self.migration_protocol,
             },
             owners,
         };
@@ -1520,6 +1526,7 @@ impl Archipelago {
             epoch: metadata.epoch,
             latched: None,
             migration: metadata.migration.clone(),
+            migration_protocol: metadata.migration_protocol,
             pending_migration: None,
         })
     }
@@ -1765,6 +1772,11 @@ impl Archipelago {
         }
 
         let start_tick = start_tick.unwrap_or(Tick(0));
+        let migration_protocol = if migration.is_some() {
+            MigrationProtocol::RelativeIslandV2
+        } else {
+            MigrationProtocol::AbsoluteSharedV1
+        };
         tracing::info!(
             island_count = built.len(),
             topology = ?topology,
@@ -1798,6 +1810,7 @@ impl Archipelago {
             epoch: 0,
             latched: None,
             migration,
+            migration_protocol,
             pending_migration: None,
         })
     }
@@ -2203,12 +2216,18 @@ impl Archipelago {
         let Some(policy) = self.migration.clone() else {
             return Ok(None);
         };
-        // The first barrier is one interval after construction, even when the
-        // factories supply already-running worlds. Both epochs and the original
-        // cadence survive checkpoints; an absolute tick modulus can miss every
-        // barrier when the common starting tick is off that grid.
-        let barriers_per_migration = policy.interval_ticks / self.barrier_interval.get();
-        if !epoch.is_multiple_of(barriers_per_migration) {
+        // An absolute tick modulus can miss every barrier for pre-stepped worlds.
+        // Keep it only for exact continuation of historical archives.
+        let due = match self.migration_protocol {
+            MigrationProtocol::AbsoluteSharedV1 => {
+                barrier_tick.0.is_multiple_of(policy.interval_ticks)
+            }
+            MigrationProtocol::RelativeIslandV2 => {
+                let barriers_per_migration = policy.interval_ticks / self.barrier_interval.get();
+                epoch.is_multiple_of(barriers_per_migration)
+            }
+        };
+        if !due {
             return Ok(None);
         }
         // The migration graph is DERIVED from the archipelago's own topology, so
@@ -2241,8 +2260,14 @@ impl Archipelago {
             .collect();
 
         // PHASE 2 — select everything before applying anything.
-        let plan = select_emigrants(&candidates, &config, self.master_seed, epoch)
-            .map_err(|source| ArchipelagoError::MigrationSelection { source })?;
+        let plan = select_emigrants_with_protocol(
+            &candidates,
+            &config,
+            self.master_seed,
+            epoch,
+            self.migration_protocol,
+        )
+        .map_err(|source| ArchipelagoError::MigrationSelection { source })?;
 
         Ok(Some(PendingMigration {
             epoch,
@@ -3134,6 +3159,58 @@ mod tests {
                     assert_same_checkpoint_science(&source, &restored);
                 }
                 assert_eq!(migrations > 0, migration);
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_keeps_legacy_random_migration_across_repeated_handoffs() {
+        let mut modern = checkpoint_archipelago(true);
+        let mut legacy = checkpoint_archipelago(true);
+        legacy.migration_protocol = MigrationProtocol::AbsoluteSharedV1;
+        let mut changed_ranking = false;
+        for _ in 0..4 {
+            let old_cut = legacy.checkpoint_v1().unwrap();
+            let metadata = serde_json::to_value(&old_cut.metadata).unwrap();
+            assert!(metadata.get("migration_protocol").is_none());
+            let encoded = old_cut.encode().unwrap();
+            let old_cut = ArchipelagoCheckpointV1::decode(&encoded).unwrap();
+            let mut handoff =
+                Archipelago::restore_checkpoint_v1(&old_cut, |_| Ok(BrainRegistry::new())).unwrap();
+
+            let modern_cut = modern.checkpoint_v1().unwrap();
+            let metadata = serde_json::to_value(&modern_cut.metadata).unwrap();
+            assert_eq!(metadata["migration_protocol"], "relative_island_v2");
+            let modern_report = modern.step_to_barrier().unwrap();
+            let old_report = legacy.step_to_barrier().unwrap();
+            let continued = handoff.step_to_barrier().unwrap();
+            assert_eq!(continued.migration, old_report.migration);
+            assert_same_checkpoint_science(&legacy, &handoff);
+            changed_ranking |= modern_report.migration != old_report.migration;
+            legacy = handoff;
+        }
+        assert!(changed_ranking);
+    }
+
+    #[test]
+    fn untagged_prestepped_checkpoints_keep_their_historical_absolute_schedule() {
+        for start_tick in [1, 2] {
+            let mut old = checkpoint_archipelago_at(true, start_tick);
+            old.migration_protocol = MigrationProtocol::AbsoluteSharedV1;
+            let mut new = checkpoint_archipelago_at(true, start_tick);
+            for elapsed in [2, 4, 6, 8] {
+                let expected_tick = start_tick + elapsed;
+                let bytes = old.checkpoint_v1().unwrap().encode().unwrap();
+                let cut = ArchipelagoCheckpointV1::decode(&bytes).unwrap();
+                assert_eq!(cut.encode().unwrap(), bytes);
+                old =
+                    Archipelago::restore_checkpoint_v1(&cut, |_| Ok(BrainRegistry::new())).unwrap();
+                let old_report = old.step_to_barrier().unwrap();
+                let new_report = new.step_to_barrier().unwrap();
+                assert_eq!(old_report.barrier_tick, Tick(expected_tick));
+                assert_eq!(new_report.barrier_tick, Tick(expected_tick));
+                assert_eq!(old_report.migration.is_some(), expected_tick % 4 == 0);
+                assert_eq!(new_report.migration.is_some(), elapsed % 4 == 0);
             }
         }
     }

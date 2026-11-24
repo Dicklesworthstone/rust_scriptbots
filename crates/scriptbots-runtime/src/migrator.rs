@@ -5,12 +5,57 @@
 //! tie-breaking (no `partial_cmp().unwrap()`, no `HashMap` iteration).
 
 use rand::Rng;
-use scriptbots_core::{SmallRngStream, rng_domains::derive_migration_seed};
+use scriptbots_core::{
+    SmallRngStream,
+    rng_domains::{derive_island_migration_seed, derive_migration_seed},
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use scriptbots_core::rng_domains::IslandId;
+
+// Untagged checkpoints scheduled on absolute ticks and shared a single rank stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MigrationProtocol {
+    #[default]
+    AbsoluteSharedV1,
+    RelativeIslandV2,
+}
+
+impl MigrationProtocol {
+    pub(crate) const fn is_legacy(&self) -> bool {
+        matches!(self, Self::AbsoluteSharedV1)
+    }
+
+    fn random_ranks(
+        self,
+        candidates: &mut [CandidateAgent],
+        shared_rng: &mut SmallRngStream,
+        master_seed: u64,
+        barrier_index: u64,
+        island: IslandId,
+    ) -> BTreeMap<u64, u64> {
+        let mut island_rng;
+        let rng = match self {
+            Self::AbsoluteSharedV1 => shared_rng,
+            Self::RelativeIslandV2 => {
+                candidates.sort_unstable_by_key(|candidate| candidate.uid);
+                island_rng = SmallRngStream::seed_from_u64(derive_island_migration_seed(
+                    master_seed,
+                    barrier_index,
+                    island,
+                ));
+                &mut island_rng
+            }
+        };
+        candidates
+            .iter()
+            .map(|candidate| (candidate.uid, rng.random::<u64>()))
+            .collect()
+    }
+}
 
 /// Emigrant selection strategy for migration barriers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,8 +324,8 @@ const fn random_rank_report_value(rank: u64) -> f64 {
 /// Returns a list of `EmigrantRecord` moves and the updated population counts.
 /// # Migration RNG domain
 ///
-/// The migration stream is ITS OWN domain, derived from `(master_seed, barrier_index)`
-/// through [`derive_migration_seed`]. bd-16g.5.3 requires exactly this and explains why:
+/// Each source's migration stream is derived from `(master_seed, barrier_index, island_id)`
+/// through [`derive_island_migration_seed`]. bd-16g.5.3 explains why:
 /// if emigrant choice were drawn from an island's generator, the selection on the
 /// island-4-to-island-5 edge would depend on how many agents happened to reproduce on
 /// island 0 that epoch -- coupling the islands through the one path nobody inspects.
@@ -294,6 +339,22 @@ pub fn select_emigrants(
     config: &MigrationConfig,
     master_seed: u64,
     barrier_index: u64,
+) -> Result<BarrierReport, MigrationError> {
+    select_emigrants_with_protocol(
+        islands_candidates,
+        config,
+        master_seed,
+        barrier_index,
+        MigrationProtocol::RelativeIslandV2,
+    )
+}
+
+pub(crate) fn select_emigrants_with_protocol(
+    islands_candidates: &BTreeMap<IslandId, Vec<CandidateAgent>>,
+    config: &MigrationConfig,
+    master_seed: u64,
+    barrier_index: u64,
+    protocol: MigrationProtocol,
 ) -> Result<BarrierReport, MigrationError> {
     if islands_candidates.is_empty() {
         return Err(MigrationError::EmptyArchipelago);
@@ -313,16 +374,22 @@ pub fn select_emigrants(
 
     // Rank candidates per island
     let mut ranked_candidates: BTreeMap<IslandId, Vec<(CandidateAgent, f64)>> = BTreeMap::new();
-    let mut rng = SmallRngStream::seed_from_u64(derive_migration_seed(master_seed, barrier_index));
+    let mut shared_rng =
+        SmallRngStream::seed_from_u64(derive_migration_seed(master_seed, barrier_index));
 
     for (&island_id, candidates) in islands_candidates {
         let mut sorted = candidates.clone();
-        let mut random_ranks: BTreeMap<u64, u64> = BTreeMap::new();
-        if config.selection_rule == EmigrantSelectionRule::Random {
-            for c in &sorted {
-                random_ranks.insert(c.uid, rng.random::<u64>());
-            }
-        }
+        let random_ranks = if config.selection_rule == EmigrantSelectionRule::Random {
+            protocol.random_ranks(
+                &mut sorted,
+                &mut shared_rng,
+                master_seed,
+                barrier_index,
+                island_id,
+            )
+        } else {
+            BTreeMap::new()
+        };
 
         sorted.sort_by(|a, b| {
             let r_a = random_ranks.get(&a.uid).copied().unwrap_or(0);
@@ -807,5 +874,54 @@ mod tests {
             edge_moves(&large),
             "who leaves island 0 for island 1 must not depend on island 2 existing"
         );
+    }
+
+    #[test]
+    fn random_selection_ignores_disconnected_populations_and_candidate_order() {
+        let agents = |count: u64| {
+            (1..=count)
+                .map(|uid| CandidateAgent {
+                    uid,
+                    energy: 1.0,
+                    health: 1.0,
+                    age: 1,
+                    speed: 1.0,
+                })
+                .collect::<Vec<_>>()
+        };
+        let config = MigrationConfig {
+            selection_rule: EmigrantSelectionRule::Random,
+            emigrants_per_edge: 4,
+            topology: MigrationTopology::Custom(vec![(IslandId(4), IslandId(5))]),
+            ..MigrationConfig::default()
+        };
+        let mut candidates = BTreeMap::from([(IslandId(4), agents(16)), (IslandId(5), vec![])]);
+        let ids = |report: &BarrierReport| {
+            report
+                .moves
+                .iter()
+                .map(|record| record.agent_uid)
+                .collect::<Vec<_>>()
+        };
+        // Independently computed FNV-1a / SplitMix64 / Xoshiro256++ fixture for
+        // seed 42, barrier 3, the 16 UIDs in order, and their four lowest ranks.
+        let isolated = select_emigrants(&candidates, &config, 42, 3).unwrap();
+        assert_eq!(ids(&isolated), [2, 4, 8, 16]);
+        let legacy = |candidates: &BTreeMap<IslandId, Vec<CandidateAgent>>| {
+            select_emigrants_with_protocol(
+                candidates,
+                &config,
+                42,
+                3,
+                MigrationProtocol::AbsoluteSharedV1,
+            )
+            .unwrap()
+        };
+        assert_eq!(ids(&legacy(&candidates)), [3, 5, 12, 13]);
+        candidates.insert(IslandId(0), agents(3));
+        assert_eq!(ids(&legacy(&candidates)), [2, 9, 10, 16]);
+        candidates.get_mut(&IslandId(4)).unwrap().reverse();
+        let with_neighbor = select_emigrants(&candidates, &config, 42, 3).unwrap();
+        assert_eq!(with_neighbor.moves, isolated.moves);
     }
 }

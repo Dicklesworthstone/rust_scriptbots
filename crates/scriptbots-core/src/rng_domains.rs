@@ -185,6 +185,9 @@ impl StableSeedHash {
 /// Derivation identity for the migration stream (bd-16g.5.3).
 pub const MIGRATION_RNG_DERIVATION_V1: &str = "scriptbots.island-migration-rng.v1";
 
+/// Derivation identity for migration ranks scoped to a barrier and its source island.
+pub const MIGRATION_RNG_DERIVATION_V2: &str = "scriptbots.island-migration-rng.v2";
+
 /// Stable index of one island within an archipelago.
 ///
 /// THE CANONICAL ISLAND IDENTITY (bd-cxcf). Three incompatible definitions used to exist
@@ -278,6 +281,17 @@ pub fn derive_migration_seed(root_seed: u64, barrier_index: u64) -> u64 {
     hash.absorb_field(MIGRATION_RNG_DERIVATION_V1.as_bytes());
     hash.absorb_u64(barrier_index);
     hash.absorb_u64(root_seed);
+    hash.finish()
+}
+
+/// Seed a source island's emigrant ranking independently of every other population.
+#[must_use]
+pub fn derive_island_migration_seed(root_seed: u64, barrier_index: u64, island: IslandId) -> u64 {
+    let mut hash = StableSeedHash::new();
+    hash.absorb_field(MIGRATION_RNG_DERIVATION_V2.as_bytes());
+    hash.absorb_u64(barrier_index);
+    hash.absorb_u64(root_seed);
+    hash.absorb(&island.0.to_le_bytes());
     hash.finish()
 }
 
