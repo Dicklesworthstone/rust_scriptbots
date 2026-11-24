@@ -3293,6 +3293,137 @@ pub(crate) struct EventCanvasReview {
     pub verification: scriptbots_runtime::lab_workflows::LabReplayVerification,
 }
 
+/// Admission checks for a remote reconstruction. These bound retained inputs and
+/// completed populations, not a tick's transient allocations or execution time.
+#[derive(Clone, Copy)]
+struct CanvasReplayLimits {
+    max_agents: usize,
+}
+
+#[derive(Default)]
+struct CanvasReplayPendingInputs {
+    arrivals: usize,
+    closed: Option<bool>,
+}
+
+impl CanvasReplayLimits {
+    const REMOTE: Self = Self {
+        max_agents: scriptbots_runtime::remote::REMOTE_MAX_AGENTS,
+    };
+
+    fn validate_population(self, population: usize) -> Result<(), ControlError> {
+        if population > self.max_agents {
+            return Err(ControlError::PayloadTooLarge(
+                "checkpoint replay exceeds its agent admission bound".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_config(
+        self,
+        config: &ScriptBotsConfig,
+        population: usize,
+    ) -> Result<(), ControlError> {
+        ControlHandle::validate_checkpoint_preview_config(config, population)?;
+        self.validate_population(population)?;
+        if !config.closed {
+            self.validate_population(config.population_minimum)?;
+            if config.population_spawn_interval != 0 {
+                self.validate_population(config.population_spawn_count as usize)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_world(self, world: &WorldState) -> Result<(), ControlError> {
+        self.validate_config(world.config(), world.agent_count())
+    }
+
+    fn validate_arrivals(
+        self,
+        world: &WorldState,
+        pending: usize,
+        additional: usize,
+    ) -> Result<(), ControlError> {
+        let population = world
+            .agent_count()
+            .checked_add(pending)
+            .and_then(|population| population.checked_add(additional))
+            .ok_or_else(|| {
+                ControlError::PayloadTooLarge(
+                    "checkpoint replay population admission overflowed".into(),
+                )
+            })?;
+        self.validate_population(population)
+    }
+
+    fn admit_command(
+        self,
+        world: &WorldState,
+        command: &ControlCommand,
+        pending: &mut CanvasReplayPendingInputs,
+    ) -> Result<(), ControlError> {
+        let arrivals = match command {
+            ControlCommand::SpawnAgent { .. } | ControlCommand::SpawnCrossover { .. } => 1,
+            ControlCommand::Intervention(command) => {
+                match &command.intervention {
+                    scriptbots_core::Intervention::InjectCohort { count, .. } => {
+                        let count = usize::from(*count);
+                        self.validate_arrivals(world, pending.arrivals, count)?;
+                        pending.arrivals += count;
+                    }
+                    scriptbots_core::Intervention::SetClosedWorld { closed } => {
+                        pending.closed = Some(*closed);
+                    }
+                    _ => {}
+                }
+                0
+            }
+            _ => 0,
+        };
+        self.validate_arrivals(world, pending.arrivals, arrivals)
+    }
+
+    fn validate_step(
+        self,
+        world: &WorldState,
+        pending: &CanvasReplayPendingInputs,
+    ) -> Result<(), ControlError> {
+        self.validate_world(world)?;
+        self.validate_arrivals(world, pending.arrivals, 0)?;
+        let config = world.config();
+        if !pending.closed.unwrap_or(config.closed) {
+            let population = world
+                .agent_count()
+                .checked_add(pending.arrivals)
+                .map(|population| population.max(config.population_minimum))
+                .ok_or_else(|| {
+                    ControlError::PayloadTooLarge(
+                        "checkpoint replay population admission overflowed".into(),
+                    )
+                })?;
+            let scheduled = config.population_spawn_interval != 0
+                && world.tick().0.checked_add(1).is_some_and(|tick| {
+                    tick.is_multiple_of(u64::from(config.population_spawn_interval))
+                });
+            let population = population
+                .checked_add(if scheduled {
+                    config.population_spawn_count as usize
+                } else {
+                    0
+                })
+                .ok_or_else(|| {
+                    ControlError::PayloadTooLarge(
+                        "checkpoint replay population admission overflowed".into(),
+                    )
+                })?;
+            self.validate_population(population)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct CheckpointRetentionState {
     limits: scriptbots_storage::CheckpointRetentionLimits,
@@ -6741,7 +6872,7 @@ impl ControlHandle {
         &self,
         checkpoint_id: &str,
     ) -> Result<(CheckpointMetadataDto, Arc<RenderSnapshot>), ControlError> {
-        let (metadata, checkpoint) = self.read_bounded_canvas_checkpoint(checkpoint_id)?;
+        let (metadata, checkpoint, _) = self.read_bounded_canvas_checkpoint(checkpoint_id)?;
         let snapshot = self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?;
         Ok((metadata, snapshot))
     }
@@ -6753,7 +6884,14 @@ impl ControlHandle {
     fn read_bounded_canvas_checkpoint(
         &self,
         checkpoint_id: &str,
-    ) -> Result<(CheckpointMetadataDto, scriptbots_core::WorldCheckpointV1), ControlError> {
+    ) -> Result<
+        (
+            CheckpointMetadataDto,
+            scriptbots_core::WorldCheckpointV1,
+            PathBuf,
+        ),
+        ControlError,
+    > {
         if checkpoint_id.len() > MAX_CHECKPOINT_BRANCH_ID_BYTES
             || !valid_checkpoint_catalog_id(checkpoint_id)
         {
@@ -6855,7 +6993,7 @@ impl ControlHandle {
             ));
         }
         validate_cached_identity()?;
-        Ok((metadata, checkpoint))
+        Ok((metadata, checkpoint, directory))
     }
 
     fn validate_checkpoint_preview_config(
@@ -7014,35 +7152,7 @@ impl ControlHandle {
             ));
         }
 
-        let retained = if target_tick == metadata.tick {
-            None
-        } else {
-            let retention = self
-                .data_services
-                .checkpoint_retention
-                .lock()
-                .map_err(|_| ControlError::Lock)?;
-            let mut matches = retention
-                .requests
-                .values()
-                .filter(|entry| entry.metadata.checkpoint_id == metadata.checkpoint_id);
-            let retained = matches.next().ok_or_else(|| {
-                ControlError::BadRequest(
-                    "selected checkpoint has no acknowledged current-owner replay history; only its saved cut can be reviewed".into(),
-                )
-            })?;
-            if matches.next().is_some()
-                || !retained.acknowledged
-                || retained.source_session != session_id
-                || retained.metadata != metadata
-                || retained.artifact != checkpoint_artifact_metadata(&metadata)
-            {
-                return Err(ControlError::Conflict(
-                    "selected checkpoint replay history is ambiguous, unacknowledged or belongs to another source".into(),
-                ));
-            }
-            Some(retained.clone())
-        };
+        let retained = self.retained_checkpoint_for_replay(session_id, &metadata, target_tick)?;
         if let Some(retained) = &retained {
             let artifact = self.retained_artifact(&metadata.checkpoint_id)?;
             if artifact.directory != retained.directory || artifact.metadata != retained.artifact {
@@ -7054,7 +7164,9 @@ impl ControlHandle {
         let (artifact, bytes) = self.read_artifact_bytes(&metadata.checkpoint_id)?;
         let checkpoint = Self::decode_canvas_checkpoint(&metadata, &artifact, &bytes)?;
         match retained {
-            Some(retained) => self.replay_retained_canvas(&retained, &checkpoint, target_tick),
+            Some(retained) => {
+                self.replay_retained_canvas(&retained, &checkpoint, target_tick, None)
+            }
             None => Ok(EventCanvasReview {
                 snapshot: self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?,
                 checkpoint_id: metadata.checkpoint_id,
@@ -7062,6 +7174,92 @@ impl ControlHandle {
                 verification: scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut,
             }),
         }
+    }
+
+    /// Review an explicitly selected saved source through the remote admission lane.
+    ///
+    /// Read and decode the bounded artifact once, without triggering general catalog
+    /// recovery. Later targets reuse the native replay proof and check resource
+    /// admission at every configuration/input/tick boundary of the complete interval.
+    /// The caller owns concurrency and response deadlines; no live owner is changed.
+    pub(crate) fn replay_canvas_from_checkpoint_bounded(
+        &self,
+        session_id: scriptbots_runtime::HostSessionId,
+        checkpoint_id: &str,
+        target_tick: u64,
+    ) -> Result<(CheckpointMetadataDto, EventCanvasReview), ControlError> {
+        if session_id != self.session_id() {
+            return Err(ControlError::Conflict(
+                "checkpoint replay belongs to a different owner session".into(),
+            ));
+        }
+        let (metadata, checkpoint, directory) =
+            self.read_bounded_canvas_checkpoint(checkpoint_id)?;
+        if target_tick < metadata.tick {
+            return Err(ControlError::BadRequest(
+                "review target precedes the selected checkpoint".into(),
+            ));
+        }
+        let retained = self.retained_checkpoint_for_replay(session_id, &metadata, target_tick)?;
+        let review = match retained {
+            Some(retained) => {
+                if retained.directory != directory {
+                    return Err(ControlError::Conflict(
+                        "selected checkpoint changed its retained source directory".into(),
+                    ));
+                }
+                self.replay_retained_canvas(
+                    &retained,
+                    &checkpoint,
+                    target_tick,
+                    Some(CanvasReplayLimits::REMOTE),
+                )?
+            }
+            None => EventCanvasReview {
+                snapshot: self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?,
+                checkpoint_id: metadata.checkpoint_id.clone(),
+                base_tick: checkpoint.tick().0,
+                verification: scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut,
+            },
+        };
+        Ok((metadata, review))
+    }
+
+    fn retained_checkpoint_for_replay(
+        &self,
+        session_id: scriptbots_runtime::HostSessionId,
+        metadata: &CheckpointMetadataDto,
+        target_tick: u64,
+    ) -> Result<Option<RetainedCheckpoint>, ControlError> {
+        if target_tick == metadata.tick {
+            return Ok(None);
+        }
+        let retention = self
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        let mut matches = retention
+            .requests
+            .values()
+            .filter(|entry| entry.metadata.checkpoint_id == metadata.checkpoint_id);
+        let retained = matches.next().ok_or_else(|| {
+            ControlError::BadRequest(
+                "selected checkpoint has no acknowledged current-owner replay history; only its saved cut can be reviewed".into(),
+            )
+        })?;
+        if matches.next().is_some()
+            || !retained.acknowledged
+            || retained.source_session != session_id
+            || retained.metadata != *metadata
+            || retained.artifact != checkpoint_artifact_metadata(metadata)
+        {
+            return Err(ControlError::Conflict(
+                "selected checkpoint replay history is ambiguous, unacknowledged or belongs to another source".into(),
+            ));
+        }
+        retention.verify_completed_catalog(&retained.directory, metadata)?;
+        Ok(Some(retained.clone()))
     }
 
     /// Reconstruct an older event from ticks and complete observed input histories.
@@ -7098,7 +7296,7 @@ impl ControlHandle {
                 verification: scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut,
             });
         }
-        self.replay_retained_canvas(&retained, &checkpoint, target_tick)
+        self.replay_retained_canvas(&retained, &checkpoint, target_tick, None)
     }
 
     fn replay_retained_canvas(
@@ -7106,6 +7304,7 @@ impl ControlHandle {
         retained: &RetainedCheckpoint,
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         target_tick: u64,
+        limits: Option<CanvasReplayLimits>,
     ) -> Result<EventCanvasReview, ControlError> {
         let current = self.host.scientific_digest_cut()?;
         Self::validate_event_review_boundary(retained, &current, target_tick)?;
@@ -7143,6 +7342,7 @@ impl ControlHandle {
             target_tick,
             retained.source_persistence_interval,
             retained.source_config_revision,
+            limits,
         )?;
         // The replay checked this exact captured endpoint. A target can retain
         // queued boundary inputs, so do not invent a settled target digest.
@@ -7158,6 +7358,11 @@ impl ControlHandle {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "replay inputs, original revision axes, full-interval proof and remote admission must share one ordered reconstruction"
+    )]
     fn replay_event_canvas_world(
         checkpoint: &scriptbots_core::WorldCheckpointV1,
         current: &scriptbots_core::WorldDigestV1,
@@ -7166,8 +7371,15 @@ impl ControlHandle {
         target_tick: u64,
         source_persistence_interval: u32,
         source_config_revision: scriptbots_runtime::ConfigRevision,
+        limits: Option<CanvasReplayLimits>,
     ) -> Result<WorldState, ControlError> {
+        if let Some(limits) = limits {
+            limits.validate_config(checkpoint.config(), checkpoint.agent_count())?;
+        }
         let mut world = Self::restore_canvas_world(checkpoint)?;
+        if let Some(limits) = limits {
+            limits.validate_world(&world)?;
+        }
         let restored_config_revision = world.config_revision();
         let mut edits = config_audit.iter().peekable();
         let mut commands = scientific_commands.iter().peekable();
@@ -7198,20 +7410,27 @@ impl ControlHandle {
                     commands.clone(),
                 ));
             }
-            Self::apply_event_review_boundary_inputs(
+            let pending = Self::apply_event_review_boundary_inputs(
                 &mut world,
                 &mut edits,
                 &mut commands,
                 source_persistence_interval,
                 source_config_revision,
                 restored_config_revision,
+                limits,
             )?;
             if world.tick() == current.tick {
                 break;
             }
+            if let Some(limits) = limits {
+                limits.validate_step(&world, &pending)?;
+            }
             world
                 .step()
                 .map_err(|error| ControlError::Serialization(error.to_string()))?;
+            if let Some(limits) = limits {
+                limits.validate_world(&world)?;
+            }
         }
         if edits.peek().is_some() {
             return Err(ControlError::InvalidPatch(
@@ -7239,6 +7458,9 @@ impl ControlHandle {
                 )
             })?;
         let mut target_world = Self::restore_canvas_world_parts(&target, Some(&continuity))?;
+        if let Some(limits) = limits {
+            limits.validate_world(&target_world)?;
+        }
         let restored_target_revision = target_world.config_revision();
         // The current-digest oracle has now checked the entire interval. Reapply only
         // the target's same-tick inputs, including queued interventions, through the
@@ -7250,7 +7472,11 @@ impl ControlHandle {
             source_persistence_interval,
             target_revision,
             restored_target_revision,
+            limits,
         )?;
+        if let Some(limits) = limits {
+            limits.validate_world(&target_world)?;
+        }
         Ok(target_world)
     }
 
@@ -7280,7 +7506,9 @@ impl ControlHandle {
         source_persistence_interval: u32,
         source_config_revision: scriptbots_runtime::ConfigRevision,
         restored_config_revision: u64,
-    ) -> Result<(), ControlError> {
+        limits: Option<CanvasReplayLimits>,
+    ) -> Result<CanvasReplayPendingInputs, ControlError> {
+        let mut pending = CanvasReplayPendingInputs::default();
         loop {
             if let Some(entry) = commands
                 .peek()
@@ -7302,8 +7530,14 @@ impl ControlHandle {
                 }
                 if replayed_config_revision == command_config_revision {
                     let entry = commands.next().expect("peeked scientific command");
+                    if let Some(limits) = limits {
+                        limits.admit_command(world, entry.command(), &mut pending)?;
+                    }
                     scriptbots_core::apply_control_command(world, entry.command().clone())
                         .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+                    if let Some(limits) = limits {
+                        limits.validate_world(world)?;
+                    }
                     continue;
                 }
                 if !edits
@@ -7317,7 +7551,7 @@ impl ControlHandle {
                 .peek()
                 .is_some_and(|entry| entry.tick == world.tick().0)
             {
-                return Ok(());
+                return Ok(pending);
             }
             // Commands partition the config audit by the revision they observed,
             // preserving arbitrary input/edit ordering at a shared completed tick.
@@ -7328,7 +7562,12 @@ impl ControlHandle {
                 world,
                 edits.next().expect("peeked audit entry"),
                 source_persistence_interval,
+                limits,
             )?;
+            if let Some(limits) = limits {
+                limits.validate_world(world)?;
+                limits.validate_arrivals(world, pending.arrivals, 0)?;
+            }
             if world.config_revision() != expected {
                 return Err(ControlError::InvalidPatch(
                     "recorded config edit did not advance its revision".into(),
@@ -7613,6 +7852,7 @@ impl ControlHandle {
         world: &mut WorldState,
         entry: &ConfigAuditEntry,
         source_persistence_interval: u32,
+        limits: Option<CanvasReplayLimits>,
     ) -> Result<(), ControlError> {
         // set_closed records a sparse patch and deliberately does not run the full
         // config-update cache/food refresh. Preserve that operation's actual semantics.
@@ -7620,6 +7860,11 @@ impl ControlHandle {
             && patch.len() == 1
             && let Some(closed) = patch.get("closed").and_then(Value::as_bool)
         {
+            if let Some(limits) = limits {
+                let mut proposed = world.config().clone();
+                proposed.closed = closed;
+                limits.validate_config(&proposed, world.agent_count())?;
+            }
             world
                 .set_closed(closed)
                 .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
@@ -7641,6 +7886,9 @@ impl ControlHandle {
         config
             .validate()
             .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        if let Some(limits) = limits {
+            limits.validate_config(&config, world.agent_count())?;
+        }
         config.persistence_interval = 0;
         world
             .apply_config_update(config)
@@ -12290,6 +12538,7 @@ pub(crate) mod tests {
                 oracle.world.tick,
                 0,
                 source.source_config_revision,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -12303,6 +12552,20 @@ pub(crate) mod tests {
             assert_eq!(
                 review.snapshot.world.agents.len(),
                 oracle.world.agents.len()
+            );
+            let (metadata, remote) = handle
+                .replay_canvas_from_checkpoint_bounded(
+                    handle.session_id(),
+                    &checkpoint_id,
+                    oracle.world.tick,
+                )
+                .unwrap();
+            assert_eq!(metadata, source.metadata);
+            assert_eq!(remote.checkpoint_id, checkpoint_id);
+            assert_eq!(remote.verification, review.verification);
+            assert_eq!(
+                serde_json::to_value(&remote.snapshot.world).unwrap(),
+                serde_json::to_value(&review.snapshot.world).unwrap(),
             );
             assert_eq!(host.port.scientific_digest_v1().unwrap(), current.digest);
             assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
@@ -12389,7 +12652,8 @@ pub(crate) mod tests {
                 &current.scientific_commands,
                 2,
                 0,
-                source.source_config_revision
+                source.source_config_revision,
+                None,
             )
             .is_err()
         );
@@ -12402,7 +12666,8 @@ pub(crate) mod tests {
                     &current.scientific_commands,
                     2,
                     0,
-                    source.source_config_revision.checked_next().unwrap()
+                    source.source_config_revision.checked_next().unwrap(),
+                    None,
                 ),
                 Err(ControlError::InvalidPatch(message)) if message.contains("command configuration")
             ),
@@ -12544,6 +12809,7 @@ pub(crate) mod tests {
                 pending.world.tick,
                 source.source_persistence_interval,
                 source.source_config_revision,
+                None,
             )
             .unwrap();
             assert!(matches!(
@@ -12593,6 +12859,7 @@ pub(crate) mod tests {
                 applied.world.tick,
                 source.source_persistence_interval,
                 source.source_config_revision,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -12746,6 +13013,7 @@ pub(crate) mod tests {
                 oracle.world.tick,
                 source.source_persistence_interval,
                 source.source_config_revision,
+                None,
             )
             .unwrap();
             assert_eq!(&target.world_digest_v1().unwrap(), digest);
@@ -12867,6 +13135,7 @@ pub(crate) mod tests {
                 oracle.world.tick,
                 source.source_persistence_interval,
                 source.source_config_revision,
+                None,
             )
             .unwrap();
             assert_eq!(&target.world_digest_v1().unwrap(), digest);
@@ -13062,6 +13331,7 @@ pub(crate) mod tests {
                         target_tick,
                         source.source_persistence_interval,
                         source.source_config_revision,
+                        None,
                     ),
                     Err(ControlError::InvalidPatch(message))
                         if message.contains("current scientific digest")
@@ -13164,6 +13434,7 @@ pub(crate) mod tests {
                 oracle.world.tick,
                 0,
                 retained.source_config_revision,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -13450,6 +13721,7 @@ pub(crate) mod tests {
                 oracle.world.tick,
                 source.source_persistence_interval,
                 source.source_config_revision,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -13496,6 +13768,7 @@ pub(crate) mod tests {
                         oracle.world.tick,
                         source.source_persistence_interval,
                         source.source_config_revision,
+                        None,
                     )
                     .is_err(),
                     "{fault}"
@@ -14019,6 +14292,15 @@ pub(crate) mod tests {
                         }
                     );
                     assert_eq!(host.port.scientific_digest_v1().unwrap(), endpoint);
+                    let (_, remote) = handle
+                        .replay_canvas_from_checkpoint_bounded(
+                            handle.session_id(),
+                            &checkpoint.checkpoint_id,
+                            1,
+                        )
+                        .expect("remote review accepts the unchanged complete interval bound");
+                    assert_eq!(remote.verification, boundary.verification);
+                    assert_eq!(remote.snapshot.world.tick, 1);
                 }
             }
             let before = host.port.scientific_digest_v1().unwrap();
@@ -14041,6 +14323,19 @@ pub(crate) mod tests {
             } else {
                 "at most"
             }));
+            let remote_error = handle
+                .replay_canvas_from_checkpoint_bounded(
+                    handle.session_id(),
+                    &checkpoint.checkpoint_id,
+                    1,
+                )
+                .err()
+                .expect("remote target does not shorten the full captured verification interval");
+            assert!(remote_error.to_string().contains(if scheduled {
+                "owner schedule"
+            } else {
+                "at most"
+            }));
             let saved = handle
                 .replay_canvas_from_checkpoint(handle.session_id(), &selected, checkpoint.tick)
                 .expect("a verified exact saved cut does not require interval replay");
@@ -14049,6 +14344,14 @@ pub(crate) mod tests {
                 saved.verification,
                 scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut
             );
+            let (_, remote_saved) = handle
+                .replay_canvas_from_checkpoint_bounded(
+                    handle.session_id(),
+                    &checkpoint.checkpoint_id,
+                    checkpoint.tick,
+                )
+                .unwrap();
+            assert_eq!(remote_saved.verification, saved.verification);
             assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
             if scheduled {
                 let mut retention = handle.data_services.checkpoint_retention.lock().unwrap();
@@ -16672,6 +16975,277 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn bounded_checkpoint_replay_keeps_selected_source_across_cold_catalogs() {
+        let AgentCanvasJourney {
+            handle,
+            host,
+            checkpoint_id,
+            oracles,
+            ..
+        } = mixed_canvas_journey();
+        let selected = handle.get_checkpoint(&checkpoint_id).unwrap();
+        let target_tick = oracles[0].0.world.tick;
+        let newer = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        assert!(newer.tick > target_tick);
+        assert_ne!(newer.checkpoint_id, checkpoint_id);
+        host.wait_applied(&handle.step().unwrap());
+        let live = handle.read_snapshot().unwrap();
+        let digest = host.port.scientific_digest_v1().unwrap();
+        let native = handle
+            .replay_canvas_from_checkpoint(
+                handle.session_id(),
+                &lab_checkpoint_descriptor(&selected),
+                target_tick,
+            )
+            .unwrap();
+        for cold in [false, true] {
+            if cold {
+                handle.data_services.checkpoints.lock().unwrap().clear();
+                handle.data_services.artifacts.lock().unwrap().clear();
+            }
+            let (metadata, review) = handle
+                .replay_canvas_from_checkpoint_bounded(
+                    handle.session_id(),
+                    &checkpoint_id,
+                    target_tick,
+                )
+                .unwrap();
+            assert_eq!(metadata, selected);
+            assert_eq!(review.checkpoint_id, checkpoint_id);
+            assert_eq!(review.base_tick, selected.tick);
+            assert_eq!(review.snapshot.world.tick, target_tick);
+            assert_eq!(review.verification, native.verification);
+            assert_eq!(
+                serde_json::to_value(&review.snapshot.world).unwrap(),
+                serde_json::to_value(&native.snapshot.world).unwrap(),
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
+        }
+        assert!(matches!(
+            handle.replay_canvas_from_checkpoint_bounded(
+                scriptbots_runtime::HostSessionId::new(handle.session_id().get() + 1),
+                "missing-checkpoint",
+                target_tick,
+            ),
+            Err(ControlError::Conflict(_))
+        ));
+        assert!(matches!(
+            handle.replay_canvas_from_checkpoint_bounded(
+                handle.session_id(),
+                &newer.checkpoint_id,
+                target_tick,
+            ),
+            Err(ControlError::BadRequest(reason)) if reason.contains("precedes")
+        ));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
+    }
+
+    #[test]
+    fn bounded_checkpoint_replay_refuses_recorded_allocation_growth_without_narrowing_native() {
+        for patch in [
+            serde_json::json!({"history_capacity": MAX_CHECKPOINT_PREVIEW_HISTORY + 1}),
+            serde_json::json!({"narrative_capacity": MAX_CHECKPOINT_PREVIEW_HISTORY + 1}),
+            serde_json::json!({
+                "closed": false,
+                "population_minimum": scriptbots_runtime::remote::REMOTE_MAX_AGENTS + 1,
+            }),
+            serde_json::json!({
+                "closed": false,
+                "population_spawn_interval": 1,
+                "population_spawn_count": scriptbots_runtime::remote::REMOTE_MAX_AGENTS + 1,
+            }),
+        ] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let (handle, host) = checkpoint_test_handle(&directory, 8, 64 * 1024 * 1024);
+            let saved = handle
+                .create_checkpoint(CheckpointCreateRequest::default())
+                .unwrap();
+            host.wait_applied(&handle.step().unwrap());
+            host.wait_applied(&handle.apply_patch(patch.clone()).unwrap());
+            let publication = handle.read_snapshot().unwrap();
+            let current = host.port.scientific_digest_v1().unwrap();
+            assert!(current.tick.0 > saved.tick);
+            assert!(publication.world.agents.is_empty());
+            let native = handle
+                .replay_canvas_from_checkpoint(
+                    handle.session_id(),
+                    &lab_checkpoint_descriptor(&saved),
+                    current.tick.0,
+                )
+                .expect("native replay retains its original resource policy");
+            assert_eq!(native.snapshot.world.tick, current.tick.0);
+            assert!(
+                matches!(
+                    handle.replay_canvas_from_checkpoint_bounded(
+                        handle.session_id(),
+                        &saved.checkpoint_id,
+                        current.tick.0,
+                    ),
+                    Err(ControlError::PayloadTooLarge(_))
+                ),
+                "recorded patch {patch}"
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), current);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+        }
+    }
+
+    #[test]
+    fn replay_population_admission_observes_real_agent_and_crossover_spawns() {
+        let AgentCanvasJourney {
+            handle,
+            host,
+            checkpoint_id,
+            ..
+        } = agent_canvas_journey();
+        let source = handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests[&checkpoint_id]
+            .clone();
+        let checkpoint = handle.verified_canvas_checkpoint(&checkpoint_id).unwrap();
+        let current = host.port.scientific_digest_cut().unwrap();
+        let publication = handle.read_snapshot().unwrap();
+        assert_eq!(
+            publication.world.agents.len(),
+            checkpoint.agent_count() + 2,
+            "the real owner applied both the injected agent and the crossover"
+        );
+        // A small explicit policy exercises the same admission checks without creating
+        // 65,537 agents. The production ceiling is covered by the exact-boundary test.
+        let limits = CanvasReplayLimits {
+            max_agents: checkpoint.agent_count() + 1,
+        };
+        let commands = ControlHandle::event_review_scientific_commands(
+            &source,
+            &current,
+            current.digest.tick.0,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            commands.len(),
+            3,
+            "only the three actual post-source inputs"
+        );
+        assert!(matches!(
+            ControlHandle::replay_event_canvas_world(
+                &checkpoint,
+                &current.digest,
+                &[],
+                &commands,
+                current.digest.tick.0,
+                source.source_persistence_interval,
+                source.source_config_revision,
+                Some(limits),
+            ),
+            Err(ControlError::PayloadTooLarge(_))
+        ));
+        let native = handle
+            .replay_canvas_from_checkpoint(
+                handle.session_id(),
+                &lab_checkpoint_descriptor(&source.metadata),
+                current.digest.tick.0,
+            )
+            .unwrap();
+        assert_eq!(
+            native.snapshot.world.agents.len(),
+            publication.world.agents.len()
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), current.digest);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+    }
+
+    #[test]
+    fn replay_population_admission_counts_cohorts_queued_at_the_same_boundary() {
+        use scriptbots_core::{
+            CohortSource, Intervention, InterventionCommand, InterventionSurface, Placement, Region,
+        };
+        let AgentCanvasJourney { handle, host, .. } = agent_canvas_journey();
+        let saved = handle
+            .create_checkpoint(CheckpointCreateRequest::default())
+            .unwrap();
+        let checkpoint = handle
+            .verified_canvas_checkpoint(&saved.checkpoint_id)
+            .unwrap();
+        let source = handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests[&saved.checkpoint_id]
+            .clone();
+        let brain = checkpoint.required_brain_registry().entries[0].key;
+        host.wait_applied(&handle.step().unwrap());
+        for seed in [700, 701] {
+            let command = InterventionCommand::new(
+                Intervention::InjectCohort {
+                    count: 2,
+                    genome: CohortSource::RegisteredBrain { key: brain },
+                    placement: Placement::Seeded {
+                        region: Region::All,
+                        seed,
+                    },
+                    herbivore_tendency: 0.75,
+                },
+                InterventionSurface::Script,
+                "bounded replay cohort",
+            );
+            host.wait_applied(
+                &handle
+                    .submit_control_command(ControlCommand::Intervention(Box::new(command)))
+                    .unwrap(),
+            );
+        }
+        host.wait_applied(&handle.step().unwrap());
+        let current = host.port.scientific_digest_cut().unwrap();
+        let publication = handle.read_snapshot().unwrap();
+        assert_eq!(publication.world.agents.len(), checkpoint.agent_count() + 4);
+        let commands = ControlHandle::event_review_scientific_commands(
+            &source,
+            &current,
+            current.digest.tick.0,
+            &[],
+        )
+        .unwrap();
+        let limits = CanvasReplayLimits {
+            max_agents: checkpoint.agent_count() + 3,
+        };
+        assert!(matches!(
+            ControlHandle::replay_event_canvas_world(
+                &checkpoint,
+                &current.digest,
+                &[],
+                &commands,
+                current.digest.tick.0,
+                source.source_persistence_interval,
+                source.source_config_revision,
+                Some(limits),
+            ),
+            Err(ControlError::PayloadTooLarge(_))
+        ));
+        let native = handle
+            .replay_canvas_from_checkpoint(
+                handle.session_id(),
+                &lab_checkpoint_descriptor(&saved),
+                current.digest.tick.0,
+            )
+            .unwrap();
+        assert_eq!(
+            native.snapshot.world.agents.len(),
+            publication.world.agents.len()
+        );
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), current.digest);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &publication));
+    }
+
+    #[test]
     fn bounded_checkpoint_canvas_refuses_large_descriptors_before_payload_access() {
         let directory = tempfile::tempdir().unwrap().keep();
         let (handle, host) = checkpoint_test_handle(&directory, 8, 64 * 1024 * 1024);
@@ -16697,6 +17271,14 @@ pub(crate) mod tests {
                 handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
                 Err(ControlError::PayloadTooLarge(_))
             ));
+            assert!(matches!(
+                handle.replay_canvas_from_checkpoint_bounded(
+                    handle.session_id(),
+                    &metadata.checkpoint_id,
+                    metadata.tick.saturating_add(1),
+                ),
+                Err(ControlError::PayloadTooLarge(_))
+            ));
         }
         // A false small declaration cannot make an oversized physical file admissible.
         let mut metadata = saved.clone();
@@ -16709,6 +17291,14 @@ pub(crate) mod tests {
             .unwrap();
         assert!(matches!(
             handle.checkpoint_canvas_bounded(&metadata.checkpoint_id),
+            Err(ControlError::PayloadTooLarge(_))
+        ));
+        assert!(matches!(
+            handle.replay_canvas_from_checkpoint_bounded(
+                handle.session_id(),
+                &metadata.checkpoint_id,
+                metadata.tick,
+            ),
             Err(ControlError::PayloadTooLarge(_))
         ));
         assert_eq!(
