@@ -789,6 +789,15 @@ ID for the next continuation. Opaque factory state, corrupt checkpoints and stal
 are refused. Ordinary launch manifests retain `checkpoint_replay_guarantee=false`;
 the handoff report's scoped guarantee does not discharge the remaining native acceptance.
 
+Full-owner artifacts retain the successful scientific-command observations used by
+historical event review, including their original application boundaries. Continuation
+therefore preserves the available spawn, crossover, mutation-rate and intervention
+inputs alongside the saved configuration audit. The existing entry and byte limits
+still apply: evicted, oversized or unsupported inputs leave gaps, and review refuses
+any interval whose inputs are incomplete. Restoring the history does not reapply its
+commands or change the saved scientific state. Owner-envelope codec revision 5 makes
+this history mandatory; earlier owner-envelope revisions are explicitly refused.
+
 Source IDs are embedded at build time. RCH's plain hexadecimal commit stamp supplies
 the revision when `SCRIPTBOTS_SOURCE_REVISION` was not supplied; explicit ScriptBots
 identity takes precedence. Unknown, dirty and overlay RCH stamps leave that fallback

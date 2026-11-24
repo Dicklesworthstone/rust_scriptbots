@@ -62,7 +62,7 @@ pub const MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES: usize = 1024 * 1024;
 /// Full owner checkpoint schema; distinct from the science-only core schema.
 pub const HOST_CHECKPOINT_V1_SCHEMA: &str = "scriptbots.host-checkpoint.v1";
 /// Canonical envelope revision for [`HostCheckpointV1`].
-pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 4;
+pub const HOST_CHECKPOINT_V1_CODEC_VERSION: u16 = 5;
 /// Actual envelope, payload and corruption-checksum codecs.
 pub const HOST_CHECKPOINT_V1_CODEC: &str = "postcard-envelope+json+blake3-v1";
 /// Fixed resource ceiling for a complete encoded host artifact.
@@ -131,11 +131,13 @@ pub struct WorldDigestCut {
 /// Retention shares `HostCoreOptions::archived_command_capacity` and obeys
 /// [`MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES`]. Oversized commands still apply but leave an
 /// observable revision gap in this history; consumers must prove interval completeness.
-/// Host checkpoint restore starts an empty presentation history rather than claiming to
-/// recover discarded input evidence. Intervention application queues its actual effect
-/// for the next science tick, preserving the ordinary core command semantics.
-#[derive(Debug, Clone)]
+/// Full owner checkpoints preserve these retained observations, including any gaps;
+/// they cannot recover discarded input evidence. Intervention application queues its
+/// actual effect for the next science tick, preserving the ordinary core command semantics.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppliedScientificCommand {
+    command_id: CommandId,
+    admission_sequence: AdmissionSequence,
     boundary: AppliedCommand,
     command: ControlCommand,
 }
@@ -160,6 +162,20 @@ impl AppliedScientificCommand {
 }
 
 fn scientific_command_retained_bytes(command: &ControlCommand) -> Option<usize> {
+    scientific_command_owned_bytes(command, true)
+}
+
+fn scientific_command_owned_bytes(
+    command: &ControlCommand,
+    include_spare_capacity: bool,
+) -> Option<usize> {
+    let allocation = |length: usize, capacity: usize| {
+        if include_spare_capacity {
+            capacity
+        } else {
+            length
+        }
+    };
     let heap = match command {
         ControlCommand::AdjustAgentMutationRates { .. }
         | ControlCommand::SpawnAgent { .. }
@@ -169,11 +185,12 @@ fn scientific_command_retained_bytes(command: &ControlCommand) -> Option<usize> 
             let selector = match &command.intervention {
                 Intervention::SpawnFromArchive { selector, .. } => match selector {
                     CellSelector::AxisRange(axes) => {
-                        axes.capacity()
+                        allocation(axes.len(), axes.capacity())
                             .saturating_mul(size_of::<(usize, f32, f32)>())
                     }
                     CellSelector::Explicit(cells) => {
-                        cells.capacity().saturating_mul(size_of::<CellId>())
+                        allocation(cells.len(), cells.capacity())
+                            .saturating_mul(size_of::<CellId>())
                     }
                     CellSelector::All | CellSelector::TopKByQuality(_) => 0,
                 },
@@ -186,12 +203,52 @@ fn scientific_command_retained_bytes(command: &ControlCommand) -> Option<usize> 
                 | Intervention::SetClosedWorld { .. } => 0,
             };
             size_of::<InterventionCommand>()
-                .saturating_add(command.actor.capacity())
+                .saturating_add(allocation(command.actor.len(), command.actor.capacity()))
                 .saturating_add(selector)
         }
         _ => return None,
     };
     Some(size_of::<AppliedScientificCommand>().saturating_add(heap))
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScientificCommandCheckpointV1 {
+    command_id: CommandId,
+    admission_sequence: AdmissionSequence,
+    boundary: AppliedCommand,
+    command: ControlCommand,
+}
+
+fn scientific_checkpoint_history_bytes(
+    history: &[ScientificCommandCheckpointV1],
+    capacity: usize,
+    include_spare_capacity: bool,
+) -> Result<usize, HostCheckpointError> {
+    if history.len() > capacity || history.len() > MAX_HOST_CHECKPOINT_ENTRIES {
+        return Err(checkpoint_error(
+            "scientific_commands.capacity",
+            "retained scientific command history exceeds entry bound",
+        ));
+    }
+    history.iter().try_fold(0_usize, |total, entry| {
+        let bytes = scientific_command_owned_bytes(&entry.command, include_spare_capacity)
+            .ok_or_else(|| {
+                checkpoint_error(
+                    "scientific_commands.command",
+                    "unsupported retained scientific command",
+                )
+            })?;
+        total
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES)
+            .ok_or_else(|| {
+                checkpoint_error(
+                    "scientific_commands.bytes",
+                    "retained scientific command payloads exceed byte bound",
+                )
+            })
+    })
 }
 
 /// Capture, wire or continued-owner reconstruction refusal.
@@ -424,6 +481,7 @@ struct HostCheckpointStateV1 {
     next_audit_order: u64,
     commands: Vec<CommandAuthority>,
     archived: Vec<ArchivedIdempotency>,
+    scientific_commands: Vec<ScientificCommandCheckpointV1>,
     last_applied: Option<(AdmissionSequence, CommandId)>,
     visible_boundary: AppliedCommand,
     latest_completed_summary: Option<TickSummary>,
@@ -702,8 +760,24 @@ impl HostCheckpointV1 {
         if *blake3::hash(&wire.payload).as_bytes() != wire.payload_blake3 {
             return Err(checkpoint_error("payload.hash", "payload BLAKE3 mismatch"));
         }
-        let state: HostCheckpointStateV1 = serde_json::from_slice(&wire.payload)
+        let mut state: HostCheckpointStateV1 = serde_json::from_slice(&wire.payload)
             .map_err(|error| checkpoint_error("payload.decode", error.to_string()))?;
+        // Refuse oversized content before copying it. JSON's growing String/Vec decoder
+        // can retain more spare capacity than the exact clones kept by the live owner.
+        // Normalize those allocations before checking the actual retained-byte ceiling.
+        scientific_checkpoint_history_bytes(
+            &state.scientific_commands,
+            state.options.archived_command_capacity,
+            false,
+        )?;
+        state.scientific_commands = state
+            .scientific_commands
+            .into_iter()
+            .map(|entry| ScientificCommandCheckpointV1 {
+                command: entry.command.clone(),
+                ..entry
+            })
+            .collect();
         let world = scriptbots_core::WorldCheckpointV1::decode(&state.world_bytes)?;
         let checkpoint = Self { state, world };
         checkpoint.validate()?;
@@ -745,6 +819,7 @@ impl HostCheckpointV1 {
         }
         self.validate_owner_counters()?;
         self.validate_command_history()?;
+        self.validate_scientific_command_history()?;
         self.validate_schedule()?;
         self.validate_step_traces()?;
         state.events.validate(
@@ -791,6 +866,7 @@ impl HostCheckpointV1 {
                 || state.next_lifecycle_command_sequence != state.cut.session_id.get()
                 || !state.commands.is_empty()
                 || !state.archived.is_empty()
+                || !state.scientific_commands.is_empty()
                 || state.last_applied.is_some()
                 || !state.protocol_events.is_empty()
                 || !state.step_traces.is_empty()
@@ -936,6 +1012,103 @@ impl HostCheckpointV1 {
                 "commands.last_applied",
                 "last admission exceeds captured cut",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_scientific_command_history(&self) -> Result<(), HostCheckpointError> {
+        let state = &self.state;
+        scientific_checkpoint_history_bytes(
+            &state.scientific_commands,
+            state.options.archived_command_capacity,
+            true,
+        )?;
+        let statuses: HashMap<_, _> = state
+            .commands
+            .iter()
+            .map(|authority| &authority.status)
+            .chain(state.archived.iter().map(|archived| &archived.status))
+            .filter_map(|status| status.admission_sequence().map(|sequence| (sequence, status)))
+            .collect();
+        let envelopes: HashMap<_, _> = state
+            .commands
+            .iter()
+            .filter_map(|authority| {
+                authority.status.admission_sequence().and_then(|sequence| {
+                    authority.envelope.as_ref().map(|envelope| (sequence, envelope))
+                })
+            })
+            .collect();
+        let owner_command_ordinal = state.revisions.scientific.get() - self.tick().0;
+        let mut previous: Option<(&ScientificCommandCheckpointV1, u64)> = None;
+        for entry in &state.scientific_commands {
+            entry
+                .command
+                .validate()
+                .map_err(|error| checkpoint_error("scientific_commands.command", error.to_string()))?;
+            let boundary = entry.boundary;
+            let command_ordinal = boundary
+                .revisions
+                .scientific
+                .get()
+                .checked_sub(boundary.tick.0)
+                .filter(|ordinal| *ordinal != 0)
+                .ok_or_else(|| {
+                    checkpoint_error(
+                        "scientific_commands.boundary",
+                        "scientific input has no command revision beyond its completed tick",
+                    )
+                })?;
+            if entry.admission_sequence.get() == 0
+                || entry.admission_sequence >= state.next_admission
+                || boundary.tick > self.tick()
+                || boundary.revisions.control > state.revisions.control
+                || boundary.revisions.config > state.revisions.config
+                || boundary.revisions.scientific > state.revisions.scientific
+                || command_ordinal > boundary.revisions.control.get()
+                || command_ordinal > owner_command_ordinal
+            {
+                return Err(checkpoint_error(
+                    "scientific_commands.boundary",
+                    "scientific input boundary exceeds the captured owner cut",
+                ));
+            }
+            if previous.is_some_and(|(earlier, ordinal)| {
+                entry.admission_sequence <= earlier.admission_sequence
+                    || boundary.tick < earlier.boundary.tick
+                    || boundary.revisions.config < earlier.boundary.revisions.config
+                    || boundary.revisions.control <= earlier.boundary.revisions.control
+                    || command_ordinal <= ordinal
+            }) {
+                return Err(checkpoint_error(
+                    "scientific_commands.order",
+                    "scientific inputs do not identify distinct chronological applications",
+                ));
+            }
+            // Volatile idempotency is bounded: an evicted ID may be admitted again.
+            // Admission sequences distinguish those applications, including a flush that
+            // reuses the current control boundary without advancing a revision.
+            if let Some(status) = statuses.get(&entry.admission_sequence)
+                && (status.command_id() != entry.command_id
+                    || status.application() != &ApplicationState::Applied(boundary))
+            {
+                return Err(checkpoint_error(
+                    "scientific_commands.identity",
+                    "scientific input disagrees with retained application authority",
+                ));
+            }
+            if let Some(envelope) = envelopes.get(&entry.admission_sequence) {
+                let command = HostCommand::try_from(entry.command.clone()).map_err(|error| {
+                    checkpoint_error("scientific_commands.command", error.to_string())
+                })?;
+                if envelope.command != command {
+                    return Err(checkpoint_error(
+                        "scientific_commands.identity",
+                        "scientific input payload disagrees with its retained envelope",
+                    ));
+                }
+            }
+            previous = Some((entry, command_ordinal));
         }
         Ok(())
     }
@@ -4188,6 +4361,16 @@ impl HostCore {
             next_audit_order: shared.next_audit_order,
             commands,
             archived,
+            scientific_commands: self
+                .scientific_commands
+                .iter()
+                .map(|entry| ScientificCommandCheckpointV1 {
+                    command_id: entry.command_id,
+                    admission_sequence: entry.admission_sequence,
+                    boundary: entry.boundary,
+                    command: entry.command.clone(),
+                })
+                .collect(),
             last_applied: shared.last_applied,
             visible_boundary: shared.visible_boundary,
             latest_completed_summary: self.latest_completed_summary.clone(),
@@ -4377,7 +4560,7 @@ impl HostCore {
             persistence,
         )?;
         host.events.restore_checkpoint(&state.events)?;
-        host.restore_checkpoint_observers(state);
+        host.restore_checkpoint_observers(state)?;
         host.schedule = schedule;
         host.scheduled_patches =
             if state.snapshot.scheduled_patches.as_ref() == &state.scheduled_patches {
@@ -4400,7 +4583,31 @@ impl HostCore {
         Ok(host)
     }
 
-    fn restore_checkpoint_observers(&mut self, state: &HostCheckpointStateV1) {
+    fn restore_checkpoint_observers(
+        &mut self,
+        state: &HostCheckpointStateV1,
+    ) -> Result<(), HostCheckpointError> {
+        let scientific_commands: VecDeque<_> = state
+            .scientific_commands
+            .iter()
+            .map(|entry| AppliedScientificCommand {
+                command_id: entry.command_id,
+                admission_sequence: entry.admission_sequence,
+                boundary: entry.boundary,
+                command: entry.command.clone(),
+            })
+            .collect();
+        let scientific_command_bytes = scientific_commands.iter().try_fold(0_usize, |total, entry| {
+            scientific_command_retained_bytes(&entry.command)
+                .and_then(|bytes| total.checked_add(bytes))
+                .filter(|total| *total <= MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES)
+                .ok_or_else(|| {
+                    checkpoint_error(
+                        "scientific_commands.bytes",
+                        "restored scientific command allocations exceed byte bound",
+                    )
+                })
+        })?;
         {
             let mut shared = self.shared.borrow_mut();
             shared.next_admission = state.next_admission;
@@ -4459,7 +4666,10 @@ impl HostCore {
         self.latest_completed_summary
             .clone_from(&state.latest_completed_summary);
         self.step_traces = state.step_traces.iter().cloned().collect();
+        self.scientific_commands = scientific_commands;
+        self.scientific_command_bytes = scientific_command_bytes;
         self.snapshot_layers = layers;
+        Ok(())
     }
 
     /// Capture focused inspector data without sharing the world or its evaluator.
@@ -5970,6 +6180,8 @@ impl HostCore {
         self.complete_applied_with(envelope.command_id, admission, applied)?;
         if let Some(command) = retained_scientific_command {
             let retained = AppliedScientificCommand {
+                command_id: envelope.command_id,
+                admission_sequence: admission,
                 boundary: applied,
                 command,
             };
