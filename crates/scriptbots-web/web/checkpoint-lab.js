@@ -13,6 +13,9 @@ const POLL_MS = 2000;
 const WORLD_DIGEST = /^[0-9a-f]{16}$/;
 const CHECKSUM = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9_-]{1,128}$/;
+const WORLD_CHECKPOINT_SCHEMA = "scriptbots.world-checkpoint.v1.3";
+const HOST_CHECKPOINT_SCHEMA = "scriptbots.host-checkpoint.v1";
+const CHECKPOINT_SCHEMAS = new Set([WORLD_CHECKPOINT_SCHEMA, HOST_CHECKPOINT_SCHEMA]);
 const worldDigest = (value) => typeof value === "string" && WORLD_DIGEST.test(value);
 const checksum = (value) => typeof value === "string" && CHECKSUM.test(value);
 const identifier = (value) => typeof value === "string" && ID.test(value);
@@ -43,7 +46,7 @@ export function validateLabCheckpoint(value) {
       || !integer(value.agent_count) || !integer(value.byte_size, 1)
       || value.agent_count > value.byte_size || !worldDigest(value.world_digest_v1)
       || !checksum(value.checksum_blake3) || !checksum(value.checksum_sha256)
-      || !text(value.schema, 128) || !value.schema.startsWith("scriptbots.world-checkpoint.")
+      || !CHECKPOINT_SCHEMAS.has(value.schema)
       || !text(value.created_at_utc, 128) || !value.created_at_utc
       || (value.description != null && !text(value.description, 4096))) {
     throw new Error("The host returned invalid or inexact checkpoint metadata");
@@ -300,6 +303,7 @@ export class CheckpointLabController {
   get canOperate() { return this.enabled && this.source !== null && !this.busy; }
   get canSave() { return this.canOperate && this.ownerWritable && this.canvasPreview === null && this.saveState !== "unconfirmed"; }
   get canReview() { return this.canOperate && this.selected !== null && typeof this.services.review === "function"; }
+  get canImportLocally() { return this.canOperate && this.selected?.schema === WORLD_CHECKPOINT_SCHEMA; }
   get reviewPending() { return ["Saved-world review unavailable", "Historical replay unavailable"].includes(this.operation?.kind); }
   get canEditReplay() { return this.enabled && this.source !== null && this.selected !== null && (!this.busy || this.reviewPending); }
   get replayTarget() {
@@ -732,6 +736,11 @@ export class CheckpointLabController {
   prepareLocalImport(maxBytes) {
     if (!this.canOperate || !this.selected) return Promise.resolve(null);
     if (!integer(maxBytes, 1)) throw new Error("The browser package did not provide a valid scientific checkpoint limit");
+    if (!this.canImportLocally) {
+      this.notice = "This complete owner checkpoint requires native restoration. Review, download and server studies remain available; local import accepts standalone world checkpoints.";
+      this.emit();
+      return Promise.resolve(null);
+    }
     const limit = Math.min(maxBytes, MAX_LAB_ARTIFACT_BYTES);
     const checkpoint = this.selected;
     if (checkpoint.byte_size > limit) {
@@ -836,7 +845,7 @@ export function renderCheckpointLab(panel, controller) {
   const selected = controller.selected;
   const retention = controller.page?.retention;
   write("lab-checkpoint-detail", selected
-    ? `Saved tick ${selected.tick}; ${selected.agent_count} agents; ${selected.byte_size} bytes. World digest ${selected.world_digest_v1}. Scientific state only; the live owner remains unchanged.`
+    ? `Saved tick ${selected.tick}; ${selected.agent_count} agents; ${selected.byte_size} bytes. World digest ${selected.world_digest_v1}. ${selected.schema === HOST_CHECKPOINT_SCHEMA ? "Complete owner checkpoint. Review and server studies preserve its saved science. Independent studies do not inherit owner commands or schedules; local import requires a standalone world checkpoint." : "Standalone scientific checkpoint; the live owner remains unchanged."}`
     : retention ? `${controller.page.total} saved checkpoints; ${retention.file_bytes} of ${retention.max_bytes} retained bytes. Choose one to study.` : "No saved checkpoint selected.");
   disable("lab-checkpoint-select", !ready);
   disable("lab-checkpoint-save", !controller.canSave);
@@ -856,7 +865,7 @@ export function renderCheckpointLab(panel, controller) {
     disable(id, !controller.canEditReplay || target === null || target < BigInt(selected?.tick ?? 0)
       || target > BigInt(Number.MAX_SAFE_INTEGER));
   }
-  disable("lab-checkpoint-local", !ready || !selected);
+  disable("lab-checkpoint-local", !controller.canImportLocally);
   disable("lab-branch-launch", !controller.canLaunch);
   disable("lab-branch-retry", !ready || controller.canvasPreview !== null || controller.branchState !== "unconfirmed");
   const branch = controller.branch, status = branch?.status;

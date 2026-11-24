@@ -322,7 +322,7 @@ const checkpointLab = new CheckpointLabController({
 
 function updateLocalTransferControl(controller = checkpointLab) {
   const button = document.getElementById("lab-checkpoint-local");
-  if (button) button.disabled = !controller.canOperate || !controller.selected || checkpointLoadPending
+  if (button) button.disabled = !controller.canImportLocally || checkpointLoadPending
     || !remoteMode || !remoteConnected || !wasmInitialized || document.hidden
     || typeof wasm.import_world_checkpoint !== "function" || typeof wasm.world_checkpoint_byte_limit !== "function";
 }
@@ -458,7 +458,7 @@ async function offerLabDownload(operation) {
 
 checkpointReturnLive?.addEventListener("click", () => checkpointLab.returnToLive());
 document.getElementById("lab-checkpoint-local")?.addEventListener("click", async () => {
-  if (!remoteMode || !remoteConnected || !checkpointLab.canOperate || !checkpointLab.selected
+  if (!remoteMode || !remoteConnected || !checkpointLab.canImportLocally
       || checkpointLoadPending || !wasmInitialized || document.hidden
       || typeof wasm.import_world_checkpoint !== "function" || typeof wasm.world_checkpoint_byte_limit !== "function") return;
   const client = remoteClient;

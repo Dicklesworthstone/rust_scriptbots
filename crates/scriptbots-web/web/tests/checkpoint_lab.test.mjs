@@ -426,7 +426,9 @@ test("checkpoint selection requires exact metadata and complete bounded page cur
     { world_digest_v1: "A".repeat(16) }, { world_digest_v1: "g".repeat(16) },
     { checksum_blake3: WORLD_DIGEST }, { checksum_sha256: WORLD_DIGEST },
     { agent_count: 1025 }, { world_digest_v1: "not-a-digest" }, { checkpoint_id: "../wrong" },
-    { schema: "render-frame" }, { checksum_sha256: "C".repeat(64) }]) {
+    { schema: "render-frame" }, { schema: "scriptbots.world-checkpoint.v1.4" },
+    { schema: "scriptbots.world-checkpoint." }, { schema: "scriptbots.host-checkpoint.v2" },
+    { schema: ["scriptbots.host-checkpoint.v1"] }, { checksum_sha256: "C".repeat(64) }]) {
     assert.throws(() => validateLabCheckpoint(checkpoint(changes)));
   }
   const rows = Array.from({ length: 12 }, (_, index) => checkpoint({ checkpoint_id: `ckpt-${index}` }));
@@ -791,6 +793,59 @@ function scientificDownload(source = checkpoint(), blob = new Blob([new Uint8Arr
     filename: "world.sbworld", content_type: "application/octet-stream", relative_path: "checkpoints/world.sbworld",
     byte_size: source.byte_size, checksum_blake3: source.checksum_blake3, checksum_sha256: source.checksum_sha256 }) };
 }
+
+test("complete owner checkpoints remain usable through the saved-world workflow", async () => {
+  const source = checkpoint({ checkpoint_id: "owner-saved-t100", schema: "scriptbots.host-checkpoint.v1" });
+  const h = await harness();
+  h.controller.services.list = async () => page([checkpoint(), source]);
+  await h.controller.refresh(true);
+  h.controller.select(source.checkpoint_id);
+  assert.equal(h.controller.selected.schema, source.schema);
+  assert.equal(h.controller.canReview, true);
+  assert.equal(h.controller.canLaunch, true);
+  assert.equal(h.controller.canImportLocally, false);
+  const { panel, nodes } = labPanel();
+  renderCheckpointLab(panel, h.controller);
+  assert.equal(nodes.get("#lab-checkpoint-local").disabled, true);
+  assert.equal(nodes.get("#lab-checkpoint-review").disabled, false);
+  assert.equal(nodes.get("#lab-checkpoint-download").disabled, false);
+  assert.match(nodes.get("#lab-checkpoint-detail").textContent, /Complete owner checkpoint/);
+  assert.equal(await h.controller.prepareLocalImport(2048), null);
+  assert.equal(h.queues.download.length, 0, "unsupported local restore refuses before downloading");
+  assert.match(h.controller.notice, /standalone world checkpoints/);
+
+  const review = h.controller.reviewSelected();
+  h.queues.review[0].resolve(savedCanvas(source));
+  assert.equal((await review).checkpoint.schema, source.schema);
+  h.controller.editReplayTick("112");
+  const replay = h.controller.seekReplay();
+  h.queues.replay[0].resolve(replayCanvas(source));
+  assert.equal((await replay).targetTick, "112");
+  const download = h.controller.downloadCheckpoint();
+  h.queues.download[0].resolve(scientificDownload(source));
+  assert.equal((await download).blob.size, source.byte_size);
+  h.controller.returnToLive();
+  const branch = h.controller.launch({ branchName: "complete_source", ticks: 120 });
+  h.queues.launch[0].resolve(status(h.queues.launch[0].request, source));
+  await branch;
+  assert.equal(h.controller.branch.checkpoint.schema, source.schema);
+  assert.equal(h.controller.branch.status.status, "running");
+  assert.equal(h.queues.save.length, 0, "reviewing and studying do not replace the source owner");
+});
+
+test("a complete owner save receipt is accepted and retains its exact schema", async () => {
+  const source = checkpoint({ checkpoint_id: "owner-save-receipt", schema: "scriptbots.host-checkpoint.v1" });
+  const h = await harness();
+  const pending = h.controller.save();
+  h.queues.save[0].resolve(source);
+  await pending;
+  assert.equal(h.controller.saveState, "saved");
+  assert.deepEqual(h.controller.saveReceipt, source);
+  assert.equal(h.controller.selected.checkpoint_id, source.checkpoint_id);
+  assert.equal(h.controller.canImportLocally, false);
+  assert.throws(() => validateCheckpointCanvas(savedCanvas(checkpoint({ checkpoint_id: source.checkpoint_id })),
+    { sessionId: SESSION, checkpoint: source }), /does not match/);
+});
 
 test("local transfer reads the selected scientific bytes once without changing either owner", async () => {
   const h = await harness();
