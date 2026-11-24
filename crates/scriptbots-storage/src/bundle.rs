@@ -106,6 +106,12 @@ pub enum BundleError {
         /// Run identifier in the embedded manifest.
         manifest_run_id: String,
     },
+    /// The source revision or lockfile projection disagrees with the embedded run manifest.
+    #[error("bundle provenance field {0} differs from the embedded run manifest")]
+    ProvenanceProjectionMismatch(&'static str),
+    /// A caller-supplied artifact would occupy a role owned by the bundle assembler.
+    #[error("reserved bundle artifact name or type at {0}")]
+    ReservedArtifact(PathBuf),
     /// More than one entry names the same artifact path.
     #[error("bundle manifest lists artifact path more than once: {0}")]
     DuplicateArtifactPath(PathBuf),
@@ -501,6 +507,35 @@ pub fn create_run_bundle_from_artifacts(
     max_tick: u64,
     artifact_files: &[(&str, &str, &[u8])],
 ) -> Result<RunBundleV1, BundleError> {
+    let manifest = manifest.validate_and_normalize()?;
+    // Reserve the control files for the assembler. A supplied manifest used to
+    // become visible as a finished bundle even when the final create_new failed.
+    // Check the complete request before publishing any caller bytes.
+    let mut paths = std::collections::BTreeSet::new();
+    for &(relative_path, artifact_type, _) in artifact_files {
+        let path = validate_relative_path(relative_path)?;
+        let root = path
+            .components()
+            .next()
+            .and_then(|part| part.as_os_str().to_str());
+        if root.is_some_and(|name| {
+            name.eq_ignore_ascii_case("bundle_manifest.json") || name.eq_ignore_ascii_case("run.db")
+        }) || artifact_type == "database"
+        {
+            return Err(BundleError::ReservedArtifact(path.to_path_buf()));
+        }
+        if !paths.insert(path) {
+            return Err(BundleError::DuplicateArtifactPath(path.to_path_buf()));
+        }
+    }
+    for name in ["bundle_manifest.json", "run.db"] {
+        let path = output_bundle_dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(BundleError::ReservedArtifact(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(BundleError::Io { path, error }),
+        }
+    }
     fs::create_dir_all(output_bundle_dir).map_err(|error| BundleError::Io {
         path: output_bundle_dir.to_path_buf(),
         error,
@@ -536,6 +571,25 @@ pub fn create_run_bundle_from_artifacts(
     Ok(bundle)
 }
 
+/// Check projections shared by both producers, including runs without a database.
+fn verify_manifest_projections(bundle: &RunBundleV1) -> Result<(), BundleError> {
+    let run_id = bundle.manifest.run_id.to_string();
+    if bundle.digests.run_id != run_id {
+        return Err(BundleError::RunIdProjectionMismatch {
+            projected_run_id: bundle.digests.run_id.clone(),
+            manifest_run_id: run_id,
+        });
+    }
+    if bundle.digests.source_revision != bundle.manifest.source_revision {
+        return Err(BundleError::ProvenanceProjectionMismatch("source_revision"));
+    }
+    if bundle.digests.lockfile_digest.as_deref() != Some(bundle.manifest.cargo_lock_digest.as_str())
+    {
+        return Err(BundleError::ProvenanceProjectionMismatch("lockfile_digest"));
+    }
+    Ok(())
+}
+
 /// Verify the integrity, schema, and portability of a run bundle directory.
 pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResult, BundleError> {
     let manifest_path = bundle_dir.join("bundle_manifest.json");
@@ -552,7 +606,7 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
             error,
         })?;
 
-    let bundle: RunBundleV1 = serde_json::from_str(&manifest_data)?;
+    let mut bundle: RunBundleV1 = serde_json::from_str(&manifest_data)?;
 
     if bundle.bundle_version != RUN_BUNDLE_SCHEMA_VERSION {
         return Err(BundleError::InvalidManifest(manifest_path));
@@ -561,12 +615,7 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
     let mut total_bytes = 0u64;
     let mut artifact_paths = std::collections::BTreeSet::new();
 
-    if bundle.digests.run_id != bundle.manifest.run_id.to_string() {
-        return Err(BundleError::RunIdProjectionMismatch {
-            projected_run_id: bundle.digests.run_id,
-            manifest_run_id: bundle.manifest.run_id.to_string(),
-        });
-    }
+    verify_manifest_projections(&bundle)?;
 
     // Reserve filesystem ownership before hashing, but preserve hash refusals
     // before asking the engine to decode potentially corrupt database bytes.
@@ -623,6 +672,8 @@ pub fn verify_run_bundle(bundle_dir: &Path) -> Result<RunBundleVerificationResul
         || bundle.digests.checkpoint_count != 0
     {
         return Err(BundleError::MissingArtifact(PathBuf::from("run.db")));
+    } else {
+        bundle.manifest = bundle.manifest.validate_and_normalize()?;
     }
 
     Ok(RunBundleVerificationResult {
@@ -831,17 +882,11 @@ pub fn verify_run_bundle_bounded(
     let manifest_path = bundle_dir.join("bundle_manifest.json");
     let manifest_data =
         read_file_bounded(&manifest_path, limits.max_manifest_bytes, "manifest_bytes")?;
-    let bundle: RunBundleV1 = serde_json::from_slice(&manifest_data)?;
+    let mut bundle: RunBundleV1 = serde_json::from_slice(&manifest_data)?;
     if bundle.bundle_version != RUN_BUNDLE_SCHEMA_VERSION {
         return Err(BundleError::InvalidManifest(manifest_path));
     }
-    let manifest_run_id = bundle.manifest.run_id.to_string();
-    if bundle.digests.run_id != manifest_run_id {
-        return Err(BundleError::RunIdProjectionMismatch {
-            projected_run_id: bundle.digests.run_id,
-            manifest_run_id,
-        });
-    }
+    verify_manifest_projections(&bundle)?;
     if bundle.artifacts.len() > limits.max_artifacts {
         return Err(BundleError::VerificationLimitExceeded {
             resource: "artifact_count",
@@ -870,6 +915,8 @@ pub fn verify_run_bundle_bounded(
     {
         return Err(BundleError::MissingArtifact(PathBuf::from("run.db")));
     }
+
+    bundle.manifest = bundle.manifest.validate_and_normalize()?;
 
     let mut total_bytes = 0_u64;
     let mut artifact_paths = std::collections::BTreeSet::new();
@@ -2054,6 +2101,141 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(bundle_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_only_verification_requires_matching_source_and_lockfile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = temp_bundle_dir("artifact-provenance");
+        let mut manifest = RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(41));
+        manifest.source_revision = Some("source-a".to_owned());
+        manifest.cargo_lock_digest = "lock-a".to_owned();
+        let bundle = create_run_bundle_from_artifacts(
+            &dir,
+            manifest,
+            5,
+            &[("summary.json", "export", b"{}")],
+        )?;
+        let limits = RunBundleVerificationLimits {
+            max_manifest_bytes: 1024 * 1024,
+            max_artifacts: 1,
+            max_artifact_bytes: 2,
+            max_total_artifact_bytes: 2,
+        };
+        for (field, value) in [
+            ("source_revision", Some("source-b".to_owned())),
+            ("source_revision", None),
+            ("lockfile_digest", Some("lock-b".to_owned())),
+            ("lockfile_digest", None),
+        ] {
+            let mut changed = bundle.clone();
+            if field == "source_revision" {
+                changed.digests.source_revision = value;
+            } else {
+                changed.digests.lockfile_digest = value;
+            }
+            replace_test_manifest(&dir, &changed)?;
+            for observed in [
+                verify_run_bundle(&dir),
+                verify_run_bundle_bounded(&dir, limits),
+            ] {
+                assert!(
+                    matches!(observed, Err(BundleError::ProvenanceProjectionMismatch(actual)) if actual == field)
+                );
+            }
+        }
+        replace_test_manifest(&dir, &bundle)?;
+        assert_eq!(verify_run_bundle(&dir)?.total_bytes_verified, 2);
+        assert_eq!(
+            verify_run_bundle_bounded(&dir, limits)?.total_bytes_verified,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_only_provenance_cannot_claim_unreconstructable_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = temp_bundle_dir("unreconstructable-artifact");
+        let mut manifest = RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(43));
+        manifest.reproducible = true;
+        let rejected = |error: BundleError| {
+            matches!(
+                error,
+                BundleError::Storage(StorageError::InvalidData {
+                    context: "runs.reproducible",
+                    ..
+                })
+            )
+        };
+        let result = create_run_bundle_from_artifacts(&dir, manifest.clone(), 0, &[]);
+        assert!(rejected(result.unwrap_err()));
+        assert!(!dir.exists());
+
+        manifest.reproducible = false;
+        let mut bundle = create_run_bundle_from_artifacts(&dir, manifest, 0, &[])?;
+        bundle.manifest.reproducible = true;
+        replace_test_manifest(&dir, &bundle)?;
+        let limits = RunBundleVerificationLimits {
+            max_manifest_bytes: 1024 * 1024,
+            max_artifacts: 0,
+            max_artifact_bytes: 0,
+            max_total_artifact_bytes: 0,
+        };
+        assert!(rejected(verify_run_bundle(&dir).unwrap_err()));
+        assert!(rejected(
+            verify_run_bundle_bounded(&dir, limits).unwrap_err()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_only_assembly_reserves_manifest_and_database_before_staging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = RunManifestRecord::unattributed(scriptbots_runtime::RunId::new(42));
+        for (path, kind) in [
+            ("bundle_manifest.json", "export"),
+            ("bundle_manifest.json/nested", "export"),
+            ("run.db", "export"),
+            ("run.db/nested", "export"),
+            ("different.bin", "database"),
+        ] {
+            let dir = temp_bundle_dir("reserved-artifact");
+            let result = create_run_bundle_from_artifacts(
+                &dir,
+                manifest.clone(),
+                0,
+                &[("earlier", "export", b"ok"), (path, kind, b"payload")],
+            );
+            assert!(
+                matches!(result, Err(BundleError::ReservedArtifact(actual)) if actual == Path::new(path))
+            );
+            assert!(!dir.exists());
+        }
+
+        // The runner pre-creates its staging directory. Preserve that contract,
+        // and preserve existing evidence if it is already a bundle or a database.
+        for name in ["bundle_manifest.json", "run.db"] {
+            let dir = temp_bundle_dir("existing-control-file");
+            fs::create_dir_all(&dir)?;
+            fs::write(dir.join(name), b"retained")?;
+            let result = create_run_bundle_from_artifacts(
+                &dir,
+                manifest.clone(),
+                0,
+                &[("earlier", "export", b"ok")],
+            );
+            assert!(
+                matches!(result, Err(BundleError::ReservedArtifact(path)) if path == dir.join(name))
+            );
+            assert_eq!(fs::read(dir.join(name))?, b"retained");
+            assert!(!dir.join("earlier").exists());
+        }
+        let dir = temp_bundle_dir("empty-staging");
+        fs::create_dir_all(&dir)?;
+        create_run_bundle_from_artifacts(&dir, manifest, 0, &[("exports/data", "export", b"ok")])?;
+        assert_eq!(verify_run_bundle(&dir)?.total_bytes_verified, 2);
         Ok(())
     }
 
