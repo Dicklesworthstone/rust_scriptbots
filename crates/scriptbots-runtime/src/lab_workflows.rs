@@ -678,6 +678,17 @@ pub enum LabWorkflowRequest {
         /// Stable retained checkpoint identity.
         checkpoint_id: String,
     },
+    /// Read the current source tick and bounded replay-verification budget.
+    ReplayCapabilities,
+    /// Reconstruct an exact target from the explicitly selected saved source.
+    ReviewReplay {
+        /// Application source observed when the seek was offered.
+        session_id: HostSessionId,
+        /// Complete frozen saved checkpoint metadata.
+        checkpoint: LabCheckpoint,
+        /// Exact integer scientific boundary requested for presentation.
+        target_tick: u64,
+    },
     /// Read the compiled saved-study runner's admission limits.
     BranchCapabilities,
     /// Explicitly admit or exactly retry one frozen saved-source study.
@@ -856,7 +867,10 @@ impl LabArtifact {
             || !artifact_text_is_bounded(&self.content_type, 128)
             || !artifact_text_is_bounded(&self.created_at_utc, 64)
             || self.relative_path.len() > 4096
-            || !self.relative_path.split('/').all(artifact_filename_is_valid)
+            || !self
+                .relative_path
+                .split('/')
+                .all(artifact_filename_is_valid)
             || !lowercase_hex_is_valid(&self.checksum_blake3, 64)
             || !lowercase_hex_is_valid(&self.checksum_sha256, 64)
         {
@@ -945,6 +959,52 @@ pub struct LabCheckpoint {
     pub byte_size: u64,
     /// Scientific state digest, distinct from an artifact checksum.
     pub world_digest: String,
+}
+
+/// Current application observation used to admit a bounded replay request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabReplayCapabilities {
+    /// Application owner whose retained input history may be reconstructed.
+    pub session_id: HostSessionId,
+    /// Actual scientific tick observed by the application service.
+    pub observed_tick: u64,
+    /// Largest complete saved-source-to-current interval the service will verify.
+    pub max_verification_ticks: u64,
+}
+
+/// Evidence actually checked before the application returns a replay frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabReplayVerification {
+    /// The saved source itself was restored and its scientific digest checked.
+    SavedCut,
+    /// The complete interval matched an atomically captured current digest.
+    CapturedInterval {
+        /// Actual captured current endpoint; the requested target may precede it.
+        verified_through_tick: u64,
+        /// WorldDigestV1 overall FNV-1a64 digest, encoded as sixteen lowercase hex digits.
+        captured_current_digest: String,
+    },
+}
+
+/// Provenance of one accepted historical frame, independent of the editable target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabReplaySummary {
+    /// Application source checked before the reconstruction was returned.
+    pub session_id: HostSessionId,
+    /// Exact selected saved cut, including its original scientific digest.
+    pub checkpoint: LabCheckpoint,
+    /// Exact reconstructed scientific boundary.
+    pub target_tick: u64,
+    /// Saved-cut or complete-interval validation; no per-tick oracle is implied.
+    pub verification: LabReplayVerification,
+}
+
+/// One reconstructed presentation; it never replaces the running owner.
+pub struct LabReplayReview {
+    /// Actual source, target and verification scope.
+    pub summary: LabReplaySummary,
+    /// Immutable historical projection, including valid pending boundary inputs.
+    pub snapshot: Arc<RenderSnapshot>,
 }
 
 /// A bounded checkpoint page and actual retention usage.
@@ -1334,6 +1394,10 @@ pub enum LabWorkflowResponse {
         /// Reconstructed scientific presentation.
         snapshot: Arc<RenderSnapshot>,
     },
+    /// Current source observation and bounded replay limits.
+    ReplayCapabilities(LabReplayCapabilities),
+    /// Historical frame with its exact selected source and checked endpoint.
+    ReplayFrame(LabReplayReview),
     /// Actual saved-study runner limits.
     BranchCapabilities(LabBranchCapabilities),
     /// Source-bound managed study admission receipt.
@@ -1448,6 +1512,23 @@ pub enum LabAction {
         /// Exact absolute destination displayed when the button was rendered.
         export_directory: String,
     },
+    /// Open arbitrary-tick review for the selected saved checkpoint.
+    OpenReplay,
+    /// Leave the replay editor without replacing the presented world.
+    BackFromReplay,
+    /// Edit the exact decimal target; invalid text never becomes a different tick.
+    ReplayTickText(String),
+    /// Move the editable tick with checked signed integer arithmetic.
+    ReplayStep(i64),
+    /// Explicit reconstruction using the exact source and target shown by the control.
+    SeekReplay {
+        /// Application source observed when the seek control was rendered.
+        session_id: HostSessionId,
+        /// Complete frozen saved checkpoint metadata.
+        checkpoint: LabCheckpoint,
+        /// Exact requested scientific tick.
+        target_tick: u64,
+    },
     /// Move to another checkpoint catalog page.
     CheckpointsPage(Option<String>),
     /// Select a retained cut.
@@ -1547,6 +1628,18 @@ pub struct LabWorkflows {
     pub selected_checkpoint: Option<String>,
     /// One bounded save record; an old-source record is informational only.
     pub latest_checkpoint_save: Option<LabCheckpointSave>,
+    /// Whether arbitrary-tick review replaces the SavedCuts checkpoint view.
+    pub viewing_replay: bool,
+    /// Exact saved metadata frozen when the replay editor was opened.
+    pub replay_checkpoint: Option<LabCheckpoint>,
+    /// Bounded editable decimal target; more than twenty digits remains invalid.
+    pub replay_tick_text: String,
+    /// Current source observation and replay budget, never inferred from a frame.
+    pub replay_capabilities: Option<LabReplayCapabilities>,
+    /// Last successfully observed review; editing a target does not relabel it.
+    pub replay_summary: Option<LabReplaySummary>,
+    replay_review: Option<LabReplayReview>,
+    replay_capabilities_requested: bool,
     /// Current subview of the existing Checkpoints panel.
     pub checkpoint_view: LabCheckpointView,
     /// Actual application limits for saved-source studies.
@@ -1582,7 +1675,9 @@ fn identity_is_bounded(value: &str) -> bool {
 fn artifact_text_is_bounded(value: &str, limit: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= limit
-        && value.bytes().all(|byte| byte.is_ascii() && !byte.is_ascii_control())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
 }
 
 fn artifact_filename_is_valid(value: &str) -> bool {
@@ -1826,7 +1921,10 @@ fn branch_outcome_is_bounded(
         })
 }
 
-pub(crate) fn branch_report_matches_receipt(report: &LabBranchReport, branch: &LabCheckpointBranch) -> bool {
+pub(crate) fn branch_report_matches_receipt(
+    report: &LabBranchReport,
+    branch: &LabCheckpointBranch,
+) -> bool {
     branch_is_bounded(branch)
         && branch.status == "completed"
         && report.branch_id == branch.branch_id
@@ -1959,6 +2057,7 @@ impl LabWorkflows {
         self.context = self.context.saturating_add(1);
         self.last_refresh = None;
         self.event_review = None;
+        self.replay_review = None;
         if let Some(creation) = &mut self.latest_experiment_creation
             && matches!(creation.state, LabExperimentCreationState::Pending)
         {
@@ -1993,6 +2092,7 @@ impl LabWorkflows {
         }
         if self.panel != panel {
             self.invalidate();
+            self.clear_replay_state();
             self.viewing_artifacts = false;
             self.artifacts = None;
             self.artifact_cursor = None;
@@ -2554,6 +2654,291 @@ impl LabWorkflows {
         }
     }
 
+    fn replay_context_is_current(&self) -> bool {
+        self.viewing_replay
+            && !self.viewing_artifacts
+            && self.panel == LabPanel::Checkpoints
+            && self.checkpoint_view == LabCheckpointView::SavedCuts
+            && self.replay_checkpoint.as_ref().is_some_and(|checkpoint| {
+                checkpoint_receipt_is_bounded(checkpoint)
+                    && self.selected_checkpoint_metadata() == Some(checkpoint)
+            })
+    }
+
+    /// Parse the editable target without floating-point conversion, trimming or clamping.
+    #[must_use]
+    pub fn parsed_replay_tick(&self) -> Option<u64> {
+        let text = &self.replay_tick_text;
+        (!text.is_empty() && text.len() <= 20 && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse::<u64>().ok())
+            .flatten()
+    }
+
+    /// Exact saved source and integer target shown by the replay control.
+    ///
+    /// A busy worker does not remove this action; frontends retain the same
+    /// disabled button while dispatch separately enforces the occupied slot.
+    #[must_use]
+    pub fn replay_seek_action(&self) -> Option<LabAction> {
+        if !self.replay_context_is_current() || self.submit.is_none() {
+            return None;
+        }
+        let session_id = self.session?;
+        let checkpoint = self.replay_checkpoint.as_ref()?;
+        let capabilities = self.replay_capabilities.as_ref()?;
+        let target_tick = self.parsed_replay_tick()?;
+        if capabilities.session_id != session_id
+            || capabilities.max_verification_ticks == 0
+            || target_tick < checkpoint.tick
+            || (target_tick != checkpoint.tick
+                && (target_tick > capabilities.observed_tick
+                    || capabilities
+                        .observed_tick
+                        .checked_sub(checkpoint.tick)
+                        .is_none_or(|span| span > capabilities.max_verification_ticks)))
+        {
+            return None;
+        }
+        Some(LabAction::SeekReplay {
+            session_id,
+            checkpoint: checkpoint.clone(),
+            target_tick,
+        })
+    }
+
+    /// Whether the requested historical read can acquire the sole Lab worker.
+    #[must_use]
+    pub fn can_seek_replay(&self) -> bool {
+        !self.is_busy() && self.replay_seek_action().is_some()
+    }
+
+    /// Take one accepted reconstruction without attaching it to another viewing context.
+    pub const fn take_replay_review(&mut self) -> Option<LabReplayReview> {
+        self.replay_review.take()
+    }
+
+    fn clear_replay_state(&mut self) {
+        self.viewing_replay = false;
+        self.replay_checkpoint = None;
+        self.replay_tick_text.clear();
+        self.replay_capabilities = None;
+        self.replay_summary = None;
+        self.replay_review = None;
+        self.replay_capabilities_requested = false;
+    }
+
+    fn open_replay(&mut self) {
+        if self.panel != LabPanel::Checkpoints
+            || self.checkpoint_view != LabCheckpointView::SavedCuts
+            || self.viewing_artifacts
+            || self.session.is_none()
+        {
+            self.set_notice("Select a saved checkpoint in this source's Checkpoints panel before opening replay.");
+            return;
+        }
+        let Some(checkpoint) = self
+            .selected_checkpoint_metadata()
+            .filter(|checkpoint| checkpoint_receipt_is_bounded(checkpoint))
+            .cloned()
+        else {
+            self.set_notice("Replay requires complete verified saved metadata, including its scientific digest.");
+            return;
+        };
+        let same_source = self.replay_checkpoint.as_ref() == Some(&checkpoint);
+        self.invalidate();
+        self.viewing_replay = true;
+        if !same_source {
+            self.replay_tick_text = checkpoint.tick.to_string();
+            self.replay_summary = None;
+        }
+        self.replay_checkpoint = Some(checkpoint);
+        self.replay_capabilities = None;
+        self.replay_capabilities_requested = false;
+        if self.is_busy() {
+            self.set_notice("Replay source selected. Waiting for the occupied Lab worker before reading current replay limits.");
+        } else {
+            self.start(LabWorkflowRequest::ReplayCapabilities);
+        }
+    }
+
+    fn back_from_replay(&mut self) {
+        self.invalidate();
+        self.viewing_replay = false;
+        self.replay_capabilities = None;
+        self.replay_capabilities_requested = false;
+        self.set_notice("Returned to saved checkpoints. A pending replay read keeps its worker until completion; its discarded frame cannot replace the presentation.");
+    }
+
+    fn edit_replay_tick(&mut self, text: &str) {
+        if !self.replay_context_is_current() {
+            self.set_notice(
+                "Open replay for the same selected checkpoint before editing its target.",
+            );
+            return;
+        }
+        self.invalidate();
+        // Retain one character beyond the valid decimal width. Truncating an
+        // oversized edit to twenty digits could silently authorize another tick.
+        self.replay_tick_text = text.chars().take(21).collect();
+        self.note_replay_target();
+    }
+
+    fn step_replay_tick(&mut self, delta: i64) {
+        if !self.replay_context_is_current() {
+            self.set_notice(
+                "Open replay for the same selected checkpoint before changing its target.",
+            );
+            return;
+        }
+        self.invalidate();
+        let Some(tick) = self.parsed_replay_tick() else {
+            self.note_replay_target();
+            return;
+        };
+        let Some(next) = tick.checked_add_signed(delta) else {
+            self.set_notice("The requested tick step exceeds the exact unsigned 64-bit range; the target is unchanged.");
+            return;
+        };
+        if self
+            .replay_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| next < checkpoint.tick)
+        {
+            self.set_notice("The requested tick step precedes the selected saved source; the target is unchanged.");
+            return;
+        }
+        self.replay_tick_text = next.to_string();
+        self.note_replay_target();
+    }
+
+    fn note_replay_target(&mut self) {
+        let Some(target) = self.parsed_replay_tick() else {
+            self.set_notice("Enter one to twenty ASCII decimal digits representing an exact unsigned 64-bit tick. Invalid input cannot start replay.");
+            return;
+        };
+        let (Some(checkpoint), Some(capabilities)) =
+            (&self.replay_checkpoint, &self.replay_capabilities)
+        else {
+            self.set_notice(
+                "Refresh the current replay limits before submitting the exact target.",
+            );
+            return;
+        };
+        let notice = if target < checkpoint.tick {
+            format!(
+                "Tick {target} precedes the selected saved cut at {}.",
+                checkpoint.tick
+            )
+        } else if self.session != Some(capabilities.session_id)
+            || capabilities.max_verification_ticks == 0
+        {
+            "Refresh replay limits for the current application source.".to_owned()
+        } else if target == checkpoint.tick {
+            format!(
+                "Ready to review the verified saved cut at tick {target}; no interval replay is required."
+            )
+        } else if target > capabilities.observed_tick {
+            format!(
+                "Tick {target} is after the observed current tick {}. Refresh before seeking a newer boundary.",
+                capabilities.observed_tick
+            )
+        } else if capabilities
+            .observed_tick
+            .checked_sub(checkpoint.tick)
+            .is_none_or(|span| span > capabilities.max_verification_ticks)
+        {
+            format!(
+                "The complete interval from saved tick {} to observed tick {} exceeds the {}-tick verification limit. Choose a newer saved source or review this cut itself.",
+                checkpoint.tick, capabilities.observed_tick, capabilities.max_verification_ticks
+            )
+        } else {
+            format!(
+                "Ready to reconstruct tick {target} from saved tick {}. The application will verify through its captured current endpoint before returning a frame.",
+                checkpoint.tick
+            )
+        };
+        self.set_notice(notice);
+    }
+
+    fn seek_replay(&mut self, action: LabAction) {
+        if !self.can_seek_replay() || self.replay_seek_action().as_ref() != Some(&action) {
+            self.set_notice("Replay requires the same selected saved metadata, application source and exact target, current limits, and a free worker slot.");
+            return;
+        }
+        let LabAction::SeekReplay {
+            session_id,
+            checkpoint,
+            target_tick,
+        } = action
+        else {
+            return;
+        };
+        self.invalidate();
+        self.start(LabWorkflowRequest::ReviewReplay {
+            session_id,
+            checkpoint,
+            target_tick,
+        });
+    }
+
+    fn accept_replay_review(
+        &mut self,
+        request: &LabWorkflowRequest,
+        review: LabReplayReview,
+    ) -> bool {
+        let LabWorkflowRequest::ReviewReplay {
+            session_id,
+            checkpoint,
+            target_tick,
+        } = request
+        else {
+            return false;
+        };
+        let expected = LabAction::SeekReplay {
+            session_id: *session_id,
+            checkpoint: checkpoint.clone(),
+            target_tick: *target_tick,
+        };
+        let Some(capabilities) = &self.replay_capabilities else {
+            return false;
+        };
+        if self.replay_seek_action().as_ref() != Some(&expected)
+            || review.summary.session_id != *session_id
+            || review.summary.checkpoint != *checkpoint
+            || review.summary.target_tick != *target_tick
+            || review.snapshot.session_id != *session_id
+            || review.snapshot.world.tick != *target_tick
+        {
+            return false;
+        }
+        let verified = match &review.summary.verification {
+            LabReplayVerification::SavedCut => {
+                *target_tick == checkpoint.tick
+                    && review.snapshot.world.agents.len() == checkpoint.agent_count
+            }
+            LabReplayVerification::CapturedInterval {
+                verified_through_tick,
+                captured_current_digest,
+            } => {
+                *target_tick > checkpoint.tick
+                    && *target_tick <= *verified_through_tick
+                    && verified_through_tick
+                        .checked_sub(checkpoint.tick)
+                        .is_some_and(|span| span <= capabilities.max_verification_ticks)
+                    && lowercase_hex_is_valid(
+                        captured_current_digest,
+                        std::mem::size_of::<u64>() * 2,
+                    )
+            }
+        };
+        if !verified {
+            return false;
+        }
+        self.replay_summary = Some(review.summary.clone());
+        self.replay_review = Some(review);
+        true
+    }
+
     /// Metadata selected from the current validated application artifact page.
     #[must_use]
     pub fn selected_artifact_metadata(&self) -> Option<&LabArtifact> {
@@ -2607,6 +2992,7 @@ impl LabWorkflows {
             return;
         }
         self.invalidate();
+        self.clear_replay_state();
         self.viewing_artifacts = true;
         self.artifact_cursor = cursor;
         self.artifacts = None;
@@ -2627,9 +3013,10 @@ impl LabWorkflows {
     fn select_artifact(&mut self, id: String) {
         if self.viewing_artifacts
             && matches!(self.panel, LabPanel::Experiments | LabPanel::Checkpoints)
-            && self.artifacts.as_ref().is_some_and(|page| {
-                page.items.iter().any(|artifact| artifact.artifact_id == id)
-            })
+            && self
+                .artifacts
+                .as_ref()
+                .is_some_and(|page| page.items.iter().any(|artifact| artifact.artifact_id == id))
         {
             self.invalidate();
             self.selected_artifact = Some(id);
@@ -2639,9 +3026,7 @@ impl LabWorkflows {
     }
 
     fn export_artifact(&mut self, action: LabAction) {
-        if !self.can_export_artifact()
-            || self.export_artifact_action().as_ref() != Some(&action)
-        {
+        if !self.can_export_artifact() || self.export_artifact_action().as_ref() != Some(&action) {
             self.set_notice("Artifact export requires the same observed file, source and destination, a supported byte size, and a free worker slot. Refresh before submitting a changed selection.");
             return;
         }
@@ -2674,7 +3059,10 @@ impl LabWorkflows {
         if self.is_busy() {
             self.set_notice("Exporting the selected artifact to a new exclusive capsule. The application is verifying the copied bytes and manifest.");
         } else {
-            let reason = self.notice.clone().unwrap_or_else(|| "Export worker did not start.".into());
+            let reason = self
+                .notice
+                .clone()
+                .unwrap_or_else(|| "Export worker did not start.".into());
             if let Some(export) = &mut self.latest_artifact_export {
                 export.state = LabArtifactExportState::Failed {
                     reason: bounded_message(&reason),
@@ -2723,20 +3111,30 @@ impl LabWorkflows {
             Ok(_) => {
                 let reason = "Export response did not match the exact request, source, catalog descriptor or destination paths.".to_owned();
                 (
-                    LabArtifactExportState::Unconfirmed { reason: reason.clone() },
-                    format!("Artifact export is unconfirmed: {reason} No automatic retry was started."),
+                    LabArtifactExportState::Unconfirmed {
+                        reason: reason.clone(),
+                    },
+                    format!(
+                        "Artifact export is unconfirmed: {reason} No automatic retry was started."
+                    ),
                 )
             }
             Err(error) => {
                 let reason = bounded_message(&error);
                 let state = if disconnected {
-                    LabArtifactExportState::Unconfirmed { reason: reason.clone() }
+                    LabArtifactExportState::Unconfirmed {
+                        reason: reason.clone(),
+                    }
                 } else {
-                    LabArtifactExportState::Failed { reason: reason.clone() }
+                    LabArtifactExportState::Failed {
+                        reason: reason.clone(),
+                    }
                 };
                 (
                     state,
-                    format!("Artifact export did not return a verified receipt: {reason} Partial files may remain; no automatic retry was started."),
+                    format!(
+                        "Artifact export did not return a verified receipt: {reason} Partial files may remain; no automatic retry was started."
+                    ),
                 )
             }
         };
@@ -2881,6 +3279,9 @@ impl LabWorkflows {
             self.notice =
                 Some("A Lab request is still running; its worker slot remains occupied.".into());
             return;
+        }
+        if matches!(&request, LabWorkflowRequest::ReplayCapabilities) {
+            self.replay_capabilities_requested = true;
         }
         let Some(submit) = self.submit.clone() else {
             self.notice =
@@ -3028,9 +3429,9 @@ impl LabWorkflows {
 
     /// Consume one worker result without blocking the frontend.
     ///
-    /// An accepted, still-selected checkpoint returns a frame. An accepted event
-    /// is available through [`Self::take_event_review`]. The frontend must honor
-    /// any newer local live-view intent before displaying either result.
+    /// An accepted, still-selected checkpoint returns a frame. Accepted event and
+    /// arbitrary-tick reviews are available through [`Self::take_event_review`] and
+    /// [`Self::take_replay_review`]. Frontends must honor any newer live-view intent.
     pub fn poll(&mut self) -> Option<(String, Arc<RenderSnapshot>)> {
         let job = self.job.as_ref()?;
         let (result, disconnected) = match job.result.try_recv() {
@@ -3103,6 +3504,12 @@ impl LabWorkflows {
                 }
                 if matches!(&job.request, LabWorkflowRequest::BranchCapabilities) {
                     self.branch_capabilities = None;
+                }
+                if matches!(&job.request, LabWorkflowRequest::ReplayCapabilities) {
+                    self.replay_capabilities = None;
+                }
+                if matches!(&job.request, LabWorkflowRequest::ReviewReplay { .. }) {
+                    self.replay_review = None;
                 }
                 if matches!(&job.request, LabWorkflowRequest::ListArtifacts { .. }) {
                     self.artifacts = None;
@@ -3192,6 +3599,20 @@ impl LabWorkflows {
                 request @ LabWorkflowRequest::Compare { .. },
                 LabWorkflowResponse::Comparison(comparison),
             ) => self.accept_comparison(request, comparison),
+            (
+                LabWorkflowRequest::ReplayCapabilities,
+                LabWorkflowResponse::ReplayCapabilities(capabilities),
+            ) if self.replay_context_is_current()
+                && self.session == Some(capabilities.session_id)
+                && capabilities.max_verification_ticks > 0 =>
+            {
+                self.replay_capabilities = Some(capabilities);
+                true
+            }
+            (
+                request @ LabWorkflowRequest::ReviewReplay { .. },
+                LabWorkflowResponse::ReplayFrame(review),
+            ) => self.accept_replay_review(request, review),
             (
                 LabWorkflowRequest::ListArtifacts { cursor },
                 LabWorkflowResponse::Artifacts(page),
@@ -3347,6 +3768,12 @@ impl LabWorkflows {
         if !accepted && matches!(request, LabWorkflowRequest::BranchCapabilities) {
             self.branch_capabilities = None;
         }
+        if !accepted && matches!(request, LabWorkflowRequest::ReplayCapabilities) {
+            self.replay_capabilities = None;
+        }
+        if !accepted && matches!(request, LabWorkflowRequest::ReviewReplay { .. }) {
+            self.replay_review = None;
+        }
         if !accepted && matches!(request, LabWorkflowRequest::ListArtifacts { .. }) {
             self.artifacts = None;
             self.selected_artifact = None;
@@ -3383,6 +3810,18 @@ impl LabWorkflows {
         if accepted && matches!(request, LabWorkflowRequest::BranchCapabilities) {
             self.note_prior_branch_creation();
         }
+        if accepted && matches!(request, LabWorkflowRequest::ReplayCapabilities) {
+            self.note_replay_target();
+        }
+        if accepted
+            && matches!(request, LabWorkflowRequest::ReviewReplay { .. })
+            && let Some(summary) = &self.replay_summary
+        {
+            self.notice = Some(format!(
+                "Reconstructed tick {} from saved checkpoint {} at tick {}. Review changes presentation only.",
+                summary.target_tick, summary.checkpoint.checkpoint_id, summary.checkpoint.tick,
+            ));
+        }
     }
 
     fn accept_experiment_page(&mut self, cursor: Option<&str>, page: LabExperimentPage) -> bool {
@@ -3407,21 +3846,34 @@ impl LabWorkflows {
             || !matches!(self.panel, LabPanel::Experiments | LabPanel::Checkpoints)
             || cursor != self.artifact_cursor.as_deref()
             || artifact_cursor_offset(cursor) != Some(page.offset)
-            || !page_is_bounded(&page.items, page.offset, page.total, page.next_cursor.as_deref())
+            || !page_is_bounded(
+                &page.items,
+                page.offset,
+                page.total,
+                page.next_cursor.as_deref(),
+            )
             || page.items.len() != LAB_PAGE_SIZE.min(page.total.saturating_sub(page.offset))
             || page.next_cursor.as_ref().is_some_and(|next| {
                 artifact_cursor_offset(Some(next)) != page.offset.checked_add(page.items.len())
             })
             || !artifact_directory_is_valid(&page.export_directory)
-            || page.items.iter().any(|artifact| artifact.validate().is_err())
+            || page
+                .items
+                .iter()
+                .any(|artifact| artifact.validate().is_err())
             || page.items.iter().enumerate().any(|(index, artifact)| {
-                page.items[..index].iter().any(|previous| previous.artifact_id == artifact.artifact_id)
+                page.items[..index]
+                    .iter()
+                    .any(|previous| previous.artifact_id == artifact.artifact_id)
             })
         {
             return false;
         }
         if self.selected_artifact.as_ref().is_some_and(|id| {
-            !page.items.iter().any(|artifact| &artifact.artifact_id == id)
+            !page
+                .items
+                .iter()
+                .any(|artifact| &artifact.artifact_id == id)
         }) {
             self.selected_artifact = None;
         }
@@ -3501,6 +3953,11 @@ impl LabWorkflows {
     }
 
     fn refresh_request(&self) -> Option<LabWorkflowRequest> {
+        if self.viewing_replay {
+            return self
+                .replay_context_is_current()
+                .then_some(LabWorkflowRequest::ReplayCapabilities);
+        }
         if self.viewing_artifacts
             && matches!(self.panel, LabPanel::Experiments | LabPanel::Checkpoints)
         {
@@ -3536,6 +3993,9 @@ impl LabWorkflows {
             return;
         }
         let needs_refresh = match self.panel {
+            LabPanel::Checkpoints if self.viewing_replay => {
+                self.replay_context_is_current() && !self.replay_capabilities_requested
+            }
             LabPanel::Experiments | LabPanel::Checkpoints if self.viewing_artifacts => {
                 self.artifacts.is_none()
             }
@@ -3633,6 +4093,7 @@ impl LabWorkflows {
         self.artifacts = None;
         self.artifact_cursor = None;
         self.selected_artifact = None;
+        self.clear_replay_state();
         self.checkpoints = None;
         self.checkpoint_cursor = None;
         self.selected_checkpoint = None;
@@ -3779,6 +4240,7 @@ impl LabWorkflows {
 
     fn back_to_checkpoints(&mut self) {
         self.invalidate();
+        self.clear_replay_state();
         self.checkpoint_view = LabCheckpointView::SavedCuts;
         self.selected_branch = None;
         self.branch = None;
@@ -3913,6 +4375,28 @@ impl LabWorkflows {
 
     /// Apply one native UI intent, preserving request identity and bounded state.
     pub fn dispatch(&mut self, action: LabAction) {
+        if self.viewing_replay
+            && !matches!(
+                &action,
+                LabAction::OpenReplay
+                    | LabAction::BackFromReplay
+                    | LabAction::ReplayTickText(_)
+                    | LabAction::ReplayStep(_)
+                    | LabAction::SeekReplay { .. }
+                    | LabAction::ArtifactsPage(_)
+                    | LabAction::SelectCheckpoint(_)
+                    | LabAction::CheckpointsPage(_)
+                    | LabAction::BackToCheckpoints
+                    | LabAction::Refresh
+                    | LabAction::CancelRequest
+                    | LabAction::ReturnLive
+            )
+        {
+            self.set_notice(
+                "Return from replay before submitting an action from another Lab view.",
+            );
+            return;
+        }
         if self.viewing_artifacts
             && !matches!(
                 &action,
@@ -3925,10 +4409,17 @@ impl LabWorkflows {
                     | LabAction::ReturnLive
             )
         {
-            self.set_notice("Return from artifacts before submitting an action from another Lab view.");
+            self.set_notice(
+                "Return from artifacts before submitting an action from another Lab view.",
+            );
             return;
         }
         match action {
+            LabAction::OpenReplay => self.open_replay(),
+            LabAction::BackFromReplay => self.back_from_replay(),
+            LabAction::ReplayTickText(text) => self.edit_replay_tick(&text),
+            LabAction::ReplayStep(delta) => self.step_replay_tick(delta),
+            action @ LabAction::SeekReplay { .. } => self.seek_replay(action),
             LabAction::ArtifactsPage(cursor) => self.artifacts_page(cursor),
             LabAction::BackFromArtifacts => self.back_from_artifacts(),
             LabAction::SelectArtifact(id) => self.select_artifact(id),
@@ -3975,6 +4466,7 @@ impl LabWorkflows {
             }
             LabAction::CheckpointsPage(cursor) => {
                 self.invalidate();
+                self.clear_replay_state();
                 self.checkpoint_view = LabCheckpointView::SavedCuts;
                 self.checkpoint_cursor = cursor;
                 self.checkpoints = None;
@@ -4121,6 +4613,7 @@ impl LabWorkflows {
                 .is_some_and(|row| row.checkpoint_id == id)
         {
             self.invalidate();
+            self.clear_replay_state();
             self.selected_checkpoint = Some(id);
         }
     }
@@ -4213,6 +4706,52 @@ impl LabWorkflows {
     }
 }
 
+/// Shared presentation of the actual validation scope of one accepted replay frame.
+///
+/// The requested boundary can contain pending inputs and need not have a
+/// standalone scientific digest. Only the saved cut or captured endpoint below
+/// was checked; these lines do not imply a per-tick oracle or first divergence.
+#[must_use]
+pub fn replay_summary_lines(summary: &LabReplaySummary) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "Reviewed tick {} · original application source {}.",
+            summary.target_tick,
+            summary.session_id.get(),
+        ),
+        format!(
+            "Exact saved source: {} at tick {}.",
+            summary.checkpoint.checkpoint_id, summary.checkpoint.tick,
+        ),
+        format!(
+            "Saved scientific digest: {}.",
+            summary.checkpoint.world_digest
+        ),
+    ];
+    match &summary.verification {
+        LabReplayVerification::SavedCut => {
+            lines.push("Verified the saved cut itself; no interval replay was required.".into());
+        }
+        LabReplayVerification::CapturedInterval {
+            verified_through_tick,
+            captured_current_digest,
+        } => {
+            lines.push(format!(
+                "Replayed and verified the complete saved-source interval through captured current tick {verified_through_tick}.",
+            ));
+            lines.push(format!(
+                "Captured current scientific digest: {captured_current_digest}."
+            ));
+            lines.push("This check does not identify a first divergent tick or provide an independently recorded digest for every intermediate boundary.".into());
+        }
+    }
+    lines.push(
+        "Historical review changes presentation only; the running owner continues independently."
+            .into(),
+    );
+    lines
+}
+
 /// Bounded historical file-operation details shared by native frontends.
 ///
 /// This reports the original source and destination even after a source switch;
@@ -4221,10 +4760,20 @@ impl LabWorkflows {
 pub fn artifact_export_lines(export: &LabArtifactExport) -> Vec<String> {
     let capsule = std::path::Path::new(&export.export_directory).join(&export.request_id);
     let mut lines = vec![
-        format!("Export request {} · original source {}.", export.request_id, export.session_id.get()),
-        format!("Artifact {} · {} · {} bytes.", export.artifact.artifact_id, export.artifact.filename, export.artifact.byte_size),
+        format!(
+            "Export request {} · original source {}.",
+            export.request_id,
+            export.session_id.get()
+        ),
+        format!(
+            "Artifact {} · {} · {} bytes.",
+            export.artifact.artifact_id, export.artifact.filename, export.artifact.byte_size
+        ),
         format!("Disclosed destination: {}.", export.export_directory),
-        format!("Requested output: {}.", capsule.join(&export.artifact.filename).display()),
+        format!(
+            "Requested output: {}.",
+            capsule.join(&export.artifact.filename).display()
+        ),
     ];
     match &export.state {
         LabArtifactExportState::Pending => lines.push(
@@ -4498,7 +5047,11 @@ mod tests {
             artifact: artifact.clone(),
             export_directory: export_directory.clone(),
             output_path: capsule.join(&artifact.filename).to_str().unwrap().into(),
-            manifest_path: capsule.join("export-manifest.json").to_str().unwrap().into(),
+            manifest_path: capsule
+                .join("export-manifest.json")
+                .to_str()
+                .unwrap()
+                .into(),
         }
     }
 
@@ -4527,24 +5080,52 @@ mod tests {
         let mut state = artifact_state();
         for size in [0, LAB_MAX_ARTIFACT_BYTES as u64, u64::MAX] {
             state.artifacts.as_mut().unwrap().items[0].byte_size = size;
-            assert!(state.selected_artifact_metadata().unwrap().validate().is_ok());
-            assert_eq!(state.can_export_artifact(), size <= LAB_MAX_ARTIFACT_BYTES as u64);
+            assert!(
+                state
+                    .selected_artifact_metadata()
+                    .unwrap()
+                    .validate()
+                    .is_ok()
+            );
+            assert_eq!(
+                state.can_export_artifact(),
+                size <= LAB_MAX_ARTIFACT_BYTES as u64
+            );
         }
         for filename in [
-            "", ".", "..", "../world.json", "dir/world.json", "dir\\world.json",
-            "C:world.json", "line\nbreak", "export-manifest.json", "Export-Manifest.json",
+            "",
+            ".",
+            "..",
+            "../world.json",
+            "dir/world.json",
+            "dir\\world.json",
+            "C:world.json",
+            "line\nbreak",
+            "export-manifest.json",
+            "Export-Manifest.json",
             "naïve.json",
         ] {
             let mut artifact = artifact_fixture(0);
             artifact.filename = filename.into();
             assert!(artifact.validate().is_err(), "{filename:?}");
         }
-        for path in ["", "/world.json", "../world.json", "runs//world.json", "runs/./world.json"] {
+        for path in [
+            "",
+            "/world.json",
+            "../world.json",
+            "runs//world.json",
+            "runs/./world.json",
+        ] {
             let mut artifact = artifact_fixture(0);
             artifact.relative_path = path.into();
             assert!(artifact.validate().is_err(), "{path:?}");
         }
-        for checksum in ["A".repeat(64), "z".repeat(64), "a".repeat(63), "b".repeat(65)] {
+        for checksum in [
+            "A".repeat(64),
+            "z".repeat(64),
+            "a".repeat(63),
+            "b".repeat(65),
+        ] {
             let mut artifact = artifact_fixture(0);
             artifact.checksum_blake3.clone_from(&checksum);
             assert!(artifact.validate().is_err());
@@ -4554,10 +5135,20 @@ mod tests {
         }
         let artifact = artifact_fixture(0);
         let mut value = serde_json::to_value(&artifact).unwrap();
-        assert_eq!(serde_json::from_value::<LabArtifact>(value.clone()).unwrap(), artifact);
+        assert_eq!(
+            serde_json::from_value::<LabArtifact>(value.clone()).unwrap(),
+            artifact
+        );
         value["source_file"] = serde_json::json!("/unexpected/source");
         assert!(serde_json::from_value::<LabArtifact>(value).is_err());
-        for request_id in ["", ".", "..", "nested/request", "nested\\request", "drive:request"] {
+        for request_id in [
+            "",
+            ".",
+            "..",
+            "nested/request",
+            "nested\\request",
+            "drive:request",
+        ] {
             assert!(!artifact_export_request_identity_is_valid(request_id));
         }
     }
@@ -4570,24 +5161,34 @@ mod tests {
             let mut page = artifact_page(0, 13);
             match corruption {
                 0 => page.items.push(artifact_fixture(12)),
-                1 => { page.items.pop(); }
+                1 => {
+                    page.items.pop();
+                }
                 2 => page.items[1] = page.items[0].clone(),
                 3 => page.next_cursor = Some("012".into()),
                 4 => page.next_cursor = None,
                 5 => page.offset = 1,
                 6 => page.export_directory = "relative/exports".into(),
                 7 => page.items[0].filename = "../escape".into(),
-                8 => page.export_directory = std::env::temp_dir()
-                    .join("exports/../escape").to_str().unwrap().into(),
+                8 => {
+                    page.export_directory = std::env::temp_dir()
+                        .join("exports/../escape")
+                        .to_str()
+                        .unwrap()
+                        .into()
+                }
                 _ => unreachable!(),
             }
             state.artifacts = Some(artifact_page(0, 13));
             state.selected_artifact = Some("artifact-0".into());
-            assert!(deliver(
-                &mut state,
-                LabWorkflowRequest::ListArtifacts { cursor: None },
-                LabWorkflowResponse::Artifacts(page),
-            ).is_none());
+            assert!(
+                deliver(
+                    &mut state,
+                    LabWorkflowRequest::ListArtifacts { cursor: None },
+                    LabWorkflowResponse::Artifacts(page),
+                )
+                .is_none()
+            );
             assert!(state.artifacts.is_none(), "malformed page {corruption}");
             assert!(state.selected_artifact.is_none());
             assert!(!state.can_export_artifact());
@@ -4607,7 +5208,12 @@ mod tests {
             let action = state.export_artifact_action().unwrap();
             match change {
                 0 => state.artifacts.as_mut().unwrap().items[0].checksum_sha256 = "c".repeat(64),
-                1 => state.artifacts.as_mut().unwrap().export_directory.push_str("-changed"),
+                1 => state
+                    .artifacts
+                    .as_mut()
+                    .unwrap()
+                    .export_directory
+                    .push_str("-changed"),
                 2 => state.artifacts.as_mut().unwrap().items[0].byte_size += 1,
                 3 => state.dispatch(LabAction::SelectArtifact("artifact-1".into())),
                 4 => state.synchronize(HostSessionId::new(8), LabPanel::Experiments),
@@ -4619,7 +5225,10 @@ mod tests {
             assert!(state.latest_artifact_export.is_none());
         }
         let mut state = artifact_state();
-        assert_eq!(state.refresh_request(), Some(LabWorkflowRequest::ListArtifacts { cursor: None }));
+        assert_eq!(
+            state.refresh_request(),
+            Some(LabWorkflowRequest::ListArtifacts { cursor: None })
+        );
         state.dispatch(LabAction::CreateExperiment);
         assert!(!state.is_busy());
         assert!(state.latest_experiment_creation.is_none());
@@ -4637,8 +5246,14 @@ mod tests {
             state.submit = Some(Arc::new(move |request| {
                 observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
                 started.send(request.clone()).unwrap();
-                released.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
-                Ok(LabWorkflowResponse::ArtifactExported(artifact_receipt(&request)))
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Ok(LabWorkflowResponse::ArtifactExported(artifact_receipt(
+                    &request,
+                )))
             }));
             let action = state.export_artifact_action().unwrap();
             state.dispatch(action.clone());
@@ -4669,7 +5284,10 @@ mod tests {
             let expected = artifact_receipt(&original);
             let export = state.latest_artifact_export.as_ref().unwrap();
             assert_eq!(export.session_id, HostSessionId::new(7));
-            assert_eq!(export.state, LabArtifactExportState::Exported(expected.clone()));
+            assert_eq!(
+                export.state,
+                LabArtifactExportState::Exported(expected.clone())
+            );
             assert_eq!(state.selected_artifact, selected_after_invalidation);
             let lines = artifact_export_lines(export).join("\n");
             assert!(lines.contains(&expected.output_path));
@@ -4700,10 +5318,13 @@ mod tests {
                 Ok(LabWorkflowResponse::ArtifactExported(receipt)),
                 false,
             );
-            assert!(matches!(
-                state.latest_artifact_export.as_ref().unwrap().state,
-                LabArtifactExportState::Unconfirmed { .. }
-            ), "receipt mismatch {corruption}");
+            assert!(
+                matches!(
+                    state.latest_artifact_export.as_ref().unwrap().state,
+                    LabArtifactExportState::Unconfirmed { .. }
+                ),
+                "receipt mismatch {corruption}"
+            );
             assert!(!state.is_busy());
         }
     }
@@ -4738,7 +5359,10 @@ mod tests {
         let historical_export = state.latest_artifact_export.clone();
         state.submit = None;
         state.dispatch(LabAction::ArtifactsPage(None));
-        assert!(state.viewing_artifacts, "history stays accessible without services");
+        assert!(
+            state.viewing_artifacts,
+            "history stays accessible without services"
+        );
         assert_eq!(state.latest_artifact_export, historical_export);
         assert!(state.selected_artifact.is_none());
         assert!(!state.is_busy());
@@ -7229,6 +7853,563 @@ mod tests {
             LabCheckpointSaveState::Saved(saved_checkpoint())
         );
         assert_eq!(state.selected_checkpoint.as_deref(), Some("retained-cut"));
+    }
+
+    // Synthetic presentation fixtures exercise the reducer protocol, not
+    // scientific reconstruction. Application tests verify real pending-input
+    // boundaries and complete checkpoint-to-current replay with the engine.
+    fn replay_protocol_fixture() -> (LabWorkflows, LabWorkflowRequest, LabReplayReview) {
+        let (mut frame, _, _) = event_protocol_fixture();
+        Arc::make_mut(&mut frame).world.tick = 43;
+        let session_id = frame.session_id;
+        let checkpoint = LabCheckpoint {
+            agent_count: frame.world.agents.len(),
+            ..saved_checkpoint()
+        };
+        let mut state = LabWorkflows {
+            submit: Some(Arc::new(|_| Err("unexpected replay submission".into()))),
+            ..LabWorkflows::default()
+        };
+        state.synchronize(session_id, LabPanel::Checkpoints);
+        state.selected_checkpoint = Some(checkpoint.checkpoint_id.clone());
+        state.checkpoints = Some(LabCheckpointPage {
+            items: vec![checkpoint.clone()],
+            total: 1,
+            offset: 0,
+            next_cursor: None,
+            retained_bytes: checkpoint.byte_size,
+            max_bytes: checkpoint.byte_size,
+        });
+        state.viewing_replay = true;
+        state.replay_checkpoint = Some(checkpoint.clone());
+        state.replay_tick_text = "43".into();
+        state.replay_capabilities = Some(LabReplayCapabilities {
+            session_id,
+            observed_tick: 50,
+            max_verification_ticks: 16,
+        });
+        state.replay_capabilities_requested = true;
+        let request = LabWorkflowRequest::ReviewReplay {
+            session_id,
+            checkpoint: checkpoint.clone(),
+            target_tick: 43,
+        };
+        let review = LabReplayReview {
+            summary: LabReplaySummary {
+                session_id,
+                checkpoint,
+                target_tick: 43,
+                verification: LabReplayVerification::CapturedInterval {
+                    verified_through_tick: 50,
+                    captured_current_digest: "b".repeat(16),
+                },
+            },
+            snapshot: frame,
+        };
+        (state, request, review)
+    }
+
+    #[test]
+    fn replay_targets_preserve_exact_u64_values_and_refuse_invalid_or_overflowing_edits() {
+        let (mut state, _, _) = replay_protocol_fixture();
+        state.replay_capabilities.as_mut().unwrap().observed_tick = u64::MAX;
+        state
+            .replay_capabilities
+            .as_mut()
+            .unwrap()
+            .max_verification_ticks = u64::MAX;
+        for (text, expected) in [
+            ("0", 0),
+            ("9007199254740993", 9_007_199_254_740_993),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            state.dispatch(LabAction::ReplayTickText(text.into()));
+            assert_eq!(state.parsed_replay_tick(), Some(expected));
+            assert_eq!(state.replay_tick_text, text);
+            assert!(!state.is_busy(), "editing must never submit a seek");
+        }
+        state.dispatch(LabAction::ReplayStep(1));
+        assert_eq!(state.parsed_replay_tick(), Some(u64::MAX));
+        assert!(state.notice.as_deref().unwrap().contains("unchanged"));
+        state.dispatch(LabAction::ReplayStep(-1));
+        assert_eq!(state.parsed_replay_tick(), Some(u64::MAX - 1));
+        state.dispatch(LabAction::ReplayTickText("9007199254740993".into()));
+        state.dispatch(LabAction::ReplayStep(10));
+        assert_eq!(state.parsed_replay_tick(), Some(9_007_199_254_741_003));
+        state.dispatch(LabAction::ReplayStep(-10));
+        assert_eq!(state.parsed_replay_tick(), Some(9_007_199_254_740_993));
+        state.dispatch(LabAction::ReplayTickText("42".into()));
+        state.dispatch(LabAction::ReplayStep(-1));
+        assert_eq!(
+            state.parsed_replay_tick(),
+            Some(42),
+            "never clamp below the saved source"
+        );
+
+        for invalid in [
+            "",
+            " 43",
+            "43 ",
+            "+43",
+            "-1",
+            "4.3",
+            "4e3",
+            "４３",
+            "43\n",
+            "18446744073709551616",
+            "000000000000000000043",
+        ] {
+            state.dispatch(LabAction::ReplayTickText(invalid.into()));
+            assert!(
+                state.parsed_replay_tick().is_none(),
+                "invalid target {invalid:?}"
+            );
+            assert!(state.replay_seek_action().is_none());
+            assert!(!state.can_seek_replay());
+        }
+        state.dispatch(LabAction::ReplayTickText("9".repeat(10_000)));
+        assert_eq!(state.replay_tick_text.len(), 21);
+        assert!(
+            state.parsed_replay_tick().is_none(),
+            "overlong input must not become a valid truncated target"
+        );
+        state.dispatch(LabAction::ReplayTickText("43".into()));
+        assert!(
+            state.can_seek_replay(),
+            "an explicit valid replacement recovers the editor"
+        );
+    }
+
+    #[test]
+    fn replay_admission_uses_the_complete_interval_but_saved_cuts_bypass_its_range() {
+        let (mut state, _, _) = replay_protocol_fixture();
+        state.dispatch(LabAction::ReplayTickText("42".into()));
+        let capabilities = state.replay_capabilities.as_mut().unwrap();
+        capabilities.observed_tick = 0;
+        capabilities.max_verification_ticks = 1;
+        assert!(
+            state.can_seek_replay(),
+            "an older-run saved source is independently reviewable"
+        );
+        state.dispatch(LabAction::ReplayTickText("43".into()));
+        assert!(!state.can_seek_replay());
+        state.replay_capabilities.as_mut().unwrap().observed_tick = 60;
+        state
+            .replay_capabilities
+            .as_mut()
+            .unwrap()
+            .max_verification_ticks = 17;
+        assert!(
+            !state.can_seek_replay(),
+            "the target distance is not the full verification work"
+        );
+        state
+            .replay_capabilities
+            .as_mut()
+            .unwrap()
+            .max_verification_ticks = 18;
+        assert!(state.can_seek_replay());
+        for target in ["41", "61"] {
+            state.dispatch(LabAction::ReplayTickText(target.into()));
+            assert!(!state.can_seek_replay());
+        }
+        state.dispatch(LabAction::ReplayTickText("43".into()));
+        state
+            .replay_capabilities
+            .as_mut()
+            .unwrap()
+            .max_verification_ticks = 0;
+        assert!(!state.can_seek_replay());
+        state
+            .replay_capabilities
+            .as_mut()
+            .unwrap()
+            .max_verification_ticks = 18;
+        state.replay_capabilities.as_mut().unwrap().session_id = HostSessionId::new(99);
+        assert!(!state.can_seek_replay());
+    }
+
+    #[test]
+    fn replay_refuses_actions_with_changed_source_metadata_or_target_before_submission() {
+        let (mut state, _, _) = replay_protocol_fixture();
+        let exact = state.replay_seek_action().unwrap();
+        for mismatch in 0..7 {
+            let mut stale = exact.clone();
+            let LabAction::SeekReplay {
+                session_id,
+                checkpoint,
+                target_tick,
+            } = &mut stale
+            else {
+                unreachable!();
+            };
+            match mismatch {
+                0 => *session_id = HostSessionId::new(99),
+                1 => *target_tick += 1,
+                2 => checkpoint.checkpoint_id.push_str("-changed"),
+                3 => checkpoint.tick -= 1,
+                4 => checkpoint.agent_count += 1,
+                5 => checkpoint.byte_size += 1,
+                6 => checkpoint.world_digest = "c".repeat(16),
+                _ => unreachable!(),
+            }
+            state.dispatch(stale);
+            assert!(
+                !state.is_busy(),
+                "stale field {mismatch} must not reach the provider"
+            );
+        }
+        let original = state.checkpoints.as_ref().unwrap().items[0].clone();
+        for mismatch in 0..5 {
+            let observed = &mut state.checkpoints.as_mut().unwrap().items[0];
+            *observed = original.clone();
+            match mismatch {
+                0 => observed.tick -= 1,
+                1 => observed.agent_count += 1,
+                2 => observed.byte_size += 1,
+                3 => observed.world_digest = "d".repeat(16),
+                4 => observed.checkpoint_id.push_str("-replaced"),
+                _ => unreachable!(),
+            }
+            assert!(state.replay_seek_action().is_none());
+            state.dispatch(exact.clone());
+            assert!(
+                !state.is_busy(),
+                "same row identity cannot hide changed descriptor fields"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_responses_require_exact_source_and_captured_endpoint_evidence() {
+        let (mut state, request, review) = replay_protocol_fixture();
+        let response = || LabReplayReview {
+            summary: review.summary.clone(),
+            snapshot: Arc::clone(&review.snapshot),
+        };
+        assert!(
+            deliver(
+                &mut state,
+                request.clone(),
+                LabWorkflowResponse::ReplayFrame(response())
+            )
+            .is_none()
+        );
+        let accepted = state
+            .take_replay_review()
+            .expect("complete interval evidence");
+        assert_eq!(accepted.summary, review.summary);
+        assert!(
+            state.take_replay_review().is_none(),
+            "a presentation is consumed once"
+        );
+        let lines = replay_summary_lines(&accepted.summary).join("\n");
+        assert!(lines.contains("captured current tick 50"));
+        assert!(lines.contains("does not identify a first divergent tick"));
+        assert!(lines.contains("running owner continues"));
+        // There is deliberately no target-digest requirement: pending target
+        // boundary inputs are legitimate and are checked by application tests.
+        for mismatch in 0..16 {
+            let mut changed = response();
+            match mismatch {
+                0 => changed.summary.session_id = HostSessionId::new(99),
+                1 => changed
+                    .summary
+                    .checkpoint
+                    .checkpoint_id
+                    .push_str("-changed"),
+                2 => changed.summary.checkpoint.tick -= 1,
+                3 => changed.summary.checkpoint.agent_count += 1,
+                4 => changed.summary.checkpoint.byte_size += 1,
+                5 => changed.summary.checkpoint.world_digest = "c".repeat(16),
+                6 => changed.summary.target_tick += 1,
+                7 => Arc::make_mut(&mut changed.snapshot).session_id = HostSessionId::new(99),
+                8 => Arc::make_mut(&mut changed.snapshot).world.tick += 1,
+                9 => changed.summary.verification = LabReplayVerification::SavedCut,
+                10..=15 => {
+                    changed.summary.verification = LabReplayVerification::CapturedInterval {
+                        verified_through_tick: match mismatch {
+                            10 => 42,
+                            11 => 59,
+                            _ => 50,
+                        },
+                        captured_current_digest: match mismatch {
+                            12 => "a".repeat(64),
+                            13 => "A".repeat(16),
+                            14 => "g".repeat(16),
+                            15 => String::new(),
+                            _ => "b".repeat(16),
+                        },
+                    };
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                deliver(
+                    &mut state,
+                    request.clone(),
+                    LabWorkflowResponse::ReplayFrame(changed)
+                )
+                .is_none()
+            );
+            assert!(
+                state.take_replay_review().is_none(),
+                "mismatch {mismatch} must not paint a frame"
+            );
+            assert_eq!(
+                state.replay_summary.as_ref(),
+                Some(&review.summary),
+                "rejected reads preserve the last verified presentation's provenance"
+            );
+        }
+        state.dispatch(LabAction::ReplayTickText("42".into()));
+        state.replay_capabilities.as_mut().unwrap().observed_tick = 0;
+        let mut saved = response();
+        saved.summary.target_tick = 42;
+        saved.summary.verification = LabReplayVerification::SavedCut;
+        Arc::make_mut(&mut saved.snapshot).world.tick = 42;
+        let LabWorkflowRequest::ReviewReplay {
+            session_id,
+            checkpoint,
+            ..
+        } = request
+        else {
+            unreachable!();
+        };
+        deliver(
+            &mut state,
+            LabWorkflowRequest::ReviewReplay {
+                session_id,
+                checkpoint,
+                target_tick: 42,
+            },
+            LabWorkflowResponse::ReplayFrame(saved),
+        );
+        assert!(matches!(
+            state.take_replay_review().unwrap().summary.verification,
+            LabReplayVerification::SavedCut
+        ));
+    }
+
+    #[test]
+    fn replay_discards_late_frames_after_edits_or_view_changes_without_releasing_the_worker() {
+        for change in 0..11 {
+            let (mut state, request, review) = replay_protocol_fixture();
+            state.replay_summary = Some(review.summary.clone());
+            state.replay_review = Some(LabReplayReview {
+                summary: review.summary.clone(),
+                snapshot: Arc::clone(&review.snapshot),
+            });
+            let (send, result) = std::sync::mpsc::sync_channel(1);
+            state.generation += 1;
+            state.job = Some(LabJob {
+                request,
+                generation: state.generation,
+                context: state.context,
+                session: review.summary.session_id,
+                result,
+            });
+            assert!(
+                state.replay_seek_action().is_some(),
+                "busy buttons retain their frozen target"
+            );
+            assert!(!state.can_seek_replay());
+            match change {
+                0 => state.dispatch(LabAction::ReplayTickText("44".into())),
+                1 => state.dispatch(LabAction::ReplayStep(1)),
+                2 => state.dispatch(LabAction::CancelRequest),
+                3 => state.dispatch(LabAction::ReturnLive),
+                4 => state.dispatch(LabAction::BackFromReplay),
+                5 => state.dispatch(LabAction::SelectCheckpoint("retained-cut".into())),
+                6 => state.dispatch(LabAction::CheckpointsPage(None)),
+                7 => state.synchronize(review.summary.session_id, LabPanel::Narrative),
+                8 => state.synchronize(HostSessionId::new(99), LabPanel::Checkpoints),
+                9 => state.dispatch(LabAction::ArtifactsPage(None)),
+                10 => state.reset_observations(),
+                _ => unreachable!(),
+            }
+            assert!(
+                state.is_busy(),
+                "change {change} must preserve the sole worker"
+            );
+            assert!(
+                state.take_replay_review().is_none(),
+                "change {change} clears queued presentation"
+            );
+            if let Some(action) = state.replay_seek_action() {
+                state.dispatch(action);
+                assert!(
+                    state.is_busy(),
+                    "a changed target cannot start a second worker"
+                );
+            }
+            assert!(
+                send.send(Ok(LabWorkflowResponse::ReplayFrame(review)))
+                    .is_ok()
+            );
+            assert!(state.poll().is_none());
+            assert!(!state.is_busy());
+            assert!(
+                state.take_replay_review().is_none(),
+                "late frame {change} cannot replace the presentation"
+            );
+            assert_eq!(state.replay_summary.is_some(), change <= 4);
+        }
+    }
+
+    #[test]
+    fn replay_open_uses_saved_receipts_and_retains_only_the_same_source_draft() {
+        let (mut state, _, review) = replay_protocol_fixture();
+        state.submit = None;
+        state.checkpoints = None;
+        state.latest_checkpoint_save = Some(LabCheckpointSave {
+            request_id: "saved-replay-source".into(),
+            session_id: review.summary.session_id,
+            state: LabCheckpointSaveState::Saved(review.summary.checkpoint.clone()),
+        });
+        state.dispatch(LabAction::ReplayTickText("invalid draft".into()));
+        state.dispatch(LabAction::BackFromReplay);
+        state.dispatch(LabAction::OpenReplay);
+        assert!(state.viewing_replay);
+        assert_eq!(
+            state.replay_checkpoint.as_ref(),
+            Some(&review.summary.checkpoint)
+        );
+        assert_eq!(state.replay_tick_text, "invalid draft");
+        assert!(!state.is_busy(), "missing services cannot start a worker");
+        state.dispatch(LabAction::BackFromReplay);
+        let LabCheckpointSaveState::Saved(checkpoint) =
+            &mut state.latest_checkpoint_save.as_mut().unwrap().state
+        else {
+            unreachable!();
+        };
+        checkpoint.tick = 46;
+        state.dispatch(LabAction::OpenReplay);
+        assert_eq!(
+            state.replay_tick_text, "46",
+            "changed saved metadata starts a distinct draft"
+        );
+        state.dispatch(LabAction::BackFromReplay);
+        state.checkpoint_view = LabCheckpointView::BranchComposer;
+        state.dispatch(LabAction::OpenReplay);
+        assert!(!state.viewing_replay, "replay is only a saved-cuts subview");
+        state.checkpoint_view = LabCheckpointView::SavedCuts;
+        state.dispatch(LabAction::ArtifactsPage(None));
+        state.dispatch(LabAction::OpenReplay);
+        assert!(!state.viewing_replay && state.viewing_artifacts);
+    }
+
+    #[test]
+    fn replay_capability_reads_never_retry_or_seek_without_explicit_intent() {
+        let (mut state, _, review) = replay_protocol_fixture();
+        let (started, observed_start) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        state.submit = Some(Arc::new(move |request| {
+            started.send(request).unwrap();
+            released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        }));
+        state.dispatch(LabAction::BackFromReplay);
+        state.dispatch(LabAction::OpenReplay);
+        assert_eq!(
+            observed_start.recv_timeout(Duration::from_secs(5)).unwrap(),
+            LabWorkflowRequest::ReplayCapabilities
+        );
+        state.dispatch(LabAction::ReplayTickText("44".into()));
+        assert!(
+            state.is_busy(),
+            "draft edits cannot release an active capability read"
+        );
+        assert!(
+            release
+                .send(Ok(LabWorkflowResponse::ReplayCapabilities(
+                    LabReplayCapabilities {
+                        session_id: review.summary.session_id,
+                        observed_tick: 50,
+                        max_verification_ticks: 16,
+                    }
+                )))
+                .is_ok()
+        );
+        drain_worker(&mut state);
+        assert!(
+            state.replay_capabilities.is_none(),
+            "edited-context observations are discarded"
+        );
+        state.last_refresh = None;
+        state.maybe_refresh();
+        assert!(
+            !state.is_busy(),
+            "discarding a read must not silently retry it"
+        );
+        assert!(observed_start.try_recv().is_err());
+        for capabilities in [
+            LabReplayCapabilities {
+                session_id: HostSessionId::new(99),
+                observed_tick: 50,
+                max_verification_ticks: 16,
+            },
+            LabReplayCapabilities {
+                session_id: review.summary.session_id,
+                observed_tick: 50,
+                max_verification_ticks: 0,
+            },
+            LabReplayCapabilities {
+                session_id: review.summary.session_id,
+                observed_tick: 50,
+                max_verification_ticks: 16,
+            },
+        ] {
+            let valid = capabilities.session_id == review.summary.session_id
+                && capabilities.max_verification_ticks > 0;
+            state.dispatch(LabAction::Refresh);
+            assert_eq!(
+                observed_start.recv_timeout(Duration::from_secs(5)).unwrap(),
+                LabWorkflowRequest::ReplayCapabilities
+            );
+            assert!(
+                release
+                    .send(Ok(LabWorkflowResponse::ReplayCapabilities(capabilities)))
+                    .is_ok()
+            );
+            drain_worker(&mut state);
+            assert_eq!(state.can_seek_replay(), valid);
+            state.last_refresh = None;
+            state.maybe_refresh();
+            assert!(
+                !state.is_busy(),
+                "capability completion cannot reconstruct a frame"
+            );
+            assert!(observed_start.try_recv().is_err());
+        }
+        let action = state.replay_seek_action().unwrap();
+        state.dispatch(action);
+        let requested = observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            requested,
+            LabWorkflowRequest::ReviewReplay {
+                target_tick: 44,
+                ..
+            }
+        ));
+        assert!(
+            release
+                .send(Err("captured interval no longer verifiable".into()))
+                .is_ok()
+        );
+        drain_worker(&mut state);
+        assert!(state.take_replay_review().is_none());
+        state.last_refresh = None;
+        state.maybe_refresh();
+        assert!(
+            !state.is_busy(),
+            "failed reconstruction never retries automatically"
+        );
+        assert!(observed_start.try_recv().is_err());
     }
 
     fn saved_checkpoint() -> LabCheckpoint {

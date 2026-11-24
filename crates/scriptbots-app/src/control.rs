@@ -3290,6 +3290,7 @@ pub(crate) struct EventCanvasReview {
     pub snapshot: Arc<RenderSnapshot>,
     pub checkpoint_id: String,
     pub base_tick: u64,
+    pub verification: scriptbots_runtime::lab_workflows::LabReplayVerification,
 }
 
 #[derive(Debug)]
@@ -6973,6 +6974,96 @@ impl ControlHandle {
         Ok(projection.latest_snapshot())
     }
 
+    /// Review a caller-selected checkpoint and target without choosing another source.
+    ///
+    /// Exact saved cuts need no current-owner replay history. Later targets require
+    /// this owner's acknowledged cut and the same complete input/current-digest
+    /// checks used for narrative review. Neither path changes the live owner.
+    pub(crate) fn replay_canvas_from_checkpoint(
+        &self,
+        session_id: scriptbots_runtime::HostSessionId,
+        expected: &scriptbots_runtime::lab_workflows::LabCheckpoint,
+        target_tick: u64,
+    ) -> Result<EventCanvasReview, ControlError> {
+        if session_id != self.session_id() {
+            return Err(ControlError::Conflict(
+                "native replay review belongs to a different owner session".into(),
+            ));
+        }
+        if expected.checkpoint_id.len() > MAX_CHECKPOINT_BRANCH_ID_BYTES
+            || !valid_checkpoint_catalog_id(&expected.checkpoint_id)
+        {
+            return Err(ControlError::BadRequest(
+                "native replay review checkpoint identity is invalid".into(),
+            ));
+        }
+        if target_tick < expected.tick {
+            return Err(ControlError::BadRequest(
+                "review target precedes the selected checkpoint".into(),
+            ));
+        }
+        let metadata = self.get_checkpoint(&expected.checkpoint_id)?;
+        if metadata.checkpoint_id != expected.checkpoint_id
+            || metadata.tick != expected.tick
+            || metadata.agent_count != expected.agent_count
+            || metadata.byte_size != expected.byte_size
+            || metadata.world_digest_v1 != expected.world_digest
+        {
+            return Err(ControlError::Conflict(
+                "selected checkpoint metadata changed; refresh before reviewing".into(),
+            ));
+        }
+
+        let retained = if target_tick == metadata.tick {
+            None
+        } else {
+            let retention = self
+                .data_services
+                .checkpoint_retention
+                .lock()
+                .map_err(|_| ControlError::Lock)?;
+            let mut matches = retention
+                .requests
+                .values()
+                .filter(|entry| entry.metadata.checkpoint_id == metadata.checkpoint_id);
+            let retained = matches.next().ok_or_else(|| {
+                ControlError::BadRequest(
+                    "selected checkpoint has no acknowledged current-owner replay history; only its saved cut can be reviewed".into(),
+                )
+            })?;
+            if matches.next().is_some()
+                || !retained.acknowledged
+                || retained.source_session != session_id
+                || retained.metadata != metadata
+                || retained.artifact != checkpoint_artifact_metadata(&metadata)
+            {
+                return Err(ControlError::Conflict(
+                    "selected checkpoint replay history is ambiguous, unacknowledged or belongs to another source".into(),
+                ));
+            }
+            Some(retained.clone())
+        };
+        if let Some(retained) = &retained {
+            let artifact = self.retained_artifact(&metadata.checkpoint_id)?;
+            if artifact.directory != retained.directory || artifact.metadata != retained.artifact {
+                return Err(ControlError::Conflict(
+                    "selected checkpoint changed its retained source directory or artifact".into(),
+                ));
+            }
+        }
+        let (artifact, bytes) = self.read_artifact_bytes(&metadata.checkpoint_id)?;
+        let checkpoint = Self::decode_canvas_checkpoint(&metadata, &artifact, &bytes)?;
+        match retained {
+            Some(retained) => self.replay_retained_canvas(&retained, &checkpoint, target_tick),
+            None => Ok(EventCanvasReview {
+                snapshot: self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?,
+                checkpoint_id: metadata.checkpoint_id,
+                base_tick: checkpoint.tick().0,
+                verification: scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut,
+            }),
+        }
+    }
+
     /// Reconstruct an older event from ticks and complete observed input histories.
     /// Configuration schedules require their complete committed outcome history;
     /// scientific commands retain the configuration revision observed at application.
@@ -7004,14 +7095,24 @@ impl ControlHandle {
                 snapshot: self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?,
                 checkpoint_id,
                 base_tick,
+                verification: scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut,
             });
         }
+        self.replay_retained_canvas(&retained, &checkpoint, target_tick)
+    }
+
+    fn replay_retained_canvas(
+        &self,
+        retained: &RetainedCheckpoint,
+        checkpoint: &scriptbots_core::WorldCheckpointV1,
+        target_tick: u64,
+    ) -> Result<EventCanvasReview, ControlError> {
         let current = self.host.scientific_digest_cut()?;
-        Self::validate_event_review_boundary(&retained, &current, target_tick)?;
+        Self::validate_event_review_boundary(retained, &current, target_tick)?;
         let published = self.read_snapshot()?;
-        Self::validate_event_review_schedule(&retained, &current, &published)?;
+        Self::validate_event_review_schedule(retained, &current, &published)?;
         let (config_audit, scientific_commands) =
-            match Self::validate_event_review_span(&retained, &current, target_tick) {
+            match Self::validate_event_review_span(retained, &current, target_tick) {
                 Ok(()) => (Vec::new(), Vec::new()),
                 Err(error) => {
                     if retained.source_config_revision > current.config_revision
@@ -7023,10 +7124,10 @@ impl ControlHandle {
                     let audit = if retained.source_config_revision == current.config_revision {
                         Vec::new()
                     } else {
-                        Self::event_review_config_audit(&retained, &current, &published)?
+                        Self::event_review_config_audit(retained, &current, &published)?
                     };
                     let commands = Self::event_review_scientific_commands(
-                        &retained,
+                        retained,
                         &current,
                         target_tick,
                         &audit,
@@ -7035,7 +7136,7 @@ impl ControlHandle {
                 }
             };
         let world = Self::replay_event_canvas_world(
-            &checkpoint,
+            checkpoint,
             &current.digest,
             &config_audit,
             &scientific_commands,
@@ -7043,10 +7144,17 @@ impl ControlHandle {
             retained.source_persistence_interval,
             retained.source_config_revision,
         )?;
+        // The replay checked this exact captured endpoint. A target can retain
+        // queued boundary inputs, so do not invent a settled target digest.
         Ok(EventCanvasReview {
             snapshot: self.project_canvas_world(world)?,
-            checkpoint_id,
-            base_tick,
+            checkpoint_id: retained.metadata.checkpoint_id.clone(),
+            base_tick: checkpoint.tick().0,
+            verification:
+                scriptbots_runtime::lab_workflows::LabReplayVerification::CapturedInterval {
+                    verified_through_tick: current.digest.tick.0,
+                    captured_current_digest: current.digest.overall,
+                },
         })
     }
 
@@ -8914,7 +9022,7 @@ pub(crate) mod tests {
             )
         }
 
-        fn spawn_with_identity(
+        pub(crate) fn spawn_with_identity(
             world: WorldState,
             schedule: Option<Vec<scriptbots_runtime::ScheduledConfigPatch>>,
             session_id: scriptbots_runtime::HostSessionId,
@@ -11930,6 +12038,18 @@ pub(crate) mod tests {
         (handle, host)
     }
 
+    fn lab_checkpoint_descriptor(
+        metadata: &CheckpointMetadataDto,
+    ) -> scriptbots_runtime::lab_workflows::LabCheckpoint {
+        scriptbots_runtime::lab_workflows::LabCheckpoint {
+            checkpoint_id: metadata.checkpoint_id.clone(),
+            tick: metadata.tick,
+            agent_count: metadata.agent_count,
+            byte_size: metadata.byte_size,
+            world_digest: metadata.world_digest_v1.clone(),
+        }
+    }
+
     struct AgentCanvasJourney {
         handle: ControlHandle,
         host: TestHost,
@@ -12374,6 +12494,17 @@ pub(crate) mod tests {
                 host.port.scientific_digest_v1().is_err(),
                 "queued input is not a settled cut"
             );
+            assert!(
+                handle
+                    .replay_canvas_from_checkpoint(
+                        handle.session_id(),
+                        &lab_checkpoint_descriptor(&source.metadata),
+                        pending.world.tick,
+                    )
+                    .is_err(),
+                "a queued current input cannot provide the required settled endpoint"
+            );
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &pending));
             host.wait_applied(&handle.step().unwrap());
             let applied = handle.read_snapshot().unwrap();
             assert!(
@@ -12421,7 +12552,24 @@ pub(crate) mod tests {
                     field: "pending_interventions"
                 })
             ));
-            let review = handle.event_canvas(pending.world.tick).unwrap();
+            let review = handle
+                .replay_canvas_from_checkpoint(
+                    handle.session_id(),
+                    &lab_checkpoint_descriptor(&source.metadata),
+                    pending.world.tick,
+                )
+                .unwrap();
+            assert_eq!(review.checkpoint_id, checkpoint_id);
+            assert_eq!(
+                review.verification,
+                scriptbots_runtime::lab_workflows::LabReplayVerification::CapturedInterval {
+                    verified_through_tick: current.digest.tick.0,
+                    captured_current_digest: current.digest.overall.clone(),
+                }
+            );
+            let narrative = handle.event_canvas(pending.world.tick).unwrap();
+            assert_eq!(narrative.verification, review.verification);
+            assert_eq!(narrative.snapshot.world.tick, pending.world.tick);
             assert_eq!(review.snapshot.world.tick, pending.world.tick);
             assert_eq!(
                 review.snapshot.world.agents.len(),
@@ -13418,6 +13566,15 @@ pub(crate) mod tests {
             assert!(
                 matches!(handle.event_canvas(oracle.world.tick), Err(ControlError::BadRequest(message)) if message.contains("complete ordered configuration audit"))
             );
+            assert!(matches!(
+                handle.replay_canvas_from_checkpoint(
+                    handle.session_id(),
+                    &lab_checkpoint_descriptor(&checkpoint),
+                    oracle.world.tick,
+                ),
+                Err(ControlError::BadRequest(message))
+                    if message.contains("complete ordered configuration audit")
+            ));
         }
         assert_eq!(
             distinct.len(),
@@ -13488,6 +13645,24 @@ pub(crate) mod tests {
             let current = host.port.snapshot_hub().latest();
             let current_digest = host.port.scientific_digest_v1().unwrap();
             let review = handle.event_canvas(target_tick).unwrap();
+            let selected = handle
+                .replay_canvas_from_checkpoint(
+                    handle.session_id(),
+                    &lab_checkpoint_descriptor(&checkpoint),
+                    target_tick,
+                )
+                .unwrap();
+            assert_eq!(selected.checkpoint_id, checkpoint.checkpoint_id);
+            assert_eq!(selected.base_tick, checkpoint.tick);
+            assert_eq!(selected.snapshot.world.tick, target_tick);
+            assert_eq!(
+                selected.verification,
+                scriptbots_runtime::lab_workflows::LabReplayVerification::CapturedInterval {
+                    verified_through_tick: current_digest.tick.0,
+                    captured_current_digest: current_digest.overall.clone(),
+                }
+            );
+            assert_eq!(review.verification, selected.verification);
             assert_eq!(review.checkpoint_id, checkpoint.checkpoint_id);
             assert_eq!(review.base_tick, checkpoint.tick);
             assert_eq!(review.snapshot.world.tick, target_tick);
@@ -13505,6 +13680,10 @@ pub(crate) mod tests {
             };
             assert_eq!(
                 logical(serde_json::to_value(&review.snapshot.world).unwrap()),
+                logical(serde_json::to_value(&oracle.world).unwrap())
+            );
+            assert_eq!(
+                logical(serde_json::to_value(&selected.snapshot.world).unwrap()),
                 logical(serde_json::to_value(&oracle.world).unwrap())
             );
             assert!(
@@ -13578,6 +13757,16 @@ pub(crate) mod tests {
                     _ => unreachable!(),
                 };
                 assert!(error.to_string().contains(expected), "{fault}: {error}");
+                assert!(
+                    handle
+                        .replay_canvas_from_checkpoint(
+                            handle.session_id(),
+                            &lab_checkpoint_descriptor(&checkpoint),
+                            target_tick,
+                        )
+                        .is_err(),
+                    "the selected source must also refuse {fault}"
+                );
                 assert_eq!(host.port.scientific_digest_v1().unwrap(), current_digest);
                 assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &current));
                 handle
@@ -13608,7 +13797,7 @@ pub(crate) mod tests {
                     .with_artifacts_dir(directory.join("wrong-world"))
                     .unwrap();
                 other.wait_applied(&wrong.step().unwrap());
-                wrong
+                let wrong_checkpoint = wrong
                     .create_checkpoint(CheckpointCreateRequest::default())
                     .unwrap();
                 wrong.host = host.port.clone();
@@ -13616,6 +13805,15 @@ pub(crate) mod tests {
                     matches!(wrong.event_canvas(target_tick), Err(ControlError::InvalidPatch(message))
                     if message.contains("current scientific digest"))
                 );
+                assert!(matches!(
+                    wrong.replay_canvas_from_checkpoint(
+                        wrong.session_id(),
+                        &lab_checkpoint_descriptor(&wrong_checkpoint),
+                        target_tick,
+                    ),
+                    Err(ControlError::InvalidPatch(message))
+                        if message.contains("current scientific digest")
+                ));
                 host.wait_applied(
                     &handle
                         .submit_control_command(ControlCommand::SpawnAgent {
@@ -13712,6 +13910,15 @@ pub(crate) mod tests {
                         if message.contains("scientific revisions")),
                     "{refusal}"
                 );
+                assert!(matches!(
+                    handle.replay_canvas_from_checkpoint(
+                        handle.session_id(),
+                        &lab_checkpoint_descriptor(&fresh),
+                        fresh_target,
+                    ),
+                    Err(ControlError::BadRequest(message))
+                        if message.contains("scientific revisions")
+                ));
                 assert_eq!(host.port.scientific_digest_v1().unwrap(), after_omitted);
                 assert!(Arc::ptr_eq(
                     &handle.read_snapshot().unwrap(),
@@ -13740,6 +13947,14 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(matches!(
                 handle.event_canvas(target_tick),
+                Err(ControlError::InvalidPatch(_))
+            ));
+            assert!(matches!(
+                handle.replay_canvas_from_checkpoint(
+                    handle.session_id(),
+                    &lab_checkpoint_descriptor(&checkpoint),
+                    target_tick,
+                ),
                 Err(ControlError::InvalidPatch(_))
             ));
             eprintln!(
@@ -13779,16 +13994,32 @@ pub(crate) mod tests {
                 }),
             );
             let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
-            handle
+            let checkpoint = handle
                 .create_checkpoint(CheckpointCreateRequest::default())
                 .unwrap();
+            let selected = lab_checkpoint_descriptor(&checkpoint);
             let ticks = if scheduled {
                 2
             } else {
                 MAX_EVENT_REVIEW_TICKS + 1
             };
-            for _ in 0..ticks {
+            for completed in 1..=ticks {
                 host.wait_applied(&handle.step().unwrap());
+                if !scheduled && completed == MAX_EVENT_REVIEW_TICKS {
+                    let endpoint = host.port.scientific_digest_v1().unwrap();
+                    let boundary = handle
+                        .replay_canvas_from_checkpoint(handle.session_id(), &selected, 1)
+                        .expect("the full supported captured interval remains reviewable");
+                    assert_eq!(boundary.snapshot.world.tick, 1);
+                    assert_eq!(
+                        boundary.verification,
+                        scriptbots_runtime::lab_workflows::LabReplayVerification::CapturedInterval {
+                            verified_through_tick: completed,
+                            captured_current_digest: endpoint.overall.clone(),
+                        }
+                    );
+                    assert_eq!(host.port.scientific_digest_v1().unwrap(), endpoint);
+                }
             }
             let before = host.port.scientific_digest_v1().unwrap();
             assert_eq!(before.tick.0, ticks, "observe the completed owner interval");
@@ -13801,6 +14032,23 @@ pub(crate) mod tests {
             } else {
                 "at most"
             }));
+            let selected_error = handle
+                .replay_canvas_from_checkpoint(handle.session_id(), &selected, 1)
+                .err()
+                .expect("selected review must enforce the same interval and schedule bounds");
+            assert!(selected_error.to_string().contains(if scheduled {
+                "owner schedule"
+            } else {
+                "at most"
+            }));
+            let saved = handle
+                .replay_canvas_from_checkpoint(handle.session_id(), &selected, checkpoint.tick)
+                .expect("a verified exact saved cut does not require interval replay");
+            assert_eq!(saved.snapshot.world.tick, checkpoint.tick);
+            assert_eq!(
+                saved.verification,
+                scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut
+            );
             assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
             if scheduled {
                 let mut retention = handle.data_services.checkpoint_retention.lock().unwrap();
@@ -14352,6 +14600,26 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(snapshot.world.tick, expected.tick);
             assert_eq!(snapshot.world.agents.len(), expected.agent_count);
+            let selected = lab_checkpoint_descriptor(expected);
+            let review = restarted
+                .replay_canvas_from_checkpoint(restarted.session_id(), &selected, expected.tick)
+                .unwrap();
+            assert_eq!(review.checkpoint_id, expected.checkpoint_id);
+            assert_eq!(review.snapshot.world.tick, expected.tick);
+            assert_eq!(review.snapshot.world.agents.len(), expected.agent_count);
+            assert_eq!(
+                review.verification,
+                scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut
+            );
+            assert!(matches!(
+                restarted.replay_canvas_from_checkpoint(
+                    restarted.session_id(),
+                    &selected,
+                    expected.tick + 1,
+                ),
+                Err(ControlError::BadRequest(message))
+                    if message.contains("no acknowledged current-owner replay history")
+            ));
         }
         assert_eq!(restarted.list_artifacts(None, None).unwrap().total, 2);
         let usage = restarted.checkpoint_retention_usage().unwrap();

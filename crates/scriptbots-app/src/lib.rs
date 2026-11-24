@@ -4182,7 +4182,7 @@ pub mod renderer {
     ) -> scriptbots_runtime::lab_workflows::LabWorkflowSubmit {
         use scriptbots_runtime::lab_workflows::{
             LAB_PAGE_SIZE, LabArtifactPage, LabCheckpoint, LabCheckpointPage, LabComparison,
-            LabExperimentPage, LabWorkflowRequest, LabWorkflowResponse,
+            LabExperimentPage, LabReplayCapabilities, LabWorkflowRequest, LabWorkflowResponse,
         };
         Arc::new(move |request| {
             let result = match request {
@@ -4194,7 +4194,11 @@ pub mod renderer {
                             .list_artifacts(Some(LAB_PAGE_SIZE), cursor.as_deref())
                             .map(|page| {
                                 LabWorkflowResponse::Artifacts(LabArtifactPage {
-                                    items: page.items.into_iter().map(project_lab_artifact).collect(),
+                                    items: page
+                                        .items
+                                        .into_iter()
+                                        .map(project_lab_artifact)
+                                        .collect(),
                                     total: page.total,
                                     offset: page.offset,
                                     next_cursor: page.next_cursor,
@@ -4381,6 +4385,18 @@ pub mod renderer {
                         snapshot,
                     }),
                 LabWorkflowRequest::ReviewEvent { event } => review_lab_event(&control, event),
+                LabWorkflowRequest::ReplayCapabilities => control.read_snapshot().map(|source| {
+                    LabWorkflowResponse::ReplayCapabilities(LabReplayCapabilities {
+                        session_id: source.session_id,
+                        observed_tick: source.world.tick,
+                        max_verification_ticks: crate::control::MAX_EVENT_REVIEW_TICKS,
+                    })
+                }),
+                LabWorkflowRequest::ReviewReplay {
+                    session_id,
+                    checkpoint,
+                    target_tick,
+                } => review_lab_replay(&control, session_id, checkpoint, target_tick),
             };
             result.map_err(|error| error.to_string())
         })
@@ -4402,6 +4418,72 @@ pub mod renderer {
             .retry_failed_experiment(experiment_id, expected_generation)
             .and_then(project_lab_experiment)
             .map(scriptbots_runtime::lab_workflows::LabWorkflowResponse::Experiment)
+    }
+
+    fn project_lab_checkpoint(
+        checkpoint: crate::control::CheckpointMetadataDto,
+    ) -> scriptbots_runtime::lab_workflows::LabCheckpoint {
+        scriptbots_runtime::lab_workflows::LabCheckpoint {
+            checkpoint_id: checkpoint.checkpoint_id,
+            tick: checkpoint.tick,
+            agent_count: checkpoint.agent_count,
+            byte_size: checkpoint.byte_size,
+            world_digest: checkpoint.world_digest_v1,
+        }
+    }
+
+    fn review_lab_replay(
+        control: &crate::control::ControlHandle,
+        session_id: scriptbots_runtime::HostSessionId,
+        checkpoint: scriptbots_runtime::lab_workflows::LabCheckpoint,
+        target_tick: u64,
+    ) -> Result<scriptbots_runtime::lab_workflows::LabWorkflowResponse, crate::control::ControlError>
+    {
+        use scriptbots_runtime::lab_workflows::{
+            LabReplayReview, LabReplaySummary, LabReplayVerification, LabWorkflowResponse,
+        };
+
+        // The selected saved cut is part of the request. A newer checkpoint
+        // cannot silently replace the source while this worker is running.
+        let review = control.replay_canvas_from_checkpoint(session_id, &checkpoint, target_tick)?;
+        let current = control.read_snapshot()?;
+        let retained = project_lab_checkpoint(control.get_checkpoint(&checkpoint.checkpoint_id)?);
+        let verification_matches = match &review.verification {
+            LabReplayVerification::SavedCut => target_tick == checkpoint.tick,
+            LabReplayVerification::CapturedInterval {
+                verified_through_tick,
+                ..
+            } => {
+                target_tick > checkpoint.tick
+                    && *verified_through_tick >= target_tick
+                    && *verified_through_tick <= current.world.tick
+                    && verified_through_tick
+                        .checked_sub(checkpoint.tick)
+                        .is_some_and(|span| span <= crate::control::MAX_EVENT_REVIEW_TICKS)
+            }
+        };
+        if current.session_id != session_id
+            || retained != checkpoint
+            || review.checkpoint_id != checkpoint.checkpoint_id
+            || review.base_tick != checkpoint.tick
+            || review.snapshot.session_id != session_id
+            || review.snapshot.world.tick != target_tick
+            || !verification_matches
+        {
+            return Err(crate::control::ControlError::Conflict(
+                "replay review changed its source, selected checkpoint, target or verification boundary"
+                    .into(),
+            ));
+        }
+        Ok(LabWorkflowResponse::ReplayFrame(LabReplayReview {
+            summary: LabReplaySummary {
+                session_id,
+                checkpoint,
+                target_tick,
+                verification: review.verification,
+            },
+            snapshot: review.snapshot,
+        }))
     }
 
     fn retained_lab_event(
@@ -5189,6 +5271,266 @@ pub mod renderer {
             None
         }
 
+        fn native_lab_replay_fixture() -> (
+            TestHost,
+            crate::control::ControlHandle,
+            scriptbots_runtime::lab_workflows::LabCheckpoint,
+            std::path::PathBuf,
+        ) {
+            let directory = tempfile::Builder::new()
+                .prefix("native-lab-replay-")
+                .tempdir()
+                .unwrap()
+                .keep()
+                .canonicalize()
+                .unwrap();
+            let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(42),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                topography_enabled: false,
+                metabolism_drain: 0.0,
+                movement_drain: 0.0,
+                reproduction_energy_threshold: f32::MAX,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+            for _ in 0..2 {
+                let agent = world
+                    .try_spawn_agent(scriptbots_core::AgentData::default())
+                    .unwrap();
+                assert!(
+                    world
+                        .bind_agent_brain(agent, brains.population()[0])
+                        .unwrap()
+                );
+            }
+            let host = TestHost::spawn(world);
+            let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            let checkpoint = project_lab_checkpoint(
+                handle
+                    .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+                    .unwrap(),
+            );
+            assert_eq!(checkpoint.agent_count, 2);
+            (host, handle, checkpoint, directory)
+        }
+
+        #[test]
+        fn native_lab_replay_provider_uses_selected_cut_and_exact_non_event_target() {
+            use scriptbots_runtime::lab_workflows::{
+                LabReplayVerification, LabWorkflowRequest as Request,
+                LabWorkflowResponse as Response,
+            };
+
+            let (host, handle, checkpoint, _) = native_lab_replay_fixture();
+            for _ in 0..2 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            let target = handle.read_snapshot().unwrap();
+            assert_eq!(target.world.tick, 2);
+            assert!(!target.world.agents.is_empty());
+            assert!(
+                target
+                    .narrative_events
+                    .iter()
+                    .all(|event| event.tick.0 != target.world.tick),
+                "this target must be reachable without a narrative event selection"
+            );
+            let newer = handle
+                .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+                .unwrap();
+            assert_eq!(newer.tick, target.world.tick);
+            for _ in 0..3 {
+                host.wait_applied(&handle.step().unwrap());
+            }
+            let live = handle.read_snapshot().unwrap();
+            let live_digest = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit(handle.clone());
+            let Response::ReplayCapabilities(capabilities) =
+                provider(Request::ReplayCapabilities).unwrap()
+            else {
+                panic!("expected actual replay capabilities");
+            };
+            assert_eq!(capabilities.session_id, live.session_id);
+            assert_eq!(capabilities.observed_tick, live.world.tick);
+            assert_eq!(
+                capabilities.max_verification_ticks,
+                crate::control::MAX_EVENT_REVIEW_TICKS
+            );
+
+            let Response::ReplayFrame(review) = provider(Request::ReviewReplay {
+                session_id: live.session_id,
+                checkpoint: checkpoint.clone(),
+                target_tick: target.world.tick,
+            })
+            .unwrap() else {
+                panic!("expected the selected checkpoint's replay frame");
+            };
+            assert_eq!(review.summary.session_id, live.session_id);
+            assert_eq!(review.summary.checkpoint, checkpoint);
+            assert_ne!(review.summary.checkpoint.checkpoint_id, newer.checkpoint_id);
+            assert_eq!(review.summary.target_tick, target.world.tick);
+            assert_eq!(
+                review.summary.verification,
+                LabReplayVerification::CapturedInterval {
+                    verified_through_tick: live.world.tick,
+                    captured_current_digest: live_digest.overall.clone(),
+                }
+            );
+            assert_eq!(review.snapshot.session_id, live.session_id);
+            assert_eq!(review.snapshot.world.tick, target.world.tick);
+            assert_eq!(review.snapshot.world.world, target.world.world);
+            assert_eq!(review.snapshot.layers.food, target.layers.food);
+            assert!(review.snapshot.agent_visuals_complete());
+            // Arena handles belong to each reconstructed presentation; stable
+            // agent identities and every other published field must agree.
+            let logical_agents = |snapshot: &scriptbots_runtime::RenderSnapshot| {
+                let mut agents = serde_json::to_value(&snapshot.world.agents).unwrap();
+                for agent in agents.as_array_mut().unwrap() {
+                    agent.as_object_mut().unwrap().remove("id");
+                }
+                agents
+            };
+            assert_eq!(logical_agents(&review.snapshot), logical_agents(&target));
+
+            let Response::ReplayFrame(saved) = provider(Request::ReviewReplay {
+                session_id: live.session_id,
+                checkpoint: checkpoint.clone(),
+                target_tick: checkpoint.tick,
+            })
+            .unwrap() else {
+                panic!("expected the exact saved cut");
+            };
+            assert_eq!(saved.summary.verification, LabReplayVerification::SavedCut);
+            assert_eq!(saved.summary.checkpoint, checkpoint);
+            assert_eq!(saved.snapshot.world.tick, checkpoint.tick);
+
+            for field in [
+                "checkpoint_id",
+                "tick",
+                "agent_count",
+                "byte_size",
+                "world_digest",
+            ] {
+                let mut stale = checkpoint.clone();
+                match field {
+                    "checkpoint_id" => stale.checkpoint_id = "missing-replay-cut".into(),
+                    "tick" => stale.tick += 1,
+                    "agent_count" => stale.agent_count += 1,
+                    "byte_size" => stale.byte_size += 1,
+                    "world_digest" => {
+                        stale.world_digest.replace_range(
+                            ..1,
+                            if checkpoint.world_digest.starts_with('0') {
+                                "1"
+                            } else {
+                                "0"
+                            },
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    provider(Request::ReviewReplay {
+                        session_id: live.session_id,
+                        checkpoint: stale,
+                        target_tick: target.world.tick,
+                    })
+                    .is_err(),
+                    "changed selected checkpoint field was accepted: {field}"
+                );
+            }
+            assert!(
+                provider(Request::ReviewReplay {
+                    session_id: scriptbots_runtime::HostSessionId::new(live.session_id.get() + 1),
+                    checkpoint: checkpoint.clone(),
+                    target_tick: target.world.tick,
+                })
+                .is_err()
+            );
+            assert!(
+                provider(Request::ReviewReplay {
+                    session_id: live.session_id,
+                    checkpoint,
+                    target_tick: live.world.tick + 1,
+                })
+                .is_err()
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), live_digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &live));
+        }
+
+        #[test]
+        fn native_lab_replay_provider_keeps_recovered_cuts_inspectable_without_inventing_history() {
+            use scriptbots_runtime::lab_workflows::{
+                LabReplayVerification, LabWorkflowRequest as Request,
+                LabWorkflowResponse as Response,
+            };
+
+            let (checkpoint, directory, original_session) = {
+                let (host, handle, checkpoint, directory) = native_lab_replay_fixture();
+                let original_session = handle.session_id();
+                drop(handle);
+                drop(host);
+                (checkpoint, directory, original_session)
+            };
+            let host = TestHost::spawn_with_identity(
+                scriptbots_core::WorldState::new(ScriptBotsConfig {
+                    rng_seed: Some(91),
+                    world_width: 120,
+                    world_height: 120,
+                    food_cell_size: 20,
+                    population_minimum: 0,
+                    population_spawn_interval: 0,
+                    persistence_interval: 0,
+                    closed: true,
+                    ..ScriptBotsConfig::default()
+                })
+                .unwrap(),
+                None,
+                scriptbots_runtime::HostSessionId::new(original_session.get() + 1),
+            );
+            let handle = host.handle().with_artifacts_dir(directory).unwrap();
+            let live = handle.read_snapshot().unwrap();
+            assert_ne!(live.session_id, original_session);
+            let digest = host.port.scientific_digest_v1().unwrap();
+            let provider = lab_workflow_submit(handle.clone());
+            let Response::ReplayFrame(saved) = provider(Request::ReviewReplay {
+                session_id: live.session_id,
+                checkpoint: checkpoint.clone(),
+                target_tick: checkpoint.tick,
+            })
+            .unwrap() else {
+                panic!("a verified recovered cut remains inspectable");
+            };
+            assert_eq!(saved.summary.verification, LabReplayVerification::SavedCut);
+            assert_eq!(saved.summary.checkpoint, checkpoint);
+            assert_eq!(saved.snapshot.world.agents.len(), checkpoint.agent_count);
+
+            // Advancing this new owner does not supply the old owner's input history.
+            host.wait_applied(&handle.step().unwrap());
+            let advanced = handle.read_snapshot().unwrap();
+            let advanced_digest = host.port.scientific_digest_v1().unwrap();
+            assert!(
+                provider(Request::ReviewReplay {
+                    session_id: live.session_id,
+                    checkpoint,
+                    target_tick: 1,
+                })
+                .is_err()
+            );
+            assert_ne!(advanced_digest, digest);
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), advanced_digest);
+            assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &advanced));
+        }
+
         #[test]
         fn native_lab_export_directory_resolution_is_explicit_and_side_effect_free() {
             use std::ffi::OsStr;
@@ -5214,9 +5556,7 @@ pub mod renderer {
             assert!(
                 resolve_lab_export_directory(&root, Some(OsStr::new(&"x".repeat(4097)))).is_err()
             );
-            assert!(
-                resolve_lab_export_directory(std::path::Path::new("relative"), None).is_err()
-            );
+            assert!(resolve_lab_export_directory(std::path::Path::new("relative"), None).is_err());
         }
 
         #[test]
@@ -5246,10 +5586,7 @@ pub mod renderer {
                 .population;
             crate::seed_founders(&mut world, &brains, crate::FounderRecipe::Spread).unwrap();
             let host = TestHost::spawn(world);
-            let handle = host
-                .handle()
-                .with_artifacts_dir(root.clone())
-                .unwrap();
+            let handle = host.handle().with_artifacts_dir(root.clone()).unwrap();
             let checkpoint = handle
                 .create_checkpoint(crate::control::CheckpointCreateRequest::default())
                 .unwrap();
@@ -5283,7 +5620,11 @@ pub mod renderer {
                 assert!(page.items.len() <= LAB_PAGE_SIZE);
                 offset += page.items.len();
                 for artifact in page.items {
-                    assert!(artifacts.insert(artifact.artifact_id.clone(), artifact).is_none());
+                    assert!(
+                        artifacts
+                            .insert(artifact.artifact_id.clone(), artifact)
+                            .is_none()
+                    );
                 }
                 if page.next_cursor.is_none() {
                     assert_eq!(artifacts.len(), page.total);
@@ -5292,7 +5633,10 @@ pub mod renderer {
                 assert!(offset < page.total);
                 cursor = page.next_cursor;
             }
-            assert!(!destination.exists(), "catalog reads must not create export files");
+            assert!(
+                !destination.exists(),
+                "catalog reads must not create export files"
+            );
             let saved = artifacts.get(&checkpoint.checkpoint_id).unwrap().clone();
             let experiment = artifacts
                 .values()
@@ -5314,8 +5658,12 @@ pub mod renderer {
 
             for (index, artifact) in [saved, experiment].into_iter().enumerate() {
                 let request_id = format!("native-export-{index}");
-                let (metadata, expected) = handle.read_artifact_bytes(&artifact.artifact_id).unwrap();
-                assert_eq!(serde_json::to_value(&artifact).unwrap(), serde_json::to_value(metadata).unwrap());
+                let (metadata, expected) =
+                    handle.read_artifact_bytes(&artifact.artifact_id).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&artifact).unwrap(),
+                    serde_json::to_value(metadata).unwrap()
+                );
                 let request = Request::ExportArtifact {
                     request_id: request_id.clone(),
                     session_id: before.session_id,
@@ -5337,14 +5685,26 @@ pub mod renderer {
                 );
                 let written = std::fs::read(&receipt.output_path).unwrap();
                 assert_eq!(written, expected);
-                assert_eq!(crate::control::compute_blake3(&written), artifact.checksum_blake3);
-                assert_eq!(crate::control::compute_sha256(&written), artifact.checksum_sha256);
+                assert_eq!(
+                    crate::control::compute_blake3(&written),
+                    artifact.checksum_blake3
+                );
+                assert_eq!(
+                    crate::control::compute_sha256(&written),
+                    artifact.checksum_sha256
+                );
                 let manifest_bytes = std::fs::read(&receipt.manifest_path).unwrap();
                 let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
                 assert_eq!(manifest["schema"], "scriptbots.native-artifact-export.v1");
                 assert_eq!(manifest["request_id"], request_id);
-                assert_eq!(manifest["source_session_id"], before.session_id.get().to_string());
-                assert_eq!(manifest["artifact"], serde_json::to_value(&artifact).unwrap());
+                assert_eq!(
+                    manifest["source_session_id"],
+                    before.session_id.get().to_string()
+                );
+                assert_eq!(
+                    manifest["artifact"],
+                    serde_json::to_value(&artifact).unwrap()
+                );
                 assert_eq!(manifest["output_path"], receipt.output_path);
                 assert_eq!(manifest["manifest_path"], receipt.manifest_path);
                 assert!(
@@ -5352,7 +5712,10 @@ pub mod renderer {
                     "repeated export must preserve the existing operation directory"
                 );
                 assert_eq!(std::fs::read(&receipt.output_path).unwrap(), expected);
-                assert_eq!(std::fs::read(&receipt.manifest_path).unwrap(), manifest_bytes);
+                assert_eq!(
+                    std::fs::read(&receipt.manifest_path).unwrap(),
+                    manifest_bytes
+                );
             }
             assert_eq!(host.port.scientific_digest_v1().unwrap(), digest);
             assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &before));

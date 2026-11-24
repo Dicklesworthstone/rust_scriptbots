@@ -2,6 +2,28 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Selected-checkpoint native replay (2026-11-23):**
+[Currently In Progress — Codex; scoped contribution to `bd-2z0.7.6.1`;
+original ownership and full native/GPU acceptance retained]
+
+Add arbitrary exact-u64 tick review from an explicitly selected saved checkpoint.
+The shared native model freezes the complete source descriptor and target, keeps
+one bounded worker, and rejects stale frames after target edits, navigation,
+source changes or return to live. The application reuses the existing replay
+engine and its complete configuration, scientific-input, schedule and captured
+current-digest checks; a newer checkpoint cannot replace the selected source.
+Exact recovered saved cuts remain inspectable without inventing the original
+owner's missing continuation history.
+
+Returned evidence distinguishes a verified saved cut from an interval checked
+through the actual captured current endpoint. Historical boundaries may retain
+pending inputs, so no standalone target digest or first-divergent-tick result is
+invented. Real-owner and reducer regressions cover explicit source selection,
+non-event targets, exact integer bounds, pending inputs, incomplete histories and
+unchanged live state. The GPUI and Bevy controls follow in the next feature commit.
+Native execution and the original full acceptance requirements remain pending.
+
+
 **Scientific input history across owner continuation (2026-11-23):**
 [Currently In Progress — Codex; scoped contribution to `bd-2z0.5.13`;
 original ownership and complete continuation acceptance retained]
