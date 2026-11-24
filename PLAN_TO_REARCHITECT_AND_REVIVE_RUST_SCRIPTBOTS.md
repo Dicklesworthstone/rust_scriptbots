@@ -2,6 +2,27 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Scientific input history across owner continuation (2026-11-23):**
+[Currently In Progress — Codex; scoped contribution to `bd-2z0.5.13`;
+original ownership and complete continuation acceptance retained]
+
+Implemented bounded scientific-command history in the full owner checkpoint,
+including exact admission identities, original application boundaries and payloads.
+Owner-envelope revision 5 requires that history and explicitly refuses older
+revisions. Restore validates command kinds, chronological boundaries and count/byte
+limits, then recomputes retained allocation accounting without reapplying inputs.
+Evicted or oversized inputs still leave an observable gap; this bounded observation
+history does not establish complete input history or journal durability.
+
+Authored runtime regressions cover exact continuation, continued eviction, reused
+command IDs, flush boundaries, omitted inputs and rehashed malformed checkpoints.
+An application regression exercises real channel-owner handoff and historical
+mixed-input event review, including refusal after a later oversized intervention.
+Source review is complete, and both modified Rust files passed a scoped DSR
+rustfmt/parse check. Compilation, Clippy and test execution remain unverified after
+repeated execution-environment failures during DSR setup. The original bead's
+complete native/DSR continuation acceptance remains open.
+
 **Native Lab artifact export (2026-11-23):**
 [Currently In Progress — Codex; scoped contribution to `bd-2z0.7.6.1`;
 original ownership and full native/GPU acceptance retained]

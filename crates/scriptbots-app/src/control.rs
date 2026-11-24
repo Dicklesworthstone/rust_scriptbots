@@ -1501,12 +1501,11 @@ fn native_artifact_export_path_is_canonical(path: &Path, canonical: &Path) -> bo
         };
         // Windows canonicalize adds this prefix without changing the location.
         let same_prefix = match (left.kind(), right.kind()) {
-            (Prefix::Disk(left), Prefix::VerbatimDisk(right)) => {
-                left.eq_ignore_ascii_case(&right)
-            }
-            (Prefix::UNC(left_server, left_share), Prefix::VerbatimUNC(right_server, right_share)) => {
-                left_server == right_server && left_share == right_share
-            }
+            (Prefix::Disk(left), Prefix::VerbatimDisk(right)) => left.eq_ignore_ascii_case(&right),
+            (
+                Prefix::UNC(left_server, left_share),
+                Prefix::VerbatimUNC(right_server, right_share),
+            ) => left_server == right_server && left_share == right_share,
             _ => false,
         };
         same_prefix && requested.eq(resolved)
@@ -6310,7 +6309,10 @@ impl ControlHandle {
                 .map_err(|error| ControlError::Serialization(error.to_string()))?;
             verify_native_artifact_export_directory(&ancestor, Some(&ancestor_identity))?;
             let mut directories = Vec::new();
-            for directory in root.ancestors().take_while(|path| *path != ancestor.as_path()) {
+            for directory in root
+                .ancestors()
+                .take_while(|path| *path != ancestor.as_path())
+            {
                 directories.push((
                     directory.to_path_buf(),
                     verify_native_artifact_export_directory(directory, None)?,
@@ -6324,15 +6326,15 @@ impl ControlHandle {
         let result = (|| -> Result<(), ControlError> {
             // An existing capsule, even an empty one from an unconfirmed attempt,
             // is never reused. A later explicit export must have a new identity.
-            fs::create_dir(&capsule)
-                .map_err(|error| ControlError::Conflict(error.to_string()))?;
+            fs::create_dir(&capsule).map_err(|error| ControlError::Conflict(error.to_string()))?;
             let capsule_identity = verify_native_artifact_export_directory(&capsule, None)?;
             for (directory, identity) in &directories {
                 verify_native_artifact_export_directory(directory, Some(identity))?;
             }
-            let payload = write_native_artifact_export_file(&output_path, &bytes, |file, bytes| {
-                file.write_all(bytes)
-            })?;
+            let payload =
+                write_native_artifact_export_file(&output_path, &bytes, |file, bytes| {
+                    file.write_all(bytes)
+                })?;
             verify_native_artifact_export_file(
                 &output_path,
                 &payload,
@@ -6341,10 +6343,11 @@ impl ControlHandle {
                 &expected.checksum_blake3,
                 &expected.checksum_sha256,
             )?;
-            let saved_manifest =
-                write_native_artifact_export_file(&manifest_path, &manifest_bytes, |file, bytes| {
-                    file.write_all(bytes)
-                })?;
+            let saved_manifest = write_native_artifact_export_file(
+                &manifest_path,
+                &manifest_bytes,
+                |file, bytes| file.write_all(bytes),
+            )?;
             verify_native_artifact_export_file(
                 &manifest_path,
                 &saved_manifest,
@@ -6353,13 +6356,11 @@ impl ControlHandle {
                 &compute_blake3(&manifest_bytes),
                 &compute_sha256(&manifest_bytes),
             )?;
-            for (directory, identity) in
-                std::iter::once((&capsule, &capsule_identity)).chain(
-                    directories
-                        .iter()
-                        .map(|(directory, identity)| (directory, identity)),
-                )
-            {
+            for (directory, identity) in std::iter::once((&capsule, &capsule_identity)).chain(
+                directories
+                    .iter()
+                    .map(|(directory, identity)| (directory, identity)),
+            ) {
                 verify_native_artifact_export_directory(directory, Some(identity))?;
                 #[cfg(unix)]
                 sync_checkpoint_directory(directory)
@@ -8892,7 +8893,7 @@ pub(crate) mod tests {
 
     pub(crate) struct TestHost {
         pub(crate) port: ChannelHostPort,
-        worker: Option<std::thread::JoinHandle<()>>,
+        worker: Option<std::thread::JoinHandle<Option<Vec<u8>>>>,
         clock_gate: Arc<Mutex<()>>,
         clock_blocked: std::sync::mpsc::Receiver<()>,
     }
@@ -8918,15 +8919,8 @@ pub(crate) mod tests {
             schedule: Option<Vec<scriptbots_runtime::ScheduledConfigPatch>>,
             session_id: scriptbots_runtime::HostSessionId,
         ) -> Self {
-            let (send, receive) = std::sync::mpsc::sync_channel(1);
-            let clock_gate = Arc::new(Mutex::new(()));
-            let owner_gate = Arc::clone(&clock_gate);
-            let (blocked, clock_blocked) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
-                use scriptbots_runtime::{
-                    FixedDeadlineHost, HostCore, HostCoreOptions, ManualInstant, PlaybackSnapshot,
-                    channel::{ChannelHostDriver, ChannelHostOptions},
-                };
+            Self::spawn_with_owner(move || {
+                use scriptbots_runtime::{HostCore, HostCoreOptions, PlaybackSnapshot};
                 let mut core = HostCore::new(
                     session_id,
                     world,
@@ -8944,14 +8938,30 @@ pub(crate) mod tests {
                     core.install_schedule(schedule, crate::resolve_scheduled_config_patch)
                         .expect("actual application schedule resolver");
                 }
+                core
+            })
+        }
+
+        fn spawn_with_owner(
+            build_owner: impl FnOnce() -> scriptbots_runtime::HostCore + Send + 'static,
+        ) -> Self {
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let clock_gate = Arc::new(Mutex::new(()));
+            let owner_gate = Arc::clone(&clock_gate);
+            let (blocked, clock_blocked) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                use scriptbots_runtime::{
+                    FixedDeadlineHost, ManualInstant,
+                    channel::{ChannelHostDriver, ChannelHostOptions, ChannelRunOutcome},
+                };
                 let (mut driver, port) = ChannelHostDriver::new(
-                    FixedDeadlineHost::new(core),
+                    FixedDeadlineHost::new(build_owner()),
                     ChannelHostOptions::default(),
                 )
                 .expect("channel owner");
                 send.send(port).expect("publish test port");
                 let epoch = std::time::Instant::now();
-                driver
+                let receipt = driver
                     .run(|| {
                         if matches!(
                             owner_gate.try_lock(),
@@ -8965,6 +8975,15 @@ pub(crate) mod tests {
                         )
                     })
                     .expect("test owner run");
+                (receipt.outcome == ChannelRunOutcome::HandedOff).then(|| {
+                    driver
+                        .host()
+                        .core()
+                        .capture_volatile_host_checkpoint_v1()
+                        .expect("retired owner and actual volatile journal")
+                        .encode()
+                        .expect("encode retired owner")
+                })
             });
             Self {
                 port: receive.recv().expect("test host rendezvous"),
@@ -8976,6 +8995,28 @@ pub(crate) mod tests {
 
         pub(crate) fn handle(&self) -> ControlHandle {
             ControlHandle::new(self.port.clone())
+        }
+
+        fn handoff(mut self) -> Vec<u8> {
+            let acknowledged = self
+                .port
+                .handoff_host_checkpoint_v1()
+                .expect("actual owner handoff");
+            let bytes = self
+                .worker
+                .take()
+                .expect("running test owner")
+                .join()
+                .expect("original owner retired")
+                .expect("handoff retained its paired cut");
+            let paired = scriptbots_runtime::VolatileHostCheckpointV1::decode(&bytes)
+                .expect("reopen actual paired cut");
+            assert_eq!(
+                paired.host_checkpoint().encode().unwrap(),
+                acknowledged.encode().unwrap(),
+                "the joined owner is the acknowledged handoff, without another drive"
+            );
+            bytes
         }
 
         pub(crate) fn wait_applied(&self, status: &CommandStatusDto) -> CommandStatusDto {
@@ -9011,7 +9052,7 @@ pub(crate) mod tests {
                 HostCommand::Shutdown,
             ));
             if let Some(worker) = self.worker.take() {
-                worker.join().expect("test host joined");
+                let _ = worker.join().expect("test host joined");
             }
         }
     }
@@ -12593,6 +12634,156 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real owner journey checks historical review across handoff and a later omitted input"
+    )]
+    fn event_canvas_preserves_mixed_input_review_after_owner_continuation() {
+        use scriptbots_runtime::{HostCore, ManualInstant, VolatileHostCheckpointV1};
+
+        let AgentCanvasJourney {
+            handle,
+            host,
+            directory,
+            checkpoint_id,
+            oracles,
+        } = mixed_canvas_journey();
+        let retention = &handle.data_services.checkpoint_retention;
+        let source = retention.lock().unwrap().requests[&checkpoint_id].clone();
+        let saved = handle.verified_canvas_checkpoint(&checkpoint_id).unwrap();
+        let before = host.port.scientific_digest_cut().unwrap();
+        let reviews = oracles
+            .iter()
+            .map(|(oracle, _)| handle.event_canvas(oracle.world.tick).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(before.scientific_commands.len(), 9);
+
+        let bytes = host.handoff();
+        fs::write(directory.join("mixed-review-owner.checkpoint"), &bytes).unwrap();
+        let continued = TestHost::spawn_with_owner(move || {
+            let paired = VolatileHostCheckpointV1::decode(&bytes).unwrap();
+            let checkpoint = paired.host_checkpoint();
+            let registry =
+                crate::brains::create_brain_registry_for_checkpoint(checkpoint.world_checkpoint())
+                    .unwrap();
+            let world = checkpoint.restore_world(registry).unwrap();
+            let persistence = world
+                .bind_persistence(Box::new(scriptbots_core::NullPersistence))
+                .unwrap();
+            HostCore::restore_volatile_host_checkpoint_v1(
+                &paired,
+                world,
+                persistence,
+                None,
+                ManualInstant::from_nanos(0),
+            )
+            .unwrap()
+        });
+        let mut restored_handle = continued.handle();
+        // Source checkpoints remain the same retained application artifacts. Only
+        // the actual owner and its journal were handed off and reconstructed.
+        restored_handle.data_services = Arc::clone(&handle.data_services);
+        let current = continued.port.scientific_digest_cut().unwrap();
+        let published = restored_handle.read_snapshot().unwrap();
+        assert_eq!(current.digest, before.digest);
+        assert_eq!(current.session_id, before.session_id);
+        assert_eq!(current.scientific_revision, before.scientific_revision);
+        assert_eq!(current.config_revision, before.config_revision);
+        assert_eq!(
+            current.scientific_commands.len(),
+            before.scientific_commands.len()
+        );
+        for (actual, expected) in current
+            .scientific_commands
+            .iter()
+            .zip(&before.scientific_commands)
+        {
+            assert_eq!(actual.boundary(), expected.boundary());
+            assert_eq!(actual.command(), expected.command());
+        }
+        let audit =
+            ControlHandle::event_review_config_audit(&source, &current, &published).unwrap();
+        for ((oracle, digest), before_review) in oracles.iter().zip(reviews) {
+            let commands = ControlHandle::event_review_scientific_commands(
+                &source,
+                &current,
+                oracle.world.tick,
+                &audit,
+            )
+            .unwrap();
+            let target = ControlHandle::replay_event_canvas_world(
+                &saved,
+                &current.digest,
+                &audit,
+                &commands,
+                oracle.world.tick,
+                source.source_persistence_interval,
+                source.source_config_revision,
+            )
+            .unwrap();
+            assert_eq!(&target.world_digest_v1().unwrap(), digest);
+            let review = restored_handle.event_canvas(oracle.world.tick).unwrap();
+            assert_eq!(review.checkpoint_id, checkpoint_id);
+            assert_eq!(review.base_tick, saved.tick().0);
+            assert_eq!(
+                serde_json::to_value(&review.snapshot.world).unwrap(),
+                serde_json::to_value(&before_review.snapshot.world).unwrap(),
+                "the historical canvas is identical across real owner continuation"
+            );
+            assert_eq!(
+                continued.port.scientific_digest_v1().unwrap(),
+                current.digest,
+                "historical review cannot mutate the continued owner"
+            );
+            assert!(Arc::ptr_eq(
+                &restored_handle.read_snapshot().unwrap(),
+                &published
+            ));
+        }
+
+        // A real accepted input larger than the history budget leaves a revision
+        // gap. Restoring earlier history must not turn that gap into a replay proof.
+        let omitted = restored_handle
+            .submit_command(
+                ControlCommand::Intervention(Box::new(scriptbots_core::InterventionCommand::new(
+                    scriptbots_core::Intervention::Embargo {
+                        region: scriptbots_core::Region::All,
+                        ticks: 2,
+                    },
+                    scriptbots_core::InterventionSurface::Script,
+                    "x".repeat(scriptbots_runtime::MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES + 1),
+                ))),
+                None,
+            )
+            .unwrap();
+        continued.wait_applied(&omitted);
+        continued.wait_applied(&restored_handle.step().unwrap());
+        let incomplete = continued.port.scientific_digest_cut().unwrap();
+        let publication = restored_handle.read_snapshot().unwrap();
+        assert_eq!(
+            incomplete.scientific_commands.len(),
+            current.scientific_commands.len()
+        );
+        assert_eq!(
+            incomplete.scientific_revision.get(),
+            current.scientific_revision.get() + 2
+        );
+        assert!(matches!(
+            restored_handle.event_canvas(oracles[0].0.world.tick),
+            Err(ControlError::BadRequest(message))
+                if message.contains("complete recorded scientific inputs")
+        ));
+        assert_eq!(
+            continued.port.scientific_digest_v1().unwrap(),
+            incomplete.digest
+        );
+        assert!(Arc::ptr_eq(
+            &restored_handle.read_snapshot().unwrap(),
+            &publication
+        ));
+    }
+
+    #[test]
     // One real mixed-history cut supplies both cross-history and final-digest negatives.
     #[allow(clippy::too_many_lines)]
     fn event_canvas_mixed_inputs_refuse_inconsistent_histories() {
@@ -14576,7 +14767,11 @@ pub(crate) mod tests {
             .read_artifact_bytes(&checkpoint.checkpoint_id)
             .unwrap();
         let selected = native_export_test_artifact(&metadata);
-        let root = directory.canonicalize().unwrap().join("exports").join("nested");
+        let root = directory
+            .canonicalize()
+            .unwrap()
+            .join("exports")
+            .join("nested");
         assert!(!root.exists());
 
         let receipt = handle
@@ -14685,11 +14880,9 @@ pub(crate) mod tests {
     #[test]
     fn native_artifact_export_rejects_wrong_session_unsafe_identity_and_size_before_output() {
         let (handle, _host, checkpoint, directory) = checkpoint_branch_fixture(None, 0);
-        let selected =
-            native_export_test_artifact(&checkpoint_artifact_metadata(&checkpoint));
+        let selected = native_export_test_artifact(&checkpoint_artifact_metadata(&checkpoint));
         let root = directory.canonicalize().unwrap().join("refused-exports");
-        let wrong_session =
-            scriptbots_runtime::HostSessionId::new(handle.session_id().get() + 1);
+        let wrong_session = scriptbots_runtime::HostSessionId::new(handle.session_id().get() + 1);
         assert!(matches!(
             handle.export_lab_artifact(
                 "wrong-session",
@@ -14781,8 +14974,7 @@ pub(crate) mod tests {
     #[test]
     fn native_artifact_export_never_reuses_existing_request_directory() {
         let (handle, _host, checkpoint, directory) = checkpoint_branch_fixture(None, 0);
-        let selected =
-            native_export_test_artifact(&checkpoint_artifact_metadata(&checkpoint));
+        let selected = native_export_test_artifact(&checkpoint_artifact_metadata(&checkpoint));
         let root = directory.canonicalize().unwrap().join("exports");
         let capsule = root.join("already-present");
         fs::create_dir_all(&capsule).unwrap();
@@ -14926,7 +15118,9 @@ pub(crate) mod tests {
         let bytes = b"the exact retained source bytes";
         let error = write_native_artifact_export_file(&path, bytes, |file, bytes| {
             file.write_all(&bytes[..4])?;
-            Err(std::io::Error::other("injected write failure after four bytes"))
+            Err(std::io::Error::other(
+                "injected write failure after four bytes",
+            ))
         })
         .map_err(|error| preserve_native_artifact_export_failure(&directory, error))
         .unwrap_err()
@@ -14953,10 +15147,9 @@ pub(crate) mod tests {
             .keep();
         let path = directory.join("payload.bin");
         let bytes = b"verified retained bytes";
-        let original = write_native_artifact_export_file(&path, bytes, |file, bytes| {
-            file.write_all(bytes)
-        })
-        .unwrap();
+        let original =
+            write_native_artifact_export_file(&path, bytes, |file, bytes| file.write_all(bytes))
+                .unwrap();
         fs::write(&path, b"corrupt copied bytes").unwrap();
         assert!(
             verify_native_artifact_export_file(
@@ -17406,7 +17599,7 @@ pub(crate) mod tests {
                 HostCommand::Shutdown,
             ))
             .unwrap();
-        host.worker.take().unwrap().join().unwrap();
+        assert!(host.worker.take().unwrap().join().unwrap().is_none());
         let stopped = serde_json::to_value(handle.remote_owner_status().unwrap()).unwrap();
         assert_eq!(stopped["identity"]["sessionId"], u64::MAX.to_string());
         assert_eq!(stopped["lifecycle"], "stopped");
@@ -17529,7 +17722,8 @@ pub(crate) mod tests {
                 HostCommand::Shutdown,
             ))
             .expect("shutdown admitted");
-        host.worker
+        let _ = host
+            .worker
             .take()
             .unwrap()
             .join()
@@ -18296,7 +18490,8 @@ pub(crate) mod tests {
                 HostCommand::Shutdown,
             ))
             .expect("ordered shutdown");
-        host.worker
+        let _ = host
+            .worker
             .take()
             .expect("owner handle")
             .join()

@@ -184,14 +184,10 @@ fn scientific_command_owned_bytes(
             use scriptbots_core::{CellId, CellSelector, Intervention, InterventionCommand};
             let selector = match &command.intervention {
                 Intervention::SpawnFromArchive { selector, .. } => match selector {
-                    CellSelector::AxisRange(axes) => {
-                        allocation(axes.len(), axes.capacity())
-                            .saturating_mul(size_of::<(usize, f32, f32)>())
-                    }
-                    CellSelector::Explicit(cells) => {
-                        allocation(cells.len(), cells.capacity())
-                            .saturating_mul(size_of::<CellId>())
-                    }
+                    CellSelector::AxisRange(axes) => allocation(axes.len(), axes.capacity())
+                        .saturating_mul(size_of::<(usize, f32, f32)>()),
+                    CellSelector::Explicit(cells) => allocation(cells.len(), cells.capacity())
+                        .saturating_mul(size_of::<CellId>()),
                     CellSelector::All | CellSelector::TopKByQuality(_) => 0,
                 },
                 Intervention::Drought { .. }
@@ -1028,24 +1024,30 @@ impl HostCheckpointV1 {
             .iter()
             .map(|authority| &authority.status)
             .chain(state.archived.iter().map(|archived| &archived.status))
-            .filter_map(|status| status.admission_sequence().map(|sequence| (sequence, status)))
+            .filter_map(|status| {
+                status
+                    .admission_sequence()
+                    .map(|sequence| (sequence, status))
+            })
             .collect();
         let envelopes: HashMap<_, _> = state
             .commands
             .iter()
             .filter_map(|authority| {
                 authority.status.admission_sequence().and_then(|sequence| {
-                    authority.envelope.as_ref().map(|envelope| (sequence, envelope))
+                    authority
+                        .envelope
+                        .as_ref()
+                        .map(|envelope| (sequence, envelope))
                 })
             })
             .collect();
         let owner_command_ordinal = state.revisions.scientific.get() - self.tick().0;
         let mut previous: Option<(&ScientificCommandCheckpointV1, u64)> = None;
         for entry in &state.scientific_commands {
-            entry
-                .command
-                .validate()
-                .map_err(|error| checkpoint_error("scientific_commands.command", error.to_string()))?;
+            entry.command.validate().map_err(|error| {
+                checkpoint_error("scientific_commands.command", error.to_string())
+            })?;
             let boundary = entry.boundary;
             let command_ordinal = boundary
                 .revisions
@@ -4597,17 +4599,20 @@ impl HostCore {
                 command: entry.command.clone(),
             })
             .collect();
-        let scientific_command_bytes = scientific_commands.iter().try_fold(0_usize, |total, entry| {
-            scientific_command_retained_bytes(&entry.command)
-                .and_then(|bytes| total.checked_add(bytes))
-                .filter(|total| *total <= MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES)
-                .ok_or_else(|| {
-                    checkpoint_error(
-                        "scientific_commands.bytes",
-                        "restored scientific command allocations exceed byte bound",
-                    )
-                })
-        })?;
+        let scientific_command_bytes =
+            scientific_commands
+                .iter()
+                .try_fold(0_usize, |total, entry| {
+                    scientific_command_retained_bytes(&entry.command)
+                        .and_then(|bytes| total.checked_add(bytes))
+                        .filter(|total| *total <= MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES)
+                        .ok_or_else(|| {
+                            checkpoint_error(
+                                "scientific_commands.bytes",
+                                "restored scientific command allocations exceed byte bound",
+                            )
+                        })
+                })?;
         {
             let mut shared = self.shared.borrow_mut();
             shared.next_admission = state.next_admission;
@@ -8518,6 +8523,413 @@ mod tests {
             scientific_command_retained_bytes(&command).unwrap()
                 > MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES
         );
+    }
+
+    fn restore_scientific_history_owner(owner: HostCore) -> HostCore {
+        let captured = owner.capture_host_checkpoint_v1().unwrap();
+        let bytes = captured.encode().unwrap();
+        let decoded = HostCheckpointV1::decode(&bytes).unwrap();
+        assert_eq!(decoded.encode().unwrap(), bytes);
+        assert_eq!(
+            decoded.state.scientific_commands,
+            captured.state.scientific_commands
+        );
+        let world = decoded
+            .restore_world(scriptbots_core::BrainRegistry::new())
+            .unwrap();
+        let persistence = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+        HostCore::restore_host_checkpoint_v1(
+            &decoded,
+            world,
+            persistence,
+            owner.journal,
+            None,
+            ManualInstant::from_nanos(1_000),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real owner journey compares retained inputs and eviction with uninterrupted science"
+    )]
+    fn full_host_checkpoint_retains_scientific_inputs_and_continues_bounded_eviction() {
+        use scriptbots_core::{Intervention, InterventionCommand, InterventionSurface, Region};
+        let mut configured = options(true);
+        configured.archived_command_capacity = 4;
+        let make_owner = || {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                persistence_interval: 0,
+                ..continuation_world().config().clone()
+            })
+            .unwrap();
+            for _ in 0..3 {
+                world.try_spawn_agent(AgentData::default()).unwrap();
+            }
+            world.set_resource_ledger_enabled(true);
+            HostCore::new(HostSessionId::new(0xa6ea), world, configured).unwrap()
+        };
+        let mut original = make_owner();
+        let mut oracle = make_owner();
+        // Crossover parents need committed origins from an earlier tick. Recording stays
+        // disabled from construction so later control births do not target a sealed tick.
+        for owner in [&mut original, &mut oracle] {
+            settle_continuation_command(
+                owner,
+                CommandEnvelope::new(CommandId::new(90), HostCommand::Step),
+                0,
+            );
+        }
+        let first_parent = original.latest_snapshot().world.agents[0].uid;
+        let second_parent = original.latest_snapshot().world.agents[1].uid;
+        let commands = [
+            HostCommand::SpawnAgent {
+                herbivore_tendency: 0.25,
+            },
+            HostCommand::SpawnCrossover {
+                parent_a: first_parent,
+                parent_b: second_parent,
+            },
+            HostCommand::AdjustAgentMutationRates {
+                agent_uid: first_parent,
+                delta_primary: 0.125,
+                delta_secondary: 0.25,
+            },
+            HostCommand::Intervention(Box::new(InterventionCommand::new(
+                Intervention::Embargo {
+                    region: Region::All,
+                    ticks: 3,
+                },
+                InterventionSurface::Script,
+                "x".repeat(MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES / 2 + 7),
+            ))),
+            HostCommand::Step,
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let sequence = u64::try_from(index + 1).unwrap();
+            let envelope = CommandEnvelope::new(CommandId::new(u128::from(sequence)), command);
+            settle_continuation_command(&mut original, envelope.clone(), sequence);
+            settle_continuation_command(&mut oracle, envelope, sequence);
+        }
+        let before = original.scientific_digest_cut().unwrap();
+        assert_eq!(before.scientific_commands.len(), 4);
+        let mut restored = restore_scientific_history_owner(original);
+        let after = restored.scientific_digest_cut().unwrap();
+        assert_eq!(
+            after.digest, before.digest,
+            "restore does not reapply any scientific input"
+        );
+        assert_eq!(after.scientific_commands, before.scientific_commands);
+        assert_eq!(
+            restored.scientific_command_bytes,
+            oracle.scientific_command_bytes
+        );
+        for (sequence, command) in [
+            (
+                6_u64,
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 0.75,
+                },
+            ),
+            (7, HostCommand::Step),
+        ] {
+            let envelope = CommandEnvelope::new(CommandId::new(u128::from(sequence)), command);
+            settle_continuation_command(&mut restored, envelope.clone(), 1_000 + sequence);
+            settle_continuation_command(&mut oracle, envelope, sequence);
+        }
+        assert_continued_owner_outputs(&restored, &oracle);
+        let continued = restored.scientific_digest_cut().unwrap();
+        assert_eq!(continued.scientific_commands.len(), 4);
+        assert_eq!(
+            continued.scientific_commands[0].command_id,
+            CommandId::new(2)
+        );
+        assert_eq!(
+            continued.scientific_commands,
+            oracle.scientific_digest_cut().unwrap().scientific_commands
+        );
+        assert_eq!(
+            restored.scientific_command_bytes,
+            restored
+                .scientific_commands
+                .iter()
+                .map(AppliedScientificCommand::retained_bytes)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            restored
+                .capture_host_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap(),
+            oracle
+                .capture_host_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn full_host_checkpoint_retains_scientific_occurrences_across_flush_and_id_reuse() {
+        let mut configured = options(true);
+        configured.archived_command_capacity = 2;
+        let mut original =
+            HostCore::new(HostSessionId::new(0xa6eb), continuation_world(), configured).unwrap();
+        settle_continuation_command(
+            &mut original,
+            CommandEnvelope::new(
+                CommandId::new(1),
+                HostCommand::SpawnAgent {
+                    herbivore_tendency: 0.5,
+                },
+            ),
+            1,
+        );
+        settle_continuation_command(
+            &mut original,
+            CommandEnvelope::new(CommandId::new(2), HostCommand::FlushPersistence),
+            2,
+        );
+        assert_eq!(
+            original.scientific_commands[0].boundary(),
+            original.applied_boundary()
+        );
+        let mut restored = restore_scientific_history_owner(original);
+        for sequence in 3_u64..=5 {
+            settle_continuation_command(
+                &mut restored,
+                CommandEnvelope::new(CommandId::new(u128::from(sequence)), HostCommand::Pause),
+                1_000 + sequence,
+            );
+        }
+        assert!(
+            !restored
+                .shared
+                .borrow()
+                .archived_idempotency
+                .contains_key(&CommandId::new(1))
+        );
+        settle_continuation_command(
+            &mut restored,
+            CommandEnvelope::new(
+                CommandId::new(1),
+                HostCommand::AdjustAgentMutationRates {
+                    agent_uid: AgentUid(u64::MAX),
+                    delta_primary: 0.1,
+                    delta_secondary: 0.2,
+                },
+            ),
+            1_006,
+        );
+        let before = restored.scientific_digest_cut().unwrap();
+        assert_eq!(before.scientific_commands.len(), 2);
+        assert!(
+            before
+                .scientific_commands
+                .iter()
+                .all(|entry| entry.command_id == CommandId::new(1))
+        );
+        assert!(
+            before.scientific_commands[0].admission_sequence
+                < before.scientific_commands[1].admission_sequence
+        );
+        let continued = restore_scientific_history_owner(restored);
+        assert_eq!(
+            continued
+                .scientific_digest_cut()
+                .unwrap()
+                .scientific_commands,
+            before.scientific_commands
+        );
+    }
+
+    #[test]
+    fn full_host_checkpoint_preserves_omitted_scientific_input_gaps() {
+        use scriptbots_core::{Intervention, InterventionCommand, InterventionSurface};
+        let mut owner = HostCore::new(
+            HostSessionId::new(0xa6ec),
+            continuation_world(),
+            options(true),
+        )
+        .unwrap();
+        let commands = [
+            HostCommand::AdjustAgentMutationRates {
+                agent_uid: AgentUid(u64::MAX),
+                delta_primary: 0.1,
+                delta_secondary: 0.2,
+            },
+            HostCommand::Intervention(Box::new(InterventionCommand::new(
+                Intervention::SetClosedWorld { closed: true },
+                InterventionSurface::Script,
+                "x".repeat(MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES + 1),
+            ))),
+            HostCommand::Step,
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            let sequence = u64::try_from(index + 1).unwrap();
+            settle_continuation_command(
+                &mut owner,
+                CommandEnvelope::new(CommandId::new(u128::from(sequence)), command),
+                sequence,
+            );
+        }
+        let before = owner.scientific_digest_cut().unwrap();
+        assert_eq!(before.scientific_revision.get() - before.digest.tick.0, 2);
+        assert_eq!(before.scientific_commands.len(), 1);
+        let restored = restore_scientific_history_owner(owner);
+        let after = restored.scientific_digest_cut().unwrap();
+        assert_eq!(after.scientific_commands, before.scientific_commands);
+        assert_eq!(after.scientific_revision, before.scientific_revision);
+        assert_eq!(after.digest, before.digest);
+        assert_eq!(
+            after.scientific_commands[0]
+                .boundary()
+                .revisions
+                .scientific
+                .get(),
+            1
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one valid owner fixture isolates each rehashed scientific-history contract violation"
+    )]
+    fn full_host_checkpoint_refuses_rehashed_scientific_history_corruption() {
+        use scriptbots_core::{Intervention, InterventionCommand, InterventionSurface};
+        let mut configured = options(true);
+        configured.archived_command_capacity = 8;
+        let mut owner =
+            HostCore::new(HostSessionId::new(0xa6ed), continuation_world(), configured).unwrap();
+        for sequence in 1_u64..=6 {
+            let command = if sequence % 2 == 0 {
+                HostCommand::Step
+            } else {
+                HostCommand::AdjustAgentMutationRates {
+                    agent_uid: AgentUid(u64::MAX),
+                    delta_primary: 0.1,
+                    delta_secondary: 0.2,
+                }
+            };
+            settle_continuation_command(
+                &mut owner,
+                CommandEnvelope::new(CommandId::new(u128::from(sequence)), command),
+                sequence,
+            );
+        }
+        let checkpoint = owner.capture_host_checkpoint_v1().unwrap();
+        let encoded = checkpoint.encode().unwrap();
+        for mutation in 0..13 {
+            let mut changed = checkpoint.clone();
+            let history = &mut changed.state.scientific_commands;
+            let expected = match mutation {
+                0 => {
+                    history.resize(configured.archived_command_capacity + 1, history[0].clone());
+                    "scientific_commands.capacity"
+                }
+                1 => {
+                    history[0].command =
+                        ControlCommand::Intervention(Box::new(InterventionCommand::new(
+                            Intervention::SetClosedWorld { closed: true },
+                            InterventionSurface::Script,
+                            "x".repeat(MAX_SCIENTIFIC_COMMAND_HISTORY_BYTES + 1),
+                        )));
+                    "scientific_commands.bytes"
+                }
+                2 => {
+                    history[0].command = ControlCommand::Pause;
+                    "scientific_commands.command"
+                }
+                3 => {
+                    history[0].command = ControlCommand::SpawnCrossover {
+                        parent_a: AgentUid(1),
+                        parent_b: AgentUid(1),
+                    };
+                    "scientific_commands.command"
+                }
+                4 => {
+                    history[0].boundary.tick = Tick(4);
+                    "scientific_commands.boundary"
+                }
+                5 => {
+                    history[0].boundary.revisions.scientific = ScientificRevision::new(0);
+                    "scientific_commands.boundary"
+                }
+                6 => {
+                    history[2].boundary.tick = Tick(1);
+                    "scientific_commands.boundary"
+                }
+                7 => {
+                    history[0].admission_sequence = AdmissionSequence::new(0);
+                    "scientific_commands.boundary"
+                }
+                8 => {
+                    history[0].admission_sequence = changed.state.next_admission;
+                    "scientific_commands.boundary"
+                }
+                9 => {
+                    history.swap(0, 1);
+                    "scientific_commands.order"
+                }
+                10 => {
+                    history[2].boundary.tick = Tick(3);
+                    "scientific_commands.order"
+                }
+                11 => {
+                    history[0].command_id = CommandId::new(999);
+                    "scientific_commands.identity"
+                }
+                _ => {
+                    history[0].boundary.revisions.control = ControlRevision::new(2);
+                    "scientific_commands.identity"
+                }
+            };
+            let mut wire: HostCheckpointWireV1 = postcard::from_bytes(&encoded).unwrap();
+            wire.payload = serde_json::to_vec(&changed.state).unwrap();
+            wire.payload_blake3 = *blake3::hash(&wire.payload).as_bytes();
+            assert!(
+                matches!(HostCheckpointV1::decode(&postcard::to_allocvec(&wire).unwrap()), Err(HostCheckpointError::Contract { path, .. }) if path == expected),
+                "mutation {mutation} must fail its semantic contract after rehashing"
+            );
+        }
+        let mut nonfinite = checkpoint.clone();
+        nonfinite.state.scientific_commands[0].command = ControlCommand::SpawnAgent {
+            herbivore_tendency: f32::NAN,
+        };
+        assert!(matches!(
+            nonfinite.encode(),
+            Err(HostCheckpointError::Contract {
+                path: "scientific_commands.command",
+                ..
+            })
+        ));
+        for missing in [true, false] {
+            let mut wire: HostCheckpointWireV1 = postcard::from_bytes(&encoded).unwrap();
+            let mut payload: serde_json::Value = serde_json::from_slice(&wire.payload).unwrap();
+            if missing {
+                assert!(
+                    payload
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("scientific_commands")
+                        .is_some()
+                );
+            } else {
+                payload["scientific_commands"][0]["unrecognized"] = serde_json::json!(true);
+            }
+            wire.payload = serde_json::to_vec(&payload).unwrap();
+            wire.payload_blake3 = *blake3::hash(&wire.payload).as_bytes();
+            assert!(matches!(
+                HostCheckpointV1::decode(&postcard::to_allocvec(&wire).unwrap()),
+                Err(HostCheckpointError::Contract {
+                    path: "payload.decode",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
