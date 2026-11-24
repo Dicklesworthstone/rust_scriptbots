@@ -5,6 +5,7 @@ import {
   CHECKPOINT_LAB_PAGE_SIZE, MAX_LAB_ARTIFACT_BYTES, CheckpointLabController,
   renderCheckpointLab, validateLabArtifact, validateLabArtifactPage, validateLabBranchObservation, validateLabBranchPage, validateLabBranchStatus,
   validateLabCheckpoint, validateLabCheckpointPage, validateLabIntervention, validateCheckpointCanvas,
+  parseReplayTarget, validateCheckpointReplay,
 } from "../checkpoint-lab.js";
 import { RemoteOwnerHttpError, RemoteStreamClient } from "../remote.js";
 import { MAX_STUDY_REPORT_BYTES } from "../study-report.js";
@@ -34,6 +35,22 @@ function savedCanvas(source = checkpoint()) {
         terrainRevision: "1", foodRevision: "1", hydrologyRevision: "0", foodMax: 1, hydrologyEnabled: false,
         cells: [{ terrain: "Grass", elevation: 0, food: 1, waterDepth: 0 }] },
       playback: { paused: true, speedMultiplier: 1 } } };
+}
+
+function replayCanvas(source = checkpoint(), targetTick = "112") {
+  const value = savedCanvas(source);
+  const savedCut = targetTick === String(source.tick);
+  value.schema = "scriptbots.checkpoint-replay.v1";
+  value.targetTick = targetTick;
+  value.maxVerificationTicks = "1024";
+  value.verification = savedCut ? { kind: "saved_cut" }
+    : { kind: "captured_interval", verifiedThroughTick: "120", capturedCurrentDigest: "e".repeat(16) };
+  value.frame.identity.tick = targetTick;
+  value.frame.snapshot.tick = Number(targetTick);
+  // A reconstructed later population need not have the checkpoint's size.
+  if (!savedCut) value.frame.snapshot.agents.splice(0, 4);
+  value.frame.snapshot.summary.agentCount = value.frame.snapshot.agents.length;
+  return value;
 }
 
 function page(items = [checkpoint()], changes = {}) {
@@ -80,7 +97,7 @@ function artifactPage(items = [artifact()], changes = {}) {
 
 async function harness({ listStudies, parseReport } = {}) {
   let time = 0, nextId = 0;
-  const queues = Object.fromEntries(["save", "review", "launch", "status", "cancel", "artifacts", "download"].map((kind) => [kind, []]));
+  const queues = Object.fromEntries(["save", "review", "replay", "launch", "status", "cancel", "artifacts", "download"].map((kind) => [kind, []]));
   const services = Object.fromEntries(Object.keys(queues).map((kind) => [kind, (request, signal) => new Promise((resolve, reject) => {
     queues[kind].push({ request, signal, resolve, reject });
   })]));
@@ -207,6 +224,196 @@ test("a failed review retains the prior saved canvas and changing selection retu
   h.controller.page = page([checkpoint(), checkpoint({ checkpoint_id: "ckpt-second" })]);
   h.controller.select("ckpt-second");
   assert.equal(h.controller.canvasPreview, null);
+});
+
+test("historical replay binds its target to the complete captured interval and actual population", () => {
+  const request = { sessionId: SESSION, checkpoint: checkpoint(), targetTick: "112" };
+  const value = replayCanvas();
+  assert.equal(validateCheckpointReplay(value, request), value);
+  assert.equal(value.frame.snapshot.summary.agentCount, 8);
+  assert.equal(value.checkpoint.agent_count, 12);
+  assert.deepEqual(value.verification, { kind: "captured_interval", verifiedThroughTick: "120", capturedCurrentDigest: "e".repeat(16) });
+  value.maxVerificationTicks = "20";
+  assert.equal(validateCheckpointReplay(value, request), value);
+  value.maxVerificationTicks = "19";
+  assert.throws(() => validateCheckpointReplay(value, request), /complete replay verification interval/,
+    "source-to-target fits, but the complete captured interval exceeds the returned bound");
+  const saved = replayCanvas(checkpoint(), "100");
+  assert.equal(validateCheckpointReplay(saved, { ...request, targetTick: "100" }), saved);
+  saved.verification = value.verification;
+  assert.throws(() => validateCheckpointReplay(saved, { ...request, targetTick: "100" }), /saved-cut verification/);
+  saved.verification = { kind: "saved_cut" };
+  saved.frame.snapshot.agents.pop();
+  saved.frame.snapshot.summary.agentCount -= 1;
+  assert.throws(() => validateCheckpointReplay(saved, { ...request, targetTick: "100" }), /historical target/);
+  const largeSource = checkpoint({ tick: Number.MAX_SAFE_INTEGER - 20 });
+  const largeTarget = String(BigInt(Number.MAX_SAFE_INTEGER) - 10n);
+  const large = replayCanvas(largeSource, largeTarget);
+  large.verification.verifiedThroughTick = String(Number.MAX_SAFE_INTEGER);
+  assert.equal(validateCheckpointReplay(large, { ...request, checkpoint: largeSource, targetTick: largeTarget }), large);
+});
+
+test("historical replay refuses inconsistent descriptors, interval evidence and reconstructed frames", () => {
+  const request = { sessionId: SESSION, checkpoint: checkpoint(), targetTick: "112" };
+  for (const change of [
+    (value) => { value.schema = "scriptbots.checkpoint-canvas.v1"; },
+    (value) => { value.sourceSessionId = "7"; },
+    (value) => { value.checkpoint.checkpoint_id = "other-source"; },
+    (value) => { value.checkpoint.tick = 101; },
+    (value) => { value.checkpoint.agent_count = 11; },
+    (value) => { value.checkpoint.byte_size = 2048; },
+    (value) => { value.checkpoint.world_digest_v1 = "b".repeat(16); },
+    (value) => { value.checkpoint.checksum_sha256 = "d".repeat(64); },
+    (value) => { value.checkpoint.checksum_blake3 = "d".repeat(64); },
+    (value) => { value.checkpoint.schema = "scriptbots.world-checkpoint.v1.4"; },
+    (value) => { value.checkpoint.created_at_utc = "1794000001"; },
+    (value) => { value.checkpoint.description = "substituted descriptor"; },
+    (value) => { value.targetTick = 112; },
+    (value) => { value.targetTick = "0112"; },
+    (value) => { value.targetTick = "113"; },
+    (value) => { value.maxVerificationTicks = 1024; },
+    (value) => { value.maxVerificationTicks = "0"; },
+    (value) => { value.maxVerificationTicks = "18446744073709551616"; },
+    (value) => { value.verification = { kind: "saved_cut" }; },
+    (value) => { value.verification = null; },
+    (value) => { value.verification.verifiedThroughTick = "111"; },
+    (value) => { value.verification.verifiedThroughTick = 120; },
+    (value) => { value.verification.verifiedThroughTick = "18446744073709551616"; },
+    (value) => { value.verification.capturedCurrentDigest = "e".repeat(64); },
+    (value) => { delete value.verification.capturedCurrentDigest; },
+    (value) => { value.verification.targetDigest = "a".repeat(16); },
+    (value) => { value.frame.identity.sessionId = "7"; },
+    (value) => { value.frame.identity.tick = "113"; },
+    (value) => { value.frame.identity.publicationRevision = "18446744073709551616"; },
+    (value) => { value.frame.snapshot.tick = 113; },
+    (value) => { value.frame.snapshot.summary.agentCount = 12; },
+    (value) => { value.frame.snapshot.agents.pop(); },
+    (value) => { value.frame.playback.paused = false; },
+    (value) => { value.frame.playback.speedMultiplier = 2; },
+    (value) => { value.frame.environment = null; },
+  ]) {
+    const value = replayCanvas();
+    change(value);
+    assert.throws(() => validateCheckpointReplay(value, request));
+  }
+  assert.throws(() => validateCheckpointReplay(replayCanvas(checkpoint(), "99"), { ...request, targetTick: "99" }));
+  assert.throws(() => validateCheckpointReplay(replayCanvas(), { ...request, targetTick: "9007199254740992" }), /cannot display/);
+});
+
+test("replay target drafts and checked steps preserve exact decimal identities", async () => {
+  assert.equal(parseReplayTarget("0"), 0n);
+  assert.equal(parseReplayTarget("9007199254740991"), 9007199254740991n);
+  for (const value of ["", "01", "1e3", "1.0", " 112", "112 ", "-1", "+112", 112,
+    "9007199254740992", "18446744073709551615", "18446744073709551616"]) {
+    assert.throws(() => parseReplayTarget(value));
+  }
+  const h = await harness();
+  assert.equal(h.controller.replayTickText, "100");
+  h.controller.stepReplayTick(-1);
+  assert.equal(h.controller.replayTickText, "100", "cannot step before the source");
+  h.controller.stepReplayTick(10);
+  h.controller.stepReplayTick(1);
+  h.controller.stepReplayTick(-10);
+  assert.equal(h.controller.replayTickText, "101");
+  h.controller.editReplayTick("9007199254740991");
+  h.controller.stepReplayTick(1);
+  assert.equal(h.controller.replayTickText, "9007199254740991", "overflow cannot round to a neighboring tick");
+  h.controller.stepReplayTick(-1);
+  assert.equal(h.controller.replayTickText, "9007199254740990");
+  const { panel, nodes } = labPanel();
+  for (const invalid of ["99", "01", "1e3", "9007199254740992", "1".repeat(80)]) {
+    h.controller.editReplayTick(invalid);
+    renderCheckpointLab(panel, h.controller);
+    assert.equal(h.controller.canSeekReplay, false);
+    assert.equal(nodes.get("#lab-replay-seek").disabled, true);
+    assert.equal(nodes.get("#lab-replay-tick").value, invalid.slice(0, 64));
+    assert.equal(await h.controller.seekReplay(), null);
+  }
+  assert.equal(h.queues.replay.length, 0);
+  const save = h.controller.save();
+  h.queues.save[0].resolve(checkpoint({ tick: 120, checkpoint_id: "saved-new" }));
+  await save;
+  assert.equal(h.controller.replayTickText, "120", "saving also selects and initializes the new replay source");
+});
+
+test("explicit historical seeks freeze source and target and share the occupied Lab slot", async () => {
+  const h = await harness();
+  h.controller.editReplayTick("112");
+  const pending = h.controller.seekReplay();
+  const queued = h.queues.replay[0];
+  assert.deepEqual(queued.request, { sessionId: SESSION, checkpoint: checkpoint(), targetTick: "112" });
+  assert.equal(Object.isFrozen(queued.request), true);
+  assert.equal(Object.isFrozen(queued.request.checkpoint), true);
+  assert.equal(h.controller.canvasPreview, null);
+  assert.equal(h.controller.reviewPending, true);
+  assert.equal(await h.controller.seekReplay(), null);
+  assert.equal(await h.controller.reviewSelected(), null);
+  assert.equal(await h.controller.save(), null);
+  const { panel, nodes } = labPanel();
+  renderCheckpointLab(panel, h.controller);
+  assert.equal(nodes.get("#lab-replay-tick").disabled, false, "a draft edit can supersede a seek");
+  assert.equal(nodes.get("#lab-replay-seek").disabled, true, "the worker slot remains occupied");
+  queued.resolve(replayCanvas());
+  const preview = await pending;
+  assert.equal(h.controller.canvasPreview, preview);
+  assert.equal(Object.isFrozen(preview.verification), true);
+  assert.equal(Object.isFrozen(preview.frame.snapshot.agents), true);
+  assert.equal(h.controller.canSave, false);
+  assert.equal(h.controller.canLaunch, false);
+  assert.equal(h.controller.canSeekReplay, true);
+  assert.equal(h.identities(), 0, "historical reads allocate no mutation idempotency key");
+  assert.match(h.controller.notice, /through captured current tick 120/);
+  assert.match(h.controller.notice, /not a separate target digest/);
+});
+
+test("edits, return to live, navigation and source changes reject late replay without releasing its slot", async () => {
+  for (const [supersede, retain] of [
+    [(controller) => controller.editReplayTick("114"), true],
+    [(controller) => controller.returnToLive(), false],
+    [(controller) => controller.setEnabled(false), true],
+    [(controller) => controller.observe(frame("7"), SOURCE), false],
+    [(controller) => controller.observe(frame(), "wss://other.example/api/ws/stream"), false],
+  ]) {
+    const h = await harness();
+    const saved = h.controller.reviewSelected();
+    h.queues.review[0].resolve(savedCanvas());
+    const prior = await saved;
+    h.controller.editReplayTick("113");
+    const pending = h.controller.seekReplay();
+    supersede(h.controller);
+    assert.equal(h.queues.replay[0].signal.aborted, true);
+    assert.equal(h.controller.busy, true);
+    assert.equal(await h.controller.seekReplay(), null);
+    h.queues.replay[0].resolve(replayCanvas(checkpoint(), "113"));
+    assert.equal(await pending, null);
+    assert.equal(h.controller.canvasPreview, retain ? prior : null);
+    assert.equal(h.controller.busy, false);
+    assert.equal(h.queues.replay.length, 1);
+  }
+});
+
+test("a failed or edited replay preserves the previously verified historical canvas", async () => {
+  const h = await harness();
+  h.controller.editReplayTick("112");
+  const first = h.controller.seekReplay();
+  h.queues.replay[0].resolve(replayCanvas());
+  const prior = await first;
+  h.controller.editReplayTick("113");
+  assert.equal(h.controller.canvasPreview, prior);
+  const refused = h.controller.seekReplay();
+  h.queues.replay[1].reject(new Error("captured interval exceeds the server replay bound"));
+  assert.equal(await refused, null);
+  assert.equal(h.controller.canvasPreview, prior);
+  assert.match(h.controller.notice, /server replay bound/);
+  h.controller.editReplayTick("114");
+  const invalid = h.controller.seekReplay();
+  h.queues.replay[2].resolve(replayCanvas(checkpoint(), "115"));
+  assert.equal(await invalid, null);
+  assert.equal(h.controller.canvasPreview, prior);
+  h.controller.page = page([checkpoint(), checkpoint({ checkpoint_id: "second-source", tick: 110 })]);
+  h.controller.select("second-source");
+  assert.equal(h.controller.canvasPreview, null);
+  assert.equal(h.controller.replayTickText, "110");
 });
 
 test("checkpoint selection requires exact metadata and complete bounded page cursors", () => {
@@ -1044,7 +1251,92 @@ test("saved-world transport refuses malformed, oversized, incomplete and stale r
   } finally { globalThis.fetch = previous; }
 });
 
-test("saved-world response bounds use actual bytes even with a dishonest Content-Length", async () => {
+test("historical replay transport isolates exact target reads from all live stream cursors", async () => {
+  const previous = globalThis.fetch, requests = [];
+  const preview = replayCanvas();
+  const wire = { schema: "scriptbots.remote-frame.v2", kind: "canvas", identity: preview.frame.identity,
+    payload: preview.frame.snapshot, environment: preview.frame.environment, playback: preview.frame.playback,
+    coalescedPublications: "0" };
+  const { frame: _frame, ...descriptor } = preview;
+  const envelope = { ...descriptor, frameBase64: "U0JXUw==" };
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url), ...options });
+    return new Response(JSON.stringify(envelope));
+  };
+  try {
+    const value = client();
+    const live = { ...wire, identity: { ...wire.identity, tick: "120", publicationRevision: "100" },
+      payload: { ...wire.payload, tick: 120 } };
+    value.tracker.accept(live, () => true);
+    value.tracker.accept({ ...live, kind: "telemetry" }, () => true);
+    const cursor = structuredClone(value.resume), observed = [...value.tracker.observed];
+    let decodes = 0;
+    value.decodeFrame = (bytes) => { decodes += 1; assert.deepEqual([...bytes], [83, 66, 87, 83]); return wire; };
+    value.onFrame = () => { throw new Error("A replay must not enter the live stream"); };
+    const options = { sessionId: SESSION, expected: checkpoint(), targetTick: "112" };
+    assert.deepEqual(await value.checkpointReplay(checkpoint().checkpoint_id, options), preview);
+    assert.equal(decodes, 1);
+    assert.deepEqual(value.resume, cursor);
+    assert.deepEqual([...value.tracker.observed], observed);
+    assert.equal(requests[0].method, "GET");
+    assert.equal(requests[0].url.pathname, "/nested/api/v1/checkpoints/ckpt-saved-t100/replay");
+    assert.equal(requests[0].url.search, `?session_id=${SESSION}&target_tick=112`);
+    assert.equal(requests[0].headers["X-ScriptBots-Session"], SESSION);
+    assert.equal(requests[0].body, undefined);
+    assert.equal(requests[0].credentials, "omit");
+    assert.equal(requests[0].cache, "no-store");
+    for (const targetTick of ["99", "0112", "1e3", 112, "9007199254740992", "18446744073709551615"]) {
+      await assert.rejects(value.checkpointReplay(checkpoint().checkpoint_id, { ...options, targetTick }));
+    }
+    await assert.rejects(value.checkpointReplay("different-source", options));
+    assert.equal(requests.length, 1, "unsafe or ambiguous targets never reach the host");
+    envelope.verification = { ...preview.verification, verifiedThroughTick: "1125" };
+    await assert.rejects(value.checkpointReplay(checkpoint().checkpoint_id, options), /complete replay verification interval/);
+    envelope.verification = preview.verification;
+    envelope.checkpoint = checkpoint({ created_at_utc: "1794000001" });
+    await assert.rejects(value.checkpointReplay(checkpoint().checkpoint_id, options), /selected checkpoint/);
+    assert.deepEqual(value.resume, cursor);
+    assert.deepEqual([...value.tracker.observed], observed);
+  } finally { globalThis.fetch = previous; }
+});
+
+test("historical replay transport rejects malformed frames and stale connections before publishing", async () => {
+  const previous = globalThis.fetch;
+  const preview = replayCanvas();
+  const wire = { schema: "scriptbots.remote-frame.v2", kind: "canvas", identity: preview.frame.identity,
+    payload: preview.frame.snapshot, environment: preview.frame.environment, playback: preview.frame.playback,
+    coalescedPublications: "0" };
+  const { frame: _frame, ...descriptor } = preview;
+  const envelope = { ...descriptor, frameBase64: "U0JXUw==" };
+  globalThis.fetch = async () => new Response(JSON.stringify(envelope));
+  try {
+    const value = client();
+    const options = { sessionId: SESSION, expected: checkpoint(), targetTick: "112" };
+    let decodes = 0;
+    value.decodeFrame = () => { decodes += 1; return wire; };
+    for (const encoded of ["", "U0JXUw", "U0JXUw==\n", "U0JXUx=="]) {
+      envelope.frameBase64 = encoded;
+      await assert.rejects(value.checkpointReplay(checkpoint().checkpoint_id, options));
+    }
+    assert.equal(decodes, 0);
+    envelope.frameBase64 = "U0JXUw==";
+    wire.coalescedPublications = "1";
+    await assert.rejects(value.checkpointReplay(checkpoint().checkpoint_id, options), /complete reconstructed canvas/);
+    wire.coalescedPublications = "0";
+    wire.environment = null;
+    await assert.rejects(value.checkpointReplay(checkpoint().checkpoint_id, options), /historical target/);
+    let respond;
+    globalThis.fetch = () => new Promise((resolve) => { respond = resolve; });
+    const pending = value.checkpointReplay(checkpoint().checkpoint_id, options);
+    const before = decodes;
+    value.generation += 1;
+    respond(new Response(JSON.stringify(envelope)));
+    await assert.rejects(pending, /connection changed/);
+    assert.equal(decodes, before);
+  } finally { globalThis.fetch = previous; }
+});
+
+test("saved-world and replay response bounds use actual bytes even with a dishonest Content-Length", async () => {
   const previous = globalThis.fetch;
   let cancelled = false, decoded = false;
   globalThis.fetch = async () => new Response(new ReadableStream({
@@ -1054,10 +1346,13 @@ test("saved-world response bounds use actual bytes even with a dishonest Content
   try {
     const value = client();
     value.decodeFrame = () => { decoded = true; };
-    await assert.rejects(value.checkpointCanvas(checkpoint().checkpoint_id,
-      { sessionId: SESSION, expected: checkpoint() }), /bound/);
-    assert.equal(cancelled, true);
-    assert.equal(decoded, false);
+    for (const method of ["checkpointCanvas", "checkpointReplay"]) {
+      cancelled = false;
+      await assert.rejects(value[method](checkpoint().checkpoint_id,
+        { sessionId: SESSION, expected: checkpoint(), targetTick: "112" }), /bound/);
+      assert.equal(cancelled, true);
+      assert.equal(decoded, false);
+    }
   } finally { globalThis.fetch = previous; }
 });
 
