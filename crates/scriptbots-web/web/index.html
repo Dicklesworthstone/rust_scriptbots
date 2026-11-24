@@ -264,7 +264,7 @@
         #lab-branch-form, #lab-branch-form fieldset { display: grid; gap: 0.5rem; }
         #lab-branch-form fieldset { border: 1px solid #334155; border-radius: 0.35rem; margin: 0; }
         #lab-branch-form label { display: grid; gap: 0.25rem; }
-        #lab-branch-form input { box-sizing: border-box; width: 100%; background: #0f172a; color: #e2e8f0; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
+        #lab-branch-form input, #lab-replay-tick { box-sizing: border-box; width: 100%; background: #0f172a; color: #e2e8f0; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
         #lab-notice, #lab-form-error { color: #fbbf24; }
         #lab-checkpoint-detail, #lab-branch-detail, #lab-artifact-detail { white-space: pre-line; }
         #lab-study-report { margin-top: 0.75rem; padding: 0.65rem; border: 1px solid #334155; border-radius: 0.4rem; background: #101b2e; overflow-x: auto; }
@@ -782,6 +782,17 @@
                     <p>Continuing locally replaces your retained browser world after validation and disconnects this viewer. The server keeps running independently. Original host commands, scheduled changes and durable history stay on the server. Unsupported brain families or scientific state leave both worlds intact.</p>
                 </div>
                 <p>Review draws the saved agents and environment without changing the server. Return to live before controlling, inspecting or starting a study. Births, deaths and tick rate are unavailable for a saved state.</p>
+                <label for="lab-replay-tick">Historical target tick</label>
+                <input id="lab-replay-tick" type="text" inputmode="numeric" maxlength="20" pattern="0|[1-9][0-9]*"
+                    aria-describedby="lab-replay-help" autocomplete="off" disabled />
+                <div class="inspector-actions">
+                    <button id="lab-replay-back-ten" type="button" disabled aria-label="Decrease replay target by ten ticks">−10</button>
+                    <button id="lab-replay-back-one" type="button" disabled aria-label="Decrease replay target by one tick">−1</button>
+                    <button id="lab-replay-forward-one" type="button" disabled aria-label="Increase replay target by one tick">+1</button>
+                    <button id="lab-replay-forward-ten" type="button" disabled aria-label="Increase replay target by ten ticks">+10</button>
+                    <button id="lab-replay-seek" type="button" disabled>Seek historical tick</button>
+                </div>
+                <p id="lab-replay-help">Choose a tick at or after the saved source, then seek explicitly. Later ticks require the server to verify the complete captured interval, within its replay limit. Missing history or an unsupported interval leaves the displayed world intact. This browser displays exact ticks only through 9007199254740991.</p>
                 <h3>2. Run a future from that state</h3>
                 <p>An unchanged future runs one trajectory. A treatment runs alongside an unchanged control from the same saved state. Both run independently of the live world.</p>
                 <form id="lab-branch-form">
