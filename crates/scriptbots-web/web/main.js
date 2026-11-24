@@ -302,6 +302,9 @@ const checkpointLab = new CheckpointLabController({
   review: (request, signal) => remoteClient.checkpointCanvas(request.checkpoint.checkpoint_id, {
     sessionId: request.sessionId, expected: request.checkpoint, signal,
   }),
+  replay: (request, signal) => remoteClient.checkpointReplay(request.checkpoint.checkpoint_id, {
+    sessionId: request.sessionId, expected: request.checkpoint, targetTick: request.targetTick, signal,
+  }),
   launch: (request, signal) => remoteClient.launchCheckpointBranch(request, { signal }),
   status: (request, signal) => remoteClient.checkpointBranchStatus(request.branchId, { sessionId: request.sessionId, signal }),
   cancel: (request, signal) => remoteClient.cancelCheckpointBranch(request.branchId, { sessionId: request.sessionId, signal }),
@@ -338,21 +341,36 @@ function observeCheckpointLab(frame) {
   }
 }
 
+function checkpointProvenance(preview) {
+  const checkpoint = preview?.checkpoint;
+  const verification = preview?.verification ?? (checkpoint ? { kind: "saved_cut" } : null);
+  return { checkpointId: checkpoint?.checkpoint_id ?? "", sourceTick: checkpoint ? String(checkpoint.tick) : "",
+    targetTick: preview?.targetTick ?? (checkpoint ? String(checkpoint.tick) : ""),
+    sourceSessionId: preview?.sourceSessionId ?? "", sourceWorldDigestV1: checkpoint?.world_digest_v1 ?? "",
+    verificationKind: verification?.kind ?? "", verifiedThroughTick: verification?.verifiedThroughTick ?? "",
+    capturedCurrentDigest: verification?.capturedCurrentDigest ?? "",
+    // Only a saved-cut view has its own recorded world digest. Interval evidence
+    // authenticates the source and captured endpoint, not a separate target hash.
+    worldDigestV1: verification?.kind === "saved_cut" ? checkpoint.world_digest_v1 : "" };
+}
+
 function renderCheckpointView() {
-  const pending = checkpointLab.operation?.kind === "Saved-world review unavailable"
-    && !checkpointLab.operation.abort.signal.aborted;
+  const pending = checkpointLab.reviewPending && !checkpointLab.operation.abort.signal.aborted;
   if (checkpointView) checkpointView.hidden = !reviewedCheckpoint && !pending;
-  if (checkpointReturnLive) checkpointReturnLive.textContent = reviewedCheckpoint ? "Return to live" : "Cancel saved-world review";
+  if (checkpointReturnLive) checkpointReturnLive.textContent = reviewedCheckpoint ? "Return to live" : "Cancel historical review";
   if (!checkpointViewStatus) return;
   const checkpoint = reviewedCheckpoint?.checkpoint;
+  const provenance = checkpointProvenance(reviewedCheckpoint);
   const painted = checkpoint && lastPaintedFrame?.presentationGeneration === presentationGeneration;
+  const description = provenance.verificationKind === "captured_interval"
+    ? `historical tick ${provenance.targetTick} from checkpoint ${provenance.checkpointId}, saved at tick ${provenance.sourceTick}; source world digest ${provenance.sourceWorldDigestV1}. The complete interval was verified through captured current tick ${provenance.verifiedThroughTick}, digest ${provenance.capturedCurrentDigest}. No separate target digest is asserted`
+    : `saved checkpoint ${checkpoint?.checkpoint_id} at tick ${checkpoint?.tick}; world digest ${checkpoint?.world_digest_v1}`;
   const message = checkpoint
-    ? `${painted ? "Reviewing" : "Preparing"} saved checkpoint ${checkpoint.checkpoint_id} at tick ${checkpoint.tick}; world digest ${checkpoint.world_digest_v1}. This is a reconstructed scientific state. Live controls and creature inspection are unavailable here. ${remoteConnected ? "The server and its event timeline continue independently." : "The server is disconnected; this saved view is retained."}`
-    : "Reconstructing the selected saved world. The current canvas stays visible until the saved state is ready.";
+    ? `${painted ? "Reviewing" : "Preparing"} ${description}. This is a reconstructed scientific state. Live controls and creature inspection are unavailable here. ${remoteConnected ? "The server and its event timeline continue independently." : "The server is disconnected; this historical view is retained."}`
+    : "Reconstructing the selected historical world. The current canvas stays visible until the requested state is ready.";
   if (checkpointViewStatus.textContent !== message) checkpointViewStatus.textContent = message;
-  Object.assign(checkpointViewStatus.dataset, { state: checkpoint ? painted ? "ready" : "preparing" : "loading",
-    checkpointId: checkpoint?.checkpoint_id ?? "", tick: checkpoint ? String(checkpoint.tick) : "",
-    sourceSessionId: reviewedCheckpoint?.sourceSessionId ?? "", worldDigestV1: checkpoint?.world_digest_v1 ?? "" });
+  Object.assign(checkpointViewStatus.dataset, provenance,
+    { state: checkpoint ? painted ? "ready" : "preparing" : "loading", tick: provenance.targetTick });
 }
 
 function synchronizeCheckpointView(controller) {
@@ -374,15 +392,15 @@ function synchronizeCheckpointView(controller) {
     if (reviewedCheckpoint) {
       for (const id of ["inspector-status", "brain-status", "genome-status"]) {
         const status = document.getElementById(id);
-        if (status) status.textContent = "Saved-world review: return to live to inspect the current population.";
+        if (status) status.textContent = "Historical review: return to live to inspect the current population.";
       }
     }
     document.getElementById("sim-container").dataset.view = reviewedCheckpoint ? "checkpoint" : "live";
     canvas.setAttribute("aria-label", reviewedCheckpoint
-      ? "Saved checkpoint canvas. Drag to pan, scroll to zoom, Home fits the world. Return to live to inspect creatures."
+      ? "Historical world canvas. Drag to pan, scroll to zoom, Home fits the world. Return to live to inspect creatures."
       : "Simulation canvas. Click a creature to inspect; drag to pan; scroll or plus/minus to zoom; arrows pan; Home fits; F follows; Escape clears selection.");
     const metricsHeading = document.getElementById("metrics-heading");
-    if (metricsHeading) metricsHeading.textContent = reviewedCheckpoint ? "Saved World Metrics" : "Live Metrics";
+    if (metricsHeading) metricsHeading.textContent = reviewedCheckpoint ? "Historical World Metrics" : "Live Metrics";
     resetPerformanceWindows(reviewedCheckpoint?.frame.snapshot ?? remoteFrame?.snapshot);
     updateRemoteControls();
   }
@@ -493,6 +511,11 @@ for (const [id, action] of [
   ["lab-checkpoint-save", () => checkpointLab.save()],
   ["lab-checkpoint-retry", () => checkpointLab.retrySave()],
   ["lab-checkpoint-review", () => checkpointLab.reviewSelected()],
+  ["lab-replay-seek", () => checkpointLab.seekReplay()],
+  ["lab-replay-back-ten", () => checkpointLab.stepReplayTick(-10)],
+  ["lab-replay-back-one", () => checkpointLab.stepReplayTick(-1)],
+  ["lab-replay-forward-one", () => checkpointLab.stepReplayTick(1)],
+  ["lab-replay-forward-ten", () => checkpointLab.stepReplayTick(10)],
   ["lab-checkpoint-refresh", () => checkpointLab.refresh(true)],
   ["lab-checkpoint-first", () => checkpointLab.firstPage()],
   ["lab-checkpoint-next", () => checkpointLab.nextPage()],
@@ -510,6 +533,10 @@ for (const [id, action] of [
   });
 }
 document.getElementById("lab-checkpoint-select")?.addEventListener("change", (event) => checkpointLab.select(event.target.value));
+document.getElementById("lab-replay-tick")?.addEventListener("input", (event) => checkpointLab.editReplayTick(event.target.value));
+document.getElementById("lab-replay-tick")?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); void checkpointLab.seekReplay(); }
+});
 document.getElementById("lab-history-select")?.addEventListener("change", async (event) => {
   try { await checkpointLab.selectStudy(event.target.value); }
   catch (error) { if (labFormError) labFormError.textContent = String(error.message || error).slice(0, 512); }
@@ -1537,7 +1564,7 @@ function drawSnapshot(frame, historical = false) {
         environmentStatus.dataset.layer = environmentLayer?.value ?? "combined";
       }
       rendererStatus.dataset.view = historical ? "checkpoint" : "live";
-      rendererStatus.dataset.checkpointId = historical ? reviewedCheckpoint.checkpoint.checkpoint_id : "";
+      Object.assign(rendererStatus.dataset, checkpointProvenance(historical ? reviewedCheckpoint : null));
       renderCheckpointView();
       captureAdmittedFrame(frame.identity);
       if (!historical) observePresentedLiveFrame(frame);
@@ -1594,9 +1621,12 @@ function captureAdmittedFrame(frameIdentity) {
     const identity = { ...frameIdentity };
     const capturedView = lastPaintedFrame.view;
     const checkpoint = reviewedCheckpoint?.checkpoint;
+    const provenance = checkpointProvenance(reviewedCheckpoint);
+    const interval = provenance.verificationKind === "captured_interval";
     const backend = rendererStatus.dataset.renderer;
     const filename = checkpoint
-      ? `scriptbots-checkpoint-${checkpoint.checkpoint_id}-t${checkpoint.tick}-${checkpoint.world_digest_v1}-${backend}.png`
+      ? interval ? `scriptbots-replay-${checkpoint.checkpoint_id}-from${provenance.sourceTick}-t${identity.tick}-${backend}.png`
+        : `scriptbots-checkpoint-${checkpoint.checkpoint_id}-t${checkpoint.tick}-${checkpoint.world_digest_v1}-${backend}.png`
       : `scriptbots-session-${identity.sessionId}-p${identity.publicationRevision}-s${identity.scientificRevision}-c${identity.controlRevision}-g${identity.configRevision}-t${identity.tick}-${backend}.png`;
     request.encoding = true;
     encodingRequest = request;
@@ -1625,12 +1655,13 @@ function captureAdmittedFrame(frameIdentity) {
         link.href = captureUrl;
         link.download = filename;
         link.click();
-        Object.assign(captureStatus.dataset, identity, { renderer: backend, state: "ready", filename,
-          view: checkpoint ? "checkpoint" : "live", checkpointId: checkpoint?.checkpoint_id ?? "",
-          worldDigestV1: checkpoint?.world_digest_v1 ?? "", cameraZoom: String(capturedView.zoom),
+        Object.assign(captureStatus.dataset, identity, provenance, { renderer: backend, state: "ready", filename,
+          view: checkpoint ? "checkpoint" : "live", cameraZoom: String(capturedView.zoom),
           cameraCenterX: String(capturedView.centerX), cameraCenterY: String(capturedView.centerY) });
         captureStatus.textContent = checkpoint
-          ? `Saved-world PNG ready — ${checkpoint.checkpoint_id}, tick ${checkpoint.tick}, world digest ${checkpoint.world_digest_v1} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`
+          ? interval
+            ? `Historical PNG ready — tick ${identity.tick}, source ${checkpoint.checkpoint_id} at tick ${provenance.sourceTick}, source world digest ${provenance.sourceWorldDigestV1}; interval verified through captured current tick ${provenance.verifiedThroughTick}, digest ${provenance.capturedCurrentDigest}; no separate target digest (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`
+            : `Saved-world PNG ready — ${checkpoint.checkpoint_id}, tick ${checkpoint.tick}, world digest ${checkpoint.world_digest_v1} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`
           : `PNG ready — tick ${identity.tick}, science revision ${identity.scientificRevision}, publication ${identity.publicationRevision} (${backend === "webgpu" ? "WebGPU" : "Canvas 2D"})`;
         finishCapture(request);
       } catch (error) {
