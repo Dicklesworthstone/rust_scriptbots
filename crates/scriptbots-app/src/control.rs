@@ -2929,6 +2929,67 @@ struct RetainedCheckpoint {
     source_scheduled_input_count: u64,
 }
 
+/// An immutable catalog source keeps its declared codec and complete science authority.
+enum CatalogCheckpoint {
+    Science(Box<scriptbots_core::WorldCheckpointV1>),
+    Host(Box<scriptbots_runtime::HostCheckpointV1>),
+}
+
+impl CatalogCheckpoint {
+    fn decode(schema: &str, bytes: &[u8]) -> Result<Self, ControlError> {
+        match schema {
+            scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA => {
+                scriptbots_core::WorldCheckpointV1::decode(bytes)
+                    .map(|checkpoint| Self::Science(Box::new(checkpoint)))
+                    .map_err(|error| ControlError::Serialization(error.to_string()))
+            }
+            scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA => {
+                scriptbots_runtime::HostCheckpointV1::decode(bytes)
+                    .map(|checkpoint| Self::Host(Box::new(checkpoint)))
+                    .map_err(|error| ControlError::Serialization(error.to_string()))
+            }
+            _ => Err(ControlError::InvalidPatch(
+                "unsupported checkpoint catalog schema".into(),
+            )),
+        }
+    }
+
+    fn science(&self) -> &scriptbots_core::WorldCheckpointV1 {
+        match self {
+            Self::Science(checkpoint) => checkpoint,
+            Self::Host(checkpoint) => checkpoint.world_checkpoint(),
+        }
+    }
+
+    fn schema(&self) -> &'static str {
+        match self {
+            Self::Science(_) => scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA,
+            Self::Host(_) => scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA,
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, ControlError> {
+        match self {
+            Self::Science(checkpoint) => checkpoint
+                .encode()
+                .map_err(|error| ControlError::Serialization(error.to_string())),
+            Self::Host(checkpoint) => checkpoint
+                .encode()
+                .map_err(|error| ControlError::Serialization(error.to_string())),
+        }
+    }
+
+    /// Independent branch studies retain their explicit standalone-science contract.
+    fn standalone_science(&self) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
+        match self {
+            Self::Science(checkpoint) => checkpoint.validate_standalone_restore(),
+            Self::Host(checkpoint) => checkpoint.validate_standalone_projection(),
+        }
+        .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        Ok(self.science().clone())
+    }
+}
+
 const CHECKPOINT_CATALOG_SUFFIX: &str = ".checkpoint.json";
 const CHECKPOINT_CATALOG_READY_SUFFIX: &str = ".checkpoint.ready";
 const MAX_CHECKPOINT_CATALOG_RECORD_BYTES: usize = 16 * 1024;
@@ -2964,8 +3025,8 @@ struct CheckpointRequestAdmission {
     idempotency_key: String,
     request_hash: String,
     metadata: CheckpointMetadataDto,
-    /// Original capture context only. WorldCheckpointV1 excludes host identity,
-    /// and recovery never adopts this session.
+    /// Original capture context only. Recovery never adopts this session or owner,
+    /// including when the saved artifact carries the complete owner envelope.
     source_session: scriptbots_runtime::HostSessionId,
 }
 
@@ -3154,7 +3215,11 @@ fn read_checkpoint_catalog_record(
         || record.checksum_blake3 != compute_blake3(&encoded)
         || metadata.checkpoint_id != id
         || !id.ends_with(&format!("-t{}", metadata.tick))
-        || metadata.schema != scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+        || !matches!(
+            metadata.schema.as_str(),
+            scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
+                | scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA
+        )
         || metadata.byte_size == 0
         || metadata
             .description
@@ -3187,8 +3252,9 @@ fn verify_checkpoint_catalog_payload(
     {
         return Err(checkpoint_catalog_error(&path, "artifact identity changed"));
     }
-    let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
+    let source = CatalogCheckpoint::decode(&metadata.schema, &bytes)
         .map_err(|error| checkpoint_catalog_error(&path, error))?;
+    let checkpoint = source.science();
     if checkpoint.tick().0 != metadata.tick
         || checkpoint.agent_count() != metadata.agent_count
         || checkpoint.source_digest().overall != metadata.world_digest_v1
@@ -5779,6 +5845,7 @@ impl ControlHandle {
     }
 
     /// Create a simulation checkpoint and register it as an artifact.
+    /// Retain the full owner envelope when standalone science would lose future state.
     /// Keyed retries can recover the original completed cut after catalog reopen;
     /// this does not resume or adopt the original owner or persistence session.
     pub fn create_checkpoint(
@@ -5872,11 +5939,70 @@ impl ControlHandle {
         }
         retention.refresh()?;
         retention.admit(0)?;
-        let captured = self.host.capture_checkpoint_cut()?;
-        let checkpoint = &captured.checkpoint;
-        let encoded_bytes = checkpoint
-            .encode()
-            .map_err(|e| ControlError::Serialization(e.to_string()))?;
+        // The raw owner query checks both enabled features and retained hidden science.
+        // Preserve its existing admission contract; only a refusal needs the stricter
+        // full-owner query. Each successful cut supplies all of its own provenance.
+        let (
+            source,
+            source_session,
+            source_scientific_revision,
+            source_config_revision,
+            source_persistence_interval,
+            source_scheduled_input_count,
+        ) = match self.host.capture_checkpoint_cut() {
+            Ok(captured) => (
+                CatalogCheckpoint::Science(Box::new(captured.checkpoint)),
+                captured.session_id,
+                captured.scientific_revision,
+                captured.config_revision,
+                captured.persistence_interval,
+                captured.scheduled_input_count,
+            ),
+            Err(_) => {
+                let captured = self
+                    .host
+                    .capture_host_checkpoint_v1()
+                    .map_err(|error| match error {
+                        scriptbots_runtime::HostCheckpointError::Host(error) => {
+                            ControlError::Host(error)
+                        }
+                        other => ControlError::Host(
+                            scriptbots_runtime::HostAccessError::ProtocolViolation {
+                                message: other.to_string(),
+                            },
+                        ),
+                    })?;
+                let source_session = captured.session_id();
+                let source_scientific_revision = captured.scientific_revision();
+                let source_config_revision = captured.config_revision();
+                let source_persistence_interval = captured.config().persistence_interval;
+                let source_scheduled_input_count = captured
+                    .remaining_schedule()
+                    .and_then(|remaining| remaining.last())
+                    .map_or(captured.completed_schedule_sequence().unwrap_or(0), |patch| {
+                        patch.sequence
+                    });
+                let source = match captured.validate_standalone_projection() {
+                    Ok(()) => {
+                        CatalogCheckpoint::Science(Box::new(captured.world_checkpoint().clone()))
+                    }
+                    Err(scriptbots_core::WorldCheckpointError::RequiresHostContinuity { .. }) => {
+                        CatalogCheckpoint::Host(Box::new(captured))
+                    }
+                    Err(error) => return Err(ControlError::Serialization(error.to_string())),
+                };
+                (
+                    source,
+                    source_session,
+                    source_scientific_revision,
+                    source_config_revision,
+                    source_persistence_interval,
+                    source_scheduled_input_count,
+                )
+            }
+        };
+        let checkpoint = source.science();
+        let encoded_bytes = source.encode()?;
         if encoded_bytes.len() > MAX_ARTIFACT_DOWNLOAD_BYTES {
             return Err(ControlError::PayloadTooLarge(
                 "checkpoint exceeds the artifact download byte bound".to_owned(),
@@ -5886,7 +6012,7 @@ impl ControlHandle {
             .map_err(|error| ControlError::Serialization(error.to_string()))?;
         retention.admit(byte_size)?;
         let tick = checkpoint.tick().0;
-        let schema = scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA.to_string();
+        let schema = source.schema().to_string();
 
         let blake3_hex = compute_blake3(&encoded_bytes);
         let sha256_hex = compute_sha256(&encoded_bytes);
@@ -5919,11 +6045,11 @@ impl ControlHandle {
             directory: dir,
             database_metadata: serde_json::json!({"source": "control_api", "description": request.description}),
             acknowledged: false,
-            source_session: captured.session_id,
-            source_scientific_revision: captured.scientific_revision,
-            source_config_revision: captured.config_revision,
-            source_persistence_interval: captured.persistence_interval,
-            source_scheduled_input_count: captured.scheduled_input_count,
+            source_session,
+            source_scientific_revision,
+            source_config_revision,
+            source_persistence_interval,
+            source_scheduled_input_count,
         };
         if let Some(key) = request.idempotency_key.as_deref() {
             let admitted = write_checkpoint_request_admission(&retained.directory, key, &retained);
@@ -6005,19 +6131,35 @@ impl ControlHandle {
                     retained.metadata.checkpoint_id,
                 )))?;
             retention.verify_directory(&retained.directory)?;
-            let checkpoint = scriptbots_core::WorldCheckpointV1::decode(&bytes)
-                .map_err(|error| ControlError::Serialization(error.to_string()))?;
+            let checkpoint = CatalogCheckpoint::decode(&retained.metadata.schema, &bytes)?;
             if let Some(writer) = &self.checkpoint_writer {
-                writer.record(&retained.metadata.checkpoint_id, &checkpoint, &retained.database_metadata)
-                    .map_err(|error| match error {
-                        scriptbots_storage::StorageError::CheckpointCapacityExceeded { .. } => ControlError::CheckpointCapacity(error.to_string()),
-                        other => ControlError::CheckpointRetentionUnavailable(format!(
-                            "checkpoint {} persistence receipt is unconfirmed: {other}; retained file and request identity permit exact retry",
-                            retained.metadata.checkpoint_id,
-                        )),
-                    })?;
+                let recorded = match &checkpoint {
+                    CatalogCheckpoint::Science(science) => writer
+                        .record(
+                            &retained.metadata.checkpoint_id,
+                            science,
+                            &retained.database_metadata,
+                        )
+                        .map(|_| ()),
+                    CatalogCheckpoint::Host(owner) => writer
+                        .record_host(
+                            &retained.metadata.checkpoint_id,
+                            owner,
+                            &retained.database_metadata,
+                        )
+                        .map(|_| ()),
+                };
+                recorded.map_err(|error| match error {
+                    scriptbots_storage::StorageError::CheckpointCapacityExceeded { .. } => {
+                        ControlError::CheckpointCapacity(error.to_string())
+                    }
+                    other => ControlError::CheckpointRetentionUnavailable(format!(
+                        "checkpoint {} persistence receipt is unconfirmed: {other}; retained file and request identity permit exact retry",
+                        retained.metadata.checkpoint_id,
+                    )),
+                })?;
             }
-            // A raw .bin can exist after an unconfirmed write. Publish its
+            // A payload .bin can exist after an unconfirmed write. Publish its
             // immutable descriptor only after the original persistence receipt,
             // so restart discovery cannot turn an incomplete capture into one.
             write_checkpoint_catalog(&retained.directory, &retained.metadata)?;
@@ -6859,8 +7001,8 @@ impl ControlHandle {
         &self,
         checkpoint_id: &str,
     ) -> Result<Arc<RenderSnapshot>, ControlError> {
-        let checkpoint = self.verified_canvas_checkpoint(checkpoint_id)?;
-        self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)
+        let checkpoint = self.verified_canvas_source(checkpoint_id)?;
+        self.project_canvas_world(Self::restore_catalog_world(&checkpoint)?)
     }
 
     /// Project saved science for remote review with explicit resource admission bounds.
@@ -6873,7 +7015,7 @@ impl ControlHandle {
         checkpoint_id: &str,
     ) -> Result<(CheckpointMetadataDto, Arc<RenderSnapshot>), ControlError> {
         let (metadata, checkpoint, _) = self.read_bounded_canvas_checkpoint(checkpoint_id)?;
-        let snapshot = self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?;
+        let snapshot = self.project_canvas_world(Self::restore_catalog_world(&checkpoint)?)?;
         Ok((metadata, snapshot))
     }
 
@@ -6884,14 +7026,7 @@ impl ControlHandle {
     fn read_bounded_canvas_checkpoint(
         &self,
         checkpoint_id: &str,
-    ) -> Result<
-        (
-            CheckpointMetadataDto,
-            scriptbots_core::WorldCheckpointV1,
-            PathBuf,
-        ),
-        ControlError,
-    > {
+    ) -> Result<(CheckpointMetadataDto, CatalogCheckpoint, PathBuf), ControlError> {
         if checkpoint_id.len() > MAX_CHECKPOINT_BRANCH_ID_BYTES
             || !valid_checkpoint_catalog_id(checkpoint_id)
         {
@@ -6984,7 +7119,10 @@ impl ControlHandle {
             ));
         }
         let checkpoint = Self::decode_canvas_checkpoint(&metadata, &artifact, &bytes)?;
-        Self::validate_checkpoint_preview_config(checkpoint.config(), checkpoint.agent_count())?;
+        Self::validate_checkpoint_preview_config(
+            checkpoint.science().config(),
+            checkpoint.science().agent_count(),
+        )?;
         if find_directory()? != directory
             || read_checkpoint_catalog_record(&directory, checkpoint_id)? != metadata
         {
@@ -7015,10 +7153,20 @@ impl ControlHandle {
         Ok(())
     }
 
+    /// Independent branch studies require a source that can stand alone without
+    /// retained owner-only science. They do not adopt the captured owner's session.
     fn verified_canvas_checkpoint(
         &self,
         checkpoint_id: &str,
     ) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
+        self.verified_canvas_source(checkpoint_id)?
+            .standalone_science()
+    }
+
+    fn verified_canvas_source(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<CatalogCheckpoint, ControlError> {
         let metadata = self.get_checkpoint(checkpoint_id)?;
         let (artifact, bytes) = self.read_artifact_bytes(checkpoint_id)?;
         Self::decode_canvas_checkpoint(&metadata, &artifact, &bytes)
@@ -7028,13 +7176,12 @@ impl ControlHandle {
         metadata: &CheckpointMetadataDto,
         artifact: &ArtifactMetadataDto,
         bytes: &[u8],
-    ) -> Result<scriptbots_core::WorldCheckpointV1, ControlError> {
-        let checkpoint = scriptbots_core::WorldCheckpointV1::decode(bytes)
-            .map_err(|error| ControlError::Serialization(error.to_string()))?;
-        if metadata.schema != scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA
-            || metadata.tick != checkpoint.tick().0
-            || metadata.agent_count != checkpoint.agent_count()
-            || metadata.world_digest_v1 != checkpoint.source_digest().overall
+    ) -> Result<CatalogCheckpoint, ControlError> {
+        let checkpoint = CatalogCheckpoint::decode(&metadata.schema, bytes)?;
+        let science = checkpoint.science();
+        if metadata.tick != science.tick().0
+            || metadata.agent_count != science.agent_count()
+            || metadata.world_digest_v1 != science.source_digest().overall
             || metadata.byte_size != artifact.byte_size
             || metadata.checksum_blake3 != artifact.checksum_blake3
             || metadata.checksum_sha256 != artifact.checksum_sha256
@@ -7044,6 +7191,34 @@ impl ControlHandle {
             ));
         }
         Ok(checkpoint)
+    }
+
+    fn restore_catalog_world(checkpoint: &CatalogCheckpoint) -> Result<WorldState, ControlError> {
+        match checkpoint {
+            CatalogCheckpoint::Science(science) => Self::restore_canvas_world(science),
+            CatalogCheckpoint::Host(owner) => {
+                let science = owner.world_checkpoint();
+                let registry = crate::brains::create_brain_registry_for_checkpoint(science)
+                    .map_err(|error| {
+                        ControlError::BadRequest(format!(
+                            "checkpoint registry does not match the compiled application adapters: {error}"
+                        ))
+                    })?;
+                let world = owner
+                    .restore_science_projection(registry)
+                    .map_err(|error| ControlError::Serialization(error.to_string()))?;
+                let actual_digest = world
+                    .world_digest_v1()
+                    .map_err(|error| ControlError::Serialization(error.to_string()))?;
+                if &actual_digest != science.source_digest() {
+                    return Err(ControlError::InvalidPatch(
+                        "reconstructed checkpoint scientific digest differs from its saved cut"
+                            .into(),
+                    ));
+                }
+                Ok(world)
+            }
+        }
     }
 
     fn restore_canvas_world(
@@ -7168,9 +7343,9 @@ impl ControlHandle {
                 self.replay_retained_canvas(&retained, &checkpoint, target_tick, None)
             }
             None => Ok(EventCanvasReview {
-                snapshot: self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?,
+                snapshot: self.project_canvas_world(Self::restore_catalog_world(&checkpoint)?)?,
                 checkpoint_id: metadata.checkpoint_id,
-                base_tick: checkpoint.tick().0,
+                base_tick: checkpoint.science().tick().0,
                 verification: scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut,
             }),
         }
@@ -7216,9 +7391,9 @@ impl ControlHandle {
                 )?
             }
             None => EventCanvasReview {
-                snapshot: self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?,
+                snapshot: self.project_canvas_world(Self::restore_catalog_world(&checkpoint)?)?,
                 checkpoint_id: metadata.checkpoint_id.clone(),
-                base_tick: checkpoint.tick().0,
+                base_tick: checkpoint.science().tick().0,
                 verification: scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut,
             },
         };
@@ -7267,8 +7442,9 @@ impl ControlHandle {
     /// scientific commands retain the configuration revision observed at application.
     /// Other scientific revisions refuse before stepping. The atomic current digest
     /// must also match before the reconstructed target is published.
-    /// Saved source cuts are science-only; archive resurrection requires archive
-    /// authority they do not contain and is explicitly refused.
+    /// Complete sources retain their companion science during reconstruction.
+    /// Archive resurrection still requires its separate input-history admission
+    /// contract and remains explicitly refused.
     pub(crate) fn event_canvas(&self, target_tick: u64) -> Result<EventCanvasReview, ControlError> {
         let retained = self
             .data_services
@@ -7286,11 +7462,11 @@ impl ControlHandle {
                 ))
             })?;
         let checkpoint_id = retained.metadata.checkpoint_id.clone();
-        let checkpoint = self.verified_canvas_checkpoint(&checkpoint_id)?;
-        let base_tick = checkpoint.tick().0;
+        let checkpoint = self.verified_canvas_source(&checkpoint_id)?;
+        let base_tick = checkpoint.science().tick().0;
         if target_tick == base_tick {
             return Ok(EventCanvasReview {
-                snapshot: self.project_canvas_world(Self::restore_canvas_world(&checkpoint)?)?,
+                snapshot: self.project_canvas_world(Self::restore_catalog_world(&checkpoint)?)?,
                 checkpoint_id,
                 base_tick,
                 verification: scriptbots_runtime::lab_workflows::LabReplayVerification::SavedCut,
@@ -7302,7 +7478,7 @@ impl ControlHandle {
     fn replay_retained_canvas(
         &self,
         retained: &RetainedCheckpoint,
-        checkpoint: &scriptbots_core::WorldCheckpointV1,
+        checkpoint: &CatalogCheckpoint,
         target_tick: u64,
         limits: Option<CanvasReplayLimits>,
     ) -> Result<EventCanvasReview, ControlError> {
@@ -7334,8 +7510,15 @@ impl ControlHandle {
                     (audit, commands)
                 }
             };
-        let world = Self::replay_event_canvas_world(
-            checkpoint,
+        if let Some(limits) = limits {
+            limits.validate_config(
+                checkpoint.science().config(),
+                checkpoint.science().agent_count(),
+            )?;
+        }
+        let world = Self::replay_event_canvas_world_restored(
+            Self::restore_catalog_world(checkpoint)?,
+            checkpoint.science(),
             &current.digest,
             &config_audit,
             &scientific_commands,
@@ -7349,7 +7532,7 @@ impl ControlHandle {
         Ok(EventCanvasReview {
             snapshot: self.project_canvas_world(world)?,
             checkpoint_id: retained.metadata.checkpoint_id.clone(),
-            base_tick: checkpoint.tick().0,
+            base_tick: checkpoint.science().tick().0,
             verification:
                 scriptbots_runtime::lab_workflows::LabReplayVerification::CapturedInterval {
                     verified_through_tick: current.digest.tick.0,
@@ -7358,10 +7541,10 @@ impl ControlHandle {
         })
     }
 
+    #[cfg(test)]
     #[allow(
         clippy::too_many_arguments,
-        clippy::too_many_lines,
-        reason = "replay inputs, original revision axes, full-interval proof and remote admission must share one ordered reconstruction"
+        reason = "raw-science fixtures exercise the same admitted replay loop"
     )]
     fn replay_event_canvas_world(
         checkpoint: &scriptbots_core::WorldCheckpointV1,
@@ -7376,7 +7559,38 @@ impl ControlHandle {
         if let Some(limits) = limits {
             limits.validate_config(checkpoint.config(), checkpoint.agent_count())?;
         }
-        let mut world = Self::restore_canvas_world(checkpoint)?;
+        Self::replay_event_canvas_world_restored(
+            Self::restore_canvas_world(checkpoint)?,
+            checkpoint,
+            current,
+            config_audit,
+            scientific_commands,
+            target_tick,
+            source_persistence_interval,
+            source_config_revision,
+            limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "replay inputs, original revision axes, full-interval proof and remote admission must share one ordered reconstruction"
+    )]
+    fn replay_event_canvas_world_restored(
+        mut world: WorldState,
+        checkpoint: &scriptbots_core::WorldCheckpointV1,
+        current: &scriptbots_core::WorldDigestV1,
+        config_audit: &[ConfigAuditEntry],
+        scientific_commands: &[scriptbots_runtime::AppliedScientificCommand],
+        target_tick: u64,
+        source_persistence_interval: u32,
+        source_config_revision: scriptbots_runtime::ConfigRevision,
+        limits: Option<CanvasReplayLimits>,
+    ) -> Result<WorldState, ControlError> {
+        if let Some(limits) = limits {
+            limits.validate_config(checkpoint.config(), checkpoint.agent_count())?;
+        }
         if let Some(limits) = limits {
             limits.validate_world(&world)?;
         }
@@ -12895,7 +13109,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn event_canvas_refuses_archive_inputs_without_source_archive_authority() {
+    fn event_canvas_retains_archive_input_admission_refusal_for_full_sources() {
         let directory = tempfile::Builder::new()
             .prefix("event-archive-authority-")
             .tempdir()
@@ -12920,6 +13134,10 @@ pub(crate) mod tests {
         let checkpoint = handle
             .create_checkpoint(CheckpointCreateRequest::default())
             .unwrap();
+        assert_eq!(
+            checkpoint.schema,
+            scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA
+        );
         host.wait_applied(&handle.step().unwrap());
         let target = handle.read_snapshot().unwrap().world.tick;
         let command = handle
@@ -16752,6 +16970,567 @@ pub(crate) mod tests {
             assert_eq!(capacity.lock().unwrap().reserved_grid_cells, 0);
             assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one actual auxiliary-science owner proves full capture, exact replay, immutable retries and different-owner cold recovery"
+    )]
+    fn full_checkpoint_catalog_preserves_auxiliary_science_and_cold_recovery() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            spike_damage: 0.0,
+            archive_enabled: true,
+            archive_interval: 1,
+            archive_min_lifetime_ticks: 1,
+            selection_mode: scriptbots_core::EvolutionSelectionMode::Novelty,
+            communication_scramble: true,
+            communication_scramble_seed: Some(0x6361_7461),
+            communication_mi_interval: 1,
+            communication_mi_window: 4,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let width = world.terrain().width();
+        let height = world.terrain().height();
+        let map = scriptbots_core::MapArtifact::new(
+            world.terrain().clone(),
+            Some(
+                scriptbots_core::ScalarField::new(
+                    width,
+                    height,
+                    vec![0.25; world.terrain().tiles().len()],
+                )
+                .unwrap(),
+            ),
+            Some(
+                scriptbots_core::ScalarField::new(
+                    width,
+                    height,
+                    vec![0.75; world.terrain().tiles().len()],
+                )
+                .unwrap(),
+            ),
+            None,
+            None,
+            scriptbots_core::MapArtifactMetadata {
+                generator: scriptbots_core::MapGeneratorKind::RuleBased,
+                tileset_id: "full-catalog-auxiliary-science".to_owned(),
+                tileset_hash: 1,
+                seed: 42,
+                width,
+                height,
+                attempt_count: 1,
+                succeeded_on: 1,
+                generated_at_epoch_ms: 0,
+            },
+        )
+        .unwrap();
+        world.apply_map_artifact(&map).unwrap();
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+        for _ in 0..2 {
+            let agent = world
+                .try_spawn_agent(scriptbots_core::AgentData {
+                    position: scriptbots_core::Position::new(40.0, 40.0),
+                    ..scriptbots_core::AgentData::default()
+                })
+                .unwrap();
+            assert!(world.bind_agent_brain(agent, brains.population()[0]).unwrap());
+        }
+        let host = TestHost::spawn_with_schedule(
+            world,
+            Some(vec![
+                scriptbots_runtime::ScheduledConfigPatch::new(
+                    1,
+                    Tick(4),
+                    serde_json::json!({"food_growth_rate": 0.017}),
+                )
+                .unwrap(),
+            ]),
+        );
+        let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+        for _ in 0..2 {
+            host.wait_applied(&handle.step().unwrap());
+        }
+        let saved_snapshot = host.port.snapshot_hub().latest();
+        let saved_digest = host.port.scientific_digest_v1().unwrap();
+        let request = CheckpointCreateRequest {
+            description: Some("full auxiliary-science cut".to_owned()),
+            idempotency_key: Some("full-catalog-cut".to_owned()),
+        };
+        let saved = handle.create_checkpoint(request.clone()).unwrap();
+        assert_eq!(saved.schema, scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA);
+        assert_eq!(saved.tick, 2);
+        assert_eq!(saved.agent_count, 2);
+        assert_eq!(saved.world_digest_v1, saved_digest.overall);
+        let (artifact, bytes) = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap();
+        let owner = scriptbots_runtime::HostCheckpointV1::decode(&bytes).unwrap();
+        assert_eq!(owner.session_id(), handle.session_id());
+        assert_eq!(owner.remaining_schedule().unwrap().len(), 1);
+        assert!(owner.validate_standalone_projection().is_err());
+        let source = CatalogCheckpoint::decode(&saved.schema, &bytes).unwrap();
+        let mut detached = ControlHandle::restore_catalog_world(&source).unwrap();
+        assert_eq!(detached.world_digest_v1().unwrap(), saved_digest);
+        assert!(detached.temperature().is_some());
+
+        host.wait_applied(&handle.step().unwrap());
+        let target_snapshot = host.port.snapshot_hub().latest();
+        let target_digest = host.port.scientific_digest_v1().unwrap();
+        detached.step().unwrap();
+        assert_eq!(detached.world_digest_v1().unwrap(), target_digest);
+        for _ in 0..2 {
+            host.wait_applied(&handle.step().unwrap());
+        }
+        let live = host.port.scientific_digest_cut().unwrap();
+        let publication = host.port.snapshot_hub().latest();
+        assert_eq!(live.digest.tick.0, 5);
+        assert_eq!(publication.scheduled_patches.len(), 1);
+        let retained = handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let audit =
+            ControlHandle::event_review_config_audit(&retained, &live, &publication).unwrap();
+        let target = ControlHandle::replay_event_canvas_world_restored(
+            ControlHandle::restore_catalog_world(&source).unwrap(),
+            source.science(),
+            &live.digest,
+            &audit,
+            &[],
+            3,
+            retained.source_persistence_interval,
+            retained.source_config_revision,
+            None,
+        )
+        .unwrap();
+        assert_eq!(target.world_digest_v1().unwrap(), target_digest);
+
+        // Slot handles and the prior-tick death counter are not scientific identity.
+        // Compare every remaining projected field against the real owner observations.
+        let logical = |mut value: Value| {
+            for agent in value["agents"].as_array_mut().unwrap() {
+                agent.as_object_mut().unwrap().remove("id").unwrap();
+            }
+            value["summary"]
+                .as_object_mut()
+                .unwrap()
+                .remove("deaths")
+                .unwrap();
+            value
+        };
+        let saved_view = handle.checkpoint_canvas(&saved.checkpoint_id).unwrap();
+        assert_eq!(
+            logical(serde_json::to_value(&saved_view.world).unwrap()),
+            logical(serde_json::to_value(&saved_snapshot.world).unwrap())
+        );
+        let selected = lab_checkpoint_descriptor(&saved);
+        let native = handle
+            .replay_canvas_from_checkpoint(handle.session_id(), &selected, 3)
+            .unwrap();
+        let (_, remote) = handle
+            .replay_canvas_from_checkpoint_bounded(handle.session_id(), &saved.checkpoint_id, 3)
+            .unwrap();
+        let event = handle.event_canvas(3).unwrap();
+        for review in [&native, &remote, &event] {
+            assert_eq!(
+                logical(serde_json::to_value(&review.snapshot.world).unwrap()),
+                logical(serde_json::to_value(&target_snapshot.world).unwrap())
+            );
+            assert_eq!(
+                review.verification,
+                scriptbots_runtime::lab_workflows::LabReplayVerification::CapturedInterval {
+                    verified_through_tick: 5,
+                    captured_current_digest: live.digest.overall.clone(),
+                }
+            );
+        }
+        assert_eq!(handle.create_checkpoint(request.clone()).unwrap(), saved);
+        let mut changed = request.clone();
+        changed.description = Some("different request".to_owned());
+        assert!(matches!(
+            handle.create_checkpoint(changed),
+            Err(ControlError::Conflict(_))
+        ));
+        let mut false_schema = saved.clone();
+        false_schema.schema = scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA.to_owned();
+        assert!(ControlHandle::decode_canvas_checkpoint(&false_schema, &artifact, &bytes).is_err());
+        assert!(matches!(
+            handle.create_checkpoint_branch(checkpoint_branch_request(
+                &saved.checkpoint_id,
+                "full-source-independent-branch"
+            )),
+            Err(ControlError::BadRequest(_))
+        ));
+        assert!(!directory.join("branches").exists());
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), live.digest);
+        assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &publication));
+        assert_eq!(handle.read_artifact_bytes(&saved.checkpoint_id).unwrap().1, bytes);
+        drop(handle);
+        drop(host);
+
+        let cold_owner = TestHost::spawn_with_identity(
+            WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(59),
+                world_width: 120,
+                world_height: 120,
+                food_cell_size: 20,
+                persistence_interval: 0,
+                closed: true,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap(),
+            None,
+            scriptbots_runtime::HostSessionId::new(0xc018),
+        );
+        let cold = cold_owner.handle().with_artifacts_dir(directory).unwrap();
+        let cold_digest = cold_owner.port.scientific_digest_v1().unwrap();
+        let cold_publication = cold_owner.port.snapshot_hub().latest();
+        assert_eq!(cold.create_checkpoint(request).unwrap(), saved);
+        assert_eq!(cold.read_artifact_bytes(&saved.checkpoint_id).unwrap().1, bytes);
+        let (reopened, view) = cold.checkpoint_canvas_bounded(&saved.checkpoint_id).unwrap();
+        assert_eq!(reopened, saved);
+        assert_eq!(
+            logical(serde_json::to_value(&view.world).unwrap()),
+            logical(serde_json::to_value(&saved_snapshot.world).unwrap())
+        );
+        assert!(matches!(
+            cold.replay_canvas_from_checkpoint_bounded(cold.session_id(), &saved.checkpoint_id, 3),
+            Err(ControlError::BadRequest(reason))
+                if reason.contains("no acknowledged current-owner replay history")
+        ));
+        assert!(
+            cold.data_services
+                .checkpoint_retention
+                .lock()
+                .unwrap()
+                .requests
+                .is_empty()
+        );
+        assert_eq!(cold_owner.port.scientific_digest_v1().unwrap(), cold_digest);
+        assert!(Arc::ptr_eq(
+            &cold_owner.port.snapshot_hub().latest(),
+            &cold_publication
+        ));
+    }
+
+    #[test]
+    fn checkpoint_catalog_keeps_fitness_archive_and_disabled_feature_history() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            persistence_interval: 0,
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            archive_enabled: true,
+            archive_interval: 1,
+            archive_min_lifetime_ticks: 1,
+            selection_mode: scriptbots_core::EvolutionSelectionMode::Fitness,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+        let agent = world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        assert!(world.bind_agent_brain(agent, brains.population()[0]).unwrap());
+        world.step().unwrap();
+        world.step().unwrap();
+        assert!(world.archive().unwrap().coverage_count() > 0);
+        let statistics = world.agent_stats().clone();
+        assert_eq!(statistics.len(), 1);
+        assert_eq!(statistics.values().next().unwrap().ticks_observed, 2);
+        let host = TestHost::spawn(world);
+        let handle = host.handle().with_artifacts_dir(directory).unwrap();
+        for enabled in [true, false] {
+            if !enabled {
+                host.wait_applied(
+                    &handle
+                        .apply_patch(serde_json::json!({"archive_enabled": false}))
+                        .unwrap(),
+                );
+            }
+            let saved = handle
+                .create_checkpoint(CheckpointCreateRequest {
+                    description: Some(format!("archive enabled: {enabled}")),
+                    idempotency_key: Some(format!("archive-history-{enabled}")),
+                })
+                .unwrap();
+            assert_eq!(saved.schema, scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA);
+            let (_, bytes) = handle.read_artifact_bytes(&saved.checkpoint_id).unwrap();
+            let owner = scriptbots_runtime::HostCheckpointV1::decode(&bytes).unwrap();
+            assert_eq!(owner.config().archive_enabled, enabled);
+            assert!(matches!(
+                owner.validate_standalone_projection(),
+                Err(scriptbots_core::WorldCheckpointError::RequiresHostContinuity {
+                    feature: "quality-diversity history"
+                })
+            ));
+            if !enabled {
+                owner.world_checkpoint().validate_standalone_restore().unwrap();
+            }
+            let source = CatalogCheckpoint::decode(&saved.schema, &bytes).unwrap();
+            let restored = ControlHandle::restore_catalog_world(&source).unwrap();
+            assert_eq!(restored.agent_stats(), &statistics);
+            assert_eq!(restored.archive().is_some(), enabled);
+            if enabled {
+                assert!(restored.archive().unwrap().coverage_count() > 0);
+            }
+            let current = host.port.scientific_digest_v1().unwrap();
+            assert_eq!(restored.world_digest_v1().unwrap(), current);
+            assert_eq!(
+                handle
+                    .checkpoint_canvas_bounded(&saved.checkpoint_id)
+                    .unwrap()
+                    .1
+                    .world
+                    .tick,
+                saved.tick
+            );
+            assert_eq!(host.port.scientific_digest_v1().unwrap(), current);
+        }
+    }
+
+    #[test]
+    fn full_checkpoint_capture_refusal_publishes_no_catalog_or_request() {
+        struct ExternalSenseProvider;
+
+        impl scriptbots_core::SenseProvider for ExternalSenseProvider {
+            fn compute_accumulators(
+                &mut self,
+                _world: &WorldState,
+                handles: &[scriptbots_core::AgentId],
+            ) -> Result<
+                Vec<scriptbots_core::sense_fixed::SenseAccum>,
+                scriptbots_core::SenseProviderError,
+            > {
+                Ok(handles.iter().map(|_| Default::default()).collect())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let mut world = WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(42),
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            persistence_interval: 0,
+            closed: true,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            archive_enabled: true,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world.set_sense_provider(Box::new(ExternalSenseProvider));
+        let host = TestHost::spawn(world);
+        let handle = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+        let publication = host.port.snapshot_hub().latest();
+        let request = CheckpointCreateRequest {
+            description: None,
+            idempotency_key: Some("full-capture-refusal".into()),
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                handle.create_checkpoint(request.clone()),
+                Err(ControlError::Host(error)) if error.to_string().contains("host.sense_provider")
+            ));
+            let usage = handle.checkpoint_retention_usage().unwrap();
+            assert_eq!(usage.file_count, 0);
+            assert_eq!(usage.file_bytes, 0);
+            assert_eq!(usage.request_entries, 0);
+            assert_eq!(usage.pending_entries, 0);
+            assert_eq!(handle.list_checkpoints(None, None).unwrap().total, 0);
+            assert!(fs::read_dir(&directory).unwrap().next().is_none());
+            assert!(Arc::ptr_eq(&host.port.snapshot_hub().latest(), &publication));
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one file-backed owner proves full catalog dispatch, durable storage identity, and exact retry after the owner advances"
+    )]
+    fn full_checkpoint_catalog_uses_the_matching_file_backed_owner() -> anyhow::Result<()> {
+        use crate::host_thread::{HostBootstrap, HostThread};
+        use scriptbots_runtime::{
+            ApplicationState, CommandEnvelope, CommandId, HostCommand, HostCoreOptions, HostPort,
+            HostSessionId, JournalState, PlaybackSnapshot, ScheduledConfigPatch,
+            channel::ChannelHostOptions,
+        };
+        use scriptbots_storage::{StoragePipeline, StorageReader};
+        use std::time::Duration;
+
+        fn submit_durable(
+            port: &mut impl HostPort,
+            id: u128,
+            command: HostCommand,
+        ) -> anyhow::Result<()> {
+            let id = CommandId::new(id);
+            port.submit(CommandEnvelope::new(id, command))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let status = port.command_status(id)?.expect("submitted fixture command");
+                if status.journal() == &JournalState::Durable {
+                    anyhow::ensure!(
+                        matches!(status.application(), ApplicationState::Applied(_)),
+                        "fixture command did not apply: {status:?}"
+                    );
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "fixture command did not settle: {status:?}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let root = tempfile::tempdir()?.keep();
+        let database = root.join("full-catalog.sqlite");
+        let path = database.to_str().expect("fixture path");
+        let mut pipeline = StoragePipeline::create_unattributed_file(path)?;
+        let run_id = pipeline.run_id();
+        let config = ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            rng_seed: Some(42_104),
+            closed: true,
+            persistence_interval: 3,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            spike_damage: 0.0,
+            archive_enabled: true,
+            archive_interval: 1,
+            archive_min_lifetime_ticks: 1,
+            selection_mode: scriptbots_core::EvolutionSelectionMode::Novelty,
+            ..ScriptBotsConfig::default()
+        };
+        let (mut world, persistence) =
+            WorldState::with_persistence(config, Box::new(pipeline.sink()))?;
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp)?;
+        let agent = world.try_spawn_agent(scriptbots_core::AgentData {
+            position: scriptbots_core::Position::new(40.0, 40.0),
+            ..scriptbots_core::AgentData::default()
+        })?;
+        assert!(world.bind_agent_brain(agent, brains.population()[0])?);
+        let session = HostSessionId::new(0xc018_f11e);
+        let journal = pipeline.journal_port(session, Default::default())?;
+        let host = HostThread::spawn_with_bootstrap(
+            session,
+            world,
+            persistence,
+            Box::new(journal),
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            ChannelHostOptions::default(),
+            HostBootstrap {
+                schedule: vec![
+                    ScheduledConfigPatch::new(
+                        1,
+                        Tick(3),
+                        serde_json::json!({"food_growth_rate": 0.017}),
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                ],
+                ..HostBootstrap::default()
+            },
+        )?;
+        let mut port = host.port();
+        let handle = ControlHandle::new(port.clone())
+            .with_artifacts_dir(root.join("artifacts"))?
+            .with_checkpoint_writer(Some(pipeline.checkpoint_writer()));
+        submit_durable(&mut port, 1, HostCommand::Step)?;
+        let request = CheckpointCreateRequest {
+            idempotency_key: Some("full-file-owner".to_owned()),
+            description: Some("same durable owner and storage cut".to_owned()),
+        };
+        // Save uses the existing owner capture boundary to settle this cadence tail.
+        let saved = handle.create_checkpoint(request.clone())?;
+        let observed = port.scientific_digest_v1()?;
+        assert_eq!(saved.schema, scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA);
+        assert_eq!(saved.tick, 1);
+        assert_eq!(saved.agent_count, 1);
+        assert_eq!(saved.world_digest_v1, observed.overall);
+        let bytes = handle.read_artifact_bytes(&saved.checkpoint_id)?.1;
+        let captured = scriptbots_runtime::HostCheckpointV1::decode(&bytes)?;
+        assert_eq!(captured.session_id(), session);
+        assert_eq!(captured.config().persistence_interval, 3);
+        assert_eq!(captured.world_checkpoint().source_digest(), &observed);
+        assert!(captured.validate_standalone_projection().is_err());
+        assert_eq!(captured.remaining_schedule().unwrap().len(), 1);
+        assert_eq!(captured.persistence_last_admitted_tick(), Some(Tick(1)));
+        assert!(captured.journal_cut().last_journal_sequence > 0);
+
+        submit_durable(&mut port, 2, HostCommand::Step)?;
+        submit_durable(&mut port, 3, HostCommand::FlushPersistence)?;
+        let live = port.scientific_digest_v1()?;
+        assert_eq!(live.tick.0, 2);
+        assert_eq!(handle.create_checkpoint(request)?, saved);
+        assert_eq!(handle.read_artifact_bytes(&saved.checkpoint_id)?.1, bytes);
+        assert_eq!(port.scientific_digest_v1()?, live);
+        let usage = handle.checkpoint_retention_usage()?;
+        assert_eq!(usage.file_count, 1);
+        assert_eq!(usage.sql_count, Some(1));
+        assert_eq!(usage.pending_entries, 0);
+        drop(handle);
+        port.submit(CommandEnvelope::new(CommandId::new(4), HostCommand::Shutdown))?;
+        drop(port);
+        let receipt = host.join()?;
+        assert_eq!(receipt.final_digest?, live);
+        pipeline.shutdown()?;
+
+        let reader = StorageReader::open_finished(path)?;
+        assert_eq!(reader.host_journal_sessions()?, vec![session]);
+        assert_eq!(reader.summary_ticks()?, vec![1, 2]);
+        let row = reader
+            .load_checkpoint(&saved.checkpoint_id)?
+            .expect("catalog SQL row");
+        assert_eq!(row.checkpoint_ordinal, 0);
+        assert_eq!(row.tick, saved.tick);
+        assert_eq!(row.format, format!("{}+postcard_hex", saved.schema));
+        assert_eq!(row.payload_digest, format!("blake3:{}", saved.checksum_blake3));
+        assert_eq!(row.host_checkpoint()?.encode()?, bytes);
+        let metadata: serde_json::Value = serde_json::from_str(&row.metadata_json)?;
+        assert_eq!(metadata["source"], "control_api");
+        let cut = &metadata["host_storage_cut"];
+        assert_eq!(cut["schema_version"], 1);
+        assert_eq!(cut["run_id"], run_id.to_string());
+        assert_eq!(cut["last_admitted_tick"], 1);
+        assert!(!cut["admitted"].is_null());
+        assert_eq!(cut["admitted"], cut["applied"]);
+        assert_eq!(cut["applied"], cut["durable"]);
+        reader.close()?;
+        Ok(())
     }
 
     #[test]

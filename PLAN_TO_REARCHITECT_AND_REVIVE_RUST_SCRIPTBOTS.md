@@ -2,6 +2,41 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Save and review complete owner checkpoints (2026-11-24):**
+[Currently In Progress — Codex; scoped contributions to `bd-2z0.5.13` and
+`bd-2z0.12.2`; original ownership and complete acceptance retained]
+
+Implemented complete owner artifacts through the shared Save, persistence,
+catalog recovery and saved/selected review paths. Ordinary standalone capture
+keeps its existing admission behavior, including supported stopped-owner saves.
+When omitted auxiliary science requires a full artifact, a successful complete
+capture supplies all metadata from its own atomic cut. The catalog retains the
+actual schema and routes full envelopes to the host-checkpoint writer. Checksums,
+exact keyed retries, capacity admission and original-writer acknowledgement
+remain required before publication.
+
+Saved and bounded historical review restore complete auxiliary science while
+disabling only their detached recording interval, without inventing an operator
+update or adopting the saved owner/session. Independent branch studies retain
+their explicit standalone-source restrictions. Fitness-mode archives and
+behavioral statistics retained after feature disable also require full artifacts;
+the paired projection check prevents a catalog from silently dropping them.
+
+Authored regressions use actual owners for imported maps, Novelty selection,
+scrambling, scheduled changes, current-owner replay, immutable retries and cold
+saved-cut recovery without owner adoption. A matching file pipeline exercises
+full checkpoint SQL readback and retained bytes. Core coverage compares real
+archive resurrection and detached review against the original world, includes
+an empty-archive negative, and retains behavior after disable/re-enable. Capture
+refusals retain zero new request, file or catalog publications.
+
+Independent source review is complete. The initial core increment passed DSR
+parsing; its formatter findings were addressed manually after the executor
+became unavailable. Final parsing/formatting of this four-file increment and
+native compilation, Clippy and tests remain unexecuted. The earlier canonical
+DSR native check stopped before compilation during pinned FrankenSQLite Git
+acquisition. These changes do not close the original full acceptance.
+
 **Faithful offline montage replay (2026-11-24):**
 [Currently In Progress — Codex; corrective follow-up to `bd-16g.9.2`;
 original exact-replay, output-integrity and long-run acceptance retained]

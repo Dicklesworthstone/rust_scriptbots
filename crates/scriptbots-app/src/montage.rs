@@ -403,7 +403,7 @@ impl<'a> PersistedReplaySeeker<'a> {
                         && entry.event.position.is_none()
                         && entry.event.counterpart.is_none()
                         && entry.event.counterpart_position.is_none()
-                        && overall.len() == 64
+                        && overall.len() == std::mem::size_of::<u64>() * 2
                         && overall
                             .bytes()
                             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
@@ -1318,7 +1318,7 @@ mod tests {
         use scriptbots_runtime::{ApplicationState, CommandEnvelope, CommandId, JournalState};
         use std::time::Duration;
 
-        let id = CommandId::new(id);
+        let id = CommandId::new(u128::from(id));
         port.submit(CommandEnvelope::new(id, command))?;
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {

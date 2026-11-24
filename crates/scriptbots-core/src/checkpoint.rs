@@ -210,6 +210,24 @@ impl WorldHostCheckpointV1 {
         self.persistence_discarded_records_at
     }
 
+    /// Whether the paired science component can restore without this companion.
+    ///
+    /// Enabled archive features and retained behavioral statistics require the full artifact,
+    /// even after an operator has disabled the archive or returned to Fitness selection.
+    /// The science component alone cannot reveal history it does not serialize.
+    pub fn validate_standalone_projection(
+        &self,
+        science: &WorldCheckpointV1,
+    ) -> Result<(), WorldCheckpointError> {
+        self.validate(science)?;
+        science.validate_standalone_restore()?;
+        ensure_standalone_checkpoint_features(
+            &self.config,
+            science.state.map_metadata.is_some() || self.temperature.is_some(),
+            self.archive.is_some() || !self.agent_stats.is_empty() || self.novelty_state.is_some(),
+        )
+    }
+
     /// Validate this companion against its independently validated science checkpoint.
     pub fn validate(&self, world: &WorldCheckpointV1) -> Result<(), WorldCheckpointError> {
         self.config.validate()?;
@@ -816,6 +834,7 @@ pub enum WorldCheckpointError {
 fn ensure_standalone_checkpoint_features(
     config: &ScriptBotsConfig,
     has_map_state: bool,
+    has_quality_diversity_history: bool,
 ) -> Result<(), WorldCheckpointError> {
     let feature = if has_map_state {
         "imported map state"
@@ -826,6 +845,8 @@ fn ensure_standalone_checkpoint_features(
         "selection history"
     } else if config.communication_scramble {
         "communication scrambling RNG"
+    } else if config.archive_enabled || has_quality_diversity_history {
+        "quality-diversity history"
     } else {
         return Ok(());
     };
@@ -1280,7 +1301,11 @@ impl WorldCheckpointV1 {
     /// brain-registry compatibility is checked separately at the actual restore boundary.
     pub fn validate_standalone_restore(&self) -> Result<(), WorldCheckpointError> {
         self.validate_contract()?;
-        ensure_standalone_checkpoint_features(&self.state.config, self.state.map_metadata.is_some())
+        ensure_standalone_checkpoint_features(
+            &self.state.config,
+            self.state.map_metadata.is_some(),
+            false,
+        )
     }
 
     /// Complete data-only registry recipe the host must reproduce before restoration.
@@ -1703,6 +1728,22 @@ impl WorldState {
         Ok(world)
     }
 
+    /// Restore complete science for detached observation without resuming a persistence owner.
+    ///
+    /// Saved-frame review and bounded historical reconstruction use the full auxiliary state,
+    /// but discard their own persistence output. Only the recording interval is normalized;
+    /// no configuration command, revision increment or derived-state refresh is invented.
+    /// This projection does not continue the captured owner's journal or admission authority.
+    pub fn restore_host_science_projection_v1(
+        science: &WorldCheckpointV1,
+        continuity: &WorldHostCheckpointV1,
+        registry: BrainRegistry,
+    ) -> Result<Self, WorldCheckpointError> {
+        let mut world = Self::restore_host_checkpoint_v1(science, continuity, registry)?;
+        world.config.persistence_interval = 0;
+        Ok(world)
+    }
+
     /// Capture a strict V1 checkpoint at a quiescent, persistence-disabled science boundary.
     ///
     /// Bound legacy runners are rejected because they have no versioned genome/evaluator-state
@@ -1727,6 +1768,7 @@ impl WorldState {
         ensure_standalone_checkpoint_features(
             &self.config,
             self.map_metadata.is_some() || self.temperature.is_some(),
+            self.archive.is_some() || !self.agent_stats.is_empty() || self.novelty_state.is_some(),
         )?;
         self.capture_checkpoint_inner(self.config.clone())
     }
@@ -1757,6 +1799,7 @@ impl WorldState {
         ensure_standalone_checkpoint_features(
             &self.config,
             self.map_metadata.is_some() || self.temperature.is_some(),
+            self.archive.is_some() || !self.agent_stats.is_empty() || self.novelty_state.is_some(),
         )?;
         self.capture_checkpoint_component_quiescent()
     }
@@ -3855,6 +3898,182 @@ mod tests {
                 restored.world_digest_v1().unwrap()
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one populated Fitness archive proves faithful resurrection, detached review and retained history after the feature is disabled"
+    )]
+    fn full_checkpoint_preserves_fitness_archive_and_detached_science_review() {
+        let (mut original, key) = world_with_checkpoint_family();
+        let mut config = original.config.clone();
+        config.persistence_interval = 1;
+        config.reproduction_energy_threshold = f32::MAX;
+        config.archive_enabled = true;
+        config.archive_interval = 1;
+        config.archive_min_lifetime_ticks = 1;
+        original.apply_config_update(config).unwrap();
+        assert_eq!(
+            original.config.selection_mode,
+            crate::EvolutionSelectionMode::Fitness
+        );
+        for _ in 0..2 {
+            let agent = original.try_spawn_agent(AgentData::default()).unwrap();
+            assert!(original.bind_agent_brain(agent, key).unwrap());
+        }
+        let mut source_session = original
+            .bind_persistence(Box::new(crate::NullPersistence))
+            .unwrap();
+        for _ in 0..2 {
+            source_session.step(&mut original).unwrap();
+        }
+        assert!(original.archive.as_ref().unwrap().coverage_count() > 0);
+        assert_eq!(original.agent_stats.len(), 2);
+        assert!(
+            original
+                .agent_stats
+                .values()
+                .all(|stats| stats.ticks_observed == 2)
+        );
+        assert_requires_host_continuity(
+            original.capture_checkpoint_quiescent(),
+            "quality-diversity history",
+        );
+        let (science, companion) = original.capture_host_checkpoint_parts_v1().unwrap();
+        assert_requires_host_continuity(
+            science.validate_standalone_restore(),
+            "quality-diversity history",
+        );
+        assert_requires_host_continuity(
+            companion.validate_standalone_projection(&science),
+            "quality-diversity history",
+        );
+        let mut restored = WorldState::restore_host_checkpoint_v1(
+            &science,
+            &companion,
+            prepared_checkpoint_registry(),
+        )
+        .unwrap();
+        let mut projected = WorldState::restore_host_science_projection_v1(
+            &science,
+            &companion,
+            prepared_checkpoint_registry(),
+        )
+        .unwrap();
+        assert_eq!(projected.config.persistence_interval, 0);
+        assert_eq!(restored.config.persistence_interval, 1);
+        assert_eq!(projected.config_revision, original.config_revision);
+        assert_eq!(
+            serde_json::to_value(&projected.config_audit).unwrap(),
+            serde_json::to_value(&original.config_audit).unwrap(),
+            "review must not invent an operator configuration event"
+        );
+        assert_host_auxiliary_state_equal(&original, &projected);
+        let mut archive_loss = WorldState::restore_host_science_projection_v1(
+            &science,
+            &companion,
+            prepared_checkpoint_registry(),
+        )
+        .unwrap();
+        archive_loss.archive = Some(
+            crate::MapElitesArchive::new(
+                archive_loss.config.archive_space.clone(),
+                archive_loss.config.archive_quality_metric,
+                archive_loss.config.archive_min_lifetime_ticks,
+                archive_loss.config.archive_max_bytes,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            original.world_digest_v1().unwrap(),
+            archive_loss.world_digest_v1().unwrap()
+        );
+        let mut restored_session = restored
+            .bind_persistence(Box::new(crate::NullPersistence))
+            .unwrap();
+        for world in [&mut original, &mut restored, &mut projected, &mut archive_loss] {
+            world
+                .enqueue_intervention(Intervention::SpawnFromArchive {
+                    selector: crate::CellSelector::TopKByQuality(1),
+                    placement: crate::Placement::Seeded {
+                        region: Region::All,
+                        seed: 0x51a7,
+                    },
+                    headroom: Some(1),
+                    herbivore_tendency: Some(0.7),
+                })
+                .unwrap();
+        }
+        source_session.step(&mut original).unwrap();
+        restored_session.step(&mut restored).unwrap();
+        projected.step().unwrap();
+        archive_loss.step().unwrap();
+        assert_eq!(
+            original.agent_count(),
+            3,
+            "the saved elite must actually resurrect"
+        );
+        assert_eq!(
+            archive_loss.agent_count(),
+            2,
+            "an empty replacement archive loses the resurrection"
+        );
+        for exact in [&restored, &projected] {
+            assert_protocol_state_equal(&original, exact);
+            assert_host_auxiliary_state_equal(&original, exact);
+            assert_eq!(
+                original.world_digest_v1().unwrap(),
+                exact.world_digest_v1().unwrap()
+            );
+        }
+        assert_ne!(
+            original.world_digest_v1().unwrap(),
+            archive_loss.world_digest_v1().unwrap()
+        );
+
+        // Disabling the feature leaves accumulated behavior available if it is re-enabled.
+        // Only the full companion can tell the catalog that these disabled settings still
+        // require a complete artifact.
+        let mut disabled = original.config.clone();
+        disabled.archive_enabled = false;
+        disabled.persistence_interval = 0;
+        original.apply_config_update(disabled).unwrap();
+        assert!(original.archive.is_none());
+        assert!(!original.agent_stats.is_empty());
+        assert_requires_host_continuity(
+            original.capture_checkpoint_quiescent(),
+            "quality-diversity history",
+        );
+        let (disabled_science, disabled_companion) =
+            original.capture_host_checkpoint_parts_v1().unwrap();
+        disabled_science.validate_standalone_restore().unwrap();
+        assert_requires_host_continuity(
+            disabled_companion.validate_standalone_projection(&disabled_science),
+            "quality-diversity history",
+        );
+        let mut resumed = WorldState::restore_host_checkpoint_v1(
+            &disabled_science,
+            &disabled_companion,
+            prepared_checkpoint_registry(),
+        )
+        .unwrap();
+        assert_eq!(resumed.agent_stats, original.agent_stats);
+        let mut enabled = original.config.clone();
+        enabled.archive_enabled = true;
+        enabled.persistence_interval = 1;
+        original.apply_config_update(enabled.clone()).unwrap();
+        resumed.apply_config_update(enabled).unwrap();
+        let mut resumed_session = resumed
+            .bind_persistence(Box::new(crate::NullPersistence))
+            .unwrap();
+        source_session.step(&mut original).unwrap();
+        resumed_session.step(&mut resumed).unwrap();
+        assert_host_auxiliary_state_equal(&original, &resumed);
+        assert_eq!(
+            original.world_digest_v1().unwrap(),
+            resumed.world_digest_v1().unwrap()
+        );
     }
 
     #[test]

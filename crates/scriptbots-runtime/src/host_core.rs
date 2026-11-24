@@ -623,6 +623,22 @@ impl HostCheckpointV1 {
         self.state.revisions.config
     }
 
+    /// Actual scientific revision retained at the same atomic owner cut.
+    #[must_use]
+    pub const fn scientific_revision(&self) -> ScientificRevision {
+        self.state.revisions.scientific
+    }
+
+    /// Whether the science component can be retained without losing companion state.
+    ///
+    /// Checking the component alone cannot detect history retained after its feature
+    /// was disabled. Catalogs use this paired check before choosing the raw format.
+    pub fn validate_standalone_projection(&self) -> Result<(), scriptbots_core::WorldCheckpointError> {
+        self.state
+            .continuity
+            .validate_standalone_projection(&self.world)
+    }
+
     /// Actual playback state retained at the owner cut.
     #[must_use]
     pub const fn playback(&self) -> PlaybackSnapshot {
@@ -693,6 +709,21 @@ impl HostCheckpointV1 {
     ) -> Result<WorldState, HostCheckpointError> {
         self.validate()?;
         Ok(WorldState::restore_host_checkpoint_v1(
+            &self.world,
+            &self.state.continuity,
+            registry,
+        )?)
+    }
+
+    /// Restore complete science for detached inspection with persistence disabled.
+    ///
+    /// This projection cannot continue the captured owner or its storage session.
+    pub fn restore_science_projection(
+        &self,
+        registry: scriptbots_core::BrainRegistry,
+    ) -> Result<WorldState, HostCheckpointError> {
+        self.validate()?;
+        Ok(WorldState::restore_host_science_projection_v1(
             &self.world,
             &self.state.continuity,
             registry,
