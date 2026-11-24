@@ -5,7 +5,8 @@
 
 use anyhow::{Context, Result, bail};
 use scriptbots_core::{
-    PersistenceAdmissionSession, ReplayEventKind, ScriptBotsConfig, WorldCheckpointV1, WorldState,
+    PersistenceAdmissionSession, ReplayEventKind, ScriptBotsConfig, WorldCheckpointV1,
+    WorldPersistence, WorldState,
 };
 use scriptbots_runtime::ScheduledConfigPatch;
 use scriptbots_storage::{PersistedReplayEvent, StorageReader};
@@ -30,7 +31,7 @@ pub enum ReplayOperatorCommand {
     World(scriptbots_core::ControlCommand),
     /// Explicit batch boundary, ordered relative to science inputs.
     FlushPersistence,
-    /// Applied statement from the captured owner's pending schedule.
+    /// Applied statement from the recorded owner's schedule.
     ScheduledConfigPatch(ScheduledConfigPatch),
 }
 
@@ -45,24 +46,36 @@ pub struct ReplayMirror {
     pub operator_commands: BTreeMap<u64, Vec<ReplayOperatorCommand>>,
 }
 
-/// Every science-changing operator command a recorded host applied, by applied tick.
+/// Recorded inputs and whether the host journal is their complete authority.
+#[derive(Debug, Clone, Default)]
+pub struct RecordedInputHistory {
+    /// Commands, scheduled patches and explicit flushes in actual journal order.
+    pub operator_commands: BTreeMap<u64, Vec<ReplayOperatorCommand>>,
+    /// A recorded host owns its schedule even when no scheduled patch was applied.
+    /// External scenario schedules are used only by legacy recordings with no host journal.
+    pub has_host_journal: bool,
+}
+
+/// Every science-changing input a recorded host applied, by applied tick.
 ///
 /// Flushes preserve the cut relative to science commands at the same tick.
 /// Playback-only commands are skipped; migrations require an archipelago and are
-/// refused. Full checkpoint replay also joins applied scheduled patches by their
-/// journal identity, preserving same-tick input order.
+/// refused. Genesis and checkpoint replay both join applied scheduled patches by
+/// their journal identity. Distinct sessions may only cover disjoint tick ranges:
+/// session identifiers do not define a scientific order at an overlapping boundary.
 #[allow(
     clippy::too_many_lines,
     reason = "one journal read preserves the exact checkpoint cut, command outcomes, scheduled input order and durable boundary refusals"
 )]
-pub fn recorded_operator_commands(
+pub fn recorded_input_history(
     storage: &StorageReader,
     checkpoint: Option<(u64, scriptbots_runtime::HostJournalCutV1)>,
-) -> Result<BTreeMap<u64, Vec<ReplayOperatorCommand>>> {
+) -> Result<RecordedInputHistory> {
     use scriptbots_core::ControlCommand;
     use scriptbots_runtime::{ApplicationState, HostCommand};
 
     let sessions = storage.host_journal_sessions()?;
+    let has_host_journal = !sessions.is_empty();
     if let Some((tick, cut)) = checkpoint {
         if !matches!(sessions.as_slice(), [session] if *session == cut.session_id) {
             bail!("checkpoint replay requires its exact recorded host session");
@@ -94,8 +107,11 @@ pub fn recorded_operator_commands(
             bail!("checkpoint replay journal cut differs from the recorded durable boundary");
         }
     }
-    let mut commands: BTreeMap<u64, Vec<(u64, ReplayOperatorCommand)>> = BTreeMap::new();
+    let mut commands: BTreeMap<u64, Vec<ReplayOperatorCommand>> = BTreeMap::new();
+    let mut session_ranges: Vec<(scriptbots_runtime::HostSessionId, u64, u64)> = Vec::new();
     for session in sessions {
+        let mut session_commands: BTreeMap<u64, Vec<(u64, ReplayOperatorCommand)>> =
+            BTreeMap::new();
         let mut after = None;
         loop {
             let page = storage
@@ -156,7 +172,7 @@ pub fn recorded_operator_commands(
                         existing_agent_policy,
                     },
                     HostCommand::FlushPersistence => {
-                        commands
+                        session_commands
                             .entry(record.terminal_boundary.tick.0)
                             .or_default()
                             .push((
@@ -177,7 +193,7 @@ pub fn recorded_operator_commands(
                     | HostCommand::UpdateSimulation(_)
                     | HostCommand::Shutdown => continue,
                 };
-                commands
+                session_commands
                     .entry(record.terminal_boundary.tick.0)
                     .or_default()
                     .push((
@@ -190,35 +206,43 @@ pub fn recorded_operator_commands(
                 None => break,
             }
         }
-    }
-    if let Some((tick, cut)) = checkpoint {
         // Scheduled patches are separate journal records, not operator commands.
         // Their actual position relative to same-tick commands is authoritative.
-        let mut after = (cut.last_journal_sequence != 0).then_some(
-            scriptbots_runtime::JournalBatchId::new(cut.session_id, cut.last_journal_sequence),
-        );
+        let mut after = checkpoint.and_then(|(_, cut)| {
+            (cut.last_journal_sequence != 0).then_some(
+                scriptbots_runtime::JournalBatchId::new(cut.session_id, cut.last_journal_sequence),
+            )
+        });
+        let minimum_tick = checkpoint.map_or(0, |(tick, _)| tick);
+        let mut session_range: Option<(u64, u64)> = None;
         loop {
             let page = storage.host_journal_session_conformance_page(
-                cut.session_id,
+                session,
                 after,
                 1024,
                 scriptbots_storage::MAX_HOST_JOURNAL_ARCHIVE_BYTES,
             )?;
             for record in page.records {
+                if record.state != scriptbots_storage::HostJournalRecordState::Durable
+                    || record.applied.tick.0 < minimum_tick
+                {
+                    bail!("replay input history differs from its durable journal boundary");
+                }
+                let tick = record.applied.tick.0;
+                session_range = Some(session_range.map_or((tick, tick), |(start, end)| {
+                    (start.min(tick), end.max(tick))
+                }));
                 let Some(evidence) = record.scheduled_patch else {
                     continue;
                 };
-                if record.state != scriptbots_storage::HostJournalRecordState::Durable
-                    || record.applied.tick.0 < tick
-                    || evidence.scheduled.due_tick != record.applied.tick
-                {
+                if evidence.scheduled.due_tick != record.applied.tick {
                     bail!("checkpoint replay schedule differs from its durable journal boundary");
                 }
                 if matches!(
                     evidence.outcome,
                     scriptbots_runtime::ScheduledPatchOutcome::Applied { .. }
                 ) {
-                    commands.entry(record.applied.tick.0).or_default().push((
+                    session_commands.entry(tick).or_default().push((
                         record.batch_id.sequence(),
                         ReplayOperatorCommand::ScheduledConfigPatch(evidence.scheduled),
                     ));
@@ -229,22 +253,34 @@ pub fn recorded_operator_commands(
                 None => break,
             }
         }
-        // A checkpoint requires one exact session, so its journal sequence orders
-        // every command and schedule action. Legacy multi-session iteration stays
-        // unchanged for tick-zero replay.
-        for actions in commands.values_mut() {
+        if let Some((start, end)) = session_range {
+            if let Some((other, _, _)) = session_ranges
+                .iter()
+                .find(|(_, other_start, other_end)| start <= *other_end && *other_start <= end)
+            {
+                bail!(
+                    "replay host sessions {} and {} overlap ticks; their input order is ambiguous",
+                    other.get(),
+                    session.get()
+                );
+            }
+            session_ranges.push((session, start, end));
+        }
+        for (tick, mut actions) in session_commands {
             actions.sort_by_key(|(sequence, _)| *sequence);
+            if actions.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                bail!("replay journal sequence contains multiple inputs without an ordering");
+            }
+            commands
+                .entry(tick)
+                .or_default()
+                .extend(actions.into_iter().map(|(_, action)| action));
         }
     }
-    Ok(commands
-        .into_iter()
-        .map(|(tick, actions)| {
-            (
-                tick,
-                actions.into_iter().map(|(_, action)| action).collect(),
-            )
-        })
-        .collect())
+    Ok(RecordedInputHistory {
+        operator_commands: commands,
+        has_host_journal,
+    })
 }
 
 /// Re-apply inputs at `tick` through the same core entry point the host uses.
@@ -361,8 +397,52 @@ impl ReplayCheckpointSource {
         }
     }
 
+    /// Original recording configuration when the complete owner retained it.
+    ///
+    /// A raw science checkpoint normalizes persistence to zero, so only that
+    /// legacy lane still needs the explicitly supplied recording configuration.
+    pub fn recording_config<'a>(&'a self, fallback: &'a ScriptBotsConfig) -> &'a ScriptBotsConfig {
+        match self {
+            Self::Science(_) => fallback,
+            Self::Host(checkpoint) => checkpoint.config(),
+        }
+    }
+
+    /// Bind a replay sink without rewriting full-owner recording continuity.
+    pub fn bind_restored_persistence(
+        &self,
+        world: &mut WorldState,
+        sink: Box<dyn WorldPersistence>,
+        fallback: &ScriptBotsConfig,
+    ) -> Result<PersistenceAdmissionSession> {
+        match self {
+            Self::Host(checkpoint) => {
+                let mut persistence = world
+                    .bind_persistence(sink)
+                    .context("failed to bind full-owner replay persistence")?;
+                persistence
+                    .restore_admission_cursor(world, checkpoint.persistence_last_admitted_tick())
+                    .context("failed to restore full-owner replay admission cursor")?;
+                Ok(persistence)
+            }
+            Self::Science(checkpoint) => {
+                let interval = fallback.persistence_interval.max(1);
+                let replay_cap = if fallback.replay_event_tick_cap == 0 {
+                    checkpoint.config().replay_event_tick_cap.max(65536)
+                } else {
+                    fallback.replay_event_tick_cap
+                };
+                world
+                    .bind_continuation_persistence(sink, interval, replay_cap)
+                    .context("failed to bind scientific-checkpoint replay persistence")
+            }
+        }
+    }
+
     /// Restore science without discarding any full-owner companion state.
-    pub fn restore_world(&self, registry: scriptbots_core::BrainRegistry) -> Result<WorldState> {
+    pub fn restore_world(&self) -> Result<WorldState> {
+        let registry = crate::brains::create_brain_registry_for_checkpoint(self.world_checkpoint())
+            .context("failed to reconstruct the checkpoint's exact brain registry")?;
         match self {
             Self::Science(checkpoint) => WorldState::restore_checkpoint_v1(checkpoint, registry)
                 .context(

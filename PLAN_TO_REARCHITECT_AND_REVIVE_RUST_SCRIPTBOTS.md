@@ -2,6 +2,32 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Recorded input authority for native replay (2026-11-24):**
+[Currently In Progress — Codex; scoped contribution to `bd-2z0.5.13`;
+original ownership and complete acceptance retained]
+
+Native checkpoint replay now uses the full source's recording interval, event
+cap, discarded-boundary marker and admission cursor. Registry reconstruction
+uses the saved families and keys, independent of the launch preset. Montage
+shares this same restoration and persistence binding policy. Standalone science
+sources retain their explicit continuation settings and restoration restrictions.
+
+Tick-zero replay now joins applied scheduled patches with operator commands and
+explicit flushes by actual durable journal sequence. An existing host journal
+owns the input schedule even when it contains no applied patch; only recordings
+with no host journal use the launch recipe. Ambiguous overlapping session tick
+ranges and duplicate input sequences refuse rather than invent an order.
+
+Authored real-file coverage compares native and checkpoint replay with an actual
+owner using interval-three recording, an immediate post-capture flush, a later
+mutation before an off-cadence flush, and noncommuting config/schedule inputs.
+It checks complete events and final digests, conflicting launch settings and
+brain presets, ignored invented recipe inputs, and reordered-input divergence.
+A no-journal recording retains its explicit legacy-input classification.
+Compilation, Clippy and executable tests remain unverified: executor resets
+interrupted the pinned DSR tooling restoration before source gates could run.
+These changes do not close the original native acceptance.
+
 **Save and review complete owner checkpoints (2026-11-24):**
 [Currently In Progress — Codex; scoped contributions to `bd-2z0.5.13` and
 `bd-2z0.12.2`; original ownership and complete acceptance retained]

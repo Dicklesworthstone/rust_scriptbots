@@ -25,7 +25,7 @@ use tracing::{error, info};
 
 use crate::persisted_replay::{
     ReplayCheckpointSource, ReplayMirror, apply_recorded_operator_commands, digest_due,
-    mirror_recorded_flush, recorded_flush_ticks, recorded_operator_commands,
+    mirror_recorded_flush, recorded_flush_ticks, recorded_input_history,
 };
 
 /// Supported export formats for highlight reels.
@@ -249,20 +249,22 @@ struct JournalReplayWorld {
 
 impl JournalReplayWorld {
     fn restore(source: &ReplayCheckpointSource, expected: &DigestAnchors) -> anyhow::Result<Self> {
-        let ReplayCheckpointSource::Host(owner) = source else {
+        let ReplayCheckpointSource::Host(_) = source else {
             anyhow::bail!("persisted montage requires complete owner recording continuity");
         };
         let checkpoint = source.world_checkpoint();
-        let registry = crate::brains::create_brain_registry_for_checkpoint(checkpoint)?;
-        let world = source.restore_world(registry)?;
+        let mut world = source.restore_world()?;
         let remaining = Arc::new(Mutex::new(expected.clone()));
         // Full restoration already supplied the raw recording cadence, cap and
         // disabled-boundary marker. The inner science checkpoint normalizes its
         // cadence to zero; rebinding from that config would invent batch cuts.
-        let mut persistence = world.bind_persistence(Box::new(DigestVerifier {
-            remaining: Arc::clone(&remaining),
-        }))?;
-        persistence.restore_admission_cursor(&world, owner.persistence_last_admitted_tick())?;
+        let persistence = source.bind_restored_persistence(
+            &mut world,
+            Box::new(DigestVerifier {
+                remaining: Arc::clone(&remaining),
+            }),
+            checkpoint.config(),
+        )?;
         let current_config = serde_json::to_value(world.config())?;
         Ok(Self {
             world,
@@ -424,10 +426,11 @@ impl<'a> PersistedReplaySeeker<'a> {
                 &recording_config,
                 anchor_tick,
             ),
-            operator_commands: recorded_operator_commands(
+            operator_commands: recorded_input_history(
                 storage,
                 source.journal_cut().map(|cut| (start_tick, cut)),
-            )?,
+            )?
+            .operator_commands,
         };
         source.validate_recorded_schedule(&mirror, anchor_tick)?;
         let mut verification = JournalReplayWorld::restore(&source, &expected)?;
@@ -1696,12 +1699,7 @@ mod tests {
         // Reproduce the former binding bug as a negative control. With cadence
         // one the tick-2 step emits its digest before the recorded mutation and
         // explicit flush; correct journal application cannot repair that cut.
-        let mut wrong_world =
-            seeker
-                .source
-                .restore_world(crate::brains::create_brain_registry_for_checkpoint(
-                    owner.world_checkpoint(),
-                )?)?;
+        let mut wrong_world = seeker.source.restore_world()?;
         let remaining = Arc::new(Mutex::new(seeker.expected.clone()));
         let persistence = wrong_world.bind_continuation_persistence(
             Box::new(DigestVerifier {

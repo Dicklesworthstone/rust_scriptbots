@@ -12,7 +12,7 @@ use scriptbots_app::host_thread::{
 use scriptbots_app::persisted_replay::ReplayOperatorCommand;
 use scriptbots_app::persisted_replay::{
     ReplayCheckpointSource, ReplayMirror, apply_recorded_operator_commands, digest_due,
-    mirror_recorded_flush, recorded_digest_ticks, recorded_flush_ticks, recorded_operator_commands,
+    mirror_recorded_flush, recorded_digest_ticks, recorded_flush_ticks, recorded_input_history,
 };
 #[cfg(feature = "neuro")]
 use scriptbots_app::validated_neuroflow_config;
@@ -5618,12 +5618,23 @@ fn run_replay_cli(
             .journal_cut()
             .map(|cut| (source.world_checkpoint().tick().0, cut))
     });
-    let operator_commands = recorded_operator_commands(&storage, checkpoint_cut)
-        .with_context(|| format!("failed to read the command journal of {db_display}"))?;
+    let history = recorded_input_history(&storage, checkpoint_cut)
+        .with_context(|| format!("failed to read the input journal of {db_display}"))?;
     storage.close()?;
-    let flush_ticks = recorded_flush_ticks(&recorded_batch_ticks, config, tick_limit);
+    let recording_config = replay_checkpoint
+        .as_ref()
+        .map_or(config, |source| source.recording_config(config));
+    let flush_ticks = recorded_flush_ticks(&recorded_batch_ticks, recording_config, tick_limit);
+    // A journal records applied schedules in order with operator commands. An
+    // external recipe must not repeat them or invent actions absent from history.
+    let interventions = if history.has_host_journal {
+        &[]
+    } else {
+        interventions
+    };
+    let operator_commands = history.operator_commands;
 
-    if config.rng_seed.is_none() {
+    if recording_config.rng_seed.is_none() {
         warn!(
             "config_rng_seed" = false,
             "Replay config has no rng_seed; deterministic verification may fail"
@@ -5655,7 +5666,6 @@ fn run_replay_cli(
             &source,
             config,
             tick_limit,
-            cli.brain,
             interventions,
             &mirror,
         )?;
@@ -6237,7 +6247,6 @@ fn run_headless_simulation_from_checkpoint(
     source: &ReplayCheckpointSource,
     config: &ScriptBotsConfig,
     tick_limit: u64,
-    brain_preset: BrainPreset,
     interventions: &[ScenarioInterventionV1],
     mirror: &ReplayMirror,
 ) -> Result<ReplayRun> {
@@ -6252,9 +6261,7 @@ fn run_headless_simulation_from_checkpoint(
     }
     let remaining_ticks = tick_limit - start_tick;
     let (collector, handle) = ReplayCollector::with_capacity(remaining_ticks as usize);
-    let registry = create_brain_registry_for_config(brain_preset, checkpoint.config())
-        .context("failed to create brain registry for checkpoint restore")?;
-    let mut world = source.restore_world(registry)?;
+    let mut world = source.restore_world()?;
     // The full owner supplies the exact pending suffix; the journal supplies
     // which patches actually applied and their order relative to operator inputs.
     // A launch recipe could repeat completed inputs or invent unadmitted ones.
@@ -6264,23 +6271,8 @@ fn run_headless_simulation_from_checkpoint(
     } else {
         interventions
     };
-    let persistence_interval = if config.persistence_interval == 0 {
-        1
-    } else {
-        config.persistence_interval
-    };
-    let replay_event_tick_cap = if config.replay_event_tick_cap == 0 {
-        checkpoint.config().replay_event_tick_cap.max(65536)
-    } else {
-        config.replay_event_tick_cap
-    };
-    let mut persistence = world
-        .bind_continuation_persistence(
-            Box::new(collector),
-            persistence_interval,
-            replay_event_tick_cap,
-        )
-        .context("failed to bind replay collector persistence to restored world")?;
+    let mut persistence =
+        source.bind_restored_persistence(&mut world, Box::new(collector), config)?;
 
     emit_sense_startup_contract();
     let mut current_config = serde_json::to_value(world.config())?;
@@ -11126,7 +11118,9 @@ activation = "Sigmoid"
         pipeline.shutdown()?;
 
         let reader = StorageReader::open_finished(path)?;
-        let all_commands = recorded_operator_commands(&reader, None)?;
+        let history = recorded_input_history(&reader, None)?;
+        assert!(history.has_host_journal);
+        let all_commands = history.operator_commands;
         assert_eq!(
             all_commands[&1]
                 .iter()
@@ -11140,7 +11134,7 @@ activation = "Sigmoid"
             ]
         );
         let cut = checkpoint.journal_cut();
-        let commands = recorded_operator_commands(&reader, Some((1, cut)))?;
+        let commands = recorded_input_history(&reader, Some((1, cut)))?.operator_commands;
         assert_eq!(
             commands[&1],
             [
@@ -11191,7 +11185,7 @@ activation = "Sigmoid"
             ),
         ] {
             assert!(
-                recorded_operator_commands(&reader, Some((tick, invalid_cut))).is_err(),
+                recorded_input_history(&reader, Some((tick, invalid_cut))).is_err(),
                 "foreign, impossible or weaker checkpoint cut must refuse: {tick}, {invalid_cut:?}"
             );
         }
@@ -11239,7 +11233,6 @@ activation = "Sigmoid"
             &source,
             &config,
             2,
-            BrainPreset::Mlp,
             &[ScenarioInterventionV1 {
                 tick: 1,
                 set: serde_json::json!({"food_growth_rate": 0.9}),
@@ -11263,7 +11256,6 @@ activation = "Sigmoid"
             &source,
             &config,
             2,
-            BrainPreset::Mlp,
             &[],
             &wrong_order,
         )?;
@@ -11285,12 +11277,254 @@ activation = "Sigmoid"
             &ReplayCheckpointSource::Host(Box::new(checkpoint.clone())),
             &config,
             2,
-            BrainPreset::Mlp,
             &[],
             &mirror,
         )?;
         assert_ne!(missing_command.final_digest, final_digest);
         assert_ne!(missing_command.events, recorded);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real owner recording independently exercises genesis ordering, full-source cadence and cursor, conflicting launch inputs, and a noncommuting negative control"
+    )]
+    fn replay_uses_recorded_schedules_registry_and_nonunit_persistence_cuts() -> Result<()> {
+        use scriptbots_runtime::{CommandId, HostCommand};
+
+        let directory = tempdir()?;
+        let database = directory.path().join("recorded-cadence-and-schedule.sqlite");
+        let path = database.to_str().expect("temporary UTF-8 path");
+        let mut pipeline = StoragePipeline::create_unattributed_file(path)?;
+        let (mut config, _) = replay_culling_fixture();
+        config.replay_event_tick_cap = 128;
+        let (mut world, persistence) =
+            WorldState::with_persistence(config.clone(), Box::new(pipeline.sink()))?;
+        let brains = install_brains(&mut world, BrainPreset::Mlp)?.population;
+        seed_agents(&mut world, &brains, FounderRecipe::CornerGrid)?;
+        let agent = world.agents().iter().next().expect("seeded agent").0;
+        let agent_uid = world.agent_uid(agent).expect("stable founder identity");
+        let session = HostSessionId::new(0x6361_6465);
+        let journal = pipeline.journal_port(session, Default::default())?;
+        let host = HostThread::spawn_with_bootstrap(
+            session,
+            world,
+            persistence,
+            Box::new(journal),
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    speed_multiplier: 1.0,
+                },
+                ..HostCoreOptions::default()
+            },
+            ChannelHostOptions::default(),
+            HostBootstrap {
+                schedule: vec![
+                    ScheduledConfigPatch::new(
+                        1,
+                        scriptbots_core::Tick(0),
+                        serde_json::json!({"food_growth_rate": 0.1}),
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                    ScheduledConfigPatch::new(
+                        2,
+                        scriptbots_core::Tick(1),
+                        serde_json::json!({"food_growth_rate": 0.03}),
+                    )
+                    .map_err(anyhow::Error::msg)?,
+                ],
+                ..HostBootstrap::default()
+            },
+        )?;
+        let mut port = host.port();
+        submit_durable_replay_command(&mut port, CommandId::new(1), HostCommand::Step)?;
+        submit_durable_replay_command(
+            &mut port,
+            CommandId::new(2),
+            HostCommand::FlushPersistence,
+        )?;
+        let mut operator_config = config.clone();
+        operator_config.food_growth_rate = 0.2;
+        submit_durable_replay_command(
+            &mut port,
+            CommandId::new(3),
+            HostCommand::UpdateConfig(Box::new(operator_config)),
+        )?;
+        // Capture after UpdateConfig: a later command cannot repair an incorrect
+        // persistence binding made from the caller's launch settings.
+        let checkpoint = port.capture_host_checkpoint_v1()?;
+        assert_eq!(checkpoint.config().persistence_interval, 3);
+        assert_eq!(checkpoint.world_checkpoint().config().persistence_interval, 0);
+        assert_eq!(
+            checkpoint.persistence_last_admitted_tick(),
+            Some(scriptbots_core::Tick(1))
+        );
+        pipeline.checkpoint_writer().record_host(
+            "cadence-source",
+            &checkpoint,
+            &serde_json::json!({"source": "recorded-native-replay-regression"}),
+        )?;
+        // An immediate repeated flush must retain the already-admitted cut.
+        submit_durable_replay_command(
+            &mut port,
+            CommandId::new(4),
+            HostCommand::FlushPersistence,
+        )?;
+        for tick in 2_u64..=4 {
+            port.request_replay_world_digest()?;
+            submit_durable_replay_command(
+                &mut port,
+                CommandId::new(u128::from(tick) + 10),
+                HostCommand::Step,
+            )?;
+            if tick == 2 {
+                submit_durable_replay_command(
+                    &mut port,
+                    CommandId::new(20),
+                    HostCommand::AdjustAgentMutationRates {
+                        agent_uid,
+                        delta_primary: 0.07,
+                        delta_secondary: 0.08,
+                    },
+                )?;
+                submit_durable_replay_command(
+                    &mut port,
+                    CommandId::new(21),
+                    HostCommand::FlushPersistence,
+                )?;
+            }
+        }
+        submit_durable_replay_command(&mut port, CommandId::new(30), HostCommand::Shutdown)?;
+        drop(port);
+        let final_digest = host.join()?.final_digest?;
+        pipeline.shutdown()?;
+
+        let reader = StorageReader::open_finished(path)?;
+        let mut recorded = reader.load_replay_events()?;
+        canonicalize_replay_event_order(&mut recorded)?;
+        let batch_ticks = reader.summary_ticks()?;
+        assert_eq!(batch_ticks, [1, 2, 3, 4]);
+        let history = recorded_input_history(&reader, None)?;
+        assert!(history.has_host_journal);
+        assert!(matches!(
+            history.operator_commands[&1].as_slice(),
+            [
+                ReplayOperatorCommand::FlushPersistence,
+                ReplayOperatorCommand::World(_),
+                ReplayOperatorCommand::FlushPersistence,
+                ReplayOperatorCommand::ScheduledConfigPatch(_)
+            ]
+        ));
+        let digest_ticks = Some(recorded_digest_ticks(&recorded, 4));
+        let genesis_mirror = ReplayMirror {
+            digest_ticks: digest_ticks.clone(),
+            flush_ticks: recorded_flush_ticks(&batch_ticks, &config, 4),
+            operator_commands: history.operator_commands,
+        };
+        let genesis = run_headless_simulation(
+            &config,
+            4,
+            BrainPreset::Mlp,
+            FounderRecipe::CornerGrid,
+            &[],
+            &genesis_mirror,
+        )?;
+        assert_eq!(genesis.final_digest, final_digest);
+        assert_eq!(genesis.events, recorded);
+
+        let mut conflicting_launch = config.clone();
+        conflicting_launch.persistence_interval = 1;
+        conflicting_launch.replay_event_tick_cap = 1;
+        conflicting_launch.rng_seed = Some(999);
+        let source = ReplayCheckpointSource::Host(Box::new(checkpoint.clone()));
+        let mut restored = source.restore_world()?;
+        let binding = source.bind_restored_persistence(
+            &mut restored,
+            Box::new(NullPersistence),
+            &conflicting_launch,
+        )?;
+        assert_eq!(binding.last_admitted_tick(), Some(scriptbots_core::Tick(1)));
+        assert_eq!(restored.config().persistence_interval, 3);
+        assert_eq!(restored.config().replay_event_tick_cap, 128);
+        let mirror = ReplayMirror {
+            digest_ticks,
+            flush_ticks: recorded_flush_ticks(
+                &batch_ticks,
+                source.recording_config(&conflicting_launch),
+                4,
+            ),
+            operator_commands: recorded_input_history(
+                &reader,
+                Some((1, checkpoint.journal_cut())),
+            )?
+            .operator_commands,
+        };
+        reader.close()?;
+        let resumed = run_headless_simulation_from_checkpoint(
+            &source,
+            &conflicting_launch,
+            4,
+            &[],
+            &mirror,
+        )?;
+        assert_eq!(resumed.final_digest, final_digest);
+        assert_eq!(
+            resumed.events,
+            recorded
+                .iter()
+                .filter(|entry| entry.tick > 1)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            resumed
+                .summaries
+                .iter()
+                .map(|summary| summary.tick.0)
+                .collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+
+        let invented_recipe = [ScenarioInterventionV1 {
+            tick: 1,
+            set: serde_json::json!({"food_growth_rate": 0.9}),
+        }];
+        let mut cli = AppCli::try_parse_from([
+            "scriptbots-app",
+            "--replay-db",
+            path,
+            "--brain",
+            "mlp",
+            "--tick-limit",
+            "4",
+        ])?;
+        run_replay_cli(&cli, &config, FounderRecipe::CornerGrid, &invented_recipe)?;
+        cli.checkpoint_start = true;
+        cli.brain = BrainPreset::Mixed;
+        run_replay_cli(
+            &cli,
+            &conflicting_launch,
+            FounderRecipe::Spread,
+            &invented_recipe,
+        )?;
+
+        // Moving the scheduled patch before the operator config is the old
+        // genesis behavior. Both updates apply, but the independently recorded
+        // final world and replay events must distinguish their actual order.
+        let mut reordered = genesis_mirror;
+        reordered.operator_commands.get_mut(&1).unwrap().swap(1, 3);
+        let wrong = run_headless_simulation(
+            &config,
+            4,
+            BrainPreset::Mlp,
+            FounderRecipe::CornerGrid,
+            &[],
+            &reordered,
+        )?;
+        assert_ne!(wrong.final_digest, final_digest);
+        assert_ne!(wrong.events, recorded);
         Ok(())
     }
 
@@ -11358,7 +11592,9 @@ activation = "Sigmoid"
         let final_digest = observed.final_digest?;
         pipeline.shutdown()?;
         let reader = StorageReader::open_finished(path)?;
-        let operator_commands = recorded_operator_commands(&reader, None)?;
+        let history = recorded_input_history(&reader, None)?;
+        assert!(history.has_host_journal, "a journal also owns an empty schedule");
+        let operator_commands = history.operator_commands;
         assert_eq!(
             operator_commands[&1],
             [
@@ -11447,7 +11683,6 @@ activation = "Sigmoid"
                 &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
                 &config,
                 horizon,
-                BrainPreset::Mlp,
                 &[],
                 &mirror,
             )
@@ -11463,7 +11698,6 @@ activation = "Sigmoid"
                 &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
                 &config,
                 horizon,
-                BrainPreset::Mlp,
                 &[],
                 &binding_cut,
             )
@@ -11518,7 +11752,6 @@ activation = "Sigmoid"
             &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
             &config,
             20,
-            BrainPreset::Mlp,
             &[],
             &ReplayMirror::default(),
         )
@@ -11554,7 +11787,6 @@ activation = "Sigmoid"
             &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
             &config,
             10,
-            BrainPreset::Mlp,
             &[],
             &ReplayMirror::default(),
         );
@@ -11571,7 +11803,6 @@ activation = "Sigmoid"
             &ReplayCheckpointSource::Science(Box::new(checkpoint.clone())),
             &config,
             5,
-            BrainPreset::Mlp,
             &[],
             &ReplayMirror::default(),
         );
@@ -11601,6 +11832,12 @@ activation = "Sigmoid"
             Storage::create_unattributed_file_with_thresholds(&db_display, 64, 4096, 1024, 1024)
                 .expect("create storage");
         storage.close().expect("close storage");
+
+        let reader = StorageReader::open_finished(&db_display).expect("legacy finished run");
+        let history = recorded_input_history(&reader, None).expect("no host input history");
+        assert!(!history.has_host_journal);
+        assert!(history.operator_commands.is_empty());
+        reader.close().expect("close legacy reader");
 
         let cli = AppCli::try_parse_from([
             "scriptbots-app",
