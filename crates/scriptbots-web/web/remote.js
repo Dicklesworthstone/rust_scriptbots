@@ -1,8 +1,8 @@
 // Remote presentation never owns or drives a local SimHandle. Binary decoding is
 // supplied by the shared Rust/WASM protocol; this module owns connection and
 // consumer cursors, with no queue of historical canvas frames.
-import { MAX_LAB_ARTIFACT_BYTES, validateCheckpointCanvas, validateLabArtifact,
-  validateLabCheckpoint, validateLabIntervention } from "./checkpoint-lab.js";
+import { MAX_LAB_ARTIFACT_BYTES, parseReplayTarget, validateCheckpointCanvas, validateCheckpointReplay,
+  validateLabArtifact, validateLabCheckpoint, validateLabIntervention } from "./checkpoint-lab.js";
 import { EXPERIMENT_LIMITS, EXPERIMENT_ENDPOINT_METRICS, parseExperimentJson,
   prepareExperimentRequest } from "./experiment-protocol.js";
 
@@ -608,7 +608,32 @@ export class RemoteStreamClient {
     if (result?.schema !== "scriptbots.checkpoint-canvas.v1" || result.sourceSessionId !== sessionId) {
       throw new Error("The saved-world response belongs to a different host or protocol");
     }
-    const encoded = result.frameBase64;
+    const value = { schema: result.schema, sourceSessionId: result.sourceSessionId, checkpoint: result.checkpoint,
+      frame: this.decodeCheckpointFrame(result.frameBase64) };
+    return validateCheckpointCanvas(value, { sessionId, checkpoint: expected });
+  }
+
+  /** Historical reads reuse the scientific replay engine and never consume live stream credits. */
+  async checkpointReplay(checkpointId, { sessionId, expected, targetTick, signal } = {}) {
+    labIdentifier(checkpointId);
+    validateLabCheckpoint(expected);
+    const target = parseReplayTarget(targetTick);
+    if (expected.checkpoint_id !== checkpointId || target < BigInt(expected.tick)) {
+      throw new Error("Replay request differs from its selected checkpoint or precedes its saved tick");
+    }
+    const result = await this.labJson(`/api/v1/checkpoints/${checkpointId}/replay`, sessionId, MAX_CHECKPOINT_CANVAS_BYTES,
+      { signal, query: { session_id: sessionId, target_tick: targetTick }, timeoutMs: 35000 });
+    if (result?.schema !== "scriptbots.checkpoint-replay.v1" || result.sourceSessionId !== sessionId) {
+      throw new Error("The historical replay belongs to a different host or protocol");
+    }
+    const value = { schema: result.schema, sourceSessionId: result.sourceSessionId, checkpoint: result.checkpoint,
+      targetTick: result.targetTick, maxVerificationTicks: result.maxVerificationTicks, verification: result.verification,
+      frame: this.decodeCheckpointFrame(result.frameBase64) };
+    return validateCheckpointReplay(value, { sessionId, checkpoint: expected, targetTick });
+  }
+
+  /** Shared bounded binary decoder for saved cuts and verified historical targets. */
+  decodeCheckpointFrame(encoded) {
     if (typeof encoded !== "string" || encoded.length === 0 || encoded.length % 4 !== 0
         || encoded.length > Math.ceil(MAX_FRAME_BYTES / 3) * 4 || /[^A-Za-z0-9+/=]/.test(encoded)) {
       throw new Error("The saved-world frame exceeds its byte bound or has invalid base64");
@@ -624,10 +649,8 @@ export class RemoteStreamClient {
         || decoded.coalescedPublications !== "0") {
       throw new Error("The saved-world response is not one complete reconstructed canvas");
     }
-    const value = { schema: result.schema, sourceSessionId: result.sourceSessionId, checkpoint: result.checkpoint,
-      frame: { schema: "scriptbots.browser-frame.v1", identity: decoded.identity, snapshot: decoded.payload,
-        playback: decoded.playback, environment: decoded.environment } };
-    return validateCheckpointCanvas(value, { sessionId, checkpoint: expected });
+    return { schema: "scriptbots.browser-frame.v1", identity: decoded.identity, snapshot: decoded.payload,
+      playback: decoded.playback, environment: decoded.environment };
   }
 
   async listCheckpointBranches({ sessionId, cursor = null, limit = 12, signal } = {}) {
