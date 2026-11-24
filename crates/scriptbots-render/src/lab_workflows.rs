@@ -5,11 +5,11 @@
 
 use super::*;
 use scriptbots_runtime::lab_workflows::{
-    LAB_MAX_ARTIFACT_BYTES, LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction, LabArtifactExportState,
-    LabBranchCreationState, LabBranchTreatment, LabCheckpointSaveState, LabCheckpointView,
-    LabExperimentCapabilities, LabExperimentCreationState, LabExperimentDesign,
+    LAB_MAX_ARTIFACT_BYTES, LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction,
+    LabArtifactExportState, LabBranchCreationState, LabBranchTreatment, LabCheckpointSaveState,
+    LabCheckpointView, LabExperimentCapabilities, LabExperimentCreationState, LabExperimentDesign,
     LabExperimentTreatment, LabMetric, LabPanel, VARIANTS_PER_PAGE, artifact_export_lines,
-    branch_report_lines, comparison_lines,
+    branch_report_lines, comparison_lines, replay_summary_lines,
 };
 #[cfg(test)]
 use scriptbots_runtime::lab_workflows::{
@@ -202,7 +202,8 @@ impl SimulationView {
                             let mut config = snapshot.config.as_ref().clone();
                             config.food_growth_rate = value;
                             if let Some(submit) = self.config_update_submit.clone() {
-                                let command = ControlCommand::UpdateConfig(Box::new(config.clone()));
+                                let command =
+                                    ControlCommand::UpdateConfig(Box::new(config.clone()));
                                 match submit(Box::new(config), snapshot.revisions) {
                                     Ok(status) => {
                                         let id = status.command_id();
@@ -460,51 +461,55 @@ impl SimulationView {
             );
         }
         if self.lab_workflows.submit.is_none() {
-            panel = panel.child(div().text_xs().child(
-                "Checkpoint and study services are unavailable in this view.",
-            ));
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .child("Checkpoint and study services are unavailable in this view."),
+            );
         }
         if let Some(notice) = &self.lab_workflows.notice {
             panel = panel.child(div().text_xs().child(notice.clone()));
         }
-        div().child(panel.child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .child(self.guide_button(
-                    "lab-guide-perform",
-                    label,
-                    LabGuideAction::Perform(boundary),
-                    available,
-                    cx,
-                ))
-                .child(self.guide_button(
-                    "lab-guide-next",
-                    if step == LabGuideStep::Outcome {
-                        "Finish".into()
-                    } else {
-                        "Next".into()
-                    },
-                    LabGuideAction::Next(boundary),
-                    ready && !finished,
-                    cx,
-                ))
-                .child(self.guide_button(
-                    "lab-guide-hide",
-                    "Hide; keep progress".into(),
-                    LabGuideAction::Hide,
-                    true,
-                    cx,
-                ))
-                .child(self.guide_button(
-                    "lab-guide-restart",
-                    "Restart guide".into(),
-                    LabGuideAction::Restart,
-                    true,
-                    cx,
-                )),
-        ))
+        div().child(
+            panel.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.guide_button(
+                        "lab-guide-perform",
+                        label,
+                        LabGuideAction::Perform(boundary),
+                        available,
+                        cx,
+                    ))
+                    .child(self.guide_button(
+                        "lab-guide-next",
+                        if step == LabGuideStep::Outcome {
+                            "Finish".into()
+                        } else {
+                            "Next".into()
+                        },
+                        LabGuideAction::Next(boundary),
+                        ready && !finished,
+                        cx,
+                    ))
+                    .child(self.guide_button(
+                        "lab-guide-hide",
+                        "Hide; keep progress".into(),
+                        LabGuideAction::Hide,
+                        true,
+                        cx,
+                    ))
+                    .child(self.guide_button(
+                        "lab-guide-restart",
+                        "Restart guide".into(),
+                        LabGuideAction::Restart,
+                        true,
+                        cx,
+                    )),
+            ),
+        )
     }
 
     fn synchronize_lab_source(&mut self) {
@@ -576,6 +581,52 @@ impl SimulationView {
                 "World window unavailable; checkpoint view unchanged.".into()
             });
         }
+        if let Some(review) = self.lab_workflows.take_replay_review() {
+            if self.timeline_cancelled.load(AtomicOrdering::Acquire) {
+                self.lab_workflows.set_notice(
+                    "Replay result discarded after a newer World presentation action; the displayed world is unchanged.",
+                );
+            } else {
+                let summary = &review.summary;
+                let applied = self.world_view.as_ref().is_some_and(|world| {
+                    world
+                        .update(cx, |view, cx| {
+                            if view.host.snapshot_hub().latest().session_id != summary.session_id
+                                || review.snapshot.session_id != summary.session_id
+                                || review.snapshot.world.tick != summary.target_tick
+                            {
+                                return false;
+                            }
+                            let palette = view.accessibility_snapshot().palette;
+                            let Some(frame) = HudSnapshot::from_checkpoint_canvas(
+                                &review.snapshot,
+                                summary.checkpoint.checkpoint_id.clone(),
+                                summary.checkpoint.tick,
+                                palette,
+                            ) else {
+                                return false;
+                            };
+                            view.playback.reconstructed = Some(frame);
+                            view.playback.mode = PlaybackMode::Paused;
+                            view.playback.displaying_history = true;
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false)
+                });
+                self.lab_workflows.set_notice(if applied {
+                    format!(
+                        "Showing replay tick {} from checkpoint {} at tick {}. The live owner is unchanged; edit the target to seek again.",
+                        summary.target_tick,
+                        summary.checkpoint.checkpoint_id,
+                        summary.checkpoint.tick,
+                    )
+                } else {
+                    "Replay visual layers or World window are unavailable; the displayed world is unchanged."
+                        .to_owned()
+                });
+            }
+        }
         self.lab_workflows.maybe_refresh();
         self.observe_lab_guide();
     }
@@ -591,9 +642,12 @@ impl SimulationView {
             return;
         }
         let return_live = action == LabAction::ReturnLive;
-        if action == LabAction::ReviewCheckpoint
+        if (action == LabAction::ReviewCheckpoint
             && !self.lab_workflows.is_busy()
-            && self.lab_workflows.selected_checkpoint_metadata().is_some()
+            && self.lab_workflows.selected_checkpoint_metadata().is_some())
+            || (matches!(&action, LabAction::SeekReplay { .. })
+                && self.lab_workflows.can_seek_replay()
+                && self.lab_workflows.replay_seek_action().as_ref() == Some(&action))
         {
             // A later World-window intent must supersede this reconstruction.
             self.timeline_cancelled
@@ -613,11 +667,9 @@ impl SimulationView {
         if creating_checkpoint
             && let Some(save) = &self.lab_workflows.latest_checkpoint_save
             && matches!(&save.state, LabCheckpointSaveState::Pending)
-            && previous_pending
-                .as_ref()
-                .is_none_or(|(session, request)| {
-                    *session != save.session_id || request != &save.request_id
-                })
+            && previous_pending.as_ref().is_none_or(|(session, request)| {
+                *session != save.session_id || request != &save.request_id
+            })
             && let Ok(mut guide) = self.lab_guide.lock()
         {
             guide.observe_checkpoint_save(save);
@@ -694,19 +746,26 @@ impl SimulationView {
                         idle,
                         cx,
                     ))
-                    .child(self.lab_button(
-                        "lab-cancel-request".into(),
-                        if self.lab_workflows.latest_artifact_export.as_ref().is_some_and(
-                            |export| matches!(&export.state, LabArtifactExportState::Pending),
-                        ) {
-                            "Leave pending view; export may still complete".into()
-                        } else {
-                            "Discard pending result".into()
-                        },
-                        LabAction::CancelRequest,
-                        !idle,
-                        cx,
-                    )),
+                    .child(
+                        self.lab_button(
+                            "lab-cancel-request".into(),
+                            if self
+                                .lab_workflows
+                                .latest_artifact_export
+                                .as_ref()
+                                .is_some_and(|export| {
+                                    matches!(&export.state, LabArtifactExportState::Pending)
+                                })
+                            {
+                                "Leave pending view; export may still complete".into()
+                            } else {
+                                "Discard pending result".into()
+                            },
+                            LabAction::CancelRequest,
+                            !idle,
+                            cx,
+                        ),
+                    ),
             );
         if !self.lab_workflows.viewing_artifacts {
             header = header.child(self.lab_button(
@@ -1410,23 +1469,26 @@ impl SimulationView {
                 );
             }
         } else {
-            panel = panel.child("Select a retained artifact to review its metadata and destination.");
+            panel =
+                panel.child("Select a retained artifact to review its metadata and destination.");
         }
         panel.child(
             div()
                 .flex()
                 .flex_wrap()
                 .gap_2()
-                .child(self.lab_button(
-                    "lab-artifacts-prev".into(),
-                    "Previous artifacts".into(),
-                    LabAction::ArtifactsPage(
-                        (page.offset > LAB_PAGE_SIZE)
-                            .then(|| (page.offset - LAB_PAGE_SIZE).to_string()),
+                .child(
+                    self.lab_button(
+                        "lab-artifacts-prev".into(),
+                        "Previous artifacts".into(),
+                        LabAction::ArtifactsPage(
+                            (page.offset > LAB_PAGE_SIZE)
+                                .then(|| (page.offset - LAB_PAGE_SIZE).to_string()),
+                        ),
+                        idle && page.offset > 0,
+                        cx,
                     ),
-                    idle && page.offset > 0,
-                    cx,
-                ))
+                )
                 .child(self.lab_button(
                     "lab-artifacts-next".into(),
                     "Next artifacts".into(),
@@ -2125,10 +2187,198 @@ impl SimulationView {
         }
     }
 
+    fn render_lab_replay(&self, cx: &mut Context<Self>) -> Div {
+        let state = &self.lab_workflows;
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.lab_panel_header("Replay / seek", cx))
+            .child(self.lab_button(
+                "lab-replay-back".into(),
+                "Back to saved checkpoints".into(),
+                LabAction::BackFromReplay,
+                true,
+                cx,
+            ))
+            .child(self.lab_button(
+                "lab-replay-live".into(),
+                "Return World to live".into(),
+                LabAction::ReturnLive,
+                true,
+                cx,
+            ))
+            .child(div().text_xs().child(
+                "Review an exact tick from the selected saved cut. Seeking reconstructs an independent historical view; it never steps or replaces the live owner.",
+            ));
+        let Some(checkpoint) = &state.replay_checkpoint else {
+            return panel.child("Select a saved checkpoint before opening replay.");
+        };
+        panel = panel
+            .child(div().text_sm().child(format!(
+                "Source checkpoint {} · saved tick {} · {} agents · {} bytes",
+                checkpoint.checkpoint_id,
+                checkpoint.tick,
+                checkpoint.agent_count,
+                checkpoint.byte_size,
+            )))
+            .child(
+                div()
+                    .text_xs()
+                    .child(format!("Saved world digest: {}", checkpoint.world_digest,)),
+            );
+        if let Some(capabilities) = &state.replay_capabilities {
+            panel = panel.child(div().text_xs().child(format!(
+                "Application session {} · observed live tick {} · maximum saved-cut-to-current verification interval {} ticks",
+                capabilities.session_id.get(),
+                capabilities.observed_tick,
+                capabilities.max_verification_ticks,
+            )));
+        } else {
+            panel = panel.child(
+                "Replay bounds have not arrived. Refresh to observe this application's current tick and verification limit.",
+            );
+        }
+        let target = div()
+            .id("lab-replay-target")
+            .debug_selector(|| "lab-replay-target".to_owned())
+            .focusable()
+            .tab_stop(true)
+            .role(Role::SpinButton)
+            .aria_label(format!("Replay target tick: {}", state.replay_tick_text))
+            .rounded_md()
+            .border_1()
+            .border_color(chrome::border())
+            .px_3()
+            .py_2()
+            .text_sm()
+            .child(format!(
+                "Target tick: {}",
+                if state.replay_tick_text.is_empty() {
+                    "(type decimal digits)"
+                } else {
+                    &state.replay_tick_text
+                },
+            ))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if !this.lab_workflows.viewing_replay {
+                    return;
+                }
+                let key = event.keystroke.key.as_str();
+                let modifiers = event.keystroke.modifiers;
+                if (modifiers.control || modifiers.platform) && key.eq_ignore_ascii_case("a") {
+                    this.lab_action(LabAction::ReplayTickText(String::new()), cx);
+                } else if !modifiers.control && !modifiers.alt && !modifiers.platform {
+                    match key {
+                        "backspace" => {
+                            let mut text = this.lab_workflows.replay_tick_text.clone();
+                            text.pop();
+                            this.lab_action(LabAction::ReplayTickText(text), cx);
+                        }
+                        "delete" => {
+                            this.lab_action(LabAction::ReplayTickText(String::new()), cx);
+                        }
+                        "enter" if !event.is_held => {
+                            if this.lab_workflows.can_seek_replay()
+                                && let Some(action) = this.lab_workflows.replay_seek_action()
+                            {
+                                this.lab_action(action, cx);
+                            }
+                        }
+                        "escape" => window.blur(),
+                        _ => {
+                            let typed = event.keystroke.key_char.as_deref().unwrap_or(key);
+                            if !typed.is_empty() && typed.bytes().all(|byte| byte.is_ascii_digit())
+                            {
+                                // Read the current draft for each ordered key event; a redraw
+                                // between digits is neither necessary nor guaranteed.
+                                let mut text = this.lab_workflows.replay_tick_text.clone();
+                                text.extend(typed.chars().take(21));
+                                this.lab_action(LabAction::ReplayTickText(text), cx);
+                            }
+                        }
+                    }
+                }
+                if key != "tab" {
+                    cx.stop_propagation();
+                }
+            }));
+        panel = panel
+            .child(target)
+            .child(div().text_xs().child(
+                "Click the target or Tab to it, type the exact tick, then press Enter to seek. Backspace edits; Delete, Ctrl+A or Clear empties the field; Escape leaves the field.",
+            ));
+        let mut controls = div().flex().flex_wrap().gap_2();
+        for (id, label, delta) in [
+            ("lab-replay-minus-ten", "−10", -10_i64),
+            ("lab-replay-minus-one", "−1", -1),
+            ("lab-replay-plus-one", "+1", 1),
+            ("lab-replay-plus-ten", "+10", 10),
+        ] {
+            let enabled = state.parsed_replay_tick().is_some_and(|tick| {
+                tick.checked_add_signed(delta)
+                    .is_some_and(|next| next >= checkpoint.tick)
+            });
+            controls = controls.child(self.lab_button(
+                id.into(),
+                label.into(),
+                LabAction::ReplayStep(delta),
+                enabled,
+                cx,
+            ));
+        }
+        controls = controls.child(self.lab_button(
+            "lab-replay-clear".into(),
+            "Clear target".into(),
+            LabAction::ReplayTickText(String::new()),
+            true,
+            cx,
+        ));
+        if let Some(action) = state.replay_seek_action() {
+            controls = controls.child(self.lab_button(
+                "lab-replay-seek".into(),
+                "Seek exact tick".into(),
+                action,
+                state.can_seek_replay(),
+                cx,
+            ));
+        }
+        panel = panel.child(controls);
+        if state.parsed_replay_tick().is_none() {
+            panel = panel.child(
+                "Invalid target: enter one unsigned 64-bit decimal tick (0 through 18446744073709551615).",
+            );
+        } else if state.replay_seek_action().is_none() {
+            panel = panel.child(
+                "Seek unavailable: the target must be at or after the saved cut. A later tick also needs current replay bounds, a target no later than the observed live tick, and the entire saved-cut-to-current interval within the displayed limit.",
+            );
+        }
+        panel = panel.child(div().text_xs().child(
+            "The saved tick verifies the saved cut alone. A later target is published only after replay matches the captured-current scientific digest. This does not locate a first divergent tick or provide a per-tick oracle.",
+        ));
+        if let Some(summary) = &state.replay_summary {
+            let mut evidence = div()
+                .id("lab-replay-summary")
+                .debug_selector(|| "lab-replay-summary".to_owned())
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child("Last verified review"));
+            for line in replay_summary_lines(summary) {
+                evidence = evidence.child(div().text_xs().child(line));
+            }
+            panel = panel.child(evidence);
+        }
+        panel
+    }
+
     pub(super) fn render_lab_checkpoints(&self, cx: &mut Context<Self>) -> Div {
         let state = &self.lab_workflows;
         if state.viewing_artifacts {
             return self.render_lab_artifacts(cx);
+        }
+        if state.viewing_replay {
+            return self.render_lab_replay(cx);
         }
         if state.checkpoint_view != LabCheckpointView::SavedCuts {
             return self.render_lab_checkpoint_studies(cx);
@@ -2140,6 +2390,13 @@ impl SimulationView {
             .child(self.lab_button("lab-world-live".into(), "Return World to live".into(), LabAction::ReturnLive, true, cx))
             .child(self.lab_button("lab-review-checkpoint".into(), "Review selected checkpoint in World".into(), LabAction::ReviewCheckpoint, idle && state.selected_checkpoint_metadata().is_some(), cx));
         panel = panel
+            .child(self.lab_button(
+                "lab-replay-open".into(),
+                "Replay / seek from selected checkpoint".into(),
+                LabAction::OpenReplay,
+                state.selected_checkpoint_metadata().is_some(),
+                cx,
+            ))
             .child(
                 self.lab_button(
                     "lab-new-checkpoint-branch".into(),
@@ -2227,6 +2484,339 @@ impl SimulationView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpui_replay_target_input_seeks_verified_frames_and_keeps_live_intent_authoritative() {
+        use scriptbots_runtime::{
+            HostCore, HostCoreOptions, HostSessionId,
+            lab_workflows::{
+                LabReplayCapabilities, LabReplayReview, LabReplaySummary, LabReplayVerification,
+            },
+        };
+
+        let world_at = |tick: u64| {
+            let mut world = WorldState::new(ScriptBotsConfig {
+                rng_seed: Some(17),
+                world_width: 80,
+                world_height: 80,
+                food_cell_size: 40,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .unwrap();
+            for _ in 0..tick {
+                world.step().unwrap();
+            }
+            world
+        };
+        let saved_world = world_at(0);
+        let saved_digest = saved_world.world_digest_v1().unwrap().overall;
+        let projection = |world| {
+            HostCore::new(
+                HostSessionId::new(1),
+                world,
+                HostCoreOptions {
+                    capture_agent_visuals: true,
+                    ..HostCoreOptions::default()
+                },
+            )
+            .unwrap()
+            .latest_snapshot()
+        };
+        let saved = projection(saved_world);
+        let target = projection(world_at(12));
+        let failed_target = projection(world_at(13));
+        let expected_target = Arc::clone(&target);
+        let host = TestHost::new(world_at(20));
+        let source = host.snapshot().session_id;
+        let before = host.port.scientific_digest_v1().unwrap();
+        let captured_digest = before.overall.clone();
+        let checkpoint = LabCheckpoint {
+            checkpoint_id: "gpui-replay-source".into(),
+            tick: 0,
+            agent_count: saved.world.agents.len(),
+            byte_size: 64,
+            world_digest: saved_digest,
+        };
+        let selected = checkpoint.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let (started, observed) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        let mut session = GuiSession::new(
+            host.port.clone(),
+            AnalyticsSnapshotProvider::empty(),
+            Arc::new(|_| panic!("historical replay must not command the live owner")),
+        );
+        // Explicit application-service double with actual host publications:
+        // this proves native controls/projections, not application replay or GPU pixels.
+        session.lab_submit = Some(Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ListCheckpoints { .. } => {
+                    LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                        items: vec![selected.clone()],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                        retained_bytes: 64,
+                        max_bytes: 1_024,
+                    })
+                }
+                LabWorkflowRequest::ReplayCapabilities => {
+                    LabWorkflowResponse::ReplayCapabilities(LabReplayCapabilities {
+                        session_id: source,
+                        observed_tick: 20,
+                        max_verification_ticks: 32,
+                    })
+                }
+                request @ LabWorkflowRequest::ReviewReplay { .. } => {
+                    let count = {
+                        let mut requests = recorded.lock().unwrap();
+                        requests.push(request.clone());
+                        requests.len()
+                    };
+                    if count == 3 {
+                        return Err(
+                            "Captured-current scientific digest differs; earliest divergent tick is unknown."
+                                .into(),
+                        );
+                    }
+                    if count >= 4 {
+                        started.send(()).unwrap();
+                        released
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                    }
+                    let LabWorkflowRequest::ReviewReplay {
+                        session_id,
+                        checkpoint,
+                        target_tick,
+                    } = request
+                    else {
+                        unreachable!("matched replay request")
+                    };
+                    let snapshot = match target_tick {
+                        0 => Arc::clone(&saved),
+                        12 => Arc::clone(&target),
+                        13 => Arc::clone(&failed_target),
+                        other => panic!("unexpected replay target {other}"),
+                    };
+                    LabWorkflowResponse::ReplayFrame(LabReplayReview {
+                        summary: LabReplaySummary {
+                            session_id,
+                            checkpoint,
+                            target_tick,
+                            verification: if target_tick == 0 {
+                                LabReplayVerification::SavedCut
+                            } else {
+                                LabReplayVerification::CapturedInterval {
+                                    verified_through_tick: 20,
+                                    captured_current_digest: captured_digest.clone(),
+                                }
+                            },
+                        },
+                        snapshot,
+                    })
+                }
+                other => panic!("unexpected GPUI replay request: {other:?}"),
+            })
+        }));
+        let context = gpui::TestAppContext::single();
+        let windows = context
+            .update(|app| Arc::new(session).install(app))
+            .unwrap();
+        let world = context.update(|app| windows.canvas.root(app)).unwrap();
+        let hud = context.update(|app| windows.hud.root(app)).unwrap();
+        let mut lab = gpui::VisualTestContext::from_window(windows.hud.into(), &context);
+        lab.simulate_resize(size(px(1_100.0), px(1_900.0)));
+        let draw = |lab: &mut gpui::VisualTestContext| {
+            lab.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear();
+            })
+        };
+        let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
+            draw(lab);
+            let bounds = lab.debug_bounds(selector).expect("visible replay control");
+            lab.simulate_click(bounds.center(), gpui::Modifiers::default());
+        };
+        let wait = |lab: &mut gpui::VisualTestContext, ready: &dyn Fn(&LabWorkflows) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                draw(lab);
+                if context.update(|app| ready(&hud.read(app).lab_workflows)) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "GPUI replay response deadline");
+                std::thread::yield_now();
+            }
+        };
+        click(&mut lab, "dashboard-tab-checkpoints");
+        wait(&mut lab, &|model| {
+            model.checkpoints.is_some() && !model.is_busy()
+        });
+        click(&mut lab, "lab-checkpoint-0");
+        click(&mut lab, "lab-replay-open");
+        wait(&mut lab, &|model| {
+            model.replay_capabilities.is_some() && !model.is_busy()
+        });
+        click(&mut lab, "lab-replay-seek");
+        wait(&mut lab, &|model| {
+            !model.is_busy()
+                && model.replay_summary.as_ref().is_some_and(|summary| {
+                    matches!(summary.verification, LabReplayVerification::SavedCut)
+                })
+        });
+        context.update(|app| {
+            assert!(hud.read(app).lab_workflows.viewing_replay);
+            let shown = world.read(app).playback.reconstructed.as_ref().unwrap();
+            assert_eq!(shown.tick, 0);
+            assert_eq!(
+                shown.checkpoint_review,
+                Some((checkpoint.checkpoint_id.clone(), 0))
+            );
+        });
+
+        click(&mut lab, "lab-replay-target");
+        let full_width_keys = u64::MAX
+            .to_string()
+            .chars()
+            .map(|digit| digit.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        lab.simulate_keystrokes(&format!("ctrl-a {full_width_keys}"));
+        context.update(|app| {
+            let model = &hud.read(app).lab_workflows;
+            assert_eq!(model.parsed_replay_tick(), Some(u64::MAX));
+            assert!(
+                !model.can_seek_replay(),
+                "future targets remain unavailable"
+            );
+        });
+        lab.simulate_keystrokes("0");
+        context.update(|app| {
+            let model = &hud.read(app).lab_workflows;
+            assert!(model.parsed_replay_tick().is_none());
+            assert!(
+                !model.can_seek_replay(),
+                "overflow cannot become a truncated valid tick"
+            );
+        });
+        lab.simulate_keystrokes("ctrl-a 1 2");
+        context.update(|app| {
+            assert_eq!(hud.read(app).lab_workflows.replay_tick_text, "12");
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "editing never auto-seeks"
+            );
+        });
+        lab.simulate_keystrokes("enter");
+        wait(&mut lab, &|model| {
+            !model.is_busy()
+                && model
+                    .replay_summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.target_tick == 12)
+        });
+        draw(&mut lab);
+        assert!(lab.debug_bounds("lab-replay-summary").is_some());
+        assert!(lab.debug_bounds("lab-replay-target").is_some());
+        let palette = context.update(|app| world.read(app).accessibility_snapshot().palette);
+        let expected = RenderFrame::from_snapshot(&expected_target, palette).unwrap();
+        context.update(|app| {
+            let model = &hud.read(app).lab_workflows;
+            assert!(model.viewing_replay);
+            assert!(
+                replay_summary_lines(model.replay_summary.as_ref().unwrap())
+                    .iter()
+                    .any(|line| line.contains("captured current tick 20"))
+            );
+            world.update(app, |view, _| {
+                let live = view.snapshot();
+                let shown = view.playback.snapshot_for_render(live);
+                assert_eq!(shown.tick, 12);
+                assert_eq!(shown.render_frame, Some(expected.clone()));
+                assert_eq!(
+                    shown.checkpoint_review,
+                    Some((checkpoint.checkpoint_id.clone(), 0))
+                );
+                assert!(view.playback.displaying_history);
+            });
+        });
+
+        click(&mut lab, "lab-replay-plus-one");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        click(&mut lab, "lab-replay-seek");
+        wait(&mut lab, &|model| {
+            !model.is_busy()
+                && model
+                    .notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.contains("earliest divergent tick is unknown"))
+        });
+        context.update(|app| {
+            assert_eq!(
+                world
+                    .read(app)
+                    .playback
+                    .reconstructed
+                    .as_ref()
+                    .unwrap()
+                    .tick,
+                12
+            );
+            assert_eq!(
+                hud.read(app)
+                    .lab_workflows
+                    .replay_summary
+                    .as_ref()
+                    .unwrap()
+                    .target_tick,
+                12
+            );
+        });
+
+        click(&mut lab, "lab-replay-seek");
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        click(&mut lab, "lab-replay-live");
+        context.update(|app| {
+            assert_eq!(world.read(app).playback.mode(), PlaybackMode::Live);
+            assert!(hud.read(app).lab_workflows.is_busy());
+            assert!(hud.read(app).lab_workflows.viewing_replay);
+        });
+        release.send(()).unwrap();
+        wait(&mut lab, &|model| !model.is_busy());
+        context.update(|app| {
+            assert_eq!(world.read(app).playback.mode(), PlaybackMode::Live);
+            assert!(world.read(app).playback.reconstructed.is_none());
+        });
+
+        click(&mut lab, "lab-replay-seek");
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        click(&mut lab, "lab-replay-plus-one");
+        release.send(()).unwrap();
+        wait(&mut lab, &|model| !model.is_busy());
+        context.update(|app| {
+            assert_eq!(hud.read(app).lab_workflows.replay_tick_text, "14");
+            assert_eq!(world.read(app).playback.mode(), PlaybackMode::Live);
+            assert!(world.read(app).playback.reconstructed.is_none());
+        });
+        assert_eq!(requests.lock().unwrap().len(), 5);
+        assert!(matches!(
+            &requests.lock().unwrap()[1],
+            LabWorkflowRequest::ReviewReplay { session_id, checkpoint: observed, target_tick: 12 }
+                if *session_id == source && observed == &checkpoint
+        ));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        assert_eq!(host.snapshot().world.tick, 20);
+    }
 
     #[test]
     fn gpui_artifact_controls_review_frozen_metadata_and_report_export_outcomes() {
@@ -2358,7 +2948,9 @@ mod tests {
         };
         let click = |lab: &mut gpui::VisualTestContext, selector: &'static str| {
             draw(lab);
-            let bounds = lab.debug_bounds(selector).expect("visible artifact control");
+            let bounds = lab
+                .debug_bounds(selector)
+                .expect("visible artifact control");
             lab.simulate_click(bounds.center(), gpui::Modifiers::default());
         };
         let wait = |lab: &mut gpui::VisualTestContext, ready: &dyn Fn(&LabWorkflows) -> bool| {
@@ -2373,9 +2965,13 @@ mod tests {
             }
         };
         click(&mut lab, "dashboard-tab-experiments");
-        wait(&mut lab, &|model| model.experiments.is_some() && !model.is_busy());
+        wait(&mut lab, &|model| {
+            model.experiments.is_some() && !model.is_busy()
+        });
         click(&mut lab, "lab-artifacts-open");
-        wait(&mut lab, &|model| model.artifacts.is_some() && !model.is_busy());
+        wait(&mut lab, &|model| {
+            model.artifacts.is_some() && !model.is_busy()
+        });
         draw(&mut lab);
         assert!(lab.debug_bounds("lab-artifact-export").is_none());
         click(&mut lab, "lab-artifact-0");
@@ -2383,7 +2979,10 @@ mod tests {
         assert!(lab.debug_bounds("lab-artifact-metadata").is_some());
         assert!(lab.debug_bounds("lab-artifact-export").is_some());
         let stale_action = context.update(|app| {
-            hud.read(app).lab_workflows.export_artifact_action().unwrap()
+            hud.read(app)
+                .lab_workflows
+                .export_artifact_action()
+                .unwrap()
         });
         assert_eq!(
             stale_action,
@@ -2434,15 +3033,23 @@ mod tests {
             assert_eq!(receipt.export_directory, directory);
             let lines = artifact_export_lines(model.latest_artifact_export.as_ref().unwrap());
             assert!(lines.iter().any(|line| line.contains(&receipt.output_path)));
-            assert!(lines.iter().any(|line| line.contains(&receipt.manifest_path)));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&receipt.manifest_path))
+            );
         });
         click(&mut lab, "lab-artifacts-back");
         draw(&mut lab);
         assert!(lab.debug_bounds("lab-artifacts-open").is_some());
         click(&mut lab, "dashboard-tab-checkpoints");
-        wait(&mut lab, &|model| model.checkpoints.is_some() && !model.is_busy());
+        wait(&mut lab, &|model| {
+            model.checkpoints.is_some() && !model.is_busy()
+        });
         click(&mut lab, "lab-artifacts-open");
-        wait(&mut lab, &|model| model.artifacts.is_some() && !model.is_busy());
+        wait(&mut lab, &|model| {
+            model.artifacts.is_some() && !model.is_busy()
+        });
         click(&mut lab, "lab-artifact-0");
         click(&mut lab, "lab-artifact-export");
         wait(&mut lab, &|model| {
@@ -2456,9 +3063,11 @@ mod tests {
         context.update(|app| {
             let model = &hud.read(app).lab_workflows;
             let export = model.latest_artifact_export.as_ref().unwrap();
-            assert!(artifact_export_lines(export).iter().any(|line| {
-                line.contains("destination readback verification failed")
-            }));
+            assert!(
+                artifact_export_lines(export)
+                    .iter()
+                    .any(|line| { line.contains("destination readback verification failed") })
+            );
         });
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
@@ -2470,7 +3079,10 @@ mod tests {
             LabWorkflowRequest::ExportArtifact { request_id, .. } => request_id,
             other => panic!("unexpected recorded request: {other:?}"),
         };
-        assert_ne!(first_id, second_id, "new explicit exports use distinct destinations");
+        assert_ne!(
+            first_id, second_id,
+            "new explicit exports use distinct destinations"
+        );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
 
@@ -2516,7 +3128,9 @@ mod tests {
             config_count.fetch_add(1, Ordering::SeqCst);
             let id = scriptbots_runtime::CommandId::from_client_sequence(
                 1,
-                config_host.next_command.fetch_add(1, AtomicOrdering::Relaxed),
+                config_host
+                    .next_command
+                    .fetch_add(1, AtomicOrdering::Relaxed),
             );
             config_host
                 .port
@@ -2676,7 +3290,10 @@ mod tests {
         click(&mut lab, "lab-guide-perform");
         context.update(|app| {
             let guide = hud.read(app).lab_guide.lock().unwrap();
-            assert!(!guide.ready(), "missing checkpoint services cannot report a save");
+            assert!(
+                !guide.ready(),
+                "missing checkpoint services cannot report a save"
+            );
         });
 
         // A cached request from before Checkpoint cannot become fresh merely

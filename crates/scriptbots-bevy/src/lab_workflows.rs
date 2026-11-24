@@ -5,15 +5,18 @@
 //! existing host while a checkpoint is being viewed.
 
 use super::*;
+use bevy::ecs::message::{MessageCursor, Messages};
+use bevy::input::keyboard::{Key as LogicalKey, KeyboardInput};
 use scriptbots_runtime::{
     HostSessionId,
     lab_workflows::{
         LAB_MAX_ARTIFACT_BYTES, LAB_MAX_TREATMENT_PERCENT, LAB_PAGE_SIZE, LabAction,
         LabArtifactExportState, LabBranchCreationState, LabBranchTreatment, LabCheckpointSaveState,
         LabCheckpointView, LabEventIdentity, LabEventReview, LabExperimentCapabilities,
-        LabExperimentCreationState, LabExperimentDesign, LabExperimentTreatment, LabMetric, LabPanel,
-        LabWorkflowSubmit, LabWorkflows, VARIANTS_PER_PAGE, artifact_export_lines, branch_report_lines,
-        comparison_lines,
+        LabExperimentCreationState, LabExperimentDesign, LabExperimentTreatment, LabMetric,
+        LabPanel, LabReplayReview, LabReplaySummary, LabReplayVerification, LabWorkflowSubmit,
+        LabWorkflows, VARIANTS_PER_PAGE, artifact_export_lines, branch_report_lines,
+        comparison_lines, replay_summary_lines,
     },
 };
 
@@ -34,6 +37,7 @@ enum PanelAction {
     Panel(LabPanel),
     Close,
     Workflow(LabAction),
+    EditReplayTarget,
     NarrativeOlder,
     NarrativeNewer,
     NarrativeLatest,
@@ -97,6 +101,7 @@ impl PanelRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ReviewSource {
     Checkpoint(String),
+    Replay(LabReplaySummary),
     NarrativeEvent {
         event: LabEventIdentity,
         checkpoint_id: String,
@@ -114,6 +119,7 @@ impl ReviewFrame {
     fn heading(&self) -> &'static str {
         match &self.source {
             ReviewSource::Checkpoint(_) => "SCRIPTBOTS  /  SAVED CHECKPOINT",
+            ReviewSource::Replay(_) => "SCRIPTBOTS  /  REPLAY REVIEW",
             ReviewSource::NarrativeEvent { .. } => "SCRIPTBOTS  /  EVENT REVIEW",
         }
     }
@@ -121,6 +127,24 @@ impl ReviewFrame {
     fn description(&self) -> String {
         match &self.source {
             ReviewSource::Checkpoint(id) => format!("SAVED CHECKPOINT {id} | TICK {}", self.tick),
+            ReviewSource::Replay(summary) => {
+                let verification = match &summary.verification {
+                    LabReplayVerification::SavedCut => "SAVED CUT VERIFIED".to_owned(),
+                    LabReplayVerification::CapturedInterval {
+                        verified_through_tick,
+                        ..
+                    } => {
+                        format!("VERIFIED THROUGH CAPTURED TICK {verified_through_tick}")
+                    }
+                };
+                format!(
+                    "REPLAY | TICK {} | SOURCE CHECKPOINT {} AT TICK {} | {verification} | APPLICATION SESSION {}",
+                    summary.target_tick,
+                    summary.checkpoint.checkpoint_id,
+                    summary.checkpoint.tick,
+                    summary.session_id.get(),
+                )
+            }
             ReviewSource::NarrativeEvent {
                 event,
                 checkpoint_id,
@@ -276,6 +300,8 @@ pub(super) struct LabPresentation {
     review: Option<ReviewFrame>,
     narrative: NarrativeTimeline,
     keyboard_captured: bool,
+    replay_editing: bool,
+    replay_select_all: bool,
     focus: Option<usize>,
     focus_changed: bool,
 }
@@ -293,6 +319,8 @@ impl LabPresentation {
             self.source = source;
             self.review = None;
             self.live = None;
+            self.replay_editing = false;
+            self.replay_select_all = false;
             self.narrative = NarrativeTimeline::default();
             // Revision integers are meaningful only within their source.
             state.last_applied_palette = None;
@@ -318,6 +346,38 @@ impl LabPresentation {
         self.show_history(
             ReviewSource::Checkpoint(checkpoint_id),
             snapshot,
+            state,
+            motion,
+        )
+    }
+
+    fn show_replay_review(
+        &mut self,
+        review: LabReplayReview,
+        state: &mut SnapshotState,
+        motion: &mut AgentMotionSettings,
+    ) -> bool {
+        let summary = &review.summary;
+        if self.source != Some(summary.session_id)
+            || review.snapshot.session_id != summary.session_id
+            || review.snapshot.world.tick != summary.target_tick
+            || summary.checkpoint.tick > summary.target_tick
+            || match &summary.verification {
+                LabReplayVerification::SavedCut => summary.target_tick != summary.checkpoint.tick,
+                LabReplayVerification::CapturedInterval {
+                    verified_through_tick,
+                    ..
+                } => {
+                    summary.target_tick <= summary.checkpoint.tick
+                        || *verified_through_tick < summary.target_tick
+                }
+            }
+        {
+            return false;
+        }
+        self.show_history(
+            ReviewSource::Replay(review.summary),
+            &review.snapshot,
             state,
             motion,
         )
@@ -396,6 +456,8 @@ impl LabPresentation {
     fn change_panel(&mut self, panel: LabPanel) {
         if self.panel != panel {
             self.panel = panel;
+            self.replay_editing = false;
+            self.replay_select_all = false;
             self.focus = None;
             self.focus_changed = true;
         }
@@ -566,9 +628,126 @@ pub(super) fn setup_panel(commands: &mut Commands, font: Handle<Font>) {
     });
 }
 
+/// Edit only the bounded replay draft, preserving the order of native text events.
+/// Optional messages keep headless presentation consumers independent of InputPlugin.
+fn replay_target_input(
+    model: &mut LabWorkflows,
+    presentation: &mut LabPresentation,
+    keys: &ButtonInput<KeyCode>,
+    keyboard: Option<&Messages<KeyboardInput>>,
+    cursor: &mut MessageCursor<KeyboardInput>,
+) {
+    let Some(keyboard) = keyboard else {
+        return;
+    };
+    let events = cursor.read(keyboard).collect::<Vec<_>>();
+    let modifier_keys = [
+        KeyCode::ControlLeft,
+        KeyCode::ControlRight,
+        KeyCode::SuperLeft,
+        KeyCode::SuperRight,
+        KeyCode::AltLeft,
+        KeyCode::AltRight,
+    ];
+    let mut modifiers = modifier_keys.map(|key| keys.pressed(key));
+    // ButtonInput describes the end of this frame. Undo this batch's modifier
+    // transitions, then replay them in order so a fast Ctrl+A, release, digit
+    // sequence behaves exactly like the same keys arriving in separate frames.
+    for event in events.iter().rev() {
+        if let Some(index) = modifier_keys.iter().position(|key| *key == event.key_code) {
+            match event.state {
+                ButtonState::Pressed if !event.repeat => modifiers[index] = false,
+                ButtonState::Released => modifiers[index] = true,
+                _ => {}
+            }
+        }
+    }
+    for event in events {
+        if let Some(index) = modifier_keys.iter().position(|key| *key == event.key_code) {
+            modifiers[index] = event.state == ButtonState::Pressed;
+        }
+        if event.state != ButtonState::Pressed
+            || !presentation.replay_editing
+            || !model.viewing_replay
+            || presentation.panel != LabPanel::Checkpoints
+        {
+            continue;
+        }
+        presentation.keyboard_captured = true;
+        let control = modifiers[0] || modifiers[1];
+        let command = modifiers[2] || modifiers[3];
+        let alt = modifiers[4] || modifiers[5];
+        if control || command {
+            if matches!(&event.logical_key, LogicalKey::Character(text) if text.eq_ignore_ascii_case("a"))
+            {
+                presentation.replay_select_all = true;
+            }
+            continue;
+        }
+        if alt {
+            continue;
+        }
+        match &event.logical_key {
+            LogicalKey::Escape | LogicalKey::Tab => {
+                presentation.replay_editing = false;
+                presentation.replay_select_all = false;
+            }
+            LogicalKey::Enter => {
+                if !event.repeat
+                    && model.can_seek_replay()
+                    && let Some(action) = model.replay_seek_action()
+                {
+                    // Dispatch at the event's actual position: a later digit in
+                    // this same input batch must invalidate this request's view.
+                    model.dispatch(action);
+                }
+                presentation.replay_select_all = false;
+            }
+            LogicalKey::Backspace => {
+                let mut text = if presentation.replay_select_all {
+                    String::new()
+                } else {
+                    model.replay_tick_text.clone()
+                };
+                if !presentation.replay_select_all {
+                    text.pop();
+                }
+                presentation.replay_select_all = false;
+                model.dispatch(LabAction::ReplayTickText(text));
+            }
+            LogicalKey::Delete => {
+                presentation.replay_select_all = false;
+                model.dispatch(LabAction::ReplayTickText(String::new()));
+            }
+            _ => {
+                let typed = event.text.as_deref().or_else(|| match &event.logical_key {
+                    LogicalKey::Character(text) => Some(text.as_str()),
+                    _ => None,
+                });
+                if let Some(typed) = typed.filter(|text| {
+                    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+                }) {
+                    let mut text = if presentation.replay_select_all {
+                        String::new()
+                    } else {
+                        model.replay_tick_text.clone()
+                    };
+                    presentation.replay_select_all = false;
+                    // Twenty-one digits cannot form a valid u64. Keep overflow
+                    // visibly invalid rather than truncating to a seekable value.
+                    text.extend(typed.chars().take(21));
+                    model.dispatch(LabAction::ReplayTickText(text));
+                }
+            }
+        }
+    }
+}
+
 #[derive(bevy::ecs::system::SystemParam)]
 pub(super) struct LabInput<'w, 's> {
     keys: Res<'w, ButtonInput<KeyCode>>,
+    keyboard: Option<Res<'w, Messages<KeyboardInput>>>,
+    keyboard_cursor: Local<'s, MessageCursor<KeyboardInput>>,
     open: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<OpenLabButton>)>,
     rows: Query<'w, 's, (&'static LabRow, &'static Interaction), Changed<Interaction>>,
     banners: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<LabReviewBanner>)>,
@@ -587,6 +766,8 @@ pub(super) fn update(
 ) {
     let LabInput {
         keys,
+        keyboard,
+        mut keyboard_cursor,
         open,
         rows,
         banners,
@@ -600,6 +781,10 @@ pub(super) fn update(
         model.synchronize(session, presentation.panel);
     }
     model.select_event(presentation.selected_event());
+    if !model.viewing_replay || presentation.panel != LabPanel::Checkpoints {
+        presentation.replay_editing = false;
+        presentation.replay_select_all = false;
+    }
     let mut action = rows.iter().find_map(|(row, interaction)| {
         if row.enabled && *interaction == Interaction::Pressed {
             row.action.clone()
@@ -607,6 +792,29 @@ pub(super) fn update(
             None
         }
     });
+    // Activate mouse-selected editing before consuming this frame's ordered text.
+    if action == Some(PanelAction::EditReplayTarget) {
+        presentation.replay_editing = true;
+        presentation.replay_select_all = true;
+        presentation.keyboard_captured = true;
+        action = None;
+    } else if action.is_some() {
+        presentation.replay_editing = false;
+        presentation.replay_select_all = false;
+    }
+    let was_editing_replay = presentation.replay_editing;
+    replay_target_input(
+        &mut model,
+        &mut presentation,
+        &keys,
+        keyboard.as_deref(),
+        &mut keyboard_cursor,
+    );
+    if was_editing_replay && keys.just_pressed(KeyCode::Escape) {
+        presentation.replay_editing = false;
+        presentation.replay_select_all = false;
+        presentation.keyboard_captured = true;
+    }
     if open
         .iter()
         .any(|interaction| *interaction == Interaction::Pressed)
@@ -637,11 +845,15 @@ pub(super) fn update(
         action = Some(PanelAction::Workflow(LabAction::ReturnLive));
         presentation.keyboard_captured = true;
     }
-    if keys.just_pressed(KeyCode::Escape) && presentation.panel != LabPanel::Inactive {
+    if keys.just_pressed(KeyCode::Escape)
+        && presentation.panel != LabPanel::Inactive
+        && !was_editing_replay
+    {
         action = Some(PanelAction::Close);
         presentation.keyboard_captured = true;
     }
     if presentation.panel != LabPanel::Inactive
+        && (!was_editing_replay || keys.just_pressed(KeyCode::Tab))
         && let Some(ui) = ui
     {
         let choices = ui
@@ -669,7 +881,7 @@ pub(super) fn update(
             presentation.focus = Some(choices[index]);
             presentation.focus_changed = true;
         }
-        if keys.just_pressed(KeyCode::Enter) {
+        if keys.just_pressed(KeyCode::Enter) && !was_editing_replay {
             action = presentation
                 .focus
                 .and_then(|focus| ui.shown.get(focus))
@@ -681,7 +893,18 @@ pub(super) fn update(
     if let Some(action) = action {
         rig.pending_clicked_follow = None;
         rig.clicked_follow_notice = None;
+        if action != PanelAction::EditReplayTarget {
+            presentation.replay_editing = false;
+            presentation.replay_select_all = false;
+        }
         match action {
+            PanelAction::EditReplayTarget => {
+                if model.viewing_replay && presentation.panel == LabPanel::Checkpoints {
+                    presentation.replay_editing = true;
+                    presentation.replay_select_all = true;
+                    presentation.keyboard_captured = true;
+                }
+            }
             PanelAction::Panel(panel) => presentation.change_panel(panel),
             PanelAction::Close => {
                 presentation.keyboard_captured = true;
@@ -752,6 +975,22 @@ pub(super) fn update(
             model.set_notice("Event review could not match the selected evidence or complete visual layers; the displayed world is unchanged.");
         }
     }
+    if let Some(review) = model.take_replay_review() {
+        if presentation.show_replay_review(review, &mut state, &mut motion) {
+            // Keep the replay draft open so editing and explicit step/seek remain usable.
+            presentation.keyboard_captured = true;
+            model.set_notice(
+                "Viewing the reconstructed replay target. The live owner is unchanged; edit the target to seek again or return live.",
+            );
+            rig.pending_clicked_follow = None;
+            rig.clicked_follow_notice = None;
+            rig.queue_fit(FitCommand::World);
+        } else {
+            model.set_notice(
+                "Replay source, target or visual layers no longer match; the displayed world is unchanged.",
+            );
+        }
+    }
     model.maybe_refresh();
 }
 
@@ -808,7 +1047,7 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
         rows.push(PanelRow::text(
             "Lab services are unavailable in this launch.",
         ));
-        if !model.viewing_artifacts {
+        if !model.viewing_artifacts && !model.viewing_replay {
             return rows;
         }
     }
@@ -816,7 +1055,7 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
         rows.push(PanelRow::text(
             "Waiting for an identified host publication.",
         ));
-        if !model.viewing_artifacts {
+        if !model.viewing_artifacts && !model.viewing_replay {
             return rows;
         }
     }
@@ -832,9 +1071,11 @@ fn panel_rows(model: &LabWorkflows, presentation: &LabPresentation) -> Vec<Panel
     ));
     if !idle {
         rows.push(PanelRow::workflow(
-            if model.latest_artifact_export.as_ref().is_some_and(|export| {
-                matches!(&export.state, LabArtifactExportState::Pending)
-            }) {
+            if model
+                .latest_artifact_export
+                .as_ref()
+                .is_some_and(|export| matches!(&export.state, LabArtifactExportState::Pending))
+            {
                 "Leave pending view; export may still complete"
             } else {
                 "Discard pending result"
@@ -888,7 +1129,11 @@ fn artifact_rows(
                 "Historical export: this request belongs to a previous application source.",
             ));
         }
-        rows.extend(artifact_export_lines(export).into_iter().map(PanelRow::text));
+        rows.extend(
+            artifact_export_lines(export)
+                .into_iter()
+                .map(PanelRow::text),
+        );
     }
     let Some(page) = &model.artifacts else {
         rows.push(PanelRow::text(
@@ -918,7 +1163,9 @@ fn artifact_rows(
         ));
     }
     if page.items.is_empty() {
-        rows.push(PanelRow::text("No retained artifacts are available from this source."));
+        rows.push(PanelRow::text(
+            "No retained artifacts are available from this source.",
+        ));
     }
     if let Some(artifact) = model.selected_artifact_metadata() {
         for line in [
@@ -999,9 +1246,11 @@ fn narrative_rows(model: &LabWorkflows, presentation: &LabPresentation, rows: &m
     }
     if model.is_busy() {
         rows.push(PanelRow::workflow(
-            if model.latest_artifact_export.as_ref().is_some_and(|export| {
-                matches!(&export.state, LabArtifactExportState::Pending)
-            }) {
+            if model
+                .latest_artifact_export
+                .as_ref()
+                .is_some_and(|export| matches!(&export.state, LabArtifactExportState::Pending))
+            {
                 "Leave pending view; export may still complete"
             } else {
                 "Discard pending review result"
@@ -1962,12 +2211,130 @@ fn checkpoint_study_rows(
     }
 }
 
+fn replay_rows(model: &LabWorkflows, presentation: &LabPresentation, rows: &mut Vec<PanelRow>) {
+    rows.push(PanelRow::text("REPLAY / SEEK"));
+    rows.push(PanelRow::workflow(
+        "Back to saved checkpoints",
+        LabAction::BackFromReplay,
+        true,
+    ));
+    rows.push(PanelRow::workflow(
+        "Return to live world",
+        LabAction::ReturnLive,
+        true,
+    ));
+    rows.push(PanelRow::text(
+        "Review an exact tick from the selected saved cut. Seeking reconstructs an independent historical view; it never steps or replaces the live owner.",
+    ));
+    let Some(checkpoint) = &model.replay_checkpoint else {
+        rows.push(PanelRow::text(
+            "Select a saved checkpoint before opening replay.",
+        ));
+        return;
+    };
+    rows.push(PanelRow::text(format!(
+        "Source checkpoint {} | saved tick {} | {} agents | {} bytes",
+        checkpoint.checkpoint_id, checkpoint.tick, checkpoint.agent_count, checkpoint.byte_size,
+    )));
+    rows.push(PanelRow::text(format!(
+        "Saved world digest: {}",
+        checkpoint.world_digest,
+    )));
+    if let Some(capabilities) = &model.replay_capabilities {
+        rows.push(PanelRow::text(format!(
+            "Application session {} | observed live tick {} | maximum saved-cut-to-current verification interval {} ticks",
+            capabilities.session_id.get(),
+            capabilities.observed_tick,
+            capabilities.max_verification_ticks,
+        )));
+    } else {
+        rows.push(PanelRow::text(
+            "Replay bounds have not arrived. Refresh to observe this application's current tick and verification limit.",
+        ));
+    }
+    rows.push(PanelRow::button(
+        format!(
+            "Target tick: {}{}",
+            if model.replay_tick_text.is_empty() {
+                "(type decimal digits)"
+            } else {
+                &model.replay_tick_text
+            },
+            if presentation.replay_editing {
+                if presentation.replay_select_all {
+                    " [selected: type to replace]"
+                } else {
+                    " [editing]"
+                }
+            } else {
+                " [click or select to edit]"
+            },
+        ),
+        PanelAction::EditReplayTarget,
+        true,
+    ));
+    rows.push(PanelRow::text(
+        "Activate Target tick and type the exact number. Enter seeks; Backspace edits; Delete or Clear empties; Ctrl+A selects all; Escape leaves editing. Tab returns to panel navigation.",
+    ));
+    for (label, delta) in [
+        ("−10 ticks", -10_i64),
+        ("−1 tick", -1),
+        ("+1 tick", 1),
+        ("+10 ticks", 10),
+    ] {
+        rows.push(PanelRow::workflow(
+            label,
+            LabAction::ReplayStep(delta),
+            model.parsed_replay_tick().is_some_and(|tick| {
+                tick.checked_add_signed(delta)
+                    .is_some_and(|next| next >= checkpoint.tick)
+            }),
+        ));
+    }
+    rows.push(PanelRow::workflow(
+        "Clear target",
+        LabAction::ReplayTickText(String::new()),
+        true,
+    ));
+    if let Some(action) = model.replay_seek_action() {
+        rows.push(PanelRow::workflow(
+            "Seek exact tick",
+            action,
+            model.can_seek_replay(),
+        ));
+    }
+    if model.parsed_replay_tick().is_none() {
+        rows.push(PanelRow::text(
+            "Invalid target: enter one unsigned 64-bit decimal tick (0 through 18446744073709551615).",
+        ));
+    } else if model.replay_seek_action().is_none() {
+        rows.push(PanelRow::text(
+            "Seek unavailable: the target must be at or after the saved cut. A later tick needs current replay bounds, a target no later than the observed live tick, and the whole saved-cut-to-current interval within the displayed limit.",
+        ));
+    }
+    rows.push(PanelRow::text(
+        "The saved tick verifies the saved cut alone. A later target is published only after replay matches the captured-current scientific digest. This does not locate a first divergent tick or provide a per-tick oracle.",
+    ));
+    if let Some(summary) = &model.replay_summary {
+        rows.push(PanelRow::text("Last verified review"));
+        rows.extend(
+            replay_summary_lines(summary)
+                .into_iter()
+                .map(PanelRow::text),
+        );
+    }
+}
+
 fn checkpoint_rows(
     model: &LabWorkflows,
     presentation: &LabPresentation,
     idle: bool,
     rows: &mut Vec<PanelRow>,
 ) {
+    if model.viewing_replay {
+        replay_rows(model, presentation, rows);
+        return;
+    }
     if model.checkpoint_view != LabCheckpointView::SavedCuts {
         checkpoint_study_rows(model, presentation, idle, rows);
         return;
@@ -2039,6 +2406,11 @@ fn checkpoint_rows(
         "Review selected checkpoint in world",
         LabAction::ReviewCheckpoint,
         idle && model.selected_checkpoint_metadata().is_some(),
+    ));
+    rows.push(PanelRow::workflow(
+        "Replay / seek from selected checkpoint",
+        LabAction::OpenReplay,
+        model.selected_checkpoint_metadata().is_some(),
     ));
     rows.push(PanelRow::workflow(
         "Configure a checkpoint study",
@@ -2318,6 +2690,541 @@ mod tests {
     }
 
     #[test]
+    fn replay_controls_accept_ordered_exact_ticks_and_preserve_the_displayed_world() {
+        use scriptbots_runtime::lab_workflows::LabReplayCapabilities;
+
+        let frame = |tick: u64| {
+            let mut world = WorldState::new(scriptbots_core::ScriptBotsConfig {
+                rng_seed: Some(17),
+                world_width: 80,
+                world_height: 80,
+                food_cell_size: 40,
+                population_minimum: 0,
+                population_spawn_interval: 0,
+                persistence_interval: 0,
+                closed: true,
+                ..default()
+            })
+            .unwrap();
+            for _ in 0..tick {
+                world.step().unwrap();
+            }
+            let digest = world.world_digest_v1().unwrap().overall;
+            let snapshot = HostCore::new(
+                HostSessionId::new(717),
+                world,
+                HostCoreOptions {
+                    capture_agent_visuals: true,
+                    ..default()
+                },
+            )
+            .unwrap()
+            .latest_snapshot();
+            (snapshot, digest)
+        };
+        let (saved, saved_digest) = frame(0);
+        let (target_twelve, _) = frame(12);
+        let (target_thirteen, _) = frame(13);
+        let (live, live_digest) = frame(20);
+        let (newest, _) = frame(21);
+        let session = live.session_id;
+        let checkpoint = LabCheckpoint {
+            checkpoint_id: "replay-saved-source".into(),
+            tick: 0,
+            agent_count: saved.world.agents.len(),
+            byte_size: 64,
+            world_digest: saved_digest,
+        };
+        let selected = checkpoint.clone();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let (started, observed) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        // Explicit service double around real host publications: this exercises the
+        // shipped ECS input/projection path, not replay science or hardware pixels.
+        let provider: LabWorkflowSubmit = Arc::new(move |request| {
+            Ok(match request {
+                LabWorkflowRequest::ListCheckpoints { .. } => {
+                    LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                        items: vec![selected.clone()],
+                        total: 1,
+                        offset: 0,
+                        next_cursor: None,
+                        retained_bytes: 64,
+                        max_bytes: 1_024,
+                    })
+                }
+                LabWorkflowRequest::ReplayCapabilities => {
+                    LabWorkflowResponse::ReplayCapabilities(LabReplayCapabilities {
+                        session_id: session,
+                        observed_tick: 20,
+                        max_verification_ticks: 32,
+                    })
+                }
+                request @ LabWorkflowRequest::ReviewReplay { .. } => {
+                    recorded.lock().unwrap().push(request.clone());
+                    started.send(()).unwrap();
+                    if !released
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                    {
+                        return Err(
+                            "Replay differs from the captured-current scientific digest; earliest divergent tick is unknown."
+                                .into(),
+                        );
+                    }
+                    let LabWorkflowRequest::ReviewReplay {
+                        session_id,
+                        checkpoint,
+                        target_tick,
+                    } = request
+                    else {
+                        unreachable!("matched replay request")
+                    };
+                    let snapshot = match target_tick {
+                        12 => Arc::clone(&target_twelve),
+                        13 => Arc::clone(&target_thirteen),
+                        other => panic!("unexpected requested target {other}"),
+                    };
+                    LabWorkflowResponse::ReplayFrame(LabReplayReview {
+                        summary: LabReplaySummary {
+                            session_id,
+                            checkpoint,
+                            target_tick,
+                            verification: LabReplayVerification::CapturedInterval {
+                                verified_through_tick: 20,
+                                captured_current_digest: live_digest.clone(),
+                            },
+                        },
+                        snapshot,
+                    })
+                }
+                other => panic!("unexpected replay UI request: {other:?}"),
+            })
+        });
+        let mut presentation = LabPresentation {
+            panel: LabPanel::Checkpoints,
+            ..default()
+        };
+        let mut state = SnapshotState::default();
+        let mut motion = AgentMotionSettings { enabled: true };
+        presentation.receive_live(
+            WorldSnapshot::from_snapshot(&live).unwrap(),
+            &mut state,
+            &mut motion,
+        );
+        presentation.source_changed = false;
+        let mut model = consumer(Some(provider));
+        model.synchronize(session, LabPanel::Checkpoints);
+        let mut app = App::new();
+        app.insert_non_send_resource(model)
+            .insert_resource(presentation)
+            .insert_resource(state)
+            .insert_resource(motion)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<CameraRig>()
+            .add_message::<KeyboardInput>()
+            .add_systems(Update, update);
+        let window = app.world_mut().spawn_empty().id();
+        let button = app
+            .world_mut()
+            .spawn((LabRow::default(), Interaction::None))
+            .id();
+        let press = |app: &mut App, action: PanelAction| {
+            let row = panel_rows(
+                app.world().non_send_resource::<LabWorkflows>(),
+                app.world().resource::<LabPresentation>(),
+            )
+            .into_iter()
+            .find(|row| row.action.as_ref() == Some(&action))
+            .expect("production replay control");
+            assert!(row.enabled, "enabled replay control: {}", row.text);
+            app.world_mut().entity_mut(button).insert((
+                LabRow {
+                    index: 0,
+                    action: row.action,
+                    enabled: row.enabled,
+                },
+                Interaction::Pressed,
+            ));
+            app.update();
+            app.world_mut().entity_mut(button).insert(Interaction::None);
+        };
+        let type_digits = |app: &mut App, digits: &str| {
+            {
+                let mut messages = app.world_mut().resource_mut::<Messages<KeyboardInput>>();
+                for byte in digits.bytes() {
+                    let physical = [
+                        KeyCode::Digit0,
+                        KeyCode::Digit1,
+                        KeyCode::Digit2,
+                        KeyCode::Digit3,
+                        KeyCode::Digit4,
+                        KeyCode::Digit5,
+                        KeyCode::Digit6,
+                        KeyCode::Digit7,
+                        KeyCode::Digit8,
+                        KeyCode::Digit9,
+                    ][usize::from(byte - b'0')];
+                    let text = char::from(byte).to_string();
+                    messages.write(KeyboardInput {
+                        key_code: physical,
+                        logical_key: LogicalKey::Character(text.clone().into()),
+                        state: ButtonState::Pressed,
+                        text: Some(text.into()),
+                        repeat: false,
+                        window,
+                    });
+                }
+            }
+            // All digits arrive before one update, so a render-captured buffer
+            // would lose all but the final digit and fail this real input path.
+            app.update();
+        };
+        let key = |app: &mut App, logical_key: LogicalKey, key_code: KeyCode| {
+            app.world_mut()
+                .resource_mut::<Messages<KeyboardInput>>()
+                .write(KeyboardInput {
+                    key_code,
+                    logical_key,
+                    state: ButtonState::Pressed,
+                    text: None,
+                    repeat: false,
+                    window,
+                });
+            app.update();
+        };
+        let wait_idle = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                app.update();
+                if !app.world().non_send_resource::<LabWorkflows>().is_busy() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "native replay worker deadline");
+                std::thread::yield_now();
+            }
+        };
+        wait_idle(&mut app);
+        press(
+            &mut app,
+            PanelAction::Workflow(LabAction::SelectCheckpoint(
+                checkpoint.checkpoint_id.clone(),
+            )),
+        );
+        press(&mut app, PanelAction::Workflow(LabAction::OpenReplay));
+        wait_idle(&mut app);
+        press(&mut app, PanelAction::EditReplayTarget);
+        type_digits(&mut app, "18446744073709551616");
+        assert_eq!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .replay_tick_text,
+            "18446744073709551616",
+        );
+        assert!(
+            !app.world()
+                .non_send_resource::<LabWorkflows>()
+                .can_seek_replay()
+        );
+        key(&mut app, LogicalKey::Enter, KeyCode::Enter);
+        assert!(calls.lock().unwrap().is_empty(), "overflow cannot seek");
+        key(&mut app, LogicalKey::Delete, KeyCode::Delete);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ControlLeft);
+        {
+            let mut messages = app.world_mut().resource_mut::<Messages<KeyboardInput>>();
+            for (key_code, logical_key, text) in [
+                (
+                    KeyCode::Digit7,
+                    LogicalKey::Character("7".into()),
+                    Some("7".into()),
+                ),
+                (KeyCode::ControlLeft, LogicalKey::Control, None),
+            ] {
+                messages.write(KeyboardInput {
+                    key_code,
+                    logical_key,
+                    state: ButtonState::Pressed,
+                    text,
+                    repeat: false,
+                    window,
+                });
+            }
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .replay_tick_text,
+            "7",
+            "a modifier pressed later in the same batch must not suppress an earlier digit",
+        );
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        {
+            let mut messages = app.world_mut().resource_mut::<Messages<KeyboardInput>>();
+            for (key_code, logical_key, state, text) in [
+                (
+                    KeyCode::ControlLeft,
+                    LogicalKey::Control,
+                    ButtonState::Released,
+                    None,
+                ),
+                (
+                    KeyCode::ControlLeft,
+                    LogicalKey::Control,
+                    ButtonState::Pressed,
+                    None,
+                ),
+                (
+                    KeyCode::KeyA,
+                    LogicalKey::Character("a".into()),
+                    ButtonState::Pressed,
+                    Some("a".into()),
+                ),
+                (
+                    KeyCode::ControlLeft,
+                    LogicalKey::Control,
+                    ButtonState::Released,
+                    None,
+                ),
+                (
+                    KeyCode::Digit1,
+                    LogicalKey::Character("1".into()),
+                    ButtonState::Pressed,
+                    Some("1".into()),
+                ),
+                (
+                    KeyCode::Digit2,
+                    LogicalKey::Character("2".into()),
+                    ButtonState::Pressed,
+                    Some("2".into()),
+                ),
+            ] {
+                messages.write(KeyboardInput {
+                    key_code,
+                    logical_key,
+                    state,
+                    text,
+                    repeat: false,
+                    window,
+                });
+            }
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .parsed_replay_tick(),
+            Some(12),
+            "ordered Ctrl+A, release, and digits replace the exact current draft",
+        );
+        let return_live_row = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            app.world().resource::<LabPresentation>(),
+        )
+        .into_iter()
+        .find(|row| row.action == Some(PanelAction::Workflow(LabAction::ReturnLive)))
+        .expect("production return-live row");
+        app.insert_resource(LabUi {
+            rows: Vec::new(),
+            shown: vec![return_live_row],
+        });
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::Enter);
+            keys.press(KeyCode::Tab);
+        }
+        {
+            let mut messages = app.world_mut().resource_mut::<Messages<KeyboardInput>>();
+            for (logical_key, key_code) in [
+                (LogicalKey::Enter, KeyCode::Enter),
+                (LogicalKey::Tab, KeyCode::Tab),
+            ] {
+                messages.write(KeyboardInput {
+                    key_code,
+                    logical_key,
+                    state: ButtonState::Pressed,
+                    text: None,
+                    repeat: false,
+                    window,
+                });
+            }
+        }
+        app.update();
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        assert_eq!(app.world().resource::<LabPresentation>().focus, Some(0));
+        // Enter belonged to the editor before Tab moved panel focus. It must
+        // not activate the newly focused Return Live row and cancel this seek.
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(app.world().non_send_resource::<LabWorkflows>().is_busy());
+        release.send(true).unwrap();
+        wait_idle(&mut app);
+        let presentation = app.world().resource::<LabPresentation>();
+        assert_eq!(presentation.review.as_ref().unwrap().tick, 12);
+        assert!(
+            presentation
+                .review
+                .as_ref()
+                .unwrap()
+                .description()
+                .contains("VERIFIED THROUGH CAPTURED TICK 20",)
+        );
+        assert_eq!(presentation.panel, LabPanel::Checkpoints);
+        assert!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .viewing_replay
+        );
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            12
+        );
+        assert!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .owner_source
+                .is_none()
+        );
+        assert!(!app.world().resource::<AgentMotionSettings>().enabled);
+        let rows = panel_rows(
+            app.world().non_send_resource::<LabWorkflows>(),
+            presentation,
+        );
+        assert!(rows.len() <= MAX_PANEL_ROWS);
+        assert!(rows.iter().any(|row| row.text == "Last verified review"));
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("captured current tick 20"))
+        );
+
+        press(&mut app, PanelAction::Workflow(LabAction::ReplayStep(1)));
+        let seek = app
+            .world()
+            .non_send_resource::<LabWorkflows>()
+            .replay_seek_action()
+            .unwrap();
+        press(&mut app, PanelAction::Workflow(seek));
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        press(&mut app, PanelAction::EditReplayTarget);
+        type_digits(&mut app, "14");
+        assert!(app.world().non_send_resource::<LabWorkflows>().is_busy());
+        release.send(true).unwrap();
+        wait_idle(&mut app);
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            12
+        );
+        assert_eq!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .replay_summary
+                .as_ref()
+                .unwrap()
+                .target_tick,
+            12
+        );
+
+        press(&mut app, PanelAction::EditReplayTarget);
+        type_digits(&mut app, "13");
+        key(&mut app, LogicalKey::Enter, KeyCode::Enter);
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(false).unwrap();
+        wait_idle(&mut app);
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            12
+        );
+        assert!(
+            panel_rows(
+                app.world().non_send_resource::<LabWorkflows>(),
+                app.world().resource::<LabPresentation>(),
+            )
+            .iter()
+            .any(|row| row.text.contains("earliest divergent tick is unknown"))
+        );
+
+        key(&mut app, LogicalKey::Enter, KeyCode::Enter);
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.world_mut()
+            .resource_scope(|world, mut presentation: Mut<LabPresentation>| {
+                world.resource_scope(|world, mut state: Mut<SnapshotState>| {
+                    let mut motion = world.resource_mut::<AgentMotionSettings>();
+                    presentation.receive_live(
+                        WorldSnapshot::from_snapshot(&newest).unwrap(),
+                        &mut state,
+                        &mut motion,
+                    );
+                });
+            });
+        press(&mut app, PanelAction::Workflow(LabAction::ReturnLive));
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            21
+        );
+        assert!(app.world().resource::<LabPresentation>().review.is_none());
+        assert!(app.world().non_send_resource::<LabWorkflows>().is_busy());
+        release.send(true).unwrap();
+        wait_idle(&mut app);
+        assert_eq!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .tick,
+            21
+        );
+        assert!(
+            app.world()
+                .resource::<SnapshotState>()
+                .latest
+                .as_ref()
+                .unwrap()
+                .owner_source
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .non_send_resource::<LabWorkflows>()
+                .viewing_replay
+        );
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert!(matches!(
+            &calls.lock().unwrap()[0],
+            LabWorkflowRequest::ReviewReplay { session_id, checkpoint: observed, target_tick: 12 }
+                if *session_id == session && observed == &checkpoint
+        ));
+    }
+
+    #[test]
     fn artifact_panel_routes_frozen_exports_and_retains_late_historical_receipts() {
         use scriptbots_runtime::lab_workflows::{
             LabArtifact, LabArtifactExportReceipt, LabArtifactPage,
@@ -2387,7 +3294,11 @@ mod tests {
                 request @ LabWorkflowRequest::ExportArtifact { .. } => {
                     recorded.lock().unwrap().push(request.clone());
                     started.send(()).unwrap();
-                    match released.lock().unwrap().recv_timeout(Duration::from_secs(5)) {
+                    match released
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                    {
                         Ok(true) => {}
                         Ok(false) => return Err("export readback checksum mismatch".into()),
                         Err(error) => return Err(format!("test release unavailable: {error}")),
@@ -2470,9 +3381,13 @@ mod tests {
                 std::thread::yield_now();
             }
         };
-        wait(&mut app, &|model| model.experiments.is_some() && !model.is_busy());
+        wait(&mut app, &|model| {
+            model.experiments.is_some() && !model.is_busy()
+        });
         assert!(press(&mut app, LabAction::ArtifactsPage(None)));
-        wait(&mut app, &|model| model.artifacts.is_some() && !model.is_busy());
+        wait(&mut app, &|model| {
+            model.artifacts.is_some() && !model.is_busy()
+        });
         assert!(press(
             &mut app,
             LabAction::SelectArtifact(format!("artifact-{}", LAB_PAGE_SIZE - 1)),
@@ -2515,11 +3430,23 @@ mod tests {
             .iter()
             .position(|row| row.text.starts_with("Destination:"))
             .unwrap();
-        let export = rows.iter().position(|row| row.text == "Export selected").unwrap();
-        assert!(destination < export, "review destination before the write action");
+        let export = rows
+            .iter()
+            .position(|row| row.text == "Export selected")
+            .unwrap();
+        assert!(
+            destination < export,
+            "review destination before the write action"
+        );
         assert!(rows[destination].text.contains(&directory));
-        assert!(rows.iter().any(|row| row.text.contains(&expected.relative_path)));
-        assert!(rows.iter().any(|row| row.text.contains(&expected.checksum_sha256)));
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains(&expected.relative_path))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains(&expected.checksum_sha256))
+        );
         assert!(press(&mut app, action.clone()));
         observed.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
@@ -2532,7 +3459,10 @@ mod tests {
             app.world().non_send_resource::<LabWorkflows>(),
             app.world().resource::<LabPresentation>(),
         );
-        assert!(rows.iter().any(|row| row.text.contains("export readback checksum mismatch")));
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("export readback checksum mismatch"))
+        );
         assert!(matches!(
             &app.world()
                 .non_send_resource::<LabWorkflows>()
@@ -2548,7 +3478,11 @@ mod tests {
             app.world().non_send_resource::<LabWorkflows>(),
             app.world().resource::<LabPresentation>(),
         );
-        assert!(pending_rows.iter().any(|row| row.text.contains("export may still complete")));
+        assert!(
+            pending_rows
+                .iter()
+                .any(|row| row.text.contains("export may still complete"))
+        );
         app.world_mut().resource_mut::<LabPresentation>().panel = LabPanel::Narrative;
         let narrative_rows = panel_rows(
             app.world().non_send_resource::<LabWorkflows>(),
@@ -2587,7 +3521,11 @@ mod tests {
             app.world().resource::<LabPresentation>(),
         );
         assert!(rows.len() <= MAX_PANEL_ROWS);
-        for expected in ["Historical export", &receipt.output_path, &receipt.manifest_path] {
+        for expected in [
+            "Historical export",
+            &receipt.output_path,
+            &receipt.manifest_path,
+        ] {
             assert!(
                 rows.iter().any(|row| row.text.contains(expected)),
                 "missing {expected}",
@@ -3720,26 +4658,24 @@ mod tests {
         );
         // The worst-case composer must still fit with a retained export receipt.
         // The receipt remains in its own view instead of consuming extra rows here.
-        model.latest_artifact_export = Some(
-            scriptbots_runtime::lab_workflows::LabArtifactExport {
-                request_id: "previous-export".into(),
-                session_id: HostSessionId::new(70),
-                artifact: scriptbots_runtime::lab_workflows::LabArtifact {
-                    artifact_id: "previous-report".into(),
-                    filename: "report.json".into(),
-                    content_type: "application/json".into(),
-                    byte_size: 3,
-                    checksum_blake3: "a".repeat(64),
-                    checksum_sha256: "b".repeat(64),
-                    created_at_utc: "2026-11-23T00:00:00Z".into(),
-                    relative_path: "run-42/report.json".into(),
-                },
-                export_directory: std::env::temp_dir().to_string_lossy().into_owned(),
-                state: LabArtifactExportState::Failed {
-                    reason: "Previous destination was unavailable.".into(),
-                },
+        model.latest_artifact_export = Some(scriptbots_runtime::lab_workflows::LabArtifactExport {
+            request_id: "previous-export".into(),
+            session_id: HostSessionId::new(70),
+            artifact: scriptbots_runtime::lab_workflows::LabArtifact {
+                artifact_id: "previous-report".into(),
+                filename: "report.json".into(),
+                content_type: "application/json".into(),
+                byte_size: 3,
+                checksum_blake3: "a".repeat(64),
+                checksum_sha256: "b".repeat(64),
+                created_at_utc: "2026-11-23T00:00:00Z".into(),
+                relative_path: "run-42/report.json".into(),
             },
-        );
+            export_directory: std::env::temp_dir().to_string_lossy().into_owned(),
+            state: LabArtifactExportState::Failed {
+                reason: "Previous destination was unavailable.".into(),
+            },
+        });
         let rows = panel_rows(&model, &presentation);
         assert!(rows.len() <= MAX_PANEL_ROWS);
         assert!(

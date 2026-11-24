@@ -1266,6 +1266,34 @@ Live organism picking and simulation commands are disabled during review. Click
 the banner, choose **Return live**, or press Escape with the panel closed to
 restore the newest live publication. Review does not replace or rewind the owner.
 
+Both native panes also support **Replay / seek from selected checkpoint**. Select
+a saved cut, open this view, and enter an exact decimal tick or use the -10, -1,
++1 and +10 controls. **Clear target** clears the draft; Backspace edits it.
+While editing, Ctrl+A selects the draft in Bevy and clears it in GPUI.
+Seek explicitly or press Enter in the target field.
+The selected checkpoint remains the source even if a newer checkpoint appears.
+Successful seeks keep the controls open for further navigation, and **Return live**
+restores the newest live publication.
+
+The pane shows the saved base tick, the observed live tick and the maximum
+verification interval. A later target requires complete retained configuration,
+scientific-command and schedule evidence from that base through a captured current
+boundary. The whole verification interval, including ticks after the displayed
+target, is bounded to 1,024 ticks. Selecting a more recent saved cut can keep that
+interval within the bound. Exact saved-cut inspection remains available outside
+that interval; cold-recovered cuts do not invent the previous owner's missing
+continuation history.
+
+The returned evidence distinguishes **Saved cut** verification from a reconstructed
+interval checked through the captured current tick and digest. That endpoint can
+be later than the historical world displayed. Historical boundaries can retain
+pending inputs, so the pane does not invent a standalone target digest or a
+first-divergent-tick oracle. Invalid or overflowing tick text remains invalid.
+Editing the target, changing the source or returning live invalidates a pending
+frame; a failed or stale seek preserves the previously displayed world. Seeking
+changes the historical presentation without rewinding or issuing commands to the
+independent live owner.
+
 A selected scientific cut can also seed a saved-checkpoint study: choose an
 unchanged continuation or the offered whole-world treatment, review its source
 and future horizon, then launch it through the application service. Retained
@@ -1314,11 +1342,11 @@ one saved presentation and one newest live publication, and reuses a bounded poo
 of UI rows.
 
 These panes cover experiment creation/comparison, saved-checkpoint studies and
-review, artifact export, and reconstruction at a selected narrative event tick
-under `bd-2z0.7.6.1` and `bd-ji3a`. General replay seeking and full native/GPU
-acceptance remain unfinished parts of those workflows. The new export reducer,
-filesystem/provider and GPUI/Bevy component regressions are authored; execution
-qualification remains pending.
+review, artifact export, exact-tick seeking from a selected saved source, and
+reconstruction at a selected narrative event tick under `bd-2z0.7.6.1` and
+`bd-ji3a`. Full native/GPU acceptance remains unfinished. The export and replay
+reducer, application-provider and GPUI/Bevy component regressions are authored;
+compilation and execution qualification remain pending.
 Normal simulation epoch progression preserves a saved view; a change of host
 session invalidates stale observations and results.
 

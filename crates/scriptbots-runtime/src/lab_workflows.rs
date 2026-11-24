@@ -2769,6 +2769,25 @@ impl LabWorkflows {
         self.set_notice("Returned to saved checkpoints. A pending replay read keeps its worker until completion; its discarded frame cannot replace the presentation.");
     }
 
+    // A current limits read describes the source, not the editable target.
+    // Preserve only that read across draft edits. The pre-invalidation identity
+    // checks prevent a later edit from reviving a cancelled or stale request.
+    fn invalidate_replay_target(&mut self) {
+        let current_capability_read = self.job.as_ref().is_some_and(|job| {
+            matches!(&job.request, LabWorkflowRequest::ReplayCapabilities)
+                && job.context == self.context
+                && job.generation == self.generation
+                && self.session == Some(job.session)
+        });
+        self.invalidate();
+        if current_capability_read
+            && self.context < u64::MAX
+            && let Some(job) = &mut self.job
+        {
+            job.context = self.context;
+        }
+    }
+
     fn edit_replay_tick(&mut self, text: &str) {
         if !self.replay_context_is_current() {
             self.set_notice(
@@ -2776,7 +2795,7 @@ impl LabWorkflows {
             );
             return;
         }
-        self.invalidate();
+        self.invalidate_replay_target();
         // Retain one character beyond the valid decimal width. Truncating an
         // oversized edit to twenty digits could silently authorize another tick.
         self.replay_tick_text = text.chars().take(21).collect();
@@ -2790,7 +2809,7 @@ impl LabWorkflows {
             );
             return;
         }
-        self.invalidate();
+        self.invalidate_replay_target();
         let Some(tick) = self.parsed_replay_tick() else {
             self.note_replay_target();
             return;
@@ -8300,7 +8319,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_capability_reads_never_retry_or_seek_without_explicit_intent() {
+    fn replay_capabilities_survive_initial_target_edits_without_retrying_or_seeking() {
         let (mut state, _, review) = replay_protocol_fixture();
         let (started, observed_start) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
@@ -8320,9 +8339,16 @@ mod tests {
             LabWorkflowRequest::ReplayCapabilities
         );
         state.dispatch(LabAction::ReplayTickText("44".into()));
+        state.dispatch(LabAction::ReplayStep(1));
+        assert_eq!(state.parsed_replay_tick(), Some(45));
         assert!(
             state.is_busy(),
             "draft edits cannot release an active capability read"
+        );
+        assert!(state.replay_capabilities.is_none());
+        assert!(
+            observed_start.try_recv().is_err(),
+            "edits must retain the same limits request"
         );
         assert!(
             release
@@ -8337,14 +8363,18 @@ mod tests {
         );
         drain_worker(&mut state);
         assert!(
-            state.replay_capabilities.is_none(),
-            "edited-context observations are discarded"
+            state.can_seek_replay(),
+            "initial source limits remain valid after editing and stepping the target"
+        );
+        assert!(
+            state.take_replay_review().is_none(),
+            "limits alone cannot publish a frame"
         );
         state.last_refresh = None;
         state.maybe_refresh();
         assert!(
             !state.is_busy(),
-            "discarding a read must not silently retry it"
+            "completing the original limits read must not retry it or seek"
         );
         assert!(observed_start.try_recv().is_err());
         for capabilities in [
@@ -8392,7 +8422,7 @@ mod tests {
         assert!(matches!(
             requested,
             LabWorkflowRequest::ReviewReplay {
-                target_tick: 44,
+                target_tick: 45,
                 ..
             }
         ));
@@ -8410,6 +8440,75 @@ mod tests {
             "failed reconstruction never retries automatically"
         );
         assert!(observed_start.try_recv().is_err());
+    }
+
+    #[test]
+    fn replay_target_edits_cannot_revive_cancelled_or_superseded_capability_reads() {
+        for (discard, exhaust_context) in [
+            (LabAction::CancelRequest, false),
+            (LabAction::ReturnLive, false),
+            (LabAction::CancelRequest, true),
+        ] {
+            let (mut state, _, review) = replay_protocol_fixture();
+            let (started, observed_start) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let released = Mutex::new(released);
+            state.submit = Some(Arc::new(move |request| {
+                started.send(request).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+            }));
+            state.dispatch(LabAction::BackFromReplay);
+            state.dispatch(LabAction::OpenReplay);
+            assert_eq!(
+                observed_start.recv_timeout(Duration::from_secs(5)).unwrap(),
+                LabWorkflowRequest::ReplayCapabilities
+            );
+            if exhaust_context {
+                state.context = u64::MAX - 1;
+                state.job.as_mut().unwrap().context = state.context;
+                state.dispatch(LabAction::ReplayTickText("44".into()));
+                assert_eq!(state.context, u64::MAX);
+                assert_eq!(
+                    state.job.as_ref().unwrap().context,
+                    u64::MAX - 1,
+                    "an exhausted context cannot retain a read that cancellation could no longer invalidate"
+                );
+            }
+            state.dispatch(discard);
+            state.dispatch(LabAction::ReplayTickText("44".into()));
+            state.dispatch(LabAction::ReplayStep(1));
+            assert_eq!(state.parsed_replay_tick(), Some(45));
+            assert!(
+                state.is_busy(),
+                "discarding a result still retains the occupied worker"
+            );
+            assert!(
+                release
+                    .send(Ok(LabWorkflowResponse::ReplayCapabilities(
+                        LabReplayCapabilities {
+                            session_id: review.summary.session_id,
+                            observed_tick: 50,
+                            max_verification_ticks: 16,
+                        }
+                    )))
+                    .is_ok()
+            );
+            drain_worker(&mut state);
+            assert!(
+                state.replay_capabilities.is_none(),
+                "later draft edits cannot revive a previously discarded source-limits read"
+            );
+            assert!(!state.can_seek_replay());
+            assert!(state.take_replay_review().is_none());
+            state.last_refresh = None;
+            state.maybe_refresh();
+            assert!(!state.is_busy(), "a discarded read needs explicit refresh");
+            assert!(observed_start.try_recv().is_err());
+        }
     }
 
     fn saved_checkpoint() -> LabCheckpoint {
