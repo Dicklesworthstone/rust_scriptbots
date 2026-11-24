@@ -19196,6 +19196,24 @@ impl Storage {
             return Ok(());
         }
 
+        // In a founding cohort there can be thousands of candidate identities
+        // and no persisted births. One existence check on the same transaction
+        // snapshot settles every persisted lookup in that case. Normal science
+        // ticks retain their keyed lookups. Staged births are checked either way.
+        let founding_cohort = prepared.births.len() > 1
+            && prepared.ticks.first().is_some_and(|row| row.tick == 0)
+            && prepared
+                .births
+                .iter()
+                .all(|row| row.origin == BirthOrigin::Seeded);
+        let check_persisted = !founding_cohort
+            || !reader
+                .read_rows(
+                    "SELECT 1 FROM births WHERE run_id = ?1 LIMIT 1",
+                    &[sqlite_run_id(self.run_id)],
+                )?
+                .is_empty();
+
         // Every staged set and the persisted lookup below are keyed by (island_id, value),
         // because each island mints these counters privately (bd-8jlj) and V15 lifted the
         // matching unique indexes to include island_id. A run-scoped check here contradicts the
@@ -19249,6 +19267,9 @@ impl Storage {
                 });
             }
 
+            if !check_persisted {
+                continue;
+            }
             let existing = reader.read_rows(
                 "SELECT agent_uid, spawn_ordinal, birth_ordinal
                  FROM births
@@ -19548,9 +19569,9 @@ impl Storage {
 
     /// Lifecycle and run-event identity checks for a batch about to be admitted.
     ///
-    /// They issue one lookup per birth, death, referenced parent and run event. Each runs on
-    /// a single transaction snapshot that is rolled back afterwards, so the batch pays one
-    /// committed-state refresh instead of one per lookup (see `RowReader`, bd-w1oi).
+    /// Identity lookups share one transaction snapshot, including the empty-run
+    /// check for a tick-zero founding cohort. Rolling it back after validation
+    /// avoids refreshing committed state for each lookup (see `RowReader`, bd-w1oi).
     fn validate_new_batch_identities(&self, prepared: &StorageBuffer) -> Result<(), StorageError> {
         let mut snapshot = self.connection()?.transaction()?;
         let result = self
@@ -45152,6 +45173,72 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM storage_batch_ledger")?
             .get_typed(0)?;
         assert_eq!(ledger_count, 1);
+        storage.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn founding_cohort_checks_persisted_births_once_and_preserves_collisions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct CountReads<'a> {
+            connection: &'a Connection,
+            calls: std::cell::Cell<usize>,
+        }
+
+        impl RowReader for CountReads<'_> {
+            fn read_rows(
+                &self,
+                sql: &str,
+                params: &[SqliteValue],
+            ) -> Result<Vec<Row>, FrankenError> {
+                self.calls.set(self.calls.get() + 1);
+                self.connection.query_with_params(sql, params)
+            }
+        }
+
+        let mut storage = Storage::unattributed_memory()?;
+        let mut cohort = sample_batch(0, 5.0);
+        cohort.births = (1..=5_000)
+            .map(|uid| sample_birth(0, uid, BirthOrigin::Seeded))
+            .collect();
+        synchronize_lifecycle_counts(&mut cohort);
+        let prepared = Storage::prepare_batch(&cohort)?;
+        let counter = CountReads {
+            connection: storage.connection()?,
+            calls: std::cell::Cell::new(0),
+        };
+        storage.validate_new_birth_identities(&counter, &prepared)?;
+        assert_eq!(counter.calls.get(), 1);
+
+        let mut initial = sample_batch(0, 1.0);
+        initial
+            .births
+            .push(sample_birth(0, 5_000, BirthOrigin::Seeded));
+        synchronize_lifecycle_counts(&mut initial);
+        storage.persist(&initial)?;
+
+        let mut next = sample_batch(2, 2.0);
+        next.births = vec![
+            sample_birth(2, 5_001, BirthOrigin::Injected),
+            sample_birth(2, 5_000, BirthOrigin::Injected),
+        ];
+        synchronize_lifecycle_counts(&mut next);
+        let before = storage.persistence_watermarks()?;
+        assert_invalid_data_context(storage.persist(&next), "births.agent_uid");
+        assert_eq!(storage.persistence_watermarks()?, before);
+        storage.flush()?;
+        let flushed = storage.persistence_watermarks()?;
+        assert_invalid_data_context(storage.persist(&next), "births.agent_uid");
+        assert_eq!(storage.persistence_watermarks()?, flushed);
+        // A populated run pays only the existing keyed probes for normal arrivals.
+        next.births[1] = sample_birth(2, 5_002, BirthOrigin::Injected);
+        let prepared = Storage::prepare_batch(&next)?;
+        let counter = CountReads {
+            connection: storage.connection()?,
+            calls: std::cell::Cell::new(0),
+        };
+        storage.validate_new_birth_identities(&counter, &prepared)?;
+        assert_eq!(counter.calls.get(), 2);
         storage.close()?;
         Ok(())
     }
