@@ -486,6 +486,40 @@ impl BranchStudyPlan {
         config
     }
 
+    /// Identify one scientific future independently of where its plan, saved
+    /// source or bundle was written. A canonical JSON tuple frames identifiers
+    /// and sorts patch keys before the shared nonzero BLAKE3-to-RunId mapping.
+    fn bundle_run_id(
+        &self,
+        branch: &StudyBranchSpec,
+        checkpoint_digest: &WorldDigestV1,
+        source: &BranchStudySource,
+    ) -> Result<RunId, BranchStudyError> {
+        let saved_checksum = match source {
+            BranchStudySource::SeededWarmup => None,
+            BranchStudySource::SavedCheckpoint {
+                checksum_blake3, ..
+            } => Some(checksum_blake3),
+        };
+        let due = branch
+            .intervention
+            .as_ref()
+            .map(|_| branch.scheduled_tick.unwrap_or(self.checkpoint_tick));
+        let identity = crate::canonical_json_text(&(
+            "scriptbots.branch-study.run-id.v1",
+            &self.study_id,
+            self.base_seed,
+            self.brain_preset,
+            checkpoint_digest,
+            saved_checksum,
+            self.horizon_ticks,
+            &branch.branch_id,
+            &branch.intervention,
+            due,
+        ))?;
+        Ok(crate::experiment_runner::MatchedSeedExperimentRunner::bundle_run_id(&identity))
+    }
+
     fn final_tick(&self) -> Result<u64, BranchStudyError> {
         self.checkpoint_tick
             .checked_add(self.horizon_ticks)
@@ -2158,6 +2192,8 @@ impl BranchStudyOrchestrator {
 
         // Create and verify run bundle for branch.
         let (bundle_path, bundle_verified) = self.create_and_verify_bundle(
+            self.plan
+                .bundle_run_id(branch, checkpoint.source_digest(), source)?,
             branch,
             source,
             &samples,
@@ -2274,6 +2310,7 @@ impl BranchStudyOrchestrator {
     #[allow(clippy::too_many_arguments)]
     fn create_and_verify_bundle(
         &self,
+        run_id: RunId,
         branch: &StudyBranchSpec,
         source: &BranchStudySource,
         samples: &[BranchObservation],
@@ -2347,9 +2384,7 @@ impl BranchStudyOrchestrator {
         fs::create_dir(&bundle_dir).map_err(|error| study_output_error(&bundle_dir, error))?;
 
         // 3. Manifest
-        let mut manifest = RunManifestRecord::unattributed(RunId::new(u128::from(
-            self.plan.base_seed.wrapping_add(100),
-        )));
+        let mut manifest = RunManifestRecord::unattributed(run_id);
         manifest.scenario_id = format!("branch_study_{}", branch.branch_id);
         manifest.experiment_id = Some(self.plan.study_id.clone());
         manifest.variant_id = Some(branch.branch_id.clone());
@@ -2927,6 +2962,62 @@ mod tests {
         }
     }
 
+    fn exported_run_id(branch: &BranchOutcomeReport) -> RunId {
+        assert!(branch.bundle_verified);
+        let directory = Path::new(branch.bundle_path.as_ref().unwrap());
+        let bundle: RunBundleV1 =
+            serde_json::from_slice(&fs::read(directory.join("bundle_manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(bundle.manifest.variant_id.as_ref(), Some(&branch.branch_id));
+        assert_eq!(bundle.digests.run_id, bundle.manifest.run_id.to_string());
+        assert_ne!(bundle.manifest.run_id.get(), 0);
+        bundle.manifest.run_id
+    }
+
+    #[test]
+    fn branch_bundle_ids_distinguish_same_seed_futures_and_checkpoint_sources() {
+        let directory = tempdir().unwrap();
+        let mut plan = replicated_fixture().study;
+        // The old seed + 100 formula produced a reserved zero ID for both arms.
+        plan.base_seed = u64::MAX - 99;
+        plan.config.rng_seed = Some(plan.base_seed);
+        let mut world = world_at_checkpoint(&plan);
+        let checkpoint = world.checkpoint_v1().unwrap();
+        let run = |plan: &BranchStudyPlan, cut: &WorldCheckpointV1, name: &str| {
+            BranchStudyOrchestrator::new(plan.clone(), directory.path().join(name))
+                .execute_from_checkpoint(cut, None)
+                .unwrap()
+                .branch_reports
+                .iter()
+                .map(|branch| (branch.branch_id.clone(), exported_run_id(branch)))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let original = run(&plan, &checkpoint, "first");
+        assert_ne!(original["control"], original["resource_shock"]);
+
+        let mut changed = plan.clone();
+        changed.branches[1].intervention = Some(StudyIntervention::ResourceShock {
+            region: None,
+            bloom_amount: 0.0,
+            scorch: 0.25,
+        });
+        let treatment = run(&changed, &checkpoint, "same-label-new-treatment");
+        assert_eq!(original["control"], treatment["control"]);
+        assert_ne!(original["resource_shock"], treatment["resource_shock"]);
+
+        let max_food = plan.config.food_max;
+        world
+            .try_update_food(|cells| {
+                cells[0] = if cells[0] == 0.0 { max_food } else { 0.0 };
+            })
+            .unwrap();
+        let different_cut = world.checkpoint_v1().unwrap();
+        assert_ne!(checkpoint.source_digest(), different_cut.source_digest());
+        let source = run(&plan, &different_cut, "same-seed-tick-new-cut");
+        assert_ne!(original["control"], source["control"]);
+        assert_ne!(original["resource_shock"], source["resource_shock"]);
+    }
+
     #[test]
     fn saved_checkpoint_identity_and_cancellation_refuse_before_claiming_output() {
         let directory = tempdir().unwrap();
@@ -3004,6 +3095,10 @@ mod tests {
         for (declared_branch, supplied_branch) in
             declared.branch_reports.iter().zip(&supplied.branch_reports)
         {
+            assert_eq!(
+                exported_run_id(declared_branch),
+                exported_run_id(supplied_branch)
+            );
             assert_eq!(declared_branch.final_digest, supplied_branch.final_digest);
             assert_eq!(
                 declared_branch.terminal_sample,
