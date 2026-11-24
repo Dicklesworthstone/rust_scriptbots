@@ -2277,12 +2277,10 @@ fn continue_host_checkpoint_cli(cli: &AppCli, path: &Path) -> Result<()> {
     let reader = StorageReader::open(path).context("failed to read host continuation database")?;
     let run_id = reader.run_id();
     let record = reader
-        .load_checkpoints()
+        .load_checkpoint(checkpoint_id)
         .with_context(|| {
             format!("host checkpoint {checkpoint_id} in {path} failed retained artifact readback")
         })?
-        .into_iter()
-        .find(|record| record.checkpoint_id == checkpoint_id)
         .with_context(|| format!("host checkpoint {checkpoint_id} is absent from {path}"))?;
     let checkpoint = record.host_checkpoint().with_context(|| {
         format!("host checkpoint {checkpoint_id} in {path} failed artifact validation")
@@ -2436,9 +2434,7 @@ fn finish_checkpoint_handoff(
     }
     let reader = StorageReader::open_for_run(pipeline.storage_path(), receipt.run_id)?;
     let retained = reader
-        .load_checkpoints()?
-        .into_iter()
-        .find(|record| record.checkpoint_id == checkpoint_id)
+        .load_checkpoint(checkpoint_id)?
         .context("handed-off checkpoint disappeared after worker close")?;
     if retained != receipt.record {
         bail!("handed-off checkpoint changed after worker close");
@@ -2500,10 +2496,8 @@ fn read_host_checkpoint_for_comparison(
     // Shutdown; the existing complete-graph validator does not invent one.
     let reader = StorageReader::open_finished(path)
         .with_context(|| format!("host comparison refused immutable storage at {path}"))?;
-    let records = reader.load_checkpoints()?;
-    let record = records
-        .iter()
-        .find(|record| record.checkpoint_id == checkpoint_id)
+    let record = reader
+        .load_checkpoint(checkpoint_id)?
         .with_context(|| format!("host checkpoint {checkpoint_id} is absent from {path}"))?;
     let checkpoint = record.host_checkpoint().with_context(|| {
         format!("host checkpoint {checkpoint_id} in {path} failed comparison validation")
@@ -2568,9 +2562,8 @@ fn read_host_checkpoint_for_comparison(
             let tick = tick
                 .as_u64()
                 .context("continued checkpoint source tick is not an integer")?;
-            let source = records
-                .iter()
-                .find(|source| source.checkpoint_id == id)
+            let source = reader
+                .load_checkpoint(id)?
                 .context("continued checkpoint source artifact is absent")?;
             let source_host = source.host_checkpoint()?;
             if source_host.tick().0 != tick
@@ -5566,9 +5559,6 @@ fn run_replay_cli(
     canonicalize_replay_event_order(&mut persisted_events)
         .context("recorded replay stream contains an invalid or duplicate identity")?;
     let recorded_batch_ticks = storage.summary_ticks()?;
-    // Ordered by tick; interval recording usually leaves one at the final tick, which
-    // would leave nothing to verify, so resume from the latest one before the limit.
-    let checkpoints = storage.load_checkpoints()?;
     let events_max_tick = persisted_events.iter().map(|e| e.tick).max().unwrap_or(0);
     let tick_limit = cli
         .tick_limit
@@ -5576,12 +5566,18 @@ fn run_replay_cli(
     // Validate the complete source above, then compare only the requested
     // prefix. A valid future suffix is not evidence about this replay window.
     persisted_events.retain(|event| event.tick <= tick_limit);
-    let latest_checkpoint = checkpoints
-        .iter()
-        .rev()
-        .find(|record| record.tick < tick_limit)
-        .or_else(|| checkpoints.last())
-        .cloned();
+    // Interval recording usually leaves a cut at the final tick, which would leave
+    // nothing to verify. Select the newest earlier cut in SQL, fetching only its
+    // payload. Retain the latest-cut fallback so an unreachable target still gets
+    // the existing precise refusal below. Tick-zero replay needs no checkpoint.
+    let latest_checkpoint = if cli.checkpoint_start {
+        match storage.load_latest_checkpoint_before(tick_limit)? {
+            Some(checkpoint) => Some(checkpoint),
+            None => storage.load_latest_checkpoint()?,
+        }
+    } else {
+        None
+    };
     let replay_checkpoint = if cli.checkpoint_start {
         let record = latest_checkpoint.as_ref().ok_or_else(|| {
             anyhow::anyhow!(

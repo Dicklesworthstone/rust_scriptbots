@@ -2,6 +2,25 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Selected checkpoint reads for persistent continuation (2026-11-24):**
+[Currently In Progress — Codex; scoped contribution to `bd-2z0.5.13`;
+original ownership and complete continuation acceptance retained]
+
+Implemented exact run-scoped checkpoint lookup for continuation, handoff readback,
+comparison and checkpoint-start replay. Latest-before selection projects identity
+and ordering fields, then loads and validates only the chosen artifact. Same-tick
+ordinal ordering, exclusive tick limits and selected-artifact corruption refusals
+remain explicit. Ordinary tick-zero replay no longer reads checkpoint payloads.
+This removes whole-history payload materialization in these application paths;
+it does not establish a database-engine resource bound or qualify long-run scaling.
+
+Authored real file regressions compare selection with the previous full inventory,
+isolate runs with identical quoted names, retain full owner envelope bytes and
+reject selected corruption while allowing an unrelated valid checkpoint to load.
+Source review is complete. Compilation, Clippy and test execution remain
+unverified: the DSR attempt stopped during dependency fetching before compilation,
+and the execution environment failed twice. Full native acceptance remains open.
+
 **Exact-tick checkpoint replay in FrankenTUI (2026-11-23):**
 [Currently In Progress — Codex; scoped contributions to `bd-2z0.6.8` and
 `bd-2z0.7.6.1`; original ownership and complete terminal/native acceptance retained]

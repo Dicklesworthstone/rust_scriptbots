@@ -13532,6 +13532,34 @@ impl StorageReader {
             .collect()
     }
 
+    /// Load one exact checkpoint from this reader's selected run.
+    ///
+    /// Other checkpoint payloads are not selected or decoded. The selected row
+    /// still passes the same format, checksum, metadata and checkpoint envelope
+    /// validation as a complete checkpoint inventory; corruption never causes a
+    /// fallback to another identity.
+    pub fn load_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<PersistedCheckpointRecord>, StorageError> {
+        let rows = self.connection()?.query_with_params(
+            "SELECT checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json
+             FROM checkpoints
+             WHERE run_id = ?1 AND checkpoint_id = ?2
+             LIMIT 2",
+            &[sqlite_run_id(self.run_id), checkpoint_id.into()],
+        )?;
+        if rows.len() > 1 {
+            return Err(StorageError::InvalidData {
+                context: "checkpoints.identity",
+                reason: "selected run contains duplicate checkpoint identities".to_owned(),
+            });
+        }
+        rows.first()
+            .map(persisted_checkpoint_from_query_row)
+            .transpose()
+    }
+
     /// Validate and visit one checkpoint at a time while retaining the finished-run lease.
     fn visit_finished_checkpoints<E>(
         &self,
@@ -13552,17 +13580,69 @@ impl StorageReader {
         &self,
     ) -> Result<Option<PersistedCheckpointRecord>, StorageError> {
         let rows = self.connection()?.query_with_params(
-            "SELECT checkpoint_id, tick, checkpoint_ordinal, format, payload, payload_digest, metadata_json
+            "SELECT checkpoint_id, tick, checkpoint_ordinal
              FROM checkpoints
              WHERE run_id = ?1
              ORDER BY tick DESC, checkpoint_ordinal DESC
              LIMIT 1",
             &[sqlite_run_id(self.run_id)],
         )?;
-        if rows.is_empty() {
+        self.load_selected_checkpoint(&rows)
+    }
+
+    /// Load the newest checkpoint strictly before `exclusive_tick`.
+    ///
+    /// Same-tick cuts retain their ordinal ordering. Selection projects only
+    /// identity and ordering fields, so sorting a long history does not carry
+    /// every encoded payload into the query result. Only the selected artifact
+    /// is then loaded and validated. This does not establish a time or memory
+    /// bound for the database engine's index traversal or an individual artifact.
+    pub fn load_latest_checkpoint_before(
+        &self,
+        exclusive_tick: u64,
+    ) -> Result<Option<PersistedCheckpointRecord>, StorageError> {
+        let Ok(exclusive_tick) = i64::try_from(exclusive_tick) else {
+            // Persisted ticks are nonnegative SQLite INTEGERs. Every representable
+            // stored tick is strictly below a larger u64 boundary; never narrow it.
+            return self.load_latest_checkpoint();
+        };
+        let rows = self.connection()?.query_with_params(
+            "SELECT checkpoint_id, tick, checkpoint_ordinal
+             FROM checkpoints
+             WHERE run_id = ?1 AND tick < ?2
+             ORDER BY tick DESC, checkpoint_ordinal DESC
+             LIMIT 1",
+            &[sqlite_run_id(self.run_id), exclusive_tick.into()],
+        )?;
+        self.load_selected_checkpoint(&rows)
+    }
+
+    fn load_selected_checkpoint(
+        &self,
+        rows: &[Row],
+    ) -> Result<Option<PersistedCheckpointRecord>, StorageError> {
+        let Some(row) = rows.first() else {
             return Ok(None);
+        };
+        let checkpoint_id: String = decode(row, 0, "checkpoints.checkpoint_id")?;
+        let tick = checked_u64("checkpoints.tick", decode(row, 1, "checkpoints.tick")?)?;
+        let ordinal = checked_u64(
+            "checkpoints.checkpoint_ordinal",
+            decode(row, 2, "checkpoints.checkpoint_ordinal")?,
+        )?;
+        let checkpoint =
+            self.load_checkpoint(&checkpoint_id)?
+                .ok_or_else(|| StorageError::InvalidData {
+                    context: "checkpoints.selection",
+                    reason: "selected checkpoint disappeared before payload readback".to_owned(),
+                })?;
+        if checkpoint.tick != tick || checkpoint.checkpoint_ordinal != ordinal {
+            return Err(StorageError::InvalidData {
+                context: "checkpoints.selection",
+                reason: "selected checkpoint ordering changed before payload readback".to_owned(),
+            });
         }
-        persisted_checkpoint_from_query_row(&rows[0]).map(Some)
+        Ok(Some(checkpoint))
     }
 
     /// Load every agent-arrival ancestry edge recorded in this run for offline rebuild.
@@ -43037,6 +43117,9 @@ mod tests {
         assert_eq!(preceding_commands.len(), commands[..2].len());
         let reader = StorageReader::open_finished_for_run(&path_text, receipt.run_id)?;
         assert_eq!(reader.load_checkpoints()?, vec![receipt.record.clone()]);
+        let selected = reader.load_checkpoint("host-cut")?.expect("retained host cut");
+        assert_eq!(selected, receipt.record);
+        assert_eq!(selected.host_checkpoint()?.encode()?, checkpoint.encode()?);
         assert_eq!(reader.persistence_watermarks()?, receipt.watermarks);
         reader.close()?;
 
@@ -44024,6 +44107,112 @@ mod tests {
                 "scope": "core science save/load/restore; no host-session continuation",
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real multi-run database compares exact selection with the previous inventory semantics and isolates corrupt unselected payloads"
+    )]
+    fn targeted_checkpoint_reads_preserve_selection_and_isolate_other_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut world = scriptbots_core::WorldState::new(scriptbots_core::ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            rng_seed: Some(77),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..scriptbots_core::ScriptBotsConfig::default()
+        })?;
+        let initial = world.checkpoint_v1()?;
+        let path = temp_db_path("targeted-checkpoint-readback");
+        let path_text = path.to_string_lossy().to_string();
+        let first_run = RunId::new(101);
+        let second_run = RunId::new(202);
+        let mut storage = Storage::create_new_file_for_run(
+            &path_text,
+            RunManifestRecord::unattributed(first_run),
+        )?;
+        // Quotes must be a literal identity, and the same name in another run
+        // must never substitute for this reader's selected artifact.
+        storage.record_checkpoint("same'cut", 0, &initial, &json!({"run": "first"}))?;
+        world.step()?;
+        let at_one = world.checkpoint_v1()?;
+        storage.record_checkpoint("one-low", 1, &at_one, &json!({}))?;
+        storage.record_checkpoint("one-high", 2, &at_one, &json!({}))?;
+        assert!(
+            storage
+                .record_checkpoint("same'cut", 0, &at_one, &json!({"run": "first"}))
+                .is_err(),
+            "a changed artifact must not reuse an existing identity"
+        );
+        world.step()?;
+        storage.record_checkpoint("unrelated", 3, &world.checkpoint_v1()?, &json!({}))?;
+        storage.close()?;
+        let mut second =
+            Storage::append_run(&path_text, RunManifestRecord::unattributed(second_run))?;
+        second.record_checkpoint("same'cut", 0, &initial, &json!({"run": "second"}))?;
+        second.close()?;
+
+        let reader = StorageReader::open_finished_for_run(&path_text, first_run)?;
+        let inventory = reader.load_checkpoints()?;
+        assert_eq!(inventory.len(), 4);
+        for boundary in [0, 1, 2, 3, u64::try_from(i64::MAX)?, u64::MAX] {
+            let expected = inventory.iter().rev().find(|row| row.tick < boundary);
+            assert_eq!(
+                reader.load_latest_checkpoint_before(boundary)?.as_ref(),
+                expected,
+                "changed exclusive tick/ordinal selection at {boundary}"
+            );
+        }
+        assert_eq!(
+            reader.load_latest_checkpoint_before(2)?.unwrap().checkpoint_id,
+            "one-high",
+            "the greater ordinal must win at the same tick"
+        );
+        assert_eq!(reader.load_latest_checkpoint()?.as_ref(), inventory.last());
+        assert_eq!(reader.load_checkpoint("same'cut")?.as_ref(), inventory.first());
+        assert!(reader.load_checkpoint("absent")?.is_none());
+        assert!(reader.load_checkpoint("same'cut' OR 1=1 --")?.is_none());
+        reader.close()?;
+
+        let connection = Connection::open_existing(&path_text)?;
+        let unrelated_payload = "ab".repeat(256 * 1024);
+        connection.execute_with_params(
+            "UPDATE checkpoints SET payload = ?1 WHERE run_id = ?2 AND checkpoint_id = ?3",
+            &[
+                unrelated_payload.as_str().into(),
+                sqlite_run_id(first_run),
+                "unrelated".into(),
+            ],
+        )?;
+        connection.execute_with_params(
+            "UPDATE checkpoints SET format = 'invalid-format' WHERE run_id = ?1 AND checkpoint_id = ?2",
+            &[sqlite_run_id(second_run), "same'cut".into()],
+        )?;
+        connection.close()?;
+
+        let reader = StorageReader::open_finished_for_run(&path_text, first_run)?;
+        assert_eq!(reader.load_checkpoint("same'cut")?.as_ref(), inventory.first());
+        assert_eq!(
+            reader.load_latest_checkpoint_before(2)?.as_ref(),
+            Some(&inventory[2])
+        );
+        assert!(reader.load_checkpoint("unrelated").is_err());
+        assert!(reader.load_latest_checkpoint_before(3).is_err());
+        assert!(reader.load_latest_checkpoint().is_err());
+        assert!(
+            reader.load_checkpoints().is_err(),
+            "the complete inventory must still reject its corrupt payload"
+        );
+        reader.close()?;
+        let reader = StorageReader::open_finished_for_run(&path_text, second_run)?;
+        assert!(reader.load_checkpoint("same'cut").is_err());
+        assert!(reader.load_checkpoint("one-high")?.is_none());
+        reader.close()?;
         Ok(())
     }
 
