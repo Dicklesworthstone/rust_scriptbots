@@ -2,6 +2,43 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Faithful offline montage replay (2026-11-24):**
+[Currently In Progress — Codex; corrective follow-up to `bd-16g.9.2`;
+original exact-replay, output-integrity and long-run acceptance retained]
+
+Connect persisted-run montage frames to complete owner checkpoints, their exact
+journal cut and ordered recorded inputs. Share the native replay interpreter,
+verify recorded digest anchors before publication, and refuse missing history or
+divergence without replacing an existing output or publishing a partial reel.
+
+**Full checkpoint science and ordered native replay (2026-11-24):**
+[Currently In Progress — Codex; scoped contribution to `bd-2z0.5.13`;
+original ownership and complete continuation acceptance retained]
+
+Implemented checkpoint-start replay through the complete owner world restore,
+preserving map scalars, selection history and communication scrambling RNG state.
+Applied scheduled patches join operator commands and persistence cuts by actual
+journal sequence. Each patch must match the captured pending suffix exactly;
+replay refuses to cross a due patch without its applied journal record. Full owner
+replay ignores a supplied launch recipe rather than inventing or repeating inputs.
+
+Standalone science capture and restore explicitly refuse currently enabled map,
+non-Fitness selection and scrambling features that need the continuity companion.
+An atomic science/companion capture keeps supported full owner and event-review
+paths working. Shared capture also refuses executable sensing and active injected
+science faults. Existing checkpoint encodings and digest versions are unchanged.
+
+Authored coverage includes a real file owner with noncommuting same-tick config
+and schedule inputs, exact replay events/digest, missing and forged schedule
+controls, and discarded-input divergence. Core regressions preserve full future
+state and show that omitted map temperature can leave the initial digest unchanged
+while changing the next Sense stage. Browser/study tests retain their source and
+treatment refusals and full owner positives. Independent source review and scoped
+DSR syntax/format checks passed for all six Rust files. The canonical DSR offline
+core check stopped before compilation because the pinned workspace `xcb` Git
+dependency was absent locally. Compilation, Clippy and test execution remain
+unverified. Original full acceptance stays open.
+
 **Selected checkpoint reads for persistent continuation (2026-11-24):**
 [Currently In Progress — Codex; scoped contribution to `bd-2z0.5.13`;
 original ownership and complete continuation acceptance retained]

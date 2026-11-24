@@ -4306,8 +4306,7 @@ impl HostCore {
     /// indeterminate handoff are refused. The resulting data never attests storage durability.
     pub fn capture_host_checkpoint_v1(&self) -> Result<HostCheckpointV1, HostCheckpointError> {
         self.ensure_host_checkpoint_quiescent()?;
-        let world = self.world.capture_checkpoint_quiescent()?;
-        let continuity = self.world.capture_host_continuity_v1(&world)?;
+        let (world, continuity) = self.world.capture_host_checkpoint_parts_v1()?;
         let events = self.events.capture_checkpoint()?;
         let shared = self.shared.borrow();
         let mut commands: Vec<_> = shared.commands.values().cloned().collect();
@@ -4518,8 +4517,7 @@ impl HostCore {
                 "sink session is not freshly bound",
             ));
         }
-        let actual_science = world.capture_checkpoint_quiescent()?;
-        let actual_continuity = world.capture_host_continuity_v1(&actual_science)?;
+        let (actual_science, actual_continuity) = world.capture_host_checkpoint_parts_v1()?;
         if actual_science.encode()? != state.world_bytes
             || serde_json::to_vec(&actual_continuity)
                 .map_err(|error| checkpoint_error("world.continuity.encode", error.to_string()))?

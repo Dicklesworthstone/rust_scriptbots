@@ -3213,7 +3213,14 @@ mod tests {
             let patch = serde_json::json!({"selection_mode": mode});
             let mut source_plan = base.clone();
             source_plan.config.selection_mode = mode;
-            let checkpoint = world_at_checkpoint(&source_plan).checkpoint_v1().unwrap();
+            let source_world = world_at_checkpoint(&source_plan);
+            assert!(matches!(
+                source_world.checkpoint_v1(),
+                Err(WorldCheckpointError::RequiresHostContinuity {
+                    feature: "selection history"
+                })
+            ));
+            let (checkpoint, _) = source_world.capture_host_checkpoint_parts_v1().unwrap();
             let original = checkpoint.encode().unwrap();
             for imported in [false, true] {
                 let output = directory.path().join(format!("mode-{index}-{imported}"));
@@ -3257,7 +3264,14 @@ mod tests {
         let fitness_source = world_at_checkpoint(&base).checkpoint_v1().unwrap();
         let mut source_plan = base.clone();
         source_plan.config.communication_scramble = true;
-        let checkpoint = world_at_checkpoint(&source_plan).checkpoint_v1().unwrap();
+        let source_world = world_at_checkpoint(&source_plan);
+        assert!(matches!(
+            source_world.checkpoint_v1(),
+            Err(WorldCheckpointError::RequiresHostContinuity {
+                feature: "communication scrambling RNG"
+            })
+        ));
+        let (checkpoint, _) = source_world.capture_host_checkpoint_parts_v1().unwrap();
         let original = checkpoint.encode().unwrap();
         for imported in [false, true] {
             let output = directory.path().join(format!("source-{imported}"));
@@ -3328,7 +3342,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_map_temperature_refuses_even_when_raw_restore_digest_matches() {
+    fn saved_map_temperature_requires_host_continuity_before_output() {
         let directory = tempdir().unwrap();
         let output = directory.path().join("map-source");
         let plan = replicated_fixture().study;
@@ -3356,21 +3370,31 @@ mod tests {
         )
         .unwrap();
         world.apply_map_artifact(&artifact).unwrap();
-        let checkpoint = world.checkpoint_v1().unwrap();
+        assert!(matches!(
+            world.checkpoint_v1(),
+            Err(WorldCheckpointError::RequiresHostContinuity {
+                feature: "imported map state"
+            })
+        ));
+        let (checkpoint, _) = world.capture_host_checkpoint_parts_v1().unwrap();
         let original = checkpoint.encode().unwrap();
         let registry =
             crate::brains::create_brain_registry_for_config(plan.brain_preset, checkpoint.config())
                 .unwrap();
-        let raw_restored = WorldState::restore_checkpoint_v1(&checkpoint, registry).unwrap();
-        assert_eq!(
-            raw_restored.world_digest_v1().unwrap(),
-            *checkpoint.source_digest()
-        );
-        assert!(raw_restored.map_metadata().is_some());
+        assert!(matches!(
+            WorldState::restore_checkpoint_v1(&checkpoint, registry),
+            Err(WorldCheckpointError::RequiresHostContinuity {
+                feature: "imported map state"
+            })
+        ));
         assert!(matches!(
             BranchStudyOrchestrator::new(plan, output.clone())
                 .execute_from_checkpoint(&checkpoint, None),
-            Err(BranchStudyError::CheckpointMismatch(ref reason)) if reason.contains("map temperature")
+            Err(BranchStudyError::Checkpoint(
+                WorldCheckpointError::RequiresHostContinuity {
+                    feature: "imported map state"
+                }
+            ))
         ));
         assert!(!output.exists());
         assert_eq!(checkpoint.encode().unwrap(), original);

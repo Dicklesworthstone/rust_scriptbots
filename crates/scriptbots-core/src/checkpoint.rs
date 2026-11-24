@@ -8,8 +8,9 @@
 //! configuration-audit revision, UI selection, mutation-log prose, chart history, narrative
 //! history, or renderer state. The separate [`WorldHostCheckpointV1`] companion carries
 //! core-owned auxiliary science and observational continuity for the runtime's full host
-//! artifact; it does not
-//! change the science-only wire contract or reconstruct storage ownership.
+//! artifact. Imported map state, non-fitness selection history, and the communication-scrambling
+//! RNG require that companion; standalone capture and restore refuse to silently drop them.
+//! The companion does not change the science-only wire contract or reconstruct storage ownership.
 //! Keeping that boundary explicit prevents a core round trip from being advertised as a storage
 //! or application recovery feature.
 
@@ -717,6 +718,14 @@ pub enum WorldCheckpointError {
         /// Human-readable description of the violated invariant.
         detail: String,
     },
+    /// A future-affecting feature needs state carried only by the full host companion.
+    #[error(
+        "science-only checkpoint cannot preserve {feature}; capture and restore the full host checkpoint with its continuity companion"
+    )]
+    RequiresHostContinuity {
+        /// Feature whose continuation state is outside the standalone science format.
+        feature: &'static str,
+    },
     /// Core checkpoint capture does not own or reconstruct persistence sessions.
     #[error(
         "checkpoint capture requires persistence_interval=0; found {persistence_interval} (product persistence/resume belongs to the later runtime replay layer)"
@@ -802,6 +811,25 @@ pub enum WorldCheckpointError {
     /// The embedded V1.6 source digest violated its own contract.
     #[error(transparent)]
     DigestContract(#[from] WorldDigestV1ContractError),
+}
+
+fn ensure_standalone_checkpoint_features(
+    config: &ScriptBotsConfig,
+    has_map_state: bool,
+) -> Result<(), WorldCheckpointError> {
+    let feature = if has_map_state {
+        "imported map state"
+    } else if !matches!(
+        config.selection_mode,
+        crate::EvolutionSelectionMode::Fitness
+    ) {
+        "selection history"
+    } else if config.communication_scramble {
+        "communication scrambling RNG"
+    } else {
+        return Ok(());
+    };
+    Err(WorldCheckpointError::RequiresHostContinuity { feature })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1245,6 +1273,16 @@ impl WorldCheckpointV1 {
         &self.state.config
     }
 
+    /// Validate the data contract and whether this component can restore without a host companion.
+    ///
+    /// Components embedded in full host artifacts still encode and decode normally when their
+    /// omitted auxiliary science requires [`WorldState::restore_host_checkpoint_v1`]. Executable
+    /// brain-registry compatibility is checked separately at the actual restore boundary.
+    pub fn validate_standalone_restore(&self) -> Result<(), WorldCheckpointError> {
+        self.validate_contract()?;
+        ensure_standalone_checkpoint_features(&self.state.config, self.state.map_metadata.is_some())
+    }
+
     /// Complete data-only registry recipe the host must reproduce before restoration.
     #[must_use]
     pub fn required_brain_registry(&self) -> CheckpointBrainRegistryRequirementsV1 {
@@ -1671,6 +1709,8 @@ impl WorldState {
     /// reconstruction contract. Registered but unused legacy families may remain in a mixed
     /// roster because automatic selection becomes protocol-only once an admitted family exists.
     /// A legacy-only roster is rejected whenever automatic population construction is enabled.
+    /// Features whose future depends on the host companion require
+    /// [`Self::capture_host_checkpoint_parts_v1`] instead.
     pub fn checkpoint_v1(&self) -> Result<WorldCheckpointV1, WorldCheckpointError> {
         if self.config.persistence_interval != 0 {
             return Err(WorldCheckpointError::PersistenceEnabled {
@@ -1684,7 +1724,24 @@ impl WorldState {
                 found: self.persistence_boundary,
             });
         }
+        ensure_standalone_checkpoint_features(
+            &self.config,
+            self.map_metadata.is_some() || self.temperature.is_some(),
+        )?;
         self.capture_checkpoint_inner(self.config.clone())
+    }
+
+    /// Capture the science component and required host continuity at one quiescent boundary.
+    ///
+    /// This preserves imported map scalars, selection history and communication RNG state that
+    /// the standalone science format cannot carry. Both parts must be retained and restored
+    /// together with [`Self::restore_host_checkpoint_v1`]. Capture never drains deferred output.
+    pub fn capture_host_checkpoint_parts_v1(
+        &self,
+    ) -> Result<(WorldCheckpointV1, WorldHostCheckpointV1), WorldCheckpointError> {
+        let science = self.capture_checkpoint_component_quiescent()?;
+        let continuity = self.capture_host_continuity_v1(&science)?;
+        Ok((science, continuity))
     }
 
     /// Capture a V1 checkpoint from a quiescent world whose persistence boundary is resolved.
@@ -1695,7 +1752,18 @@ impl WorldState {
     /// The captured checkpoint envelope contractually normalizes `config.persistence_interval` to 0
     /// so that restored worlds can be independently bound to a new persistence session via
     /// [`Self::bind_continuation_persistence`].
+    /// Features requiring auxiliary host science must use [`Self::capture_host_checkpoint_parts_v1`].
     pub fn capture_checkpoint_quiescent(&self) -> Result<WorldCheckpointV1, WorldCheckpointError> {
+        ensure_standalone_checkpoint_features(
+            &self.config,
+            self.map_metadata.is_some() || self.temperature.is_some(),
+        )?;
+        self.capture_checkpoint_component_quiescent()
+    }
+
+    fn capture_checkpoint_component_quiescent(
+        &self,
+    ) -> Result<WorldCheckpointV1, WorldCheckpointError> {
         let expected_boundary_open = PersistenceBoundaryStatus::Open { tick: self.tick };
         let expected_boundary_sealed = PersistenceBoundaryStatus::Sealed { tick: self.tick };
         if self.persistence_boundary != expected_boundary_open
@@ -1716,6 +1784,19 @@ impl WorldState {
         config: ScriptBotsConfig,
     ) -> Result<WorldCheckpointV1, WorldCheckpointError> {
         self.ensure_checkpoint_has_no_deferred_host_output()?;
+        if self.sense_provider.is_some() {
+            return contract_error(
+                "host.sense_provider",
+                "caller-installed executable sensing is not checkpoint data".to_owned(),
+            );
+        }
+        #[cfg(feature = "economy-faults")]
+        if self.resource_ledger.fault.is_some() {
+            return contract_error(
+                "host.resource_fault",
+                "injected economy fault cannot become continuation state".to_owned(),
+            );
+        }
         let source_digest = self.world_digest_v1()?;
 
         let mut ordered = self
@@ -1803,7 +1884,11 @@ impl WorldState {
         brain_registry: BrainRegistry,
         host_continuity: Option<&WorldHostCheckpointV1>,
     ) -> Result<Self, WorldCheckpointError> {
-        checkpoint.validate_contract()?;
+        if host_continuity.is_some() {
+            checkpoint.validate_contract()?;
+        } else {
+            checkpoint.validate_standalone_restore()?;
+        }
         let state = &checkpoint.state;
         let prepared_registry = brain_registry.checkpoint_v1();
         if prepared_registry != state.registry {
@@ -3657,6 +3742,182 @@ mod tests {
         );
     }
 
+    fn assert_requires_host_continuity<T>(
+        result: Result<T, WorldCheckpointError>,
+        expected: &'static str,
+    ) {
+        match result {
+            Err(WorldCheckpointError::RequiresHostContinuity { feature }) => {
+                assert_eq!(feature, expected);
+            }
+            Err(error) => panic!("expected host continuity refusal for {expected}: {error}"),
+            Ok(_) => panic!("standalone checkpoint unexpectedly accepted {expected}"),
+        }
+    }
+
+    #[test]
+    fn standalone_checkpoint_requires_host_history_and_communication_rng() {
+        for (selection_mode, communication_scramble, feature) in [
+            (
+                crate::EvolutionSelectionMode::Novelty,
+                false,
+                "selection history",
+            ),
+            (
+                crate::EvolutionSelectionMode::Curiosity { w: 0.5 },
+                false,
+                "selection history",
+            ),
+            (
+                crate::EvolutionSelectionMode::Fitness,
+                true,
+                "communication scrambling RNG",
+            ),
+        ] {
+            let (mut original, key) = world_with_checkpoint_family();
+            let mut config = original.config.clone();
+            config.reproduction_energy_threshold = f32::MAX;
+            config.archive_enabled = true;
+            config.archive_interval = 1;
+            config.archive_min_lifetime_ticks = 1;
+            config.selection_mode = selection_mode;
+            config.communication_mi_interval = 1;
+            config.communication_mi_window = 4;
+            config.communication_scramble = communication_scramble;
+            config.communication_scramble_seed = Some(0xc011_7105);
+            original
+                .apply_config_update(config)
+                .expect("actual auxiliary science configuration");
+            for _ in 0..2 {
+                let agent = original
+                    .try_spawn_agent(AgentData::default())
+                    .expect("actual protocol founder");
+                assert!(original.bind_agent_brain(agent, key).unwrap());
+            }
+            assert_requires_host_continuity(original.checkpoint_v1(), feature);
+            let scramble_before = original
+                .communication_scramble_stream
+                .as_ref()
+                .map(crate::SmallRngStream::state);
+
+            let mut source_session = original
+                .bind_persistence(Box::new(crate::NullPersistence))
+                .unwrap();
+            source_session
+                .step(&mut original)
+                .expect("advance actual auxiliary science state");
+            assert_eq!(original.agent_count(), 2);
+            assert_eq!(original.agent_stats.len(), 2);
+            assert_eq!(original.communication_emitted_history.len(), 1);
+            if communication_scramble {
+                assert_ne!(
+                    original
+                        .communication_scramble_stream
+                        .as_ref()
+                        .map(crate::SmallRngStream::state),
+                    scramble_before,
+                    "the source must consume the omitted scramble stream"
+                );
+            } else {
+                assert!(original.novelty_state.is_some());
+            }
+            assert_requires_host_continuity(original.capture_checkpoint_quiescent(), feature);
+
+            let (science, companion) = original
+                .capture_host_checkpoint_parts_v1()
+                .expect("full host capture retains auxiliary science");
+            let wire = science
+                .encode()
+                .expect("embedded science component encoding");
+            let decoded = WorldCheckpointV1::decode(&wire)
+                .expect("embedded science component remains a valid wire");
+            assert_requires_host_continuity(decoded.validate_standalone_restore(), feature);
+            assert_requires_host_continuity(
+                WorldState::restore_checkpoint_v1(&decoded, prepared_checkpoint_registry()),
+                feature,
+            );
+            let mut restored = WorldState::restore_host_checkpoint_v1(
+                &decoded,
+                &companion,
+                prepared_checkpoint_registry(),
+            )
+            .expect("full host continuation remains supported");
+            assert_host_auxiliary_state_equal(&original, &restored);
+            let mut restored_session = restored
+                .bind_persistence(Box::new(crate::NullPersistence))
+                .unwrap();
+            source_session.step(&mut original).unwrap();
+            restored_session.step(&mut restored).unwrap();
+            assert_host_auxiliary_state_equal(&original, &restored);
+            assert_protocol_state_equal(&original, &restored);
+            assert_eq!(
+                original.world_digest_v1().unwrap(),
+                restored.world_digest_v1().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn every_checkpoint_capture_refuses_unserialized_executable_sensing() {
+        struct ExternalSenseProvider;
+
+        impl crate::SenseProvider for ExternalSenseProvider {
+            fn compute_accumulators(
+                &mut self,
+                _world: &WorldState,
+                handles: &[AgentId],
+            ) -> Result<Vec<crate::sense_fixed::SenseAccum>, crate::SenseProviderError>
+            {
+                Ok(handles.iter().map(|_| Default::default()).collect())
+            }
+        }
+
+        let (mut world, _) = world_with_checkpoint_family();
+        world.set_sense_provider(Box::new(ExternalSenseProvider));
+        for result in [
+            world.checkpoint_v1(),
+            world.capture_checkpoint_quiescent(),
+            world
+                .capture_host_checkpoint_parts_v1()
+                .map(|(science, _)| science),
+        ] {
+            assert!(matches!(
+                result,
+                Err(WorldCheckpointError::Contract { path, .. })
+                    if path == "host.sense_provider"
+            ));
+        }
+        assert!(world.has_sense_provider());
+        assert!(world.clear_sense_provider().is_some());
+        world
+            .checkpoint_v1()
+            .expect("normal sensing remains restorable");
+    }
+
+    #[cfg(feature = "economy-faults")]
+    #[test]
+    fn every_checkpoint_capture_refuses_an_active_science_fault() {
+        let (mut world, _) = world_with_checkpoint_family();
+        world.inject_ledger_fault(crate::LedgerFault::ScaleMetabolismDrainBy10);
+        for result in [
+            world.checkpoint_v1(),
+            world.capture_checkpoint_quiescent(),
+            world
+                .capture_host_checkpoint_parts_v1()
+                .map(|(science, _)| science),
+        ] {
+            assert!(matches!(
+                result,
+                Err(WorldCheckpointError::Contract { path, .. })
+                    if path == "host.resource_fault"
+            ));
+        }
+        assert_eq!(
+            world.current_ledger_fault(),
+            Some(crate::LedgerFault::ScaleMetabolismDrainBy10)
+        );
+    }
+
     #[test]
     fn host_companion_preserves_nonempty_executable_brains_audit_rng_and_next_stage_digests() {
         let (mut original, key) = world_with_checkpoint_family();
@@ -3740,12 +4001,21 @@ mod tests {
             .apply_config_update(next_config)
             .expect("actual config mutation and audit");
         for at in 1..=2 {
-            let science = original
-                .capture_checkpoint_quiescent()
-                .expect("actual settled science boundary");
-            let companion = original
-                .capture_host_continuity_v1(&science)
-                .expect("actual full companion");
+            assert_requires_host_continuity(
+                original.capture_checkpoint_quiescent(),
+                "imported map state",
+            );
+            let (science, companion) = original
+                .capture_host_checkpoint_parts_v1()
+                .expect("actual full checkpoint boundary");
+            assert_requires_host_continuity(
+                science.validate_standalone_restore(),
+                "imported map state",
+            );
+            assert_requires_host_continuity(
+                WorldState::restore_checkpoint_v1(&science, prepared_checkpoint_registry()),
+                "imported map state",
+            );
             let encoded =
                 serde_json::to_vec(&companion).expect("data-only host companion encoding");
             let decoded: WorldHostCheckpointV1 =
@@ -3788,6 +4058,24 @@ mod tests {
             restored_session
                 .restore_admission_cursor(&restored, source_session.last_admitted_tick())
                 .expect("captured acknowledged admission cursor");
+            let mut temperature_loss = WorldState::restore_host_checkpoint_v1(
+                &science,
+                &decoded,
+                prepared_checkpoint_registry(),
+            )
+            .expect("negative control starts from an exact full continuation");
+            temperature_loss.temperature = None;
+            assert_eq!(
+                original.world_digest_v1().unwrap(),
+                temperature_loss.world_digest_v1().unwrap(),
+                "the current science digest cannot detect loss of map temperature"
+            );
+            let mut temperature_session = temperature_loss
+                .bind_persistence(Box::new(crate::NullPersistence))
+                .unwrap();
+            temperature_session
+                .restore_admission_cursor(&temperature_loss, source_session.last_admitted_tick())
+                .unwrap();
             let mut perturbed = WorldState::restore_host_checkpoint_v1(
                 &science,
                 &decoded,
@@ -3811,6 +4099,7 @@ mod tests {
             let mut left_trace = crate::WorldStepTracer::default();
             let mut right_trace = crate::WorldStepTracer::default();
             let mut negative_trace = crate::WorldStepTracer::default();
+            let mut temperature_trace = crate::WorldStepTracer::default();
             source_session
                 .step_traced(&mut original, &mut left_trace)
                 .expect("next source production stages");
@@ -3820,6 +4109,9 @@ mod tests {
             negative_session
                 .step_traced(&mut perturbed, &mut negative_trace)
                 .expect("actual negative production stages");
+            temperature_session
+                .step_traced(&mut temperature_loss, &mut temperature_trace)
+                .expect("actual omitted-temperature production stages");
             let left = left_trace.latest().expect("actual source stage trace");
             let right = right_trace
                 .latest()
@@ -3838,6 +4130,12 @@ mod tests {
                 left.first_divergence(negative_trace.latest().unwrap())
                     .unwrap(),
                 Some(crate::WorldStepTracePoint::Sense)
+            );
+            assert_eq!(
+                left.first_divergence(temperature_trace.latest().unwrap())
+                    .unwrap(),
+                Some(crate::WorldStepTracePoint::Sense),
+                "dropping map temperature changes the next actual sensory transition"
             );
         }
     }

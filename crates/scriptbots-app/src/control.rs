@@ -7389,14 +7389,11 @@ impl ControlHandle {
                 // Capture before this boundary's inputs can enqueue interventions. A
                 // previous tick must have consumed its pending inputs; the unchanged
                 // quiescent capture refuses any deferred work that survived that tick.
-                let precursor = world
-                    .capture_checkpoint_quiescent()
-                    .map_err(|error| ControlError::Serialization(error.to_string()))?;
                 // Biased terrain changes derived food profiles which a science-only
                 // checkpoint cannot restore. Preserve the existing typed companion for
                 // this in-memory projection, without asserting live owner continuity.
-                let continuity = world
-                    .capture_host_continuity_v1(&precursor)
+                let (precursor, continuity) = world
+                    .capture_host_checkpoint_parts_v1()
                     .map_err(|error| ControlError::Serialization(error.to_string()))?;
                 target = Some((
                     precursor,

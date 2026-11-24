@@ -2911,7 +2911,7 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn browser_scientific_checkpoint_refuses_omitted_auxiliary_state() {
-        use scriptbots_core::EvolutionSelectionMode;
+        use scriptbots_core::{EvolutionSelectionMode, WorldCheckpointError};
 
         for (selection_mode, communication_scramble, reason) in [
             (EvolutionSelectionMode::Novelty, false, "selection history"),
@@ -2927,12 +2927,27 @@ mod tests {
             spec.base_config.communication_scramble = communication_scramble;
             let mut source = Simulation::new(spec).unwrap();
             let before = source.core.scientific_digest_v1().unwrap();
-            let bytes = source
+            let expected_feature = if communication_scramble {
+                "communication scrambling RNG"
+            } else {
+                "selection history"
+            };
+            assert!(matches!(
+                source.core.world().checkpoint_v1(),
+                Err(WorldCheckpointError::RequiresHostContinuity { feature })
+                    if feature == expected_feature
+            ));
+            let (cut, _) = source
                 .core
-                .capture_checkpoint_v1()
-                .unwrap()
-                .encode()
+                .world()
+                .capture_host_checkpoint_parts_v1()
                 .unwrap();
+            assert!(matches!(
+                cut.validate_standalone_restore(),
+                Err(WorldCheckpointError::RequiresHostContinuity { feature })
+                    if feature == expected_feature
+            ));
+            let bytes = cut.encode().unwrap();
             let error = Simulation::from_world_checkpoint(&bytes).err().unwrap();
             assert!(format!("{error:#}").contains(reason));
             let error = source.world_checkpoint().unwrap_err();
@@ -2949,7 +2964,9 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
-    fn browser_scientific_checkpoint_refuses_maps_even_with_a_matching_digest() {
+    fn browser_scientific_checkpoint_refuses_maps_requiring_host_continuity() {
+        use scriptbots_core::WorldCheckpointError;
+
         let spec = checkpoint_world(None, SeedStrategy::None).spec;
         let mut world = WorldState::new(spec.config()).unwrap();
         let width = world.terrain().width();
@@ -2976,14 +2993,31 @@ mod tests {
         .unwrap();
         world.apply_map_artifact(&artifact).unwrap();
         let mut source = owner_for_checkpoint_test(world, spec);
-        let cut = source.core.capture_checkpoint_v1().unwrap();
+        assert!(matches!(
+            source.core.world().checkpoint_v1(),
+            Err(WorldCheckpointError::RequiresHostContinuity {
+                feature: "imported map state"
+            })
+        ));
+        let (cut, _) = source
+            .core
+            .world()
+            .capture_host_checkpoint_parts_v1()
+            .unwrap();
         let bytes = cut.encode().unwrap();
-        let native =
-            WorldState::restore_checkpoint_v1(&cut, scriptbots_core::BrainRegistry::new()).unwrap();
-        assert_eq!(native.world_digest_v1().unwrap(), *cut.source_digest());
-        assert!(native.map_metadata().is_some());
+        assert!(matches!(
+            WorldState::restore_checkpoint_v1(&cut, scriptbots_core::BrainRegistry::new()),
+            Err(WorldCheckpointError::RequiresHostContinuity {
+                feature: "imported map state"
+            })
+        ));
         let error = Simulation::from_world_checkpoint(&bytes).err().unwrap();
-        assert!(format!("{error:#}").contains("imported maps"));
+        assert!(matches!(
+            error.downcast_ref::<WorldCheckpointError>(),
+            Some(WorldCheckpointError::RequiresHostContinuity {
+                feature: "imported map state"
+            })
+        ));
         assert!(
             source
                 .world_checkpoint()
