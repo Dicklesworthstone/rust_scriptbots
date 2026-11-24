@@ -2,6 +2,41 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Working storage-backed reels and paged replay inputs (2026-11-24):**
+[Currently In Progress — Codex; corrective contribution to `bd-16g.9.2`;
+original replay-integrity and long-run acceptance retained]
+
+The actual storage-backed reel entry point no longer asks the bounded narrative
+API for 100,000 rows in one call, which exceeded its 4,096-row limit and refused
+every export. It now traverses bounded canonical pages while retaining the newest
+100,000 candidates. Empty recordings return an empty result without publishing a
+file, and selected recordings enter the full checkpoint/journal/digest verifier.
+
+Replay acquisition uses a finished-run range visitor with identity/text-size
+metadata before payload loading. Each montage payload query admits at most 1,024
+rows and 4 MiB of stored text; oversized rows refuse. Keyset ordering, duplicate
+lookahead, run isolation, exact payload/metadata matching and typed consumer errors
+remain explicit. Run-wide integer-identity checks prevent malformed stored ticks
+from disappearing behind numeric range predicates.
+
+The complete replay recording is still decoded and checked for foreign-island
+evidence, including the tail after the last selected frame. Only anchors from the
+source through the earliest covering tick are retained, with a 65,536-anchor cap
+that refuses excess rather than truncating proof. Publication still requires both
+verification passes and encoder completion.
+
+Authored real-file coverage exercises the actual ASCII/GIF entry point, empty
+selection, newest-candidate paging, covering-anchor budgets, missing evidence,
+corrupt and foreign-island tails, range boundaries, byte budgets, duplicates and
+original visitor errors. Narrative selection fixtures are explicitly seeded;
+the world, owner journal, checkpoint and digest observations come from the real
+recording fixture. Two independent source/API reviews completed. The final DSR
+source-check attempt lost its executor before Rust tooling ran; parsing, formatting,
+native compilation and executable tests for this increment remain unverified.
+These are bounded result-page and retained
+payload claims; command history, summary-tick inventory, engine memory and long-run
+query cost are not qualified.
+
 **Independent futures from complete saved owners (2026-11-24):**
 [Currently In Progress — Codex; scoped contributions to `bd-2z0.12.2` and
 the Phase 4 intervention-study runner; original complete acceptance retained]

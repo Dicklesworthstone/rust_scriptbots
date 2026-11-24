@@ -12814,6 +12814,173 @@ impl StorageReader {
             .collect()
     }
 
+    /// Visit a finished run's inclusive tick range in canonical tick/island/sequence order.
+    ///
+    /// Identity and text-byte metadata are read before payloads. Each payload query returns
+    /// at most `record_limit` rows and `page_text_byte_limit` bytes of stored scope, kind and
+    /// payload text. One extra metadata row detects an identity duplicate at a page boundary.
+    /// A single row larger than the byte budget is refused; it is never silently skipped.
+    /// These are query-result and caller-retention bounds, not an engine-memory or time limit.
+    ///
+    /// Every island is retained. Consumers requiring a single world must reject other islands.
+    /// Identity storage classes and integer domains are checked across the selected run before
+    /// range filtering. Only payloads inside the requested range are decoded; pass
+    /// `0..=i64::MAX` to inspect every payload. The immutable finished-run lease remains held.
+    /// A visitor may receive a valid prefix before an error, so callers must defer publishing
+    /// their result until this method succeeds. Visitor errors are returned unchanged.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one leased traversal binds bounded identity metadata to each exact payload page and preserves consumer errors"
+    )]
+    pub fn visit_finished_replay_event_range<E>(
+        &self,
+        first_tick: u64,
+        last_tick: u64,
+        record_limit: usize,
+        page_text_byte_limit: usize,
+        mut visitor: impl FnMut(PersistedReplayEvent) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+    {
+        if first_tick > last_tick {
+            return Err(E::from(StorageError::InvalidData {
+                context: "replay_event_range.ticks",
+                reason: "inclusive tick range is reversed".to_owned(),
+            }));
+        }
+        if record_limit == 0 || record_limit > MAX_STORAGE_QUERY_PAGE {
+            return Err(E::from(StorageError::InvalidData {
+                context: "replay_event_range.record_limit",
+                reason: format!("record limit must be in 1..={MAX_STORAGE_QUERY_PAGE}"),
+            }));
+        }
+        if page_text_byte_limit == 0 {
+            return Err(E::from(StorageError::InvalidData {
+                context: "replay_event_range.page_text_byte_limit",
+                reason: "page text byte limit must be nonzero".to_owned(),
+            }));
+        }
+        checked_i64("replay_event_range.page_text_byte_limit", page_text_byte_limit)
+            .map_err(E::from)?;
+        let first = encode_u64("replay_event_range.first_tick", first_tick).map_err(E::from)?;
+        let last = encode_u64("replay_event_range.last_tick", last_tick).map_err(E::from)?;
+        let lookahead = checked_i64("replay_event_range.lookahead", record_limit + 1)
+            .map_err(E::from)?;
+        let connection = self.finished_connection().map_err(E::from)?;
+        // SQLite affinity and CHECK(tick >= 0) alone do not prove an INTEGER storage
+        // class. Refuse malformed identities before range predicates can exclude them.
+        let invalid_identity = connection
+            .query_with_params(
+                "SELECT 1 FROM replay_events
+                 WHERE run_id = ?1 AND (
+                     typeof(tick) <> 'integer' OR tick < 0
+                     OR typeof(island_id) <> 'integer' OR island_id < 0 OR island_id > 4294967295
+                     OR typeof(seq) <> 'integer' OR seq < 0
+                 ) LIMIT 1",
+                &[sqlite_run_id(self.run_id)],
+            )
+            .map_err(StorageError::from)
+            .map_err(E::from)?;
+        if !invalid_identity.is_empty() {
+            return Err(E::from(StorageError::InvalidData {
+                context: "replay_event_range.identity",
+                reason: "selected run contains a replay identity outside its integer domain"
+                    .to_owned(),
+            }));
+        }
+        let mut after = (first - 1, 0_i64, 0_i64);
+        loop {
+            let rows = connection
+                .query_with_params(
+                    REPLAY_EVENT_RANGE_METADATA,
+                    &[
+                        sqlite_run_id(self.run_id),
+                        first.into(),
+                        last.into(),
+                        after.0.into(),
+                        after.1.into(),
+                        after.2.into(),
+                        lookahead.into(),
+                    ],
+                )
+                .map_err(StorageError::from)
+                .map_err(E::from)?;
+            let metadata = replay_event_page_metadata(&rows, after, first, last)
+                .map_err(E::from)?;
+            if metadata.is_empty() {
+                return Ok(());
+            }
+            let mut admitted = 0_usize;
+            let mut bytes = 0_usize;
+            for row in metadata.iter().take(record_limit) {
+                if row.text_bytes > page_text_byte_limit - bytes {
+                    if admitted == 0 {
+                        return Err(E::from(StorageError::InvalidData {
+                            context: "replay_event_range.page_text_byte_limit",
+                            reason: format!(
+                                "event {:?} needs {} text bytes, exceeding the {page_text_byte_limit}-byte page budget",
+                                row.identity(), row.text_bytes
+                            ),
+                        }));
+                    }
+                    break;
+                }
+                bytes += row.text_bytes;
+                admitted += 1;
+            }
+            let end = metadata[admitted - 1].identity();
+            let bound = checked_i64("replay_event_range.admitted", admitted).map_err(E::from)?;
+            let mut observed = 0_usize;
+            self.visit_finished_rows_with_params(
+                REPLAY_EVENT_RANGE_PAYLOADS,
+                &[
+                    sqlite_run_id(self.run_id),
+                    first.into(),
+                    last.into(),
+                    after.0.into(),
+                    after.1.into(),
+                    after.2.into(),
+                    end.0.into(),
+                    end.1.into(),
+                    end.2.into(),
+                    bound.into(),
+                ],
+                |row| {
+                    let identity = (
+                        decode::<i64>(row, 0, "replay_events.tick")?,
+                        decode::<i64>(row, 11, "replay_events.island_id")?,
+                        decode::<i64>(row, 1, "replay_events.seq")?,
+                    );
+                    let text_bytes = checked_usize(
+                        "replay_event_range.text_bytes",
+                        decode(row, 12, "replay_event_range.text_bytes")?,
+                    )?;
+                    if observed >= admitted
+                        || metadata[observed].identity() != identity
+                        || metadata[observed].text_bytes != text_bytes
+                    {
+                        return Err(StorageError::InvalidData {
+                            context: "replay_event_range.payload_identity",
+                            reason: format!("payload {identity:?} differs from its admitted metadata"),
+                        });
+                    }
+                    let event = persisted_replay_event_from_query_row(row)?;
+                    observed += 1;
+                    Ok(event)
+                },
+                &mut visitor,
+            )?;
+            if observed != admitted {
+                return Err(E::from(StorageError::InvalidData {
+                    context: "replay_event_range.payload_identity",
+                    reason: format!("admitted {admitted} identities but read {observed} payloads"),
+                }));
+            }
+            after = end;
+        }
+    }
+
     /// Traverse a leased finished run without retaining the complete decoded history.
     fn visit_finished_replay_events<E>(
         &self,
@@ -12833,6 +13000,24 @@ impl StorageReader {
         &self,
         sql: &str,
         decode_row: impl Fn(&Row) -> Result<T, StorageError>,
+        visitor: impl FnMut(T) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError>,
+    {
+        self.visit_finished_rows_with_params(
+            sql,
+            &[sqlite_run_id(self.run_id)],
+            decode_row,
+            visitor,
+        )
+    }
+
+    fn visit_finished_rows_with_params<T, E>(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+        mut decode_row: impl FnMut(&Row) -> Result<T, StorageError>,
         mut visitor: impl FnMut(T) -> Result<(), E>,
     ) -> Result<(), E>
     where
@@ -12842,7 +13027,7 @@ impl StorageReader {
         let result =
             self.finished_connection()
                 .map_err(E::from)?
-                .query_with_params_for_each(sql, &[sqlite_run_id(self.run_id)], |row| {
+                .query_with_params_for_each(sql, params, |row| {
                     match decode_row(row).map_err(E::from).and_then(&mut visitor) {
                         Ok(()) => Ok(()),
                         Err(error) => {
@@ -29259,6 +29444,38 @@ const REPLAY_EVENT_SELECT_ASCENDING: &str = concat!(
      ORDER BY tick ASC, island_id ASC, seq ASC"
 );
 
+macro_rules! replay_event_text_bytes {
+    () => {
+        "length(CAST(scope AS BLOB)) + length(CAST(event_type AS BLOB)) + length(CAST(payload AS BLOB))"
+    };
+}
+
+const REPLAY_EVENT_RANGE_METADATA: &str = concat!(
+    "SELECT tick, island_id, seq, ",
+    replay_event_text_bytes!(),
+    " FROM replay_events
+     WHERE run_id = ?1 AND tick >= ?2 AND tick <= ?3
+       AND (tick > ?4 OR (tick = ?4 AND island_id > ?5)
+            OR (tick = ?4 AND island_id = ?5 AND seq > ?6))
+     ORDER BY tick ASC, island_id ASC, seq ASC
+     LIMIT ?7"
+);
+
+const REPLAY_EVENT_RANGE_PAYLOADS: &str = concat!(
+    "SELECT ",
+    replay_event_columns!(),
+    ", ",
+    replay_event_text_bytes!(),
+    " FROM replay_events
+     WHERE run_id = ?1 AND tick >= ?2 AND tick <= ?3
+       AND (tick > ?4 OR (tick = ?4 AND island_id > ?5)
+            OR (tick = ?4 AND island_id = ?5 AND seq > ?6))
+       AND (tick < ?7 OR (tick = ?7 AND island_id < ?8)
+            OR (tick = ?7 AND island_id = ?8 AND seq <= ?9))
+     ORDER BY tick ASC, island_id ASC, seq ASC
+     LIMIT ?10"
+);
+
 const REPLAY_EVENT_SELECT_DESCENDING_BOUNDED: &str = concat!(
     "SELECT ",
     replay_event_columns!(),
@@ -29308,6 +29525,65 @@ const NARRATIVE_INPUT_SELECT_LAST: &str = concat!(
      ORDER BY tick DESC, seq DESC
      LIMIT 1"
 );
+
+#[derive(Debug, Clone, Copy)]
+struct ReplayEventPageMetadata {
+    tick: i64,
+    island_id: i64,
+    seq: i64,
+    text_bytes: usize,
+}
+
+impl ReplayEventPageMetadata {
+    const fn identity(self) -> (i64, i64, i64) {
+        (self.tick, self.island_id, self.seq)
+    }
+}
+
+fn replay_event_page_metadata(
+    rows: &[Row],
+    after: (i64, i64, i64),
+    first_tick: i64,
+    last_tick: i64,
+) -> Result<Vec<ReplayEventPageMetadata>, StorageError> {
+    let mut previous = after;
+    let mut metadata = Vec::with_capacity(rows.len());
+    for row in rows {
+        let tick: i64 = decode(row, 0, "replay_events.tick")?;
+        let island_id: i64 = decode(row, 1, "replay_events.island_id")?;
+        let seq: i64 = decode(row, 2, "replay_events.seq")?;
+        checked_u64("replay_events.tick", tick)?;
+        checked_u32("replay_events.island_id", island_id)?;
+        checked_u64("replay_events.seq", seq)?;
+        let identity = (tick, island_id, seq);
+        if identity <= previous || tick < first_tick || tick > last_tick {
+            return Err(StorageError::InvalidData {
+                context: "replay_event_range.identity",
+                reason: format!(
+                    "event {identity:?} is duplicated, unordered, or outside {first_tick}..={last_tick}; previous={previous:?}"
+                ),
+            });
+        }
+        let text_bytes = checked_usize(
+            "replay_event_range.text_bytes",
+            decode(row, 3, "replay_event_range.text_bytes")?,
+        )?;
+        if text_bytes == 0 {
+            return Err(StorageError::InvalidData {
+                context: "replay_event_range.text_bytes",
+                reason: format!("event {identity:?} has no stored text"),
+            });
+        }
+        metadata.push(ReplayEventPageMetadata {
+            tick,
+            island_id,
+            seq,
+            text_bytes,
+        });
+        previous = identity;
+    }
+    Ok(metadata)
+}
 
 /// Rebuild a [`ReplayEventRow`] from a query row selected with `replay_event_columns!()`.
 fn replay_event_row_from_query_row(row: &Row) -> Result<ReplayEventRow, StorageError> {
@@ -33545,6 +33821,270 @@ mod tests {
             !unrelated_lock.try_exists()?,
             "refused reader open created a writer-lease sidecar"
         );
+        Ok(())
+    }
+
+    fn finished_replay_range_fixture()
+    -> Result<(PathBuf, RunId, Vec<PersistedReplayEvent>), StorageError> {
+        let path = temp_db_path("storage-replay-range");
+        let path_string = path.to_string_lossy();
+        let run_id = RunId::new(0x7265_706c_6179);
+        let mut storage = Storage::create_new_file_for_run(
+            &path_string,
+            RunManifestRecord::unattributed(run_id),
+        )?;
+        for tick in [0, 3, 7, i64::MAX as u64] {
+            let mut batch = sample_batch(tick, 1.0);
+            batch.replay_events.push(ReplayEvent {
+                agent_uid: None,
+                position: None,
+                counterpart: None,
+                counterpart_position: None,
+                kind: ReplayEventKind::WorldDigest {
+                    overall: format!("{tick:016x}"),
+                },
+            });
+            if tick == 3 || tick == 7 {
+                batch.replay_events.push(ReplayEvent {
+                    agent_uid: None,
+                    position: None,
+                    counterpart: None,
+                    counterpart_position: None,
+                    kind: ReplayEventKind::BrainOutputs {
+                        outputs: vec![0.125, 0.75],
+                    },
+                });
+            }
+            storage.persist(&batch)?;
+        }
+        storage.flush()?;
+        let expected = storage.load_replay_events()?;
+        storage.close()?;
+        let mut second = Storage::append_run(
+            &path_string,
+            RunManifestRecord::unattributed(RunId::new(run_id.get() + 1)),
+        )?;
+        let mut other = sample_batch(3, 9.0);
+        other.replay_events.push(ReplayEvent {
+            agent_uid: None,
+            position: None,
+            counterpart: None,
+            counterpart_position: None,
+            kind: ReplayEventKind::WorldDigest {
+                overall: "ffffffffffffffff".to_owned(),
+            },
+        });
+        second.persist(&other)?;
+        second.flush()?;
+        second.close()?;
+        Ok((path, run_id, expected))
+    }
+
+    #[test]
+    fn replay_range_visits_exact_finished_run_pages_and_inclusive_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (path, run_id, expected) = finished_replay_range_fixture()?;
+        let path_string = path.to_string_lossy();
+        let live = StorageReader::open_for_run(&path_string, run_id)?;
+        let mut live_visits = 0;
+        assert!(
+            live.visit_finished_replay_event_range(8, 8, 1, 1024, |_| {
+                live_visits += 1;
+                Ok::<_, StorageError>(())
+            })
+            .is_err(),
+            "even an empty range requires the finished-run lease"
+        );
+        assert_eq!(live_visits, 0);
+        live.close()?;
+        let reader = StorageReader::open_finished_for_run(&path_string, run_id)?;
+        for limit in [1, 2, 3, MAX_STORAGE_QUERY_PAGE] {
+            for byte_limit in [80, 1024] {
+                let mut actual = Vec::new();
+                reader.visit_finished_replay_event_range(
+                    0,
+                    i64::MAX as u64,
+                    limit,
+                    byte_limit,
+                    |event| {
+                        actual.push(event);
+                        Ok::<_, StorageError>(())
+                    },
+                )?;
+                assert_eq!(actual, expected, "limits={limit}/{byte_limit}");
+            }
+        }
+        for (first, last) in [(0, 0), (3, 7), (8, 8), (i64::MAX as u64, i64::MAX as u64)] {
+            let mut actual = Vec::new();
+            reader.visit_finished_replay_event_range(first, last, 1, 1024, |event| {
+                actual.push(event);
+                Ok::<_, StorageError>(())
+            })?;
+            assert_eq!(
+                actual,
+                expected
+                    .iter()
+                    .filter(|event| event.tick >= first && event.tick <= last)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+        }
+        for (first, last, limit, bytes) in [
+            (1, 0, 1, 1024),
+            (0, u64::MAX, 1, 1024),
+            (0, 0, 0, 1024),
+            (0, 0, MAX_STORAGE_QUERY_PAGE + 1, 1024),
+            (0, 0, 1, 0),
+        ] {
+            let mut visits = 0;
+            assert!(
+                reader
+                    .visit_finished_replay_event_range(first, last, limit, bytes, |_| {
+                        visits += 1;
+                        Ok::<_, StorageError>(())
+                    })
+                    .is_err()
+            );
+            assert_eq!(visits, 0);
+        }
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn replay_range_preserves_byte_edges_consumer_errors_and_duplicate_lookahead()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (path, run_id, _) = finished_replay_range_fixture()?;
+        let reader = StorageReader::open_finished_for_run(&path.to_string_lossy(), run_id)?;
+        let rows = reader.finished_connection()?.query_with_params(
+            REPLAY_EVENT_RANGE_METADATA,
+            &[sqlite_run_id(run_id), 0.into(), 0.into(), (-1).into(), 0.into(), 0.into(), 2.into()],
+        )?;
+        assert_eq!(rows.len(), 1);
+        let bytes = replay_event_page_metadata(&rows, (-1, 0, 0), 0, 0)?[0].text_bytes;
+        for budget in [bytes - 1, bytes, bytes + 1] {
+            let mut visits = 0;
+            let result = reader.visit_finished_replay_event_range(0, 0, 1, budget, |_| {
+                visits += 1;
+                Ok::<_, StorageError>(())
+            });
+            if budget < bytes {
+                assert_invalid_data_context(result, "replay_event_range.page_text_byte_limit");
+                assert_eq!(visits, 0);
+            } else {
+                result?;
+                assert_eq!(visits, 1);
+            }
+        }
+
+        #[derive(Debug)]
+        enum VisitError {
+            Storage(StorageError),
+            Stop(u64),
+        }
+        impl From<StorageError> for VisitError {
+            fn from(error: StorageError) -> Self {
+                Self::Storage(error)
+            }
+        }
+        let mut visits = 0;
+        let stopped = reader.visit_finished_replay_event_range(0, 7, 1, 1024, |event| {
+            visits += 1;
+            if visits == 2 {
+                Err(VisitError::Stop(event.tick))
+            } else {
+                Ok(())
+            }
+        });
+        match stopped {
+            Err(VisitError::Stop(3)) => {}
+            Err(VisitError::Storage(error)) => return Err(error.into()),
+            other => panic!("consumer refusal was not preserved: {other:?}"),
+        }
+        assert_eq!(visits, 2, "no later callback may run after consumer refusal");
+
+        // The real schema prevents duplicate primary keys. Feed the production metadata
+        // validator a real-file UNION ALL query to prove that page-size-one lookahead
+        // refuses a duplicate before an exclusive cursor could skip the second identity.
+        let duplicated = reader.finished_connection()?.query_with_params(
+            "SELECT tick, island_id, seq, 64 FROM replay_events WHERE run_id = ?1 AND tick = 0
+             UNION ALL
+             SELECT tick, island_id, seq, 64 FROM replay_events WHERE run_id = ?1 AND tick = 0
+             ORDER BY tick ASC, island_id ASC, seq ASC LIMIT 2",
+            &[sqlite_run_id(run_id)],
+        )?;
+        assert_eq!(duplicated.len(), 2);
+        assert_invalid_data_context(
+            replay_event_page_metadata(&duplicated, (-1, 0, 0), 0, 0),
+            "replay_event_range.identity",
+        );
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn replay_range_refuses_corruption_and_oversized_text_before_payload_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (path, run_id, expected) = finished_replay_range_fixture()?;
+        let path_string = path.to_string_lossy();
+        let connection = Connection::open_existing(path_string.as_ref())?;
+        connection.execute_with_params(
+            "UPDATE replay_events SET payload = '!' WHERE run_id = ?1 AND tick = 3 AND seq = 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        connection.close()?;
+        let reader = StorageReader::open_finished_for_run(&path_string, run_id)?;
+        let mut visits = 0;
+        let corrupt = reader.visit_finished_replay_event_range(0, 7, 1, 1024, |_| {
+            visits += 1;
+            Ok::<_, StorageError>(())
+        });
+        assert!(matches!(corrupt, Err(StorageError::ReplayParse { tick: 3, seq: 1, .. })));
+        assert_eq!(visits, 2, "the corrupt payload itself must not reach the visitor");
+        let mut suffix = Vec::new();
+        reader.visit_finished_replay_event_range(7, 7, 1, 1024, |event| {
+            suffix.push(event);
+            Ok::<_, StorageError>(())
+        })?;
+        assert_eq!(suffix, expected.into_iter().filter(|event| event.tick == 7).collect::<Vec<_>>());
+        reader.close()?;
+
+        let connection = Connection::open_existing(path_string.as_ref())?;
+        connection.execute_with_params(
+            "UPDATE replay_events SET payload = ?2 WHERE run_id = ?1 AND tick = 0",
+            &[sqlite_run_id(run_id), "!".repeat(2048).into()],
+        )?;
+        connection.close()?;
+        let reader = StorageReader::open_finished_for_run(&path_string, run_id)?;
+        let mut visits = 0;
+        assert_invalid_data_context(
+            reader.visit_finished_replay_event_range(0, 0, 1, 1024, |_| {
+                visits += 1;
+                Ok::<_, StorageError>(())
+            }),
+            "replay_event_range.page_text_byte_limit",
+        );
+        assert_eq!(visits, 0, "oversized invalid JSON must refuse on metadata alone");
+        reader.close()?;
+
+        let connection = Connection::open_existing(path_string.as_ref())?;
+        connection.execute_with_params(
+            "UPDATE replay_events SET tick = 'not-a-tick'
+             WHERE run_id = ?1 AND tick = 7 AND seq = 1",
+            &[sqlite_run_id(run_id)],
+        )?;
+        connection.close()?;
+        let reader = StorageReader::open_finished_for_run(&path_string, run_id)?;
+        let mut visits = 0;
+        assert_invalid_data_context(
+            reader.visit_finished_replay_event_range(8, 8, 1, 1024, |_| {
+                visits += 1;
+                Ok::<_, StorageError>(())
+            }),
+            "replay_event_range.identity",
+        );
+        assert_eq!(visits, 0, "an invalid tick must not vanish outside a range predicate");
+        reader.close()?;
         Ok(())
     }
 

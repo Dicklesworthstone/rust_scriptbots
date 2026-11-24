@@ -202,6 +202,69 @@ pub trait ReplayProvider {
 
 type DigestAnchors = VecDeque<(u64, String)>;
 
+const PERSISTED_REPLAY_PAGE_RECORDS: usize = 1024;
+const PERSISTED_REPLAY_PAGE_TEXT_BYTES: usize = 4 << 20;
+const MAX_PERSISTED_MONTAGE_ANCHORS: usize = 65_536;
+const MAX_MONTAGE_NARRATIVE_EVENTS: usize = 100_000;
+
+/// Inspect the complete recording, retaining only the source-to-covering-anchor interval.
+fn recorded_montage_anchors(
+    storage: &scriptbots_storage::StorageReader,
+    start_tick: u64,
+    last_frame: u64,
+    maximum_anchors: usize,
+) -> anyhow::Result<(u64, DigestAnchors)> {
+    anyhow::ensure!(maximum_anchors > 0, "montage digest-anchor budget must be nonzero");
+    let mut anchor_tick = None;
+    let mut expected = DigestAnchors::new();
+    storage.visit_finished_replay_event_range(
+        0,
+        i64::MAX as u64,
+        PERSISTED_REPLAY_PAGE_RECORDS,
+        PERSISTED_REPLAY_PAGE_TEXT_BYTES,
+        |entry| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                entry.island_id == scriptbots_core::rng_domains::IslandId(0),
+                "offline montage replay contains another island's evidence"
+            );
+            // Continue decoding and validating the tail after the covering anchor.
+            // A short visual interval must not conceal corrupt or foreign-island rows.
+            if entry.tick <= start_tick
+                || anchor_tick.is_some_and(|anchor| entry.tick > anchor)
+            {
+                return Ok(());
+            }
+            if let ReplayEventKind::WorldDigest { overall } = entry.event.kind {
+                anyhow::ensure!(
+                    entry.seq < scriptbots_storage::NARRATIVE_INPUT_REPLAY_SEQ
+                        && entry.event.agent_uid.is_none()
+                        && entry.event.position.is_none()
+                        && entry.event.counterpart.is_none()
+                        && entry.event.counterpart_position.is_none()
+                        && overall.len() == std::mem::size_of::<u64>() * 2
+                        && overall
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                    "montage world-digest identity or encoding is invalid"
+                );
+                anyhow::ensure!(
+                    expected.len() < maximum_anchors,
+                    "montage verification interval exceeds its {maximum_anchors} digest-anchor budget"
+                );
+                expected.push_back((entry.tick, overall));
+                if entry.tick >= last_frame {
+                    anchor_tick = Some(entry.tick);
+                }
+            }
+            Ok(())
+        },
+    )?;
+    let anchor_tick = anchor_tick.ok_or_else(|| {
+        anyhow::anyhow!("montage requires a recorded digest anchor covering every frame")
+    })?;
+    Ok((anchor_tick, expected))
+}
+
 /// Verify digests where the original persistence boundary emitted them. Comparing
 /// `world_digest_v1()` after same-tick commands would observe a different cut.
 struct DigestVerifier {
@@ -364,56 +427,16 @@ impl<'a> PersistedReplaySeeker<'a> {
         let recording_config = checkpoint.config().clone();
         let source = ReplayCheckpointSource::Host(Box::new(checkpoint));
         let start_tick = source.world_checkpoint().tick().0;
-        let mut events = storage.load_replay_events()?;
-        anyhow::ensure!(
-            events
-                .iter()
-                .all(|event| event.island_id == scriptbots_core::rng_domains::IslandId(0)),
-            "offline montage replay contains another island's evidence"
-        );
-        events.sort_by_key(|event| (event.tick, event.seq));
-        anyhow::ensure!(
-            !events
-                .windows(2)
-                .any(|pair| (pair[0].tick, pair[0].seq) == (pair[1].tick, pair[1].seq)),
-            "offline montage replay contains duplicate event identities"
-        );
-        let anchor_tick = events
-            .iter()
-            .find(|event| {
-                event.tick > start_tick
-                    && event.tick >= last_frame
-                    && matches!(event.event.kind, ReplayEventKind::WorldDigest { .. })
-            })
-            .map(|event| event.tick)
-            .ok_or_else(|| {
-                anyhow::anyhow!("montage requires a recorded digest anchor covering every frame")
-            })?;
+        let (anchor_tick, expected) = recorded_montage_anchors(
+            storage,
+            start_tick,
+            last_frame,
+            MAX_PERSISTED_MONTAGE_ANCHORS,
+        )?;
         anyhow::ensure!(
             anchor_tick <= terminal_tick,
             "montage digest exceeds the recorded run"
         );
-        let mut expected = DigestAnchors::new();
-        for entry in events
-            .iter()
-            .filter(|event| event.tick > start_tick && event.tick <= anchor_tick)
-        {
-            if let ReplayEventKind::WorldDigest { overall } = &entry.event.kind {
-                anyhow::ensure!(
-                    entry.seq < scriptbots_storage::NARRATIVE_INPUT_REPLAY_SEQ
-                        && entry.event.agent_uid.is_none()
-                        && entry.event.position.is_none()
-                        && entry.event.counterpart.is_none()
-                        && entry.event.counterpart_position.is_none()
-                        && overall.len() == std::mem::size_of::<u64>() * 2
-                        && overall
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-                    "montage world-digest identity or encoding is invalid"
-                );
-                expected.push_back((entry.tick, overall.clone()));
-            }
-        }
         let mirror = ReplayMirror {
             digest_ticks: Some(
                 expected
@@ -1202,12 +1225,52 @@ pub fn encode_montage(
     encode_montage_with_seeker(&mut seeker, events, last_tick, options)
 }
 
+fn recent_montage_events(
+    storage: &scriptbots_storage::StorageReader,
+    retained_limit: usize,
+    page_limit: usize,
+) -> Result<Vec<EventRecord>, ReelReplayError> {
+    if retained_limit == 0 {
+        return Err(ReelReplayError::InvalidOptions(
+            "montage narrative retention must be nonzero".to_owned(),
+        ));
+    }
+    let mut retained = VecDeque::new();
+    let mut after = None;
+    loop {
+        let page = storage
+            .run_event_page_v1(after.as_ref(), page_limit)
+            .map_err(|error| ReelReplayError::Storage(error.to_string()))?;
+        for event in page.events {
+            if event.identity().island() != scriptbots_core::rng_domains::IslandId(0) {
+                return Err(ReelReplayError::Storage(
+                    "offline montage narrative contains another island's evidence".to_owned(),
+                ));
+            }
+            if retained.len() == retained_limit {
+                retained.pop_front();
+            }
+            retained.push_back(event.record().clone());
+        }
+        match page.next_after {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    Ok(retained.into_iter().collect())
+}
+
 /// Encode a montage reel from a finished, single-world run with full owner checkpoints.
 ///
-/// Selection considers the newest 100,000 narrative events. The recorded terminal
-/// tick determines post-roll; every selected frame must be covered by a later or
-/// same-tick recorded digest. The exact checkpoint, journal suffix and anchors are
-/// frozen and verified before encoding, and checked again before publication.
+/// Selection retains the newest 100,000 narrative events through bounded forward pages.
+/// Replay payload queries admit at most 1,024 rows and 4 MiB of stored text per page;
+/// the selected verification interval retains at most 65,536 digest anchors. Complete
+/// replay decoding still checks the whole recording. These bounds do not bound database
+/// execution memory or the separately retained command history.
+///
+/// The recorded terminal tick determines post-roll; every selected frame must be
+/// covered by a later or same-tick recorded digest. The exact checkpoint, journal suffix
+/// and anchors are frozen and verified before encoding and again before publication.
 pub fn encode_montage_from_storage(
     storage: &scriptbots_storage::StorageReader,
     options: &MontageOptions,
@@ -1219,13 +1282,11 @@ pub fn encode_montage_from_storage(
         .select_finished_run(Some(storage.run_id()))
         .map_err(|error| ReelReplayError::Storage(error.to_string()))?;
 
-    let run_events = storage
-        .recent_run_events(100_000)
-        .map_err(|e| ReelReplayError::Storage(e.to_string()))?;
-    let events: Vec<EventRecord> = run_events
-        .into_iter()
-        .map(|pe| pe.record().clone())
-        .collect();
+    let events = recent_montage_events(
+        storage,
+        MAX_MONTAGE_NARRATIVE_EVENTS,
+        PERSISTED_REPLAY_PAGE_RECORDS,
+    )?;
 
     let max_tick = storage
         .max_tick()
@@ -1526,6 +1587,162 @@ mod tests {
         assert_eq!(receipt.final_digest?, *observed.last().unwrap());
         pipeline.shutdown()?;
         Ok(observed)
+    }
+
+    fn seed_montage_narrative_candidates(path: &Path, count: u32) -> anyhow::Result<()> {
+        // These are explicit selection fixtures, not a claim that the detector emitted them.
+        // World ticks, full checkpoint, journal inputs, digest anchors and encoding are real.
+        let connection = scriptbots_storage::Connection::open_existing(
+            path.to_string_lossy().as_ref(),
+        )?;
+        for index in 0..count {
+            let inserted = connection.execute_with_params(
+                "INSERT INTO run_events (
+                    run_id, tick, kind, severity, magnitude, window_start, window_end,
+                    metric, before_value, after_value, score, subject_ref, human_text,
+                    schema_version, island_id
+                 ) SELECT run_id, 2, 'population_boom', 0.8, 30.0, 0, 2,
+                          ?1, 100.0, 130.0, 0.8, NULL, ?2, 1, 0 FROM runs",
+                &[
+                    format!("population.fixture.{index:04}").into(),
+                    format!("PopulationBoom selection fixture {index} at tick 2").into(),
+                ],
+            )?;
+            assert_eq!(inserted, 1);
+        }
+        connection.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_montage_storage_entrypoint_pages_narrative_and_encodes_real_recording()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("entrypoint.sqlite");
+        recorded_montage_fixture(&database, true, 1)?;
+        let empty_options = MontageOptions {
+            output_path: directory.path().join("empty.cast"),
+            ..MontageOptions::default()
+        };
+        let reader = scriptbots_storage::StorageReader::open_finished(database.to_str().unwrap())?;
+        let empty = encode_montage_from_storage(&reader, &empty_options)?;
+        assert_eq!(empty.clips_count, 0);
+        assert_eq!(empty.total_frames, 0);
+        assert!(!empty_options.output_path.exists());
+        reader.close()?;
+
+        seed_montage_narrative_candidates(&database, 5)?;
+        let reader = scriptbots_storage::StorageReader::open_finished(database.to_str().unwrap())?;
+        let retained = recent_montage_events(&reader, 3, 2)?;
+        assert_eq!(
+            retained.iter().map(|event| event.human_text.as_str()).collect::<Vec<_>>(),
+            [
+                "PopulationBoom selection fixture 2 at tick 2",
+                "PopulationBoom selection fixture 3 at tick 2",
+                "PopulationBoom selection fixture 4 at tick 2",
+            ],
+            "cross-page selection retains the newest candidates in canonical order"
+        );
+        for format in [ReelFormat::Ascii, ReelFormat::Gif] {
+            let options = MontageOptions {
+                format,
+                output_path: directory.path().join(format!("entrypoint-{format}")),
+                stride: 1,
+                selection: SelectionConfig {
+                    pre_window_ticks: 1,
+                    post_window_ticks: 1,
+                    ..SelectionConfig::default()
+                },
+                width: 16,
+                height: 8,
+            };
+            let summary = encode_montage_from_storage(&reader, &options)?;
+            assert_eq!(summary.clips_count, 1);
+            assert_eq!(summary.total_frames, 3);
+            assert_eq!(summary.peak_frames_in_flight, 1);
+            let bytes = std::fs::read(&options.output_path)?;
+            assert_eq!(summary.bytes_written, bytes.len() as u64);
+            assert!(!bytes.is_empty());
+            if format == ReelFormat::Ascii {
+                let text = std::str::from_utf8(&bytes)?;
+                for tick in 1..=3 {
+                    assert!(text.contains(&format!("[t={tick} rank=1]")));
+                }
+                assert!(text.contains("PopulationBoom selection fixture"));
+            } else {
+                assert_eq!(bytes.last(), Some(&0x3b));
+            }
+        }
+        let (covering, anchors) = recorded_montage_anchors(&reader, 1, 4, 3)?;
+        assert_eq!(covering, 4);
+        assert_eq!(anchors.iter().map(|(tick, _)| *tick).collect::<Vec<_>>(), [2, 3, 4]);
+        let (covering, anchors) = recorded_montage_anchors(&reader, 1, 2, 1)?;
+        assert_eq!(covering, 2);
+        assert_eq!(anchors.len(), 1, "later anchors are inspected without retention");
+        let error = recorded_montage_anchors(&reader, 1, 4, 2)
+            .expect_err("an over-budget proof interval must refuse rather than truncate");
+        assert!(error.to_string().contains("digest-anchor budget"));
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_montage_entrypoint_refuses_missing_anchor_and_corrupt_recording_tail()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        for fault in ["missing-anchor", "tail-payload", "tail-island"] {
+            let database = directory.path().join(format!("{fault}.sqlite"));
+            recorded_montage_fixture(&database, fault != "missing-anchor", 1)?;
+            seed_montage_narrative_candidates(&database, 1)?;
+            if fault != "missing-anchor" {
+                let connection = scriptbots_storage::Connection::open_existing(
+                    database.to_string_lossy().as_ref(),
+                )?;
+                let changed = if fault == "tail-payload" {
+                    connection.execute(
+                        "UPDATE replay_events SET payload = 'invalid-json'
+                         WHERE tick = 4 AND event_type = 'world_digest'",
+                    )?
+                } else {
+                    connection.execute(
+                        "UPDATE replay_events SET island_id = 7
+                         WHERE tick = 4 AND event_type = 'world_digest'",
+                    )?
+                };
+                assert_eq!(changed, 1);
+                connection.close()?;
+            }
+            let options = MontageOptions {
+                output_path: directory.path().join(format!("{fault}.cast")),
+                stride: 1,
+                selection: SelectionConfig {
+                    pre_window_ticks: 1,
+                    post_window_ticks: 1,
+                    ..SelectionConfig::default()
+                },
+                width: 16,
+                height: 8,
+                ..MontageOptions::default()
+            };
+            let reader = scriptbots_storage::StorageReader::open_finished(
+                database.to_str().unwrap(),
+            )?;
+            let error = encode_montage_from_storage(&reader, &options)
+                .expect_err("the actual encoder entry point must refuse incomplete evidence");
+            let message = error.to_string();
+            assert!(
+                match fault {
+                    "missing-anchor" => message.contains("digest anchor covering every frame"),
+                    "tail-payload" => message.contains("deserialize payload"),
+                    "tail-island" => message.contains("another island"),
+                    _ => unreachable!("fixed corruption cases"),
+                },
+                "{fault}: {message}"
+            );
+            assert!(!options.output_path.exists(), "{fault} published a partial reel");
+            reader.close()?;
+        }
+        Ok(())
     }
 
     #[test]
