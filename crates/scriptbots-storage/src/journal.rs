@@ -4865,6 +4865,7 @@ mod tests {
             budget,
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
             inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
+            budget_pressure_pending: Arc::new(AtomicBool::new(false)),
         };
         let world = timeout_test_world();
         let persistence = world.bind_persistence(Box::new(sink.clone())).unwrap();

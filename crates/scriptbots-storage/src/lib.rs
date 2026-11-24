@@ -559,7 +559,7 @@ use scriptbots_runtime::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{self, Value, json};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -24623,6 +24623,7 @@ enum StorageCommand {
     Flush {
         reply: xchan::Sender<Result<FlushReceipt, StorageWorkerError>>,
     },
+    DrainBudgetPressure(BudgetPressureDrain),
     RecordCheckpoint {
         checkpoint_id: String,
         checkpoint: Box<scriptbots_core::WorldCheckpointV1>,
@@ -24657,6 +24658,20 @@ enum StorageCommand {
     DropCheckpointsTable {
         reply: xchan::Sender<Result<(), String>>,
     },
+}
+
+/// Coalesce pressure notifications across every clone of a sink, including while a drain
+/// is running. Dropping a rejected, abandoned, or completed command reopens the notification
+/// slot without changing the separately owned scientific and narrative byte permits.
+#[derive(Debug)]
+struct BudgetPressureDrain {
+    pending: Arc<AtomicBool>,
+}
+
+impl Drop for BudgetPressureDrain {
+    fn drop(&mut self) {
+        self.pending.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug)]
@@ -25058,6 +25073,8 @@ pub struct StorageSink {
     inflight_bytes: Arc<AtomicUsize>,
     /// Narrative bytes admitted but not yet flushed.
     inflight_narrative_bytes: Arc<AtomicUsize>,
+    /// At most one queued or executing pressure drain across all sink clones.
+    budget_pressure_pending: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy)]
@@ -25126,6 +25143,26 @@ impl StorageSink {
     #[must_use]
     pub fn inflight_narrative_bytes(&self) -> usize {
         self.inflight_narrative_bytes.load(Ordering::SeqCst)
+    }
+
+    fn request_budget_pressure_drain(&self) {
+        if self
+            .budget_pressure_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        // A refused payload remains entirely with its caller. Wake the writer to apply
+        // one older admitted batch even when row thresholds have not been reached;
+        // otherwise every exact retry can be refused while the writer waits for a
+        // command that the byte ceiling prevents the caller from ever enqueueing.
+        // Never wait for queue space, the admission gate, or SQL on this refusal path.
+        let _ = self
+            .tx
+            .try_send(StorageCommand::DrainBudgetPressure(BudgetPressureDrain {
+                pending: Arc::clone(&self.budget_pressure_pending),
+            }));
     }
 
     fn publish_preparation_error(&self, error: &StorageError, tick: u64) {
@@ -25282,10 +25319,15 @@ impl StorageSink {
             *progress,
         )
         .inspect_err(|error| self.publish_preparation_error(error, tick))?
-        .map_err(|would_be| StorageError::InFlightBytesExhausted {
-            tick,
-            would_be,
-            max_inflight: self.budget.max_inflight_bytes,
+        .map_err(|would_be| {
+            if bytes <= self.budget.max_inflight_bytes {
+                self.request_budget_pressure_drain();
+            }
+            StorageError::InFlightBytesExhausted {
+                tick,
+                would_be,
+                max_inflight: self.budget.max_inflight_bytes,
+            }
         })?;
 
         let narrative_permit = if narrative_bytes > 0 {
@@ -25297,10 +25339,15 @@ impl StorageSink {
                 *progress,
             )
             .inspect_err(|error| self.publish_preparation_error(error, tick))?
-            .map_err(|would_be| StorageError::InFlightNarrativeBytesExhausted {
-                tick,
-                would_be,
-                max_inflight: self.budget.max_narrative_inflight_bytes,
+            .map_err(|would_be| {
+                if narrative_bytes <= self.budget.max_narrative_inflight_bytes {
+                    self.request_budget_pressure_drain();
+                }
+                StorageError::InFlightNarrativeBytesExhausted {
+                    tick,
+                    would_be,
+                    max_inflight: self.budget.max_narrative_inflight_bytes,
+                }
             })?;
             Some(permit)
         } else {
@@ -26711,6 +26758,7 @@ impl StoragePipeline {
                     budget: PayloadBudget::default(),
                     inflight_bytes: Arc::new(AtomicUsize::new(0)),
                     inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
+                    budget_pressure_pending: Arc::new(AtomicBool::new(false)),
                 },
                 handle: Some(handle),
                 pending_shutdown: None,
@@ -28011,6 +28059,19 @@ fn storage_worker(
                         return Some(worker_error);
                     }
                 }
+            }
+            StorageCommand::DrainBudgetPressure(request) => {
+                // One batch per notification preserves command interleaving. Keep the
+                // notification slot occupied until finalization releases the original
+                // permits, so a retry storm cannot queue a chain of drain transactions.
+                if let Err(error) =
+                    flush_one_worker_storage(&mut storage, &mut state, &analytics)
+                {
+                    analytics.publish_worker_error(&error, true);
+                    storage.abandon_after_error();
+                    return Some(error);
+                }
+                drop(request);
             }
             StorageCommand::RecordCheckpoint {
                 checkpoint_id,
@@ -32674,6 +32735,7 @@ mod tests {
                 budget: PayloadBudget::default(),
                 inflight_bytes: Arc::new(AtomicUsize::new(0)),
                 inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
+                budget_pressure_pending: Arc::new(AtomicBool::new(false)),
             };
             let payload = sample_batch(89, 8.9);
             let expected_estimate = estimate_batch_size(&payload);
@@ -32748,6 +32810,7 @@ mod tests {
             budget: PayloadBudget::default(),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
             inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
+            budget_pressure_pending: Arc::new(AtomicBool::new(false)),
         };
         let mut payload = sample_batch(90, 9.0);
         payload.replay_events.push(ReplayEvent {
@@ -46527,6 +46590,108 @@ mod tests {
     }
 
     #[test]
+    fn budget_pressure_notifications_recover_from_full_and_disconnected_queues()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, rx) = xchan::bounded(1);
+        let sink = StorageSink {
+            run_id: RunId::new(1),
+            tx,
+            analytics: AnalyticsSnapshotProvider::empty(),
+            admission: Arc::new(Mutex::new(AdmissionState { open: true })),
+            path: Arc::from(":memory:"),
+            deadlines: short_deadlines(),
+            budget: PayloadBudget::default(),
+            inflight_bytes: Arc::new(AtomicUsize::new(0)),
+            inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
+            budget_pressure_pending: Arc::new(AtomicBool::new(false)),
+        };
+        let (reply, _receiver) = xchan::bounded(1);
+        sink.tx.send(StorageCommand::Flush { reply })?;
+        let admission = Arc::clone(&sink.admission);
+        let _gate = admission.lock().expect("hold the admission gate");
+        sink.request_budget_pressure_drain();
+        assert_eq!(rx.len(), 1);
+        assert!(!sink.budget_pressure_pending.load(Ordering::SeqCst));
+        assert!(matches!(rx.try_recv()?, StorageCommand::Flush { .. }));
+
+        sink.request_budget_pressure_drain();
+        for _ in 0..16 {
+            sink.clone().request_budget_pressure_drain();
+        }
+        assert_eq!(rx.len(), 1);
+        let executing = rx.try_recv()?;
+        assert!(matches!(&executing, StorageCommand::DrainBudgetPressure(_)));
+        sink.request_budget_pressure_drain();
+        assert!(rx.is_empty(), "an executing drain must still occupy the slot");
+        drop(executing);
+        assert!(!sink.budget_pressure_pending.load(Ordering::SeqCst));
+
+        sink.request_budget_pressure_drain();
+        assert_eq!(rx.len(), 1);
+        let abandoned = rx.try_recv()?;
+        drop(rx);
+        drop(abandoned);
+        assert!(!sink.budget_pressure_pending.load(Ordering::SeqCst));
+        sink.request_budget_pressure_drain();
+        assert!(!sink.budget_pressure_pending.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[test]
+    fn budget_pressure_drain_preserves_terminal_database_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        )?;
+        let first = sample_batch(91, 9.1);
+        let second = sample_batch(92, 9.2);
+        let (bytes, events) = estimate_batch_size(&first);
+        assert_eq!(estimate_batch_size(&second), (bytes, events));
+        pipeline.set_payload_budget(PayloadBudget {
+            max_batch_bytes: bytes,
+            max_batch_events: events,
+            max_inflight_bytes: bytes.saturating_mul(2).saturating_sub(1),
+            ..PayloadBudget::default()
+        });
+        let admitted = pipeline.submit_with_receipt(&first)?;
+        pipeline.drop_metrics_table_for_test()?;
+        let pause = pipeline.pause_worker_for_test()?;
+        let refusal = pipeline.submit(&second).expect_err("byte pressure must refuse the new batch");
+        assert!(matches!(refusal, StorageError::InFlightBytesExhausted { tick: 92, .. }));
+        assert_eq!(pipeline.inflight_bytes(), bytes);
+        pause.release();
+
+        let error = pipeline.shutdown().expect_err("the pressure drain must fail closed");
+        let StorageError::Worker(worker_error) = error else {
+            panic!("expected the original worker error");
+        };
+        assert!(matches!(
+            &worker_error,
+            StorageWorkerError::Database {
+                operation: StorageOperation::Flush,
+                commit_state: FailureCommitState::RolledBack,
+                ..
+            }
+        ));
+        let snapshot = pipeline.analytics_provider().snapshot();
+        assert!(snapshot.stopped);
+        assert_eq!(
+            snapshot.last_failure.as_deref(),
+            Some(&worker_error.status())
+        );
+        assert_eq!(snapshot.watermarks.admitted, Some(admitted.batch_id));
+        assert_eq!(snapshot.watermarks.applied, None);
+        assert_eq!(snapshot.watermarks.durable, None);
+        assert_eq!(snapshot.committed_tick, None);
+        assert_eq!(pipeline.inflight_bytes(), 0);
+        assert!(!pipeline.sink.budget_pressure_pending.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[test]
     fn world_persistence_preserves_indeterminate_acknowledgement_loss()
     -> Result<(), Box<dyn std::error::Error>> {
         let (tx, rx) = xchan::bounded(1);
@@ -46540,6 +46705,7 @@ mod tests {
             budget: PayloadBudget::default(),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
             inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
+            budget_pressure_pending: Arc::new(AtomicBool::new(false)),
         };
         let worker = thread::spawn(move || -> Result<(), std::io::Error> {
             match rx
@@ -46579,6 +46745,7 @@ mod tests {
             budget: PayloadBudget::default(),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
             inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
+            budget_pressure_pending: Arc::new(AtomicBool::new(false)),
         };
         let started = Instant::now();
         let error = sink
@@ -46607,6 +46774,7 @@ mod tests {
             budget: PayloadBudget::default(),
             inflight_bytes: Arc::new(AtomicUsize::new(0)),
             inflight_narrative_bytes: Arc::new(AtomicUsize::new(0)),
+            budget_pressure_pending: Arc::new(AtomicBool::new(false)),
         };
         let admission = Arc::clone(&sink.admission);
         let guard = admission.lock().expect("test admission gate");

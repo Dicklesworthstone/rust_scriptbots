@@ -840,66 +840,99 @@ fn the_in_flight_permit_is_released_on_every_path_including_the_refusal_path() -
 }
 
 #[test]
-fn a_buffered_batch_holds_its_permit_until_flush_or_shutdown() {
-    // Maximal row thresholds deterministically keep an admitted batch buffered:
-    // the worker acknowledges its durable-outbox admission but cannot release the
-    // byte reservation until an explicit finalization barrier.
-    let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
-        usize::MAX,
-        usize::MAX,
-        usize::MAX,
-        usize::MAX,
-    )
-    .expect("pipeline");
-    let first = batch(1, 2);
-    let (bytes, events) = estimate_batch_size(&first);
-    let max_inflight = bytes.saturating_mul(2).saturating_sub(1);
-    pipeline.set_payload_budget(PayloadBudget {
-        max_batch_bytes: bytes,
-        max_batch_events: events,
-        max_inflight_bytes: max_inflight,
-        ..PayloadBudget::default()
-    });
+fn budget_pressure_drains_one_buffered_batch_without_explicit_flush() {
+    for file_backed in [false, true] {
+        let path = temp_db("pressure-drain");
+        let mut pipeline = if file_backed {
+            StoragePipeline::create_unattributed_file_with_thresholds(
+                &path,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            )
+        } else {
+            StoragePipeline::unattributed_memory_with_thresholds(
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            )
+        }
+        .expect("pipeline");
+        let first = batch(1, 2);
+        let (bytes, events) = estimate_batch_size(&first);
+        let max_inflight = bytes.saturating_mul(3).saturating_sub(1);
+        pipeline.set_payload_budget(PayloadBudget {
+            max_batch_bytes: bytes,
+            max_batch_events: events,
+            max_inflight_bytes: max_inflight,
+            ..PayloadBudget::default()
+        });
 
-    pipeline.submit(&first).expect("first admission");
-    assert_eq!(
-        pipeline.inflight_bytes(),
-        bytes,
-        "an admission acknowledgement must not release a still-buffered payload"
-    );
+        let first_receipt = pipeline.submit_with_receipt(&first).expect("first admission");
+        let second_receipt = pipeline
+            .submit_with_receipt(&batch(2, 2))
+            .expect("second admission");
+        assert_eq!(pipeline.inflight_bytes(), bytes * 2);
 
-    let error = pipeline
-        .submit(&batch(2, 2))
-        .expect_err("a second same-sized batch must exceed the buffered byte ceiling");
-    assert!(matches!(
-        error,
-        StorageError::InFlightBytesExhausted {
-            would_be,
-            max_inflight: observed_max,
-            ..
-        } if would_be == bytes.saturating_mul(2) && observed_max == max_inflight
-    ));
-    assert_eq!(
-        pipeline.inflight_bytes(),
-        bytes,
-        "a refused reservation must leave the first permit intact"
-    );
+        // Hold the writer so refusals and permit ownership have no timing race. A burst
+        // of exact retries must queue only one drain, including across sink clones.
+        let pause = pipeline.pause_worker_for_test().expect("pause worker");
+        let third = batch(3, 2);
+        for _ in 0..16 {
+            let error = pipeline
+                .sink()
+                .submit(&third)
+                .expect_err("third batch must exceed the buffered byte ceiling");
+            assert!(matches!(
+                error,
+                StorageError::InFlightBytesExhausted {
+                    tick: 3,
+                    would_be,
+                    max_inflight: observed_max,
+                } if would_be == bytes.saturating_mul(3) && observed_max == max_inflight
+            ));
+        }
+        assert_eq!(
+            pipeline.inflight_bytes(),
+            bytes * 2,
+            "refusal must not release either admitted payload before finalization"
+        );
+        pause.release();
 
-    pipeline.flush_and_wait().expect("flush");
-    assert_eq!(
-        pipeline.inflight_bytes(),
-        0,
-        "successful flush and finalization must release the buffered permit"
-    );
+        // This ordered command observes completed pressure work without performing a
+        // flush itself. Without the pressure wakeup, both original batches stay buffered
+        // forever below the row thresholds and every exact retry is refused.
+        let after_drain = pipeline.pause_worker_for_test().expect("observe pressure drain");
+        assert_eq!(
+            pipeline.inflight_bytes(),
+            bytes,
+            "one notification must finalize exactly one older batch"
+        );
+        let snapshot = pipeline.analytics_provider().snapshot();
+        assert_eq!(snapshot.committed_tick, Some(1));
+        assert_eq!(snapshot.watermarks.admitted, Some(second_receipt.batch_id));
+        assert_eq!(snapshot.watermarks.applied, Some(first_receipt.batch_id));
+        assert_eq!(
+            snapshot.watermarks.durable,
+            file_backed.then_some(first_receipt.batch_id)
+        );
+        after_drain.release();
 
-    pipeline.submit(&batch(3, 2)).expect("post-flush admission");
-    assert_eq!(pipeline.inflight_bytes(), bytes);
-    pipeline.shutdown().expect("shutdown");
-    assert_eq!(
-        pipeline.inflight_bytes(),
-        0,
-        "shutdown finalization must release the final buffered permit"
-    );
+        let retry = pipeline
+            .submit_with_receipt(&third)
+            .expect("exact retry succeeds without an explicit flush");
+        assert_eq!(retry.batch_id.get(), second_receipt.batch_id.get() + 1);
+        assert_eq!(pipeline.inflight_bytes(), bytes * 2);
+        let shutdown = pipeline.shutdown().expect("shutdown");
+        assert_eq!(shutdown.watermarks.applied, Some(retry.batch_id));
+        assert_eq!(
+            shutdown.watermarks.durable,
+            file_backed.then_some(retry.batch_id)
+        );
+        assert_eq!(pipeline.inflight_bytes(), 0);
+    }
 }
 
 #[test]
@@ -991,7 +1024,7 @@ fn tiny_scientific_with_oversized_narrative_refused_without_scientific_leak() {
 }
 
 #[test]
-fn narrative_inflight_saturation_backpressure_and_permit_release() {
+fn budget_pressure_drains_narrative_permits_without_explicit_flush() {
     clear_all_preparation_faults();
     let mut pipeline = StoragePipeline::unattributed_memory_with_thresholds(
         usize::MAX,
@@ -1024,6 +1057,7 @@ fn narrative_inflight_saturation_backpressure_and_permit_release() {
     assert_eq!(pipeline.inflight_bytes(), first_bytes);
     assert_eq!(pipeline.inflight_narrative_bytes(), narrative_bytes);
 
+    let pause = pipeline.pause_worker_for_test().expect("pause worker");
     let second = {
         let mut b = batch(2, 2);
         b.narrative_events = vec![narrative_event(2)];
@@ -1049,15 +1083,16 @@ fn narrative_inflight_saturation_backpressure_and_permit_release() {
     assert_eq!(pipeline.inflight_bytes(), first_bytes);
     assert_eq!(pipeline.inflight_narrative_bytes(), narrative_bytes);
 
-    // Flush releases narrative permits:
-    pipeline.flush_and_wait().expect("flush");
+    pause.release();
+    let after_drain = pipeline.pause_worker_for_test().expect("observe pressure drain");
     assert_eq!(pipeline.inflight_bytes(), 0);
     assert_eq!(pipeline.inflight_narrative_bytes(), 0);
+    assert_eq!(pipeline.analytics_provider().snapshot().committed_tick, Some(1));
+    after_drain.release();
 
-    // After release, exact retry of the second batch succeeds:
     pipeline
         .submit(&second)
-        .expect("retry after flush succeeds");
+        .expect("exact retry succeeds without an explicit flush");
     assert_eq!(pipeline.inflight_bytes(), first_bytes);
     assert_eq!(pipeline.inflight_narrative_bytes(), narrative_bytes);
 
