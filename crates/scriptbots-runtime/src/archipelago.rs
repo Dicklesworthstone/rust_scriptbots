@@ -337,7 +337,8 @@ impl ArchipelagoConfig {
 /// One description cannot contradict itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchipelagoMigration {
-    /// Ticks between migration barriers.
+    /// Ticks between migration barriers, measured from the common starting
+    /// tick of the islands. Restoring a checkpoint preserves this phase.
     ///
     /// Must be a nonzero multiple of [`ArchipelagoConfig::barrier_interval`].
     /// Migration is only physically possible at a barrier — that is the only
@@ -2202,7 +2203,12 @@ impl Archipelago {
         let Some(policy) = self.migration.clone() else {
             return Ok(None);
         };
-        if !barrier_tick.0.is_multiple_of(policy.interval_ticks) {
+        // The first barrier is one interval after construction, even when the
+        // factories supply already-running worlds. Both epochs and the original
+        // cadence survive checkpoints; an absolute tick modulus can miss every
+        // barrier when the common starting tick is off that grid.
+        let barriers_per_migration = policy.interval_ticks / self.barrier_interval.get();
+        if !epoch.is_multiple_of(barriers_per_migration) {
             return Ok(None);
         }
         // The migration graph is DERIVED from the archipelago's own topology, so
@@ -2997,7 +3003,7 @@ mod tests {
     use scriptbots_core::{BrainRunner, BrainSpawnError, INPUT_SIZE, OUTPUT_SIZE, RandomStream};
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
-    fn checkpoint_archipelago(migration: bool) -> Archipelago {
+    fn checkpoint_archipelago_at(migration: bool, start_tick: u64) -> Archipelago {
         let worlds = (0..3)
             .map(|id| {
                 let config = ScriptBotsConfig {
@@ -3032,6 +3038,9 @@ mod tests {
                         .try_spawn_agent(scriptbots_core::AgentData::default())
                         .expect("founder before host ownership");
                 }
+                for _ in 0..start_tick {
+                    world.step().expect("advance before archipelago ownership");
+                }
                 Ok(world)
             },
             |_| None,
@@ -3051,6 +3060,38 @@ mod tests {
                 left.island_digest(island.id).unwrap(),
                 right.island_digest(island.id).unwrap()
             );
+        }
+    }
+
+    fn checkpoint_archipelago(migration: bool) -> Archipelago {
+        checkpoint_archipelago_at(migration, 0)
+    }
+
+    #[test]
+    fn migrations_keep_the_original_cadence_for_prestepped_and_restored_islands() {
+        for start_tick in [1, 2] {
+            let mut original = checkpoint_archipelago_at(true, start_tick);
+            let first = original.step_to_barrier().unwrap();
+            assert_eq!(first.barrier_tick, Tick(start_tick + 2));
+            assert!(first.migration.is_none());
+            let bytes = original.checkpoint_v1().unwrap().encode().unwrap();
+            let cut = ArchipelagoCheckpointV1::decode(&bytes).unwrap();
+            let mut restored =
+                Archipelago::restore_checkpoint_v1(&cut, |_| Ok(BrainRegistry::new())).unwrap();
+            for elapsed in [4, 6, 8] {
+                let report = original.step_to_barrier().unwrap();
+                assert_eq!(report.barrier_tick, Tick(start_tick + elapsed));
+                let resumed = restored.step_to_barrier().unwrap();
+                assert_eq!(report.migration, resumed.migration);
+                if elapsed == 6 {
+                    assert!(report.migration.is_none());
+                } else {
+                    let migration = report.migration.expect("scheduled migration");
+                    assert!(!migration.moves.is_empty());
+                    assert_eq!(migration.total_before(), migration.total_after());
+                }
+                assert_same_checkpoint_science(&original, &restored);
+            }
         }
     }
 
