@@ -1169,15 +1169,14 @@ pub(super) fn render_live_replay_screen(
     frame: &mut ratatui::Frame<'_>,
     lab: &super::TerminalReplayLab,
     active_study: Option<&crate::control::CheckpointBranchStatusDto>,
+    displayed_replay: Option<&scriptbots_runtime::lab_workflows::LabReplaySummary>,
     live_tick: u64,
     style: ratatui::style::Style,
 ) {
-    use ratatui::{
-        layout::Rect,
-        text::Line,
-        widgets::{Clear, Paragraph, Wrap},
+    use ratatui::{layout::Rect, widgets::Clear};
+    use scriptbots_runtime::lab_workflows::{
+        LabCheckpointView, branch_report_lines, replay_summary_lines,
     };
-    use scriptbots_runtime::lab_workflows::{LabCheckpointView, branch_report_lines};
 
     let workflows = &lab.workflows;
     let selected = lab.selected_row.as_deref();
@@ -1189,6 +1188,68 @@ pub(super) fn render_live_replay_screen(
         area.height.saturating_sub(3 + SHELL_FOOTER_ROWS),
     );
     frame.render_widget(Clear, body);
+    if workflows.viewing_replay {
+        let mut lines = vec![
+            "EXACT-TICK CHECKPOINT REPLAY".to_owned(),
+            "Digits append · Backspace erase · Delete clear · paste replaces target".into(),
+            "Left/Right -1/+1 · Down/Up -10/+10 · Home saved tick · PgUp/PgDn scroll".into(),
+            "Enter seek · R refresh limits · X discard read · Esc saved cuts · G live canvas"
+                .into(),
+            format!(
+                "Target tick: {}_",
+                workflows.replay_tick_text.escape_debug()
+            ),
+            format!(
+                "Seek: {}. Observed live canvas tick: {live_tick}.",
+                if workflows.can_seek_replay() {
+                    "ready"
+                } else if workflows.is_busy() {
+                    "waiting for the occupied read worker"
+                } else {
+                    "unavailable for this target and source"
+                }
+            ),
+        ];
+        if let Some(checkpoint) = &workflows.replay_checkpoint {
+            lines.push(format!(
+                "Selected saved source: {} at tick {} · {} agents · {} bytes",
+                checkpoint.checkpoint_id,
+                checkpoint.tick,
+                checkpoint.agent_count,
+                checkpoint.byte_size,
+            ));
+            lines.push(format!(
+                "Saved scientific digest: {}",
+                checkpoint.world_digest
+            ));
+        }
+        if let Some(capabilities) = &workflows.replay_capabilities {
+            lines.push(format!(
+                "Application source {} · observed tick {} · complete-interval limit {} ticks",
+                capabilities.session_id.get(),
+                capabilities.observed_tick,
+                capabilities.max_verification_ticks,
+            ));
+        } else {
+            lines.push(
+                "Current replay limits are unavailable. R requests the actual source bounds."
+                    .into(),
+            );
+        }
+        lines.push("A later target is shown only after the complete saved-source interval matches the captured current scientific digest. This check does not locate a first divergent tick.".into());
+        if workflows.parsed_replay_tick().is_none() {
+            lines.push("Invalid target: enter one unsigned 64-bit decimal tick (0 through 18446744073709551615).".into());
+        }
+        if let Some(notice) = &workflows.notice {
+            lines.push(notice.clone());
+        }
+        if let Some(summary) = displayed_replay {
+            lines.push("Displayed historical frame (independent of the editable target):".into());
+            lines.extend(replay_summary_lines(summary));
+        }
+        render_live_replay_lines(frame, body, lines, style, lab.scroll);
+        return;
+    }
     let mut lines = vec![
         "SAVED CHECKPOINTS & BRANCH STUDIES".to_owned(),
         "Up/Down select · R refresh · PgUp/PgDn scroll · G live canvas".into(),
@@ -1224,7 +1285,7 @@ pub(super) fn render_live_replay_screen(
     match workflows.checkpoint_view {
         LabCheckpointView::SavedCuts => {
             lines.push(
-                "Enter reviews saved canvas · K save · N new study · B retained studies".into(),
+                "Enter saved canvas · T exact-tick replay · K save · N new study · B retained studies".into(),
             );
             lines.push("[ first checkpoint page · ] next page".into());
             if let Some(page) = &workflows.checkpoints {
@@ -1348,13 +1409,32 @@ pub(super) fn render_live_replay_screen(
     if let Some(notice) = &workflows.notice {
         lines.push(notice.clone());
     }
+    if let Some(summary) = displayed_replay {
+        lines.push("Displayed historical frame:".into());
+        lines.extend(replay_summary_lines(summary));
+    }
+    render_live_replay_lines(frame, body, lines, style, lab.scroll);
+}
+
+fn render_live_replay_lines(
+    frame: &mut ratatui::Frame<'_>,
+    body: ratatui::layout::Rect,
+    lines: Vec<String>,
+    style: ratatui::style::Style,
+    scroll: u16,
+) {
+    use ratatui::{
+        text::Line,
+        widgets::{Paragraph, Wrap},
+    };
+
     let paragraph = Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
         .style(style)
         .wrap(Wrap { trim: false });
     let maximum_scroll = paragraph
         .line_count(body.width)
         .saturating_sub(usize::from(body.height));
-    let scroll = u16::try_from(usize::from(lab.scroll).min(maximum_scroll)).unwrap_or(u16::MAX);
+    let scroll = u16::try_from(usize::from(scroll).min(maximum_scroll)).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((scroll, 0)), body);
 }
 

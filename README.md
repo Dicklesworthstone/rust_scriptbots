@@ -309,6 +309,17 @@ RUST_LOG=info cargo run -p scriptbots-app
   and population must agree before it is shown. Loading runs in the background;
   `x`, navigation or selection changes discard a pending result, and `g` returns
   to the live canvas. Live controls and status continue to address the live owner.
+  Press `T` on a selected saved cut to open exact-tick replay. Type decimal digits
+  or paste the complete target tick; Backspace erases and Delete clears it.
+  Left/Right changes the target by one, Down/Up by ten, and Home restores the
+  saved tick. `R` refreshes the source's actual replay limits; Enter requests the
+  selected target. Invalid, overflowing or unavailable targets cannot start a seek.
+  An accepted result opens the historical World canvas with its saved source and
+  verified-through boundary. The Replay screen also retains the displayed frame's
+  full verification evidence independently of the editable target. `X` discards
+  the pending read, Esc returns to saved cuts, and `G` returns to the live canvas.
+  Tick editing consumes unrelated character shortcuts, and cancelled or stale
+  replies cannot replace a later presentation. Replay leaves the live owner unchanged.
   This exact-cut review supports current application brain registries; custom
   registries and general recorded-input event replay remain outside it. The canvas labels
   reconstructed checkpoint state separately from cached frames: original arena

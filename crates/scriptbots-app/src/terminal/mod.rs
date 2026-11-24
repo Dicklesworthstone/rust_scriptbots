@@ -55,8 +55,8 @@ use scriptbots_runtime::{
     lab_guide::{LabGuideSource, LabGuideStep},
     lab_workflows::{
         LabAction, LabCheckpoint, LabCheckpointSave, LabCheckpointSaveState, LabCheckpointView,
-        LabExperiment, LabExperimentCreationState,
-        LabExperimentDesign, LabExperimentDraft, LabMetric, LabPanel, LabWorkflowRequest,
+        LabExperiment, LabExperimentCreationState, LabExperimentDesign, LabExperimentDraft,
+        LabMetric, LabPanel, LabReplaySummary, LabReplayVerification, LabWorkflowRequest,
         LabWorkflowResponse, LabWorkflowSubmit, LabWorkflows,
     },
 };
@@ -371,6 +371,7 @@ impl CanvasReviewTarget {
         match self {
             Self::Checkpoint(id) => {
                 app.frankentui.route == frankentui_shell::ShellRoute::Replay
+                    && !app.replay_lab.workflows.viewing_replay
                     && app.selected_checkpoint_id() == Some(id.as_str())
             }
             Self::Narrative { route, event } => {
@@ -405,8 +406,8 @@ struct TerminalExperimentLab {
     draft_edit: Option<(TerminalLabDraftField, String)>,
 }
 
-/// Read-only saved-source browsing. Checkpoint saves, canvas reviews and branch
-/// mutations still use the terminal's existing presentation and lifecycle rail.
+/// Saved-source browsing and exact-tick replay use the shared bounded Lab worker.
+/// Checkpoint saves and branch mutations retain the existing lifecycle rail.
 /// Each shared model retains its occupied worker even after leaving its route.
 #[derive(Default)]
 struct TerminalReplayLab {
@@ -484,6 +485,9 @@ impl TerminalReplayLab {
     /// X still reaches the original active-study cancellation observer.
     fn handle_key(&mut self, key: ftui::core::event::KeyCode) -> bool {
         use ftui::core::event::KeyCode as K;
+        if self.workflows.viewing_replay {
+            return self.handle_replay_key(key);
+        }
         let view = self.workflows.checkpoint_view;
         let action = match key {
             K::Up | K::Down => {
@@ -499,6 +503,7 @@ impl TerminalReplayLab {
                 return true;
             }
             K::Char('r' | 'R') => LabAction::Refresh,
+            K::Char('t' | 'T') if view == LabCheckpointView::SavedCuts => LabAction::OpenReplay,
             K::Char('b' | 'B') => LabAction::CheckpointBranchesPage(None),
             K::Char('a' | 'A') => LabAction::BackToCheckpoints,
             K::Escape if view != LabCheckpointView::SavedCuts => LabAction::BackToCheckpoints,
@@ -557,6 +562,61 @@ impl TerminalReplayLab {
         };
         self.workflows.dispatch(action);
         self.reconcile_selection();
+        self.scroll = 0;
+        true
+    }
+
+    /// Tick entry owns character keys while visible: digits cannot navigate to
+    /// another screen, and simulation or study shortcuts cannot escape the editor.
+    fn handle_replay_key(&mut self, key: ftui::core::event::KeyCode) -> bool {
+        use ftui::core::event::KeyCode as K;
+        let action = match key {
+            K::Char(digit @ '0'..='9') => {
+                let mut text = self.workflows.replay_tick_text.clone();
+                text.push(digit);
+                LabAction::ReplayTickText(text)
+            }
+            K::Backspace => {
+                let mut text = self.workflows.replay_tick_text.clone();
+                let _ = text.pop();
+                LabAction::ReplayTickText(text)
+            }
+            K::Delete => LabAction::ReplayTickText(String::new()),
+            K::Left => LabAction::ReplayStep(-1),
+            K::Right => LabAction::ReplayStep(1),
+            K::Down => LabAction::ReplayStep(-10),
+            K::Up => LabAction::ReplayStep(10),
+            K::Home => {
+                let Some(checkpoint) = &self.workflows.replay_checkpoint else {
+                    return true;
+                };
+                LabAction::ReplayTickText(checkpoint.tick.to_string())
+            }
+            K::Enter => {
+                let Some(action) = self.workflows.replay_seek_action() else {
+                    self.workflows.set_notice("Seek unavailable. Enter a valid exact tick within the saved source and current replay limits; R refreshes those limits.");
+                    return true;
+                };
+                action
+            }
+            K::Char('r' | 'R') => LabAction::Refresh,
+            K::Char('x' | 'X') => LabAction::CancelRequest,
+            K::Escape | K::Char('a' | 'A') => LabAction::BackFromReplay,
+            K::Char('g' | 'G') => {
+                self.workflows.dispatch(LabAction::ReturnLive);
+                return false;
+            }
+            K::PageUp => {
+                self.scroll = self.scroll.saturating_sub(6);
+                return true;
+            }
+            K::PageDown => {
+                self.scroll = self.scroll.saturating_add(6);
+                return true;
+            }
+            _ => return true,
+        };
+        self.workflows.dispatch(action);
         self.scroll = 0;
         true
     }
@@ -2667,11 +2727,13 @@ impl LiveTerminalModel<'_> {
                 self.checkpoint_in_flight = true;
                 let session_id = app.client.session_id();
                 app.guide_checkpoint_request = Some((request_id.clone(), session_id));
-                app.frankentui.guide.observe_checkpoint_save(&LabCheckpointSave {
-                    request_id: request_id.clone(),
-                    session_id,
-                    state: LabCheckpointSaveState::Pending,
-                });
+                app.frankentui
+                    .guide
+                    .observe_checkpoint_save(&LabCheckpointSave {
+                        request_id: request_id.clone(),
+                        session_id,
+                        state: LabCheckpointSaveState::Pending,
+                    });
                 commands.push(Cmd::task(move || {
                     let result = handle
                         .create_checkpoint(crate::control::CheckpointCreateRequest {
@@ -3743,11 +3805,9 @@ impl<'a> TerminalApp<'a> {
             HostCommand::UpdateConfig(config) => ControlCommand::UpdateConfig(config.clone()),
             _ => return,
         };
-        self.frankentui.guide.record_command(
-            &command,
-            envelope.command_id,
-            &self.retained_render,
-        );
+        self.frankentui
+            .guide
+            .record_command(&command, envelope.command_id, &self.retained_render);
     }
 
     fn handle_guide_input(&mut self, key: ftui::core::event::KeyCode) -> bool {
@@ -3765,8 +3825,7 @@ impl<'a> TerminalApp<'a> {
             return false;
         }
         if key == K::Enter
-            || (self.frankentui.guide_growth_draft.is_none()
-                && matches!(key, K::Char('e' | 'E')))
+            || (self.frankentui.guide_growth_draft.is_none() && matches!(key, K::Char('e' | 'E')))
         {
             self.refresh_snapshot();
         }
@@ -3791,14 +3850,17 @@ impl<'a> TerminalApp<'a> {
                     }
                 }
                 K::Enter => {
-                    let source_matches = self.guide_growth_source.is_some_and(|(source, generation)| {
-                        generation == self.frankentui.guide.generation()
-                            && source.session_id == self.retained_render.session_id
-                            && source.revisions.config == self.retained_render.revisions.config
-                            && source.revisions.scientific
-                                == self.retained_render.revisions.scientific
-                            && source.tick == self.retained_render.world.tick
-                    });
+                    let source_matches =
+                        self.guide_growth_source
+                            .is_some_and(|(source, generation)| {
+                                generation == self.frankentui.guide.generation()
+                                    && source.session_id == self.retained_render.session_id
+                                    && source.revisions.config
+                                        == self.retained_render.revisions.config
+                                    && source.revisions.scientific
+                                        == self.retained_render.revisions.scientific
+                                    && source.tick == self.retained_render.world.tick
+                            });
                     if !source_matches || !self.frankentui.guide_view_is_current() {
                         self.frankentui.guide_growth_draft = None;
                         self.guide_growth_source = None;
@@ -3835,8 +3897,9 @@ impl<'a> TerminalApp<'a> {
                     if self.frankentui.guide.ready() {
                         self.frankentui.guide_growth_draft = None;
                         self.guide_growth_source = None;
-                        self.frankentui.guide_notice =
-                            Some("This change is already observed. Enter continues the guide.".into());
+                        self.frankentui.guide_notice = Some(
+                            "This change is already observed. Enter continues the guide.".into(),
+                        );
                         return true;
                     }
                     if self.frankentui.guide.pending_command_id().is_some()
@@ -3869,7 +3932,11 @@ impl<'a> TerminalApp<'a> {
                         )
                         .map_or_else(
                             || "Configuration was not submitted; inspect the receipt.".into(),
-                            |id| format!("Configuration request {id}; its receipt reports the outcome."),
+                            |id| {
+                                format!(
+                                    "Configuration request {id}; its receipt reports the outcome."
+                                )
+                            },
                         ),
                     );
                 }
@@ -5159,6 +5226,9 @@ impl<'a> TerminalApp<'a> {
                 frame,
                 &self.replay_lab,
                 self.frankentui.checkpoint_branch.as_ref(),
+                self.canvas_review
+                    .as_ref()
+                    .and_then(|review| review.replay_summary.as_ref()),
                 self.snapshot.tick,
                 Style::default().fg(theme.text).bg(theme.surface),
             );
@@ -5326,6 +5396,22 @@ impl<'a> TerminalApp<'a> {
                 self.palette_selected_index = 0;
                 Ok(false)
             }
+            E::Paste(paste)
+                if !self.help_visible
+                    && !self.frankentui.guide.visible
+                    && self.frankentui.branch_draft.is_none()
+                    && self.frankentui.route == ShellRoute::Replay
+                    && self.replay_lab.enabled
+                    && self.replay_lab.workflows.viewing_replay =>
+            {
+                // Preserve invalid pasted text so it cannot silently authorize
+                // another tick after whitespace, signs, or excess digits vanish.
+                self.replay_lab
+                    .workflows
+                    .dispatch(LabAction::ReplayTickText(paste.text));
+                self.replay_lab.scroll = 0;
+                Ok(false)
+            }
             _ => Ok(false),
         }
     }
@@ -5367,6 +5453,7 @@ impl<'a> TerminalApp<'a> {
         if active
             && self.replay_lab.refresh_saved
             && self.replay_lab.workflows.checkpoint_view == LabCheckpointView::SavedCuts
+            && !self.replay_lab.workflows.viewing_replay
             && !self.replay_lab.workflows.is_busy()
         {
             self.replay_lab.refresh_saved = false;
@@ -5383,6 +5470,45 @@ impl<'a> TerminalApp<'a> {
             && self.selected_checkpoint_id() == Some(checkpoint_id.as_str())
         {
             self.show_canvas_review(&snapshot, Some(checkpoint_id));
+            self.replay_lab
+                .workflows
+                .synchronize(session, LabPanel::Inactive);
+        }
+        if let Some(review) = self.replay_lab.workflows.take_replay_review()
+            && active
+            && self.frankentui.route == frankentui_shell::ShellRoute::Replay
+            && self.replay_lab.workflows.viewing_replay
+            && self.replay_lab.workflows.replay_checkpoint.as_ref()
+                == Some(&review.summary.checkpoint)
+            && self.selected_checkpoint_id()
+                == Some(review.summary.checkpoint.checkpoint_id.as_str())
+            && review.summary.session_id == session
+            && review.snapshot.session_id == session
+            && review.snapshot.world.tick == review.summary.target_tick
+        {
+            let summary = review.summary;
+            let verification = match &summary.verification {
+                LabReplayVerification::SavedCut => "verified saved cut".to_owned(),
+                LabReplayVerification::CapturedInterval {
+                    verified_through_tick,
+                    ..
+                } => format!("verified through captured tick {verified_through_tick}"),
+            };
+            let message = format!(
+                "Reviewing tick {} from checkpoint {} at tick {}; {verification}; live owner unchanged",
+                summary.target_tick, summary.checkpoint.checkpoint_id, summary.checkpoint.tick,
+            );
+            self.show_canvas_review(
+                &review.snapshot,
+                Some(summary.checkpoint.checkpoint_id.clone()),
+            );
+            if let Some(frame) = &mut self.canvas_review {
+                frame.replayed_from_tick = (summary.target_tick > summary.checkpoint.tick)
+                    .then_some(summary.checkpoint.tick);
+                frame.replay_summary = Some(summary);
+            }
+            self.frankentui.status_message = Some(message.clone());
+            self.push_toast(message);
             self.replay_lab
                 .workflows
                 .synchronize(session, LabPanel::Inactive);
@@ -5600,11 +5726,13 @@ impl<'a> TerminalApp<'a> {
                     reason: reason.chars().take(2048).collect(),
                 },
             };
-            self.frankentui.guide.observe_checkpoint_save(&LabCheckpointSave {
-                request_id: request_id.clone(),
-                session_id: *session_id,
-                state,
-            });
+            self.frankentui
+                .guide
+                .observe_checkpoint_save(&LabCheckpointSave {
+                    request_id: request_id.clone(),
+                    session_id: *session_id,
+                    state,
+                });
             self.guide_checkpoint_request = None;
         }
         if result.is_ok() {
@@ -6072,6 +6200,7 @@ impl<'a> TerminalApp<'a> {
             day_night: frame.config.render.resolved_day_night(),
             source_checkpoint,
             replayed_from_tick: None,
+            replay_summary: None,
         });
         self.archipelago_view = false;
         self.hover_tooltip = None;
@@ -6739,8 +6868,18 @@ impl<'a> TerminalApp<'a> {
             } else {
                 "REVIEW"
             };
+            let verification = review
+                .replay_summary
+                .as_ref()
+                .map_or_else(String::new, |summary| match &summary.verification {
+                    LabReplayVerification::SavedCut => " | verified saved cut".to_owned(),
+                    LabReplayVerification::CapturedInterval {
+                        verified_through_tick,
+                        ..
+                    } => format!(" | verified through {verified_through_tick}"),
+                });
             format!(
-                "World Map {}×{} | {source} tick {} (live {}){} | g live",
+                "World Map {}×{} | {source} tick {} (live {}){}{verification} | g live",
                 review.snapshot.world_size.0,
                 review.snapshot.world_size.1,
                 review.snapshot.tick,
@@ -10395,6 +10534,8 @@ struct CanvasReviewFrame {
     day_night: (u32, f32),
     source_checkpoint: Option<String>,
     replayed_from_tick: Option<u64>,
+    /// Exact provider evidence travels with the displayed historical frame.
+    replay_summary: Option<LabReplaySummary>,
 }
 
 /// One agent's senses, explained (bd-16g.4.2).
@@ -22649,6 +22790,506 @@ for case in ('panic', 'subscription', 'renderer'):
         }
     }
 
+    #[test]
+    fn live_replay_exact_tick_editor_preserves_integer_targets_and_captures_input() {
+        use frankentui_shell::ShellRoute;
+        use ftui::core::event::{Event, KeyCode as K, PasteEvent};
+        use scriptbots_runtime::lab_workflows::{LabCheckpointPage, LabReplayCapabilities};
+
+        let host = TerminalTestHost::take(command_characterization_world());
+        let (runtime, _) = ControlRuntime::dummy();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(ShellRoute::Replay);
+        let session = app.client.session_id();
+        let before = host.port().snapshot_hub().latest();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let checkpoint = LabCheckpoint {
+            checkpoint_id: "exact-input-fixture".into(),
+            tick: 0,
+            agent_count: 0,
+            byte_size: 1024,
+            world_digest: "a".repeat(16),
+        };
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        {
+            let mut app = model.app.borrow_mut();
+            let calls = Arc::clone(&calls);
+            let checkpoint = checkpoint.clone();
+            app.replay_lab.enabled = true;
+            app.replay_lab.workflows.submit = Some(Arc::new(move |request| {
+                calls.lock().unwrap().push(request.clone());
+                Ok(match request {
+                    LabWorkflowRequest::ListCheckpoints { .. } => {
+                        LabWorkflowResponse::Checkpoints(LabCheckpointPage {
+                            items: vec![checkpoint.clone()],
+                            total: 1,
+                            offset: 0,
+                            next_cursor: None,
+                            retained_bytes: 1024,
+                            max_bytes: 1024,
+                        })
+                    }
+                    LabWorkflowRequest::ReplayCapabilities => {
+                        LabWorkflowResponse::ReplayCapabilities(LabReplayCapabilities {
+                            session_id: session,
+                            observed_tick: u64::MAX,
+                            max_verification_ticks: u64::MAX,
+                        })
+                    }
+                    LabWorkflowRequest::ReviewReplay { .. } => {
+                        // This fixture proves exact request construction only.
+                        // The real provider journey below proves reconstruction.
+                        return Err("Input fixture does not reconstruct a world".into());
+                    }
+                    _ => panic!("tick input must not submit another Lab operation"),
+                })
+            }));
+        }
+        finish_terminal_replay_read(&mut model);
+        terminal_lab_key(&mut model, K::Char('T'));
+        finish_terminal_replay_read(&mut model);
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+        for (text, value) in [
+            ("9007199254740993", 9_007_199_254_740_993_u64),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            terminal_lab_key(simulator.model_mut(), K::Delete);
+            for digit in text.chars() {
+                terminal_lab_key(simulator.model_mut(), K::Char(digit));
+            }
+            {
+                let app = simulator.model().app.borrow();
+                assert_eq!(app.frankentui.route, ShellRoute::Replay);
+                assert_eq!(app.replay_lab.workflows.parsed_replay_tick(), Some(value));
+                assert_eq!(app.replay_lab.workflows.replay_tick_text, text);
+                assert!(app.replay_lab.workflows.can_seek_replay());
+            }
+            let frame = frankentui_shell::buffer_to_string(simulator.capture_frame(140, 36));
+            assert!(frame.contains("EXACT-TICK CHECKPOINT REPLAY"));
+            assert!(frame.contains(&format!("Target tick: {text}_")));
+            terminal_lab_key(simulator.model_mut(), K::Enter);
+            finish_terminal_replay_read(simulator.model_mut());
+            assert!(calls.lock().unwrap().iter().any(|request| matches!(request,
+                LabWorkflowRequest::ReviewReplay { session_id, checkpoint: source, target_tick }
+                    if *session_id == session && source == &checkpoint && *target_tick == value)));
+            assert!(simulator.model().app.borrow().canvas_review.is_none());
+        }
+        terminal_lab_key(simulator.model_mut(), K::Right);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .parsed_replay_tick(),
+            Some(u64::MAX)
+        );
+        terminal_lab_key(simulator.model_mut(), K::Left);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .parsed_replay_tick(),
+            Some(u64::MAX - 1)
+        );
+        terminal_lab_key(simulator.model_mut(), K::Home);
+        terminal_lab_key(simulator.model_mut(), K::Left);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .parsed_replay_tick(),
+            Some(0)
+        );
+        terminal_lab_key(simulator.model_mut(), K::Up);
+        terminal_lab_key(simulator.model_mut(), K::Right);
+        terminal_lab_key(simulator.model_mut(), K::Down);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .parsed_replay_tick(),
+            Some(1)
+        );
+
+        let reads = calls.lock().unwrap().len();
+        for text in [
+            "",
+            "-1",
+            "18446744073709551616",
+            "999999999999999999999",
+            "9007199254740993\n",
+        ] {
+            let _ = simulator
+                .model_mut()
+                .update(LiveTerminalMessage::Event(Event::Paste(
+                    PasteEvent::bracketed(text),
+                )));
+            terminal_lab_key(simulator.model_mut(), K::Enter);
+            let app = simulator.model().app.borrow();
+            assert_eq!(app.replay_lab.workflows.replay_tick_text, text);
+            assert!(app.replay_lab.workflows.parsed_replay_tick().is_none());
+            assert!(!app.replay_lab.workflows.is_busy());
+        }
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            reads,
+            "invalid edits cannot start reconstruction"
+        );
+        let _ = simulator
+            .model_mut()
+            .update(LiveTerminalMessage::Event(Event::Paste(
+                PasteEvent::bracketed("9007199254740993"),
+            )));
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .parsed_replay_tick(),
+            Some(9_007_199_254_740_993)
+        );
+        terminal_lab_key(simulator.model_mut(), K::Backspace);
+        assert_eq!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .replay_tick_text,
+            "900719925474099"
+        );
+        for key in ['s', ' ', 'n', 'k', 'b', 'q'] {
+            terminal_lab_key(simulator.model_mut(), K::Char(key));
+        }
+        {
+            let app = simulator.model().app.borrow();
+            assert_eq!(app.frankentui.route, ShellRoute::Replay);
+            assert!(app.frankentui.branch_draft.is_none());
+            assert!(app.frankentui.receipts.is_empty());
+            assert!(app.replay_lab.workflows.viewing_replay);
+        }
+        let after = host.port().snapshot_hub().latest();
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.playback, before.playback);
+        terminal_lab_key(simulator.model_mut(), K::Escape);
+        assert!(
+            !simulator
+                .model()
+                .app
+                .borrow()
+                .replay_lab
+                .workflows
+                .viewing_replay
+        );
+        assert_eq!(
+            simulator.model().app.borrow().selected_checkpoint_id(),
+            Some(checkpoint.checkpoint_id.as_str())
+        );
+        terminal_lab_key(simulator.model_mut(), K::Char('N'));
+        assert!(
+            simulator
+                .model()
+                .app
+                .borrow()
+                .frankentui
+                .branch_draft
+                .is_some(),
+            "existing branch shortcut remains available outside tick entry"
+        );
+    }
+
+    #[test]
+    fn live_replay_exact_tick_uses_verified_source_and_returns_live_without_mutation() {
+        use frankentui_shell::ShellRoute;
+        use ftui::core::event::KeyCode as K;
+
+        let (host, runtime, handle, checkpoint, _) = checkpoint_branch_terminal_fixture();
+        let renderer = TerminalRenderer::default();
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.palette = Palette::test_backend_evidence();
+        app.manual_focus_cleared = true;
+        let paint = |app: &mut TerminalApp<'_>| {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| app.draw_map(frame, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut cells = Vec::new();
+            for y in 1..buffer.area.height - 1 {
+                for x in 1..buffer.area.width - 1 {
+                    cells.push(buffer[(x, y)].clone());
+                }
+            }
+            cells
+        };
+        apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::Step);
+        app.refresh_snapshot();
+        let target = app.snapshot.tick;
+        let target_cells = paint(&mut app);
+        let target_agents = app.snapshot.agent_count;
+        apply_terminal_owner_command_without_refresh(
+            &mut app,
+            ControlCommand::SpawnAgent {
+                herbivore_tendency: 1.0,
+            },
+        );
+        apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::Step);
+        app.refresh_snapshot();
+        let live_tick = app.snapshot.tick;
+        assert_eq!(app.snapshot.agent_count, target_agents + 1);
+        let live_cells = paint(&mut app);
+        let newer = handle
+            .create_checkpoint(crate::control::CheckpointCreateRequest::default())
+            .unwrap();
+        assert!(newer.tick > target);
+        let before = host.port().scientific_digest_v1().unwrap();
+        let retained = host.port().snapshot_hub().latest();
+        app.navigate_route(ShellRoute::Replay);
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        finish_terminal_replay_read(&mut model);
+        let rows = model
+            .app
+            .borrow()
+            .replay_lab
+            .workflows
+            .checkpoints
+            .as_ref()
+            .unwrap()
+            .items
+            .len();
+        for _ in 0..rows {
+            if model.app.borrow().selected_checkpoint_id()
+                == Some(checkpoint.checkpoint_id.as_str())
+            {
+                break;
+            }
+            terminal_lab_key(&mut model, K::Down);
+        }
+        assert_eq!(
+            model.app.borrow().selected_checkpoint_id(),
+            Some(checkpoint.checkpoint_id.as_str())
+        );
+        terminal_lab_key(&mut model, K::Char('T'));
+        finish_terminal_replay_read(&mut model);
+        {
+            let app = model.app.borrow();
+            let limits = app
+                .replay_lab
+                .workflows
+                .replay_capabilities
+                .as_ref()
+                .unwrap();
+            assert_eq!(limits.session_id, app.client.session_id());
+            assert_eq!(limits.observed_tick, live_tick);
+            assert!(limits.max_verification_ticks >= live_tick - checkpoint.tick);
+        }
+        terminal_lab_key(&mut model, K::Delete);
+        for digit in target.to_string().chars() {
+            terminal_lab_key(&mut model, K::Char(digit));
+        }
+        terminal_lab_key(&mut model, K::Enter);
+        finish_terminal_replay_read(&mut model);
+        let mut simulator = ftui::runtime::ProgramSimulator::new(model);
+        {
+            let mut app = simulator.model().app.borrow_mut();
+            assert_eq!(app.frankentui.route, ShellRoute::WorldCanvas);
+            let frame = app
+                .canvas_review
+                .as_ref()
+                .expect("real provider frame reached the canvas");
+            assert_eq!(frame.snapshot.tick, target);
+            assert_eq!(frame.snapshot.agent_count, target_agents);
+            assert_eq!(
+                frame.source_checkpoint.as_deref(),
+                Some(checkpoint.checkpoint_id.as_str())
+            );
+            assert_eq!(frame.replayed_from_tick, Some(checkpoint.tick));
+            let summary = frame.replay_summary.as_ref().unwrap();
+            assert_eq!(summary.checkpoint.checkpoint_id, checkpoint.checkpoint_id);
+            assert_eq!(summary.checkpoint.world_digest, checkpoint.world_digest_v1);
+            assert_eq!(summary.target_tick, target);
+            assert_eq!(
+                summary.verification,
+                LabReplayVerification::CapturedInterval {
+                    verified_through_tick: live_tick,
+                    captured_current_digest: before.overall.clone(),
+                }
+            );
+            assert_eq!(
+                paint(&mut app),
+                target_cells,
+                "reconstructed terminal cells match the actual historical observation"
+            );
+            assert_eq!(
+                app.snapshot.tick, live_tick,
+                "current controls still observe the live owner"
+            );
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
+            terminal
+                .draw(|frame| app.draw_map(frame, frame.area()))
+                .unwrap();
+            assert!(buffer_text(&terminal).contains(&format!("verified through {live_tick}")));
+        }
+        assert_eq!(host.port().scientific_digest_v1().unwrap(), before);
+        assert!(Arc::ptr_eq(&retained, &host.port().snapshot_hub().latest()));
+        terminal_lab_key(simulator.model_mut(), K::Char('7'));
+        finish_terminal_replay_read(simulator.model_mut());
+        let evidence = frankentui_shell::buffer_to_string(simulator.capture_frame(180, 60));
+        assert!(evidence.contains("Displayed historical frame:"));
+        assert!(evidence.contains(&format!("captured current tick {live_tick}")));
+        assert!(evidence.contains(&before.overall));
+        terminal_lab_key(simulator.model_mut(), K::Char('G'));
+        {
+            let mut app = simulator.model().app.borrow_mut();
+            assert!(app.canvas_review.is_none());
+            assert_eq!(app.frankentui.route, ShellRoute::WorldCanvas);
+            assert_eq!(paint(&mut app), live_cells);
+        }
+        assert_eq!(host.port().scientific_digest_v1().unwrap(), before);
+        assert!(Arc::ptr_eq(&retained, &host.port().snapshot_hub().latest()));
+    }
+
+    #[test]
+    fn live_replay_exact_tick_discards_superseded_reads_and_legacy_frames() {
+        use frankentui_shell::ShellRoute;
+        use ftui::core::event::{KeyCode as K, Modifiers};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (host, runtime, _, checkpoint, _) = checkpoint_branch_terminal_fixture();
+        let renderer = TerminalRenderer::default();
+        let before = host.port().scientific_digest_v1().unwrap();
+        let retained = host.port().snapshot_hub().latest();
+        for change in ["target", "live", "back", "source"] {
+            let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+            app.navigate_route(ShellRoute::Replay);
+            let mut model = LiveTerminalModel::new(app).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = std::sync::Mutex::new(release_rx);
+            let reads = Arc::new(AtomicUsize::new(0));
+            {
+                let mut app = model.app.borrow_mut();
+                let provider = app.replay_lab.workflows.submit.clone().unwrap();
+                let reads = Arc::clone(&reads);
+                app.replay_lab.workflows.submit = Some(Arc::new(move |request| {
+                    let seek = matches!(&request, LabWorkflowRequest::ReviewReplay { .. });
+                    let response = provider(request)?;
+                    if seek {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        // Hold the real successful reconstruction before delivery.
+                        assert!(matches!(&response, LabWorkflowResponse::ReplayFrame(_)));
+                        entered_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(response)
+                }));
+            }
+            finish_terminal_replay_read(&mut model);
+            terminal_lab_key(&mut model, K::Char('T'));
+            finish_terminal_replay_read(&mut model);
+            terminal_lab_key(&mut model, K::Enter);
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(model.app.borrow().replay_lab.workflows.is_busy());
+            assert!(model.app.borrow().canvas_review.is_none());
+            match change {
+                "target" => terminal_lab_key(&mut model, K::Right),
+                "live" => terminal_lab_key(&mut model, K::Char('G')),
+                "back" => {
+                    terminal_lab_key(&mut model, K::Escape);
+                    terminal_lab_key(&mut model, K::Char('T'));
+                }
+                "source" => {
+                    let mut app = model.app.borrow_mut();
+                    let foreign = HostSessionId::new(app.client.session_id().get() + 1);
+                    app.replay_lab
+                        .workflows
+                        .synchronize(foreign, LabPanel::Checkpoints);
+                    app.service_replay_lab(ShellRoute::Replay);
+                }
+                _ => unreachable!(),
+            }
+            if change != "live" {
+                for _ in 0..3 {
+                    terminal_lab_key(&mut model, K::Char('R'));
+                }
+            }
+            assert!(
+                model.app.borrow().replay_lab.workflows.is_busy(),
+                "{change}: discarded work still occupies its slot"
+            );
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            release_tx.send(()).unwrap();
+            finish_terminal_replay_read(&mut model);
+            assert!(
+                model.app.borrow().canvas_review.is_none(),
+                "{change}: the old successful frame cannot replace a newer viewing intent"
+            );
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            if change == "live" {
+                assert_eq!(model.app.borrow().frankentui.route, ShellRoute::WorldCanvas);
+            }
+        }
+
+        // Enter's existing saved-cut worker also loses its presentation authority
+        // permanently when the user switches to the exact-tick editor.
+        let mut app = TerminalApp::new(&renderer, host.context(&runtime));
+        app.navigate_route(ShellRoute::Replay);
+        let mut model = LiveTerminalModel::new(app).unwrap();
+        finish_terminal_replay_read(&mut model);
+        let work = checkpoint_branch_terminal_task(
+            model.update(checkpoint_branch_terminal_key(K::Enter, Modifiers::NONE)),
+        );
+        assert!(model.checkpoint_review_in_flight.is_some());
+        terminal_lab_key(&mut model, K::Char('T'));
+        assert!(model.checkpoint_review_cancelled);
+        finish_terminal_replay_read(&mut model);
+        terminal_lab_key(&mut model, K::Escape);
+        assert_eq!(
+            model.app.borrow().selected_checkpoint_id(),
+            Some(checkpoint.checkpoint_id.as_str())
+        );
+        assert!(
+            model
+                .checkpoint_review_in_flight
+                .as_ref()
+                .unwrap()
+                .1
+                .matches(&model.app.borrow())
+        );
+        let message = std::thread::spawn(work).join().unwrap();
+        assert!(matches!(
+            &message,
+            LiveTerminalMessage::CheckpointCanvas { result: Ok(_), .. }
+        ));
+        let _ = model.update(message);
+        assert!(model.checkpoint_review_in_flight.is_none());
+        assert!(
+            model.app.borrow().canvas_review.is_none(),
+            "returning to saved cuts cannot revive the earlier Enter request"
+        );
+        assert_eq!(host.port().scientific_digest_v1().unwrap(), before);
+        assert!(Arc::ptr_eq(&retained, &host.port().snapshot_hub().latest()));
+    }
+
     fn terminal_replay_fixture_report(
         branch: &scriptbots_runtime::lab_workflows::LabCheckpointBranch,
     ) -> scriptbots_runtime::lab_workflows::LabBranchReport {
@@ -24752,7 +25393,11 @@ for case in ('panic', 'subscription', 'renderer'):
             let id = world
                 .try_spawn_agent(scriptbots_core::AgentData::default())
                 .unwrap();
-            assert!(world.bind_agent_brain(id, installed.population()[0]).unwrap());
+            assert!(
+                world
+                    .bind_agent_brain(id, installed.population()[0])
+                    .unwrap()
+            );
         }
         let (mut driver, port) = terminal_manual_driver(
             world,
@@ -24787,10 +25432,16 @@ for case in ('panic', 'subscription', 'renderer'):
         let _ = terminal_guide_frame(&app, 100, 32);
         terminal_guide_press(&mut app, K::Enter);
         assert_eq!(app.frankentui.guide.step(), LabGuideStep::Pause);
-        assert!(!app.frankentui.guide.ready(), "a paused snapshot is not a receipt");
+        assert!(
+            !app.frankentui.guide.ready(),
+            "a paused snapshot is not a receipt"
+        );
         terminal_guide_press(&mut app, K::Escape);
         app.execute_palette_action(CommandPaletteAction::Pause);
-        assert!(!app.frankentui.guide.ready(), "submission is not application");
+        assert!(
+            !app.frankentui.guide.ready(),
+            "submission is not application"
+        );
         finish_terminal_guide_command(&mut app, &mut driver, &mut owner_time);
         assert_eq!(app.retained_render.world.tick, initial.world.tick);
 
@@ -24819,7 +25470,13 @@ for case in ('panic', 'subscription', 'renderer'):
         let sequence = app.command_sequence;
         terminal_guide_press(&mut app, K::Enter);
         assert_eq!(app.command_sequence, sequence);
-        assert!(app.frankentui.guide_notice.as_deref().unwrap().contains("finite"));
+        assert!(
+            app.frankentui
+                .guide_notice
+                .as_deref()
+                .unwrap()
+                .contains("finite")
+        );
         assert!(!app.frankentui.guide.ready());
         terminal_guide_press(&mut app, K::Escape);
         terminal_guide_press(&mut app, K::Char('e'));
@@ -24842,9 +25499,18 @@ for case in ('panic', 'subscription', 'renderer'):
         terminal_guide_press(&mut app, K::Enter);
         assert_eq!(app.command_sequence, sequence);
         assert!(app.frankentui.guide_growth_draft.is_none());
-        assert!(app.frankentui.guide_notice.as_deref().unwrap().contains("source changed"));
+        assert!(
+            app.frankentui
+                .guide_notice
+                .as_deref()
+                .unwrap()
+                .contains("source changed")
+        );
         assert_eq!(app.retained_render.config.as_ref(), &external_config);
-        assert!(!app.frankentui.guide.ready(), "another client's edit is not our receipt");
+        assert!(
+            !app.frankentui.guide.ready(),
+            "another client's edit is not our receipt"
+        );
 
         let _ = terminal_guide_frame(&app, 100, 32);
         terminal_guide_press(&mut app, K::Char('e'));
@@ -24860,16 +25526,31 @@ for case in ('panic', 'subscription', 'renderer'):
         terminal_guide_press(&mut app, K::Enter);
         assert!(!app.frankentui.guide.ready());
         let submitted = &app.unresolved_commands.back().unwrap().envelope;
-        assert_eq!(submitted.expected_config_revision, Some(before.revisions.config));
-        assert_eq!(submitted.expected_scientific_revision, Some(before.revisions.scientific));
+        assert_eq!(
+            submitted.expected_config_revision,
+            Some(before.revisions.config)
+        );
+        assert_eq!(
+            submitted.expected_scientific_revision,
+            Some(before.revisions.scientific)
+        );
         terminal_guide_press(&mut app, K::Char('e'));
-        assert!(app.frankentui.guide_growth_draft.is_none(), "pending edit cannot reopen");
+        assert!(
+            app.frankentui.guide_growth_draft.is_none(),
+            "pending edit cannot reopen"
+        );
         finish_terminal_guide_command(&mut app, &mut driver, &mut owner_time);
         assert_eq!(app.retained_render.config.as_ref(), &expected);
         terminal_guide_press(&mut app, K::Char('e'));
-        assert!(app.frankentui.guide_growth_draft.is_none(), "completed edit cannot reopen");
+        assert!(
+            app.frankentui.guide_growth_draft.is_none(),
+            "completed edit cannot reopen"
+        );
         assert_eq!(app.retained_render.world.tick, before.world.tick);
-        assert_eq!(app.retained_render.revisions.scientific, before.revisions.scientific);
+        assert_eq!(
+            app.retained_render.revisions.scientific,
+            before.revisions.scientific
+        );
         let _ = terminal_guide_frame(&app, 100, 32);
         terminal_guide_press(&mut app, K::Enter);
         assert_eq!(app.frankentui.guide.step(), LabGuideStep::Checkpoint);
@@ -24882,7 +25563,13 @@ for case in ('panic', 'subscription', 'renderer'):
         app.frankentui.guide.observe_snapshot(&replacement, None);
         app.frankentui.handle_guide_key(K::Enter);
         assert_eq!(app.frankentui.guide.step(), LabGuideStep::Identify);
-        assert!(app.frankentui.guide_notice.as_deref().unwrap().contains("changed"));
+        assert!(
+            app.frankentui
+                .guide_notice
+                .as_deref()
+                .unwrap()
+                .contains("changed")
+        );
     }
 
     #[test]
@@ -24907,12 +25594,19 @@ for case in ('panic', 'subscription', 'renderer'):
                 app.navigate_route(frankentui_shell::ShellRoute::Replay);
                 let mut key = ftui::core::event::KeyEvent::new(code);
                 key.modifiers = modifiers;
-                app.handle_ftui_event(ftui::core::event::Event::Key(key)).unwrap();
-                assert_eq!(app.frankentui.route, frankentui_shell::ShellRoute::WorldCanvas);
+                app.handle_ftui_event(ftui::core::event::Event::Key(key))
+                    .unwrap();
+                assert_eq!(
+                    app.frankentui.route,
+                    frankentui_shell::ShellRoute::WorldCanvas
+                );
             }
             assert_eq!(app.command_sequence, 0);
             assert_eq!(app.retained_render.world.tick, before.world.tick);
-            assert_eq!(app.retained_render.revisions.scientific, before.revisions.scientific);
+            assert_eq!(
+                app.retained_render.revisions.scientific,
+                before.revisions.scientific
+            );
         });
     }
 
@@ -26936,10 +27630,8 @@ for case in ('panic', 'subscription', 'renderer'):
         let mut port = host.port();
         let (runtime, _) = ControlRuntime::dummy();
         let renderer = TerminalRenderer::default();
-        let result = renderer.run_headless_budget(
-            host.context(&runtime),
-            HeadlessBudget::new(2, 2).unwrap(),
-        );
+        let result = renderer
+            .run_headless_budget(host.context(&runtime), HeadlessBudget::new(2, 2).unwrap());
         let snapshot = port.snapshot_hub().latest();
         // Remove the owner before assertions can invoke the ordinary fixture's
         // successful-shutdown Drop expectation. Faulted owners exit even while
@@ -32027,9 +32719,16 @@ for case in ('panic', 'subscription', 'renderer'):
     fn test_command_palette_fuzzy_matching() {
         let items = all_command_palette_items();
         let matched = fuzzy_match_command_palette(&items, "pause");
-        assert!(!matched.is_empty(), "query 'pause' must find playback controls");
+        assert!(
+            !matched.is_empty(),
+            "query 'pause' must find playback controls"
+        );
         assert_eq!(matched[0].action, CommandPaletteAction::Pause);
-        assert!(matched.iter().any(|item| item.action == CommandPaletteAction::TogglePause));
+        assert!(
+            matched
+                .iter()
+                .any(|item| item.action == CommandPaletteAction::TogglePause)
+        );
 
         let matched_cat = fuzzy_match_command_palette(&items, "science");
         assert!(

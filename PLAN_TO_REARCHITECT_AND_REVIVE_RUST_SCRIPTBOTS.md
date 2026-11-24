@@ -2,6 +2,39 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Exact-tick checkpoint replay in FrankenTUI (2026-11-23):**
+[Currently In Progress — Codex; scoped contributions to `bd-2z0.6.8` and
+`bd-2z0.7.6.1`; original ownership and complete terminal/native acceptance retained]
+
+Implemented the terminal Replay screen's shared selected-checkpoint workflow:
+exact decimal target entry and paste, checked stepping, source capabilities,
+verified historical-frame presentation and return to live. The selected saved
+descriptor stays bound to the request. Its returned verification summary travels
+with the displayed historical frame. Editing consumes unrelated character
+shortcuts; cancellation, source changes and navigation discard stale results.
+Opening the editor permanently cancels an older legacy saved-cut presentation.
+
+Three authored regressions cover exact values above 2^53 and at u64::MAX,
+invalid/overflowing edits, real older-source reconstruction against observed
+terminal cells, retained current-digest evidence, unchanged live owner state,
+and late successful responses after newer viewing intent. Independent source
+review and scoped DSR rustfmt/parse checking are complete. App compilation and
+test execution remain unverified: bounded dependency hydration did not complete
+the locked workspace graph. The original full terminal/native acceptance stays open.
+
+**Resume archipelago migration under journal pressure (2026-11-23):**
+[Currently In Progress — Codex; scoped contribution to `bd-16g.5`;
+original ownership and complete archipelago acceptance retained]
+
+Keep a frozen migration plan and its exact command/transfer phase across an
+ordinary bounded-journal refusal. A later explicit barrier call must retry the
+retained owner work and finish each departure and arrival exactly once, including
+pressure after an arrival has already applied. Preserve the last published barrier
+until the complete migration and conservation checks settle. Terminal journal
+failures still latch with their actual organism ownership evidence. Cover real
+multi-island journeys against an uninterrupted oracle, including pressure before
+and after transfer, later moves, and terminal failures.
+
 **Selected-checkpoint native replay (2026-11-23):**
 [Currently In Progress — Codex; scoped contribution to `bd-2z0.7.6.1`;
 original ownership and full native/GPU acceptance retained]
