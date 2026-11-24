@@ -1287,11 +1287,19 @@ struct Island {
     core: HostCore,
     next_command_sequence: u64,
     time_cursor: u64,
+    /// Keep the admitted command across journal pressure, including pressure from an
+    /// earlier input audit that prevents this step from applying at all.
+    pending_step: Option<PendingIslandStep>,
     /// The island's exposed view: the snapshot captured at the last completed
     /// barrier (or at construction). Refreshed only after every island has
     /// reached the barrier tick, so a mid-barrier fault can never leak a
     /// partially-stepped view.
     committed_snapshot: Arc<RenderSnapshot>,
+}
+
+struct PendingIslandStep {
+    before: Tick,
+    envelope: CommandEnvelope,
 }
 
 impl Island {
@@ -1512,6 +1520,7 @@ impl Archipelago {
                 core,
                 next_command_sequence: saved.next_command_sequence,
                 time_cursor: saved.time_cursor,
+                pending_step: None,
                 committed_snapshot,
             });
         }
@@ -1767,6 +1776,7 @@ impl Archipelago {
                 core,
                 next_command_sequence: 1,
                 time_cursor: 0,
+                pending_step: None,
                 committed_snapshot,
             });
         }
@@ -1983,6 +1993,21 @@ impl Archipelago {
                 detail: "migration has not completed the retained barrier".to_owned(),
             });
         }
+        if let Some(island) = self
+            .islands
+            .iter()
+            .find(|island| island.pending_step.is_some())
+            .or_else(|| {
+                self.islands
+                    .iter()
+                    .find(|island| island.core.world_tick() != self.barrier_tick)
+            })
+        {
+            return Err(ArchipelagoError::JournalBlocked {
+                island: island.meta.id,
+                detail: "island stepping has not completed the retained barrier".to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -2013,11 +2038,12 @@ impl Archipelago {
     /// Islands step in ascending island-id order ([`StepTopology`] records the
     /// policy in the report). Every island reaches the barrier tick before the
     /// method returns. Transient journal-capacity backpressure keeps the
-    /// barrier tick unchanged and the exact pending batch private; the next
-    /// explicit call retries that batch once and resumes the same target
-    /// without duplicating science. During migration, the selected organisms,
-    /// completed moves and exact departure or arrival command remain frozen;
-    /// resumption does not step islands or select migrants again. Any terminal
+    /// barrier tick unchanged and the exact pending batch and step command
+    /// private; the next explicit call retries that batch once and resumes the
+    /// same command and target without duplicating science. During migration,
+    /// the selected organisms, completed moves and exact departure or arrival
+    /// command remain frozen; resumption does not step islands or select
+    /// migrants again. Any terminal
     /// island fault latches the archipelago, and every later call returns
     /// [`ArchipelagoError::Latched`].
     ///
@@ -2760,10 +2786,20 @@ impl Archipelago {
                 })?;
             Self::verify_island_health(island)?;
         }
-        while island.core.world_tick().0 < target.0 {
-            let before = island.core.world_tick();
-            let command_id = island.next_command_id()?;
-            let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
+        while island.pending_step.is_some() || island.core.world_tick().0 < target.0 {
+            let (before, envelope) = if let Some(pending) = &island.pending_step {
+                (pending.before, pending.envelope.clone())
+            } else {
+                let before = island.core.world_tick();
+                let command_id = island.next_command_id()?;
+                let envelope = CommandEnvelope::new(command_id, HostCommand::Step);
+                island.pending_step = Some(PendingIslandStep {
+                    before,
+                    envelope: envelope.clone(),
+                });
+                (before, envelope)
+            };
+            let command_id = envelope.command_id;
             let mut port = island.core.local_port();
             let submitted = Self::submit_step_with_authority(island_id, &mut port, &envelope)?;
             let mut applied = Self::step_status_applied(island, &submitted)?;
@@ -2791,6 +2827,9 @@ impl Archipelago {
                         detail: "step command status was not retained".to_owned(),
                     })?;
                 applied = Self::step_status_applied(island, &status)?;
+                if let Some(blocked) = Self::journal_full_error(island) {
+                    return Err(blocked);
+                }
             }
             Self::verify_island_health(island)?;
             if !applied {
@@ -2810,6 +2849,7 @@ impl Archipelago {
                     health: format!("{:?}", island.core.health()),
                 });
             }
+            island.pending_step = None;
         }
 
         // One extra boundary drains journal receipts admitted by the final
@@ -4706,6 +4746,222 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn pressured_step_archipelago(
+        interval: u64,
+        pressure: Option<Rc<RefCell<MigrationPressureState>>>,
+    ) -> Archipelago {
+        let config = ScriptBotsConfig {
+            population_spawn_interval: 1,
+            ..populated_config(None)
+        };
+        let islands = vec![spec(0, config.clone()), spec(1, config)];
+        Archipelago::with_factories(
+            archipelago_config(islands, interval),
+            populated_world_factory,
+            move |meta| {
+                pressure
+                    .as_ref()
+                    .filter(|_| meta.id == IslandId(1))
+                    .map(|state| {
+                        Box::new(MigrationPressureJournal {
+                            inner: crate::VolatileJournal::with_capacity(64),
+                            state: Rc::clone(state),
+                        }) as Box<dyn JournalPort>
+                    })
+            },
+        )
+        .expect("two independently stepped owners")
+    }
+
+    fn reject_before_island_step(archipelago: &mut Archipelago) {
+        let rejected = archipelago.islands[1]
+            .core
+            .local_port()
+            .submit(CommandEnvelope::new(
+                CommandId::new(u128::MAX),
+                HostCommand::SetSpeed(-1.0),
+            ))
+            .unwrap();
+        assert!(matches!(
+            rejected.application(),
+            ApplicationState::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn island_step_retries_admitted_command_behind_rejected_audit() {
+        for interval in [1, 3] {
+            let state = Rc::new(RefCell::new(MigrationPressureState::new(
+                MigrationPressurePoint::RejectedAudit,
+                1,
+            )));
+            let mut archipelago = pressured_step_archipelago(interval, Some(Rc::clone(&state)));
+            let mut uninterrupted = pressured_step_archipelago(interval, None);
+            reject_before_island_step(&mut archipelago);
+            let expected_id = CommandId::from_client_sequence(ARCHIPELAGO_COMMAND_NAMESPACE, 1);
+            for _ in 0..2 {
+                assert!(matches!(
+                    archipelago.step_to_barrier(),
+                    Err(ArchipelagoError::JournalBlocked {
+                        island: IslandId(1),
+                        ..
+                    })
+                ));
+                assert!(archipelago.latched().is_none());
+                assert_eq!(archipelago.barrier_tick(), Tick(0));
+                assert_eq!(archipelago.islands[0].core.world_tick(), Tick(interval));
+                assert_eq!(archipelago.islands[1].core.world_tick(), Tick(0));
+                let pending = archipelago.islands[1].pending_step.as_ref().unwrap();
+                assert_eq!(pending.before, Tick(0));
+                assert_eq!(pending.envelope.command_id, expected_id);
+                assert_eq!(archipelago.islands[1].next_command_sequence, 2);
+                assert_eq!(
+                    archipelago.islands[1]
+                        .core
+                        .local_port()
+                        .command_status(expected_id)
+                        .unwrap()
+                        .unwrap()
+                        .application(),
+                    &ApplicationState::Admitted
+                );
+                for island in &archipelago.islands {
+                    assert_eq!(island.committed_snapshot.world.tick, 0);
+                }
+            }
+            let report = archipelago.step_to_barrier().unwrap();
+            uninterrupted.step_to_barrier().unwrap();
+            assert_eq!(report.barrier_tick, Tick(interval));
+            assert_eq!(report.epoch, 1);
+            assert_same_checkpoint_science(&archipelago, &uninterrupted);
+            assert!(!archipelago.organism_census().unwrap().is_empty());
+            for island in &archipelago.islands {
+                assert!(island.pending_step.is_none());
+                assert_eq!(island.next_command_sequence, interval + 1);
+            }
+            {
+                let journal = state.borrow();
+                let blocked = journal.blocked.as_ref().unwrap();
+                assert!(blocked.uses_ingress_audit_slot());
+                assert_eq!(journal.blocked_attempts(), 3);
+                for attempt in journal
+                    .attempts
+                    .iter()
+                    .filter(|batch| batch.id() == blocked.id())
+                {
+                    assert!(Arc::ptr_eq(attempt, blocked));
+                }
+                let commands: Vec<_> = journal
+                    .accepted
+                    .iter()
+                    .filter_map(|batch| batch.command())
+                    .filter(|envelope| matches!(envelope.command, HostCommand::Step))
+                    .map(|envelope| envelope.command_id)
+                    .collect();
+                assert_eq!(commands.len(), usize::try_from(interval).unwrap());
+                assert_eq!(commands[0], expected_id);
+                assert_eq!(
+                    commands.iter().collect::<BTreeSet<_>>().len(),
+                    commands.len()
+                );
+            }
+            archipelago.step_to_barrier().unwrap();
+            uninterrupted.step_to_barrier().unwrap();
+            assert_same_checkpoint_science(&archipelago, &uninterrupted);
+        }
+    }
+
+    #[test]
+    fn pending_step_refuses_reads_after_owner_pressure_has_cleared() {
+        let state = Rc::new(RefCell::new(MigrationPressureState::new(
+            MigrationPressurePoint::RejectedAudit,
+            1,
+        )));
+        let mut archipelago = pressured_step_archipelago(1, Some(Rc::clone(&state)));
+        let mut uninterrupted = pressured_step_archipelago(1, None);
+        reject_before_island_step(&mut archipelago);
+        assert!(archipelago.step_to_barrier().is_err());
+        state.borrow_mut().remaining_full = 0;
+        let island = &mut archipelago.islands[1];
+        island.core.retry_retained_journal().unwrap();
+        let now = island.next_instant();
+        island.core.drive(now).unwrap();
+        assert!(Archipelago::journal_full_error(island).is_none());
+        assert_eq!(island.core.world_tick(), Tick(1));
+
+        for id in [IslandId(0), IslandId(1)] {
+            assert_eq!(archipelago.island_snapshot(id).unwrap().world.tick, 0);
+            assert!(matches!(
+                archipelago.island_digest(id),
+                Err(ArchipelagoError::JournalBlocked {
+                    island: IslandId(1),
+                    ..
+                })
+            ));
+            let mut called = false;
+            assert!(matches!(
+                archipelago.with_island_world(id, |_| called = true),
+                Err(ArchipelagoError::JournalBlocked { .. })
+            ));
+            assert!(!called, "an unsettled step cannot expose live science");
+        }
+        assert!(matches!(
+            archipelago.organism_census(),
+            Err(ArchipelagoError::JournalBlocked { .. })
+        ));
+        assert!(matches!(
+            archipelago.checkpoint_v1(),
+            Err(ArchipelagoError::JournalBlocked { .. })
+        ));
+        let attempts = state.borrow().attempts.len();
+        archipelago.step_to_barrier().unwrap();
+        uninterrupted.step_to_barrier().unwrap();
+        assert_same_checkpoint_science(&archipelago, &uninterrupted);
+        assert!(
+            archipelago
+                .islands
+                .iter()
+                .all(|island| island.pending_step.is_none())
+        );
+        assert_eq!(archipelago.islands[1].next_command_sequence, 2);
+        assert_eq!(
+            state.borrow().attempts.len(),
+            attempts,
+            "settling an applied Step must not add another journal batch"
+        );
+    }
+
+    #[test]
+    fn pending_step_latches_if_retried_audit_journal_closes() {
+        let mut pressure = MigrationPressureState::new(MigrationPressurePoint::RejectedAudit, 1);
+        pressure.remaining_full = 1;
+        pressure.close_on_retry = true;
+        let state = Rc::new(RefCell::new(pressure));
+        let mut archipelago = pressured_step_archipelago(1, Some(Rc::clone(&state)));
+        reject_before_island_step(&mut archipelago);
+        assert!(matches!(
+            archipelago.step_to_barrier(),
+            Err(ArchipelagoError::JournalBlocked { .. })
+        ));
+        assert!(matches!(
+            archipelago.step_to_barrier(),
+            Err(ArchipelagoError::IslandFault {
+                island: IslandId(1),
+                ..
+            })
+        ));
+        assert!(archipelago.latched().is_some());
+        assert_eq!(archipelago.barrier_tick(), Tick(0));
+        assert_eq!(archipelago.islands[1].core.world_tick(), Tick(0));
+        assert_eq!(archipelago.islands[1].next_command_sequence, 2);
+        let attempts = state.borrow().attempts.len();
+        assert!(matches!(
+            archipelago.step_to_barrier(),
+            Err(ArchipelagoError::Latched { .. })
+        ));
+        assert_eq!(state.borrow().attempts.len(), attempts);
     }
 
     fn assert_partial_barrier_stays_private(archipelago: &Archipelago) {
