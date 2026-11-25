@@ -855,6 +855,12 @@ pub enum BrainInspectionError {
         /// Description of the invalid data.
         detail: String,
     },
+    /// The owner stopped partway through a scientific transition.
+    #[error("brain inspection requires a completed scientific boundary: {detail}")]
+    IncompleteScientificStep {
+        /// Original scientific fault, including its stage path and backend diagnostic.
+        detail: String,
+    },
 }
 
 fn activation_payload_bytes(activations: &BrainActivations) -> usize {
@@ -6921,15 +6927,17 @@ impl WorldStepTracePoint {
     }
 }
 
-/// Timing for the most recently completed profiled simulation step.
+/// Timing for the most recently observed profiled simulation step.
 ///
 /// Timing is disabled by default. When enabled, durations use the process monotonic clock and are
 /// diagnostic only: they never enter persistence, replay, digests, or scientific decisions.
+/// A terminal sensing failure records only the stages reached before the incomplete transition
+/// stopped; the attempted tick is not a completed scientific boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorldStepProfile {
     /// Schema governing stage names and grouping.
     pub schema: String,
-    /// Completed tick described by this profile.
+    /// Attempted tick described by this profile; an early failure does not complete it.
     pub tick: Tick,
     /// Whole-step elapsed time under the profile's declared schema.
     ///
@@ -7044,7 +7052,7 @@ impl Default for WorldStepProfiler {
 }
 
 impl WorldStepProfiler {
-    /// Most recently completed profiled step, if any.
+    /// Most recently observed profiled step, possibly an incomplete terminal transition.
     #[must_use]
     pub const fn latest(&self) -> Option<&WorldStepProfile> {
         self.latest.as_ref()
@@ -7469,7 +7477,8 @@ pub struct WorldStepStageDigest {
     pub capture: WorldStepTraceCapture,
 }
 
-/// Clock-free diagnostic trace for the most recently completed simulation step.
+/// Clock-free diagnostic trace for the most recently observed simulation step.
+/// Incomplete transitions retain their observed prefix and fail `validate_contract`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorldStepTrace {
@@ -7477,11 +7486,11 @@ pub struct WorldStepTrace {
     pub schema: String,
     /// Payload codec revision.
     pub codec_version: u16,
-    /// Completed tick described by this trace.
+    /// Attempted tick described by this trace; an early failure does not complete it.
     pub tick: Tick,
-    /// Six ordered stage captures.
+    /// Ordered captures; a complete trace has all six points, an interrupted trace only a prefix.
     pub stages: Vec<WorldStepStageDigest>,
-    /// Hash of the trace metadata and all six ordered success/error captures.
+    /// Hash of the trace metadata and observed success/error captures.
     pub overall: String,
 }
 
@@ -8014,7 +8023,10 @@ pub struct WorldStepTracer {
 }
 
 impl WorldStepTracer {
-    /// Most recently completed stage trace, if any.
+    /// Most recently observed stage trace, if any.
+    ///
+    /// A terminal sensing failure retains a partial trace; `validate_contract` rejects it
+    /// because it does not contain every completed-step trace point.
     #[must_use]
     pub const fn latest(&self) -> Option<&WorldStepTrace> {
         self.latest.as_ref()
@@ -9299,7 +9311,7 @@ impl PersistenceAdmissionError {
 /// Failure while executing a simulation tick.
 #[derive(Debug, Clone, Error)]
 pub enum WorldStepError {
-    /// A lineage or other scientific invariant rejected the tick before it began.
+    /// A scientific invariant or sensing backend failure rejected the transition.
     #[error(transparent)]
     ScientificState(#[from] ScientificStateError),
     /// A registered brain family could not construct, inherit, or evaluate a live brain.
@@ -12052,6 +12064,17 @@ impl AgentArena {
 /// Typed rejection at a scientific-state construction or mutation boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ScientificStateError {
+    /// An external sensory backend failed before the current transition could complete.
+    ///
+    /// Earlier stages may have changed state, so this terminal fault cannot be finalized
+    /// as a completed tick or cleared by replacing the backend.
+    #[error("sensory accumulation failed at `{path}`: {source}")]
+    SenseProvider {
+        /// Exact stage or collection path rejected.
+        path: String,
+        /// Original backend failure or exact accumulator-count mismatch.
+        source: SenseProviderError,
+    },
     /// A float that can influence simulation or imported environment state was not finite.
     #[error("non-finite scientific state at `{path}`")]
     NonFinite {
@@ -12223,7 +12246,8 @@ impl ScientificStateError {
     #[must_use]
     pub fn path(&self) -> &str {
         match self {
-            Self::NonFinite { path }
+            Self::SenseProvider { path, .. }
+            | Self::NonFinite { path }
             | Self::NegativeValue { path }
             | Self::LengthMismatch { path, .. }
             | Self::DimensionOverflow { path }
@@ -22450,10 +22474,11 @@ pub struct WorldState {
     brain_fault: Option<BrainSpawnError>,
     /// Latched scientific-state invariant violation (bd-cqja).
     ///
-    /// Mirrors `brain_fault`: a stage that cannot return an error records the exact typed
-    /// fault, finishes the transition inertly, and every later transition is refused. The
-    /// release profile is `panic = "abort"`, so the alternative was killing the process and
-    /// taking the run's unadmitted scientific state with it.
+    /// Records the exact typed fault and refuses every later transition. Most stage faults
+    /// finish a containment boundary; an external sensing failure instead stops the partial
+    /// transition before brain evaluation and refuses final persistence projection. The release
+    /// profile is `panic = "abort"`, so panicking would kill the process and strand its
+    /// unadmitted scientific state.
     scientific_fault: Option<ScientificStateError>,
     persistence_discarded_records_at: Option<Tick>,
     pending_persistence_runtime_tail: AgentMap<PersistenceRuntimeTail>,
@@ -24346,11 +24371,30 @@ impl WorldState {
         let temperature_field = self.temperature.as_ref();
 
         let gpu_accumulators = if let Some(mut provider) = self.sense_provider.take() {
-            let res = provider.compute_accumulators(self, handles).expect(
-                "sense provider compute_accumulators failed (silent fallback is forbidden)",
-            );
+            let result = provider.compute_accumulators(self, handles);
+            // Retain the configured backend even when it fails. A device failure must not
+            // silently turn a later call into CPU sensing or lose the original diagnosis.
             self.sense_provider = Some(provider);
-            Some(res)
+            let result = result.and_then(|accumulators| {
+                if accumulators.len() == agent_count {
+                    Ok(accumulators)
+                } else {
+                    Err(SenseProviderError::AccumulatorCountMismatch {
+                        expected: agent_count,
+                        actual: accumulators.len(),
+                    })
+                }
+            });
+            match result {
+                Ok(accumulators) => Some(accumulators),
+                Err(source) => {
+                    self.latch_scientific_fault(ScientificStateError::SenseProvider {
+                        path: "stage_sense.accumulators".to_owned(),
+                        source,
+                    });
+                    return;
+                }
+            }
         } else {
             None
         };
@@ -30890,9 +30934,13 @@ impl WorldState {
 
     /// Execute one simulation transition without performing downstream persistence I/O.
     ///
-    /// `Err` means no new transition started. Once a transition begins, this always advances to a
-    /// completed boundary and returns its [`StepCompletion`]. A validated agent-local execution
-    /// fault uses zero outputs and removes that agent at death cleanup with its exact typed cause.
+    /// Preflight errors refuse before a new transition starts. A
+    /// [`ScientificStateError::SenseProvider`] instead terminates an already-started transition
+    /// before brain evaluation or tick advancement. Earlier stages may have mutated state; that
+    /// terminal world cannot resume, publish a canonical digest/checkpoint, or finalize a new
+    /// persistence batch. Other started transitions reach a completed boundary and return their
+    /// [`StepCompletion`]. A validated agent-local execution fault uses zero outputs and removes
+    /// that agent at death cleanup with its exact typed cause.
     /// Other brain evaluation failures use a deterministic zero-output containment action,
     /// suppress births, and are carried alongside
     /// population-construction faults in [`StepCompletion::fault`]; the latch rejects every later
@@ -31069,8 +31117,23 @@ impl WorldState {
         });
         observed_stage!(WorldStepStage::Sense, {
             self.stage_sense();
-            self.record_replay_hearing_events(next_tick);
+            if !matches!(
+                self.scientific_fault.as_ref(),
+                Some(ScientificStateError::SenseProvider { .. })
+            ) {
+                self.record_replay_hearing_events(next_tick);
+            }
         });
+        if let Some(error @ ScientificStateError::SenseProvider { .. }) =
+            self.scientific_fault.clone()
+        {
+            // Interventions, aging and food dynamics may already have run. Do not evaluate
+            // brains with stale sensors, advance the clock, or publish this partial cut as a
+            // completed tick. The permanent latch also prevents a backend switch from retrying
+            // those earlier stages. Diagnostics retain only the stages actually observed.
+            observer.end_step(step_started_at);
+            return Err(error.into());
+        }
         let mut execution_faults = BTreeMap::new();
         let brain_evaluation = observed_stage!(WorldStepStage::Brains, {
             self.stage_brains(&mut execution_faults)
@@ -32452,9 +32515,10 @@ impl WorldState {
 
     /// Pull current selected-brain detail without mutating simulation or evaluator state.
     ///
-    /// The response is synchronous, so paused worlds have no pending state and a caller never
-    /// receives an untagged value from an earlier focus. Stable UIDs prevent a removed agent's
-    /// request from aliasing a later occupant of the same generational slot.
+    /// Responses are synchronous and tagged to the completed world tick. A terminal sensing
+    /// failure refuses inspection rather than labeling partial state as a completed boundary.
+    /// Stable UIDs prevent a removed agent's request from aliasing a later occupant of the same
+    /// generational slot.
     // bd-tqpj: ~138-line inspection dispatch; reviewed as a unit per lint policy.
     #[allow(clippy::too_many_lines)]
     pub fn inspect_brains(
@@ -32465,6 +32529,13 @@ impl WorldState {
             return Err(BrainInspectionError::TargetLimitExceeded {
                 requested: request.targets.len(),
                 limit: ACTIVATION_CAPTURE_BUDGET,
+            });
+        }
+        if let Some(error @ ScientificStateError::SenseProvider { .. }) =
+            self.scientific_fault.as_ref()
+        {
+            return Err(BrainInspectionError::IncompleteScientificStep {
+                detail: error.to_string(),
             });
         }
 
@@ -32614,6 +32685,13 @@ impl WorldState {
     fn finalize_persistence_projection(
         &mut self,
     ) -> Result<Option<PersistenceProjection>, ScientificStateError> {
+        if let Some(error @ ScientificStateError::SenseProvider { .. }) =
+            self.scientific_fault.as_ref()
+        {
+            // A failed sensing pass leaves a partial transition at the previous tick number.
+            // Serializing it here would relabel changed state as a completed scientific cut.
+            return Err(error.clone());
+        }
         if let PersistenceBoundaryStatus::Pending { tick } = self.persistence_boundary {
             return Err(ScientificStateError::PersistenceBoundaryUnresolved {
                 path: "persistence.finalize".to_owned(),
@@ -40520,6 +40598,269 @@ mod tests {
             !knob_range("food_max").expect("declared").fresh_world_only,
             "food_max is settable live"
         );
+    }
+
+    struct ScriptedSenseProvider {
+        calls: Arc<AtomicUsize>,
+        result: Result<Vec<sense_fixed::SenseAccum>, SenseProviderError>,
+    }
+
+    impl SenseProvider for ScriptedSenseProvider {
+        fn compute_accumulators(
+            &mut self,
+            _world: &WorldState,
+            _handles: &[AgentId],
+        ) -> Result<Vec<sense_fixed::SenseAccum>, SenseProviderError> {
+            self.calls.fetch_add(1, AtomicUsizeOrdering::Relaxed);
+            self.result.clone()
+        }
+    }
+
+    #[test]
+    fn sense_provider_failures_stop_before_brains_and_refuse_partial_tick_publication() {
+        struct SenseCountingBrain(Arc<AtomicUsize>);
+
+        impl BrainRunner for SenseCountingBrain {
+            fn kind(&self) -> &'static str {
+                "test.sense-fault"
+            }
+
+            fn tick(&mut self, _inputs: &[f32; INPUT_SIZE]) -> [f32; OUTPUT_SIZE] {
+                self.0.fetch_add(1, AtomicUsizeOrdering::Relaxed);
+                [1.0; OUTPUT_SIZE]
+            }
+
+            fn state_digest(&self) -> Option<u64> {
+                Some(self.0.load(AtomicUsizeOrdering::Relaxed) as u64)
+            }
+        }
+
+        let execution_error =
+            SenseProviderError::Execution("device lost during sensory dispatch".to_owned());
+        for (result, source) in [
+            (Err(execution_error.clone()), execution_error),
+            (
+                Ok(vec![sense_fixed::SenseAccum::default(); 1]),
+                SenseProviderError::AccumulatorCountMismatch {
+                    expected: 2,
+                    actual: 1,
+                },
+            ),
+            (
+                Ok(vec![sense_fixed::SenseAccum::default(); 3]),
+                SenseProviderError::AccumulatorCountMismatch {
+                    expected: 2,
+                    actual: 3,
+                },
+            ),
+        ] {
+            for persistence_interval in [0, 3] {
+                let mut config = quiet_trace_config(0x5E45_E001, persistence_interval);
+                config.initial_food = 0.5;
+                config.food_decay_rate = 0.1;
+                config.bot_speed = 0.5;
+                let logs = Arc::new(Mutex::new(Vec::new()));
+                let (mut world, mut session) = world_with_session(
+                    config,
+                    RejectOncePersistence {
+                        logs: Arc::clone(&logs),
+                        reject_next: false,
+                    },
+                );
+                let brain_calls = Arc::new(AtomicUsize::new(0));
+                let key = world
+                    .brain_registry_mut()
+                    .expect("unstarted registry")
+                    .register("test.sense-fault", {
+                        let calls = Arc::clone(&brain_calls);
+                        move |_rng| Ok(Box::new(SenseCountingBrain(Arc::clone(&calls))))
+                    });
+                let ids = [
+                    world.spawn_agent(sample_agent(0)),
+                    world.spawn_agent(sample_agent(1)),
+                ];
+                for id in ids {
+                    assert!(world.bind_agent_brain(id, key).expect("counting brain"));
+                    let runtime = world.agent_runtime_mut(id).expect("live runtime");
+                    runtime.sensors = [0.125; INPUT_SIZE];
+                    runtime.outputs = [0.25; OUTPUT_SIZE];
+                }
+                world.set_realized_hearing_capture_enabled(true);
+                let positions_before = world.agents.columns().positions().to_vec();
+                let food_before = world.food.cells().to_vec();
+                let replay_before = world.replay_events.clone();
+                let provider_calls = Arc::new(AtomicUsize::new(0));
+                world.set_sense_provider(Box::new(ScriptedSenseProvider {
+                    calls: Arc::clone(&provider_calls),
+                    result: result.clone(),
+                }));
+                let expected = ScientificStateError::SenseProvider {
+                    path: "stage_sense.accumulators".to_owned(),
+                    source: source.clone(),
+                };
+                let mut tracer = WorldStepTracer::default();
+
+                let error = session
+                    .step_traced_outcome(&mut world, &mut tracer)
+                    .expect_err("failed sensing cannot produce a completed tick");
+                assert!(matches!(
+                    error,
+                    WorldStepError::ScientificState(actual) if actual == expected
+                ));
+                assert_eq!(world.scientific_fault(), Some(&expected));
+                assert_eq!(provider_calls.load(AtomicUsizeOrdering::Relaxed), 1);
+                assert!(world.has_sense_provider());
+                assert_eq!(brain_calls.load(AtomicUsizeOrdering::Relaxed), 0);
+                assert_eq!(world.tick(), Tick::zero());
+                assert_eq!(world.agents.columns().positions(), positions_before.as_slice());
+                for id in ids {
+                    let runtime = world.agent_runtime(id).expect("live runtime");
+                    assert_eq!(runtime.sensors, [0.125; INPUT_SIZE]);
+                    assert_eq!(runtime.outputs, [0.25; OUTPUT_SIZE]);
+                }
+                // Food dynamics precedes sensing. This is an explicitly terminal partial
+                // transition, not a rollback and not a completed boundary at the old tick.
+                assert_ne!(world.food.cells(), food_before.as_slice());
+                assert!(world.history.is_empty());
+                assert_eq!(world.replay_events, replay_before);
+                assert!(world.latest_realized_hearing_observations().is_empty());
+                assert!(!session.has_pending_batch());
+                assert_eq!(session.last_admitted_tick(), None);
+                assert!(logs.lock().unwrap().is_empty());
+                let trace = tracer.latest().expect("observed partial trace");
+                assert_eq!(trace.stages.len(), 1);
+                assert_eq!(trace.stages[0].point, WorldStepTracePoint::Sense);
+                assert!(trace.validate_contract().is_err());
+                assert!(matches!(
+                    world.world_digest_v1(),
+                    Err(CharacterizationError::NonContinuable {
+                        blocker: WorldContinuationBlocker::ScientificFault,
+                    })
+                ));
+
+                let inspection_error = world
+                    .inspect_brains(&BrainInspectionRequest {
+                        client_id: BrainInspectionClientId::new(1),
+                        revision: BrainInspectionRevision::new(1),
+                        targets: vec![world.agent_uid(ids[0]).expect("live stable identity")],
+                        limits: BrainInspectionLimits::hard(),
+                    })
+                    .expect_err("partial brain state cannot claim a completed source tick");
+                assert_eq!(
+                    inspection_error,
+                    BrainInspectionError::IncompleteScientificStep {
+                        detail: expected.to_string(),
+                    }
+                );
+                let wire = serde_json::to_vec(&inspection_error).expect("encode refusal");
+                assert_eq!(
+                    serde_json::from_slice::<BrainInspectionError>(&wire).unwrap(),
+                    inspection_error
+                );
+
+                let partial_digest = world
+                    .characterization_digest_v0_inner(false)
+                    .expect("diagnostic partial state");
+                assert!(world.clear_sense_provider().is_some());
+                let retry = session
+                    .step_outcome(&mut world)
+                    .expect_err("replacing a failed backend cannot replay earlier stages");
+                assert!(matches!(
+                    retry,
+                    WorldStepError::ScientificState(actual) if actual == expected
+                ));
+                assert_eq!(
+                    session.finalize(&mut world),
+                    Err(PersistenceSessionError::ScientificState(expected))
+                );
+                assert_eq!(
+                    world.characterization_digest_v0_inner(false).unwrap(),
+                    partial_digest
+                );
+                assert_eq!(provider_calls.load(AtomicUsizeOrdering::Relaxed), 1);
+                assert_eq!(brain_calls.load(AtomicUsizeOrdering::Relaxed), 0);
+                assert_eq!(world.tick(), Tick::zero());
+                assert!(!session.has_pending_batch());
+                assert!(logs.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn valid_sense_provider_matches_cpu_for_nonzero_toroidal_neighbor_signals() {
+        let mut config = quiet_trace_config(0x5E45_E002, 0);
+        config.initial_food = 0.4;
+        config.sense_radius = 20.0;
+        let mut cpu = WorldState::new(config.clone()).expect("CPU world");
+        let mut provided = WorldState::new(config).expect("provider world");
+        for world in [&mut cpu, &mut provided] {
+            for (x, emission) in [(95.0, 0.25), (5.0, 0.75)] {
+                let id = world.spawn_agent(AgentData {
+                    position: Position::new(x, 20.0),
+                    health: 2.0,
+                    ..AgentData::default()
+                });
+                let runtime = world.agent_runtime_mut(id).expect("live runtime");
+                runtime.eye_fov = [0.0; NUM_EYES];
+                runtime.trait_modifiers = TraitModifiers {
+                    smell: 1.0,
+                    sound: 1.0,
+                    hearing: 1.0,
+                    eye: 1.0,
+                    blood: 1.0,
+                };
+                runtime.outputs = [0.5; OUTPUT_SIZE];
+                runtime.sound_multiplier = emission;
+            }
+        }
+        // Across the seam the distance is 10 and radius is 20: one-half attenuation.
+        // Closed eyes and full health give zero visual/blood terms; wheel effort is 0.5.
+        let accumulator = |hearing| {
+            sense_fixed::SenseAccum::from_raw_channels(
+                [0; NUM_EYES],
+                [0; NUM_EYES],
+                [0; NUM_EYES],
+                [0; NUM_EYES],
+                sense_fixed::to_fixed(0.5),
+                sense_fixed::to_fixed(0.25),
+                sense_fixed::to_fixed(hearing),
+                0,
+                0,
+            )
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        provided.set_sense_provider(Box::new(ScriptedSenseProvider {
+            calls: Arc::clone(&calls),
+            result: Ok(vec![accumulator(0.375), accumulator(0.125)]),
+        }));
+
+        let cpu_events = cpu.step().expect("CPU sensing completes");
+        let provided_events = provided.step().expect("valid provider completes");
+        assert_eq!(provided_events, cpu_events);
+        assert_eq!(provided.tick(), Tick(1));
+        assert_eq!(calls.load(AtomicUsizeOrdering::Relaxed), 1);
+        assert!(provided.has_sense_provider());
+        assert!(provided.scientific_fault().is_none());
+        assert_eq!(
+            provided.world_digest_v1().expect("provider world digest"),
+            cpu.world_digest_v1().expect("CPU world digest")
+        );
+        let hearing = SENSOR_LAYOUT
+            .iter()
+            .find(|channel| channel.kind == SensorKind::Hearing)
+            .expect("named hearing channel");
+        for ((cpu_id, provided_id), expected_hearing) in cpu
+            .agents
+            .iter_handles()
+            .zip(provided.agents.iter_handles())
+            .zip([0.375, 0.125])
+        {
+            let cpu_runtime = cpu.agent_runtime(cpu_id).expect("CPU runtime");
+            let provided_runtime = provided.agent_runtime(provided_id).expect("provider runtime");
+            assert_eq!(provided_runtime.sensors, cpu_runtime.sensors);
+            assert_eq!(provided_runtime.outputs, cpu_runtime.outputs);
+            assert_eq!(provided_runtime.sensors.sensor(hearing), expected_hearing);
+        }
     }
 
     /// The attribution must reproduce core's own sensing, or the inspector is

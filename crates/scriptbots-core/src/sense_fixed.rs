@@ -542,6 +542,9 @@ pub trait SenseProvider: Send {
     ///
     /// Receives a reference to the world state and slice of active agent IDs in handle order.
     /// Returns an accumulator per agent matching `handles.len()`.
+    ///
+    /// An error or mismatched length terminates the current transition before brain evaluation.
+    /// The world retains the provider and refuses further science ticks; there is no CPU fallback.
     fn compute_accumulators(
         &mut self,
         world: &crate::WorldState,
@@ -550,11 +553,19 @@ pub trait SenseProvider: Send {
 }
 
 /// Typed error returned by a [`SenseProvider`].
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SenseProviderError {
     /// Failure during sensory accumulator execution.
     #[error("sense provider failed: {0}")]
     Execution(String),
+    /// The backend did not return exactly one accumulator per requested live agent.
+    #[error("sense provider returned {actual} accumulators; expected exactly {expected}")]
+    AccumulatorCountMismatch {
+        /// Number of agents passed to the backend.
+        expected: usize,
+        /// Number of accumulators actually returned.
+        actual: usize,
+    },
 }
 
 #[cfg(test)]

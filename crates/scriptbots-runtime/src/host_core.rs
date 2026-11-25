@@ -3622,6 +3622,9 @@ impl HostCore {
         journal: Box<dyn JournalPort>,
         events: EventHub,
     ) -> Result<Self, HostCoreBuildError> {
+        if let Some(error @ ScientificStateError::SenseProvider { .. }) = world.scientific_fault() {
+            return Err(error.clone().into());
+        }
         events.refresh_genesis_origins(&world, options.genesis_origin_capacity);
         let revisions = HostRevisions {
             control: ControlRevision::new(0),
@@ -4169,7 +4172,16 @@ impl HostCore {
         self.snapshots.latest()
     }
 
+    fn ensure_complete_inspection_boundary(&self) -> Result<(), HostAccessError> {
+        if let Some(error @ ScientificStateError::SenseProvider { .. }) = self.world.scientific_fault()
+        {
+            return Err(error.clone().into());
+        }
+        Ok(())
+    }
+
     /// Pull bounded selected-brain detail for one client without mutating host or science state.
+    /// An incomplete sensing transition cannot supply a completed-tick projection.
     pub fn inspect_brains(
         &self,
         request: &BrainProjectionRequest,
@@ -4208,6 +4220,7 @@ impl HostCore {
         &self,
         uid: AgentUid,
     ) -> Result<crate::inspector::BrainActivityInspection, HostAccessError> {
+        self.ensure_complete_inspection_boundary()?;
         let request = BrainProjectionRequest::focused(
             crate::ProjectionClientId::new(0),
             crate::ProjectionRequestRevision::new(0),
@@ -4236,6 +4249,7 @@ impl HostCore {
         locus_offset: usize,
         delta_offset: usize,
     ) -> Result<crate::inspector::GenomeInspection, HostAccessError> {
+        self.ensure_complete_inspection_boundary()?;
         let latest = self.latest_snapshot();
         crate::inspector::GenomeInspection::from_world(
             &self.world,
@@ -4258,7 +4272,8 @@ impl HostCore {
         &self.health
     }
 
-    /// Read-only access to the underlying world state.
+    /// Read-only diagnostic access to the underlying world state.
+    /// A terminal sensing failure can leave an incomplete transition in this live state.
     #[must_use]
     pub const fn world(&self) -> &WorldState {
         &self.world
@@ -4755,6 +4770,7 @@ impl HostCore {
         include_genome: bool,
     ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
         Self::validate_inspector_request(max_contributors, genome_offset)?;
+        self.ensure_complete_inspection_boundary()?;
         let page_size = crate::channel::INSPECTOR_GENOME_PAGE_SIZE;
         let Some(id) = self
             .world
@@ -4916,9 +4932,11 @@ impl HostCore {
 
     /// Read the owned world through a closure, without handing out a borrow.
     ///
-    /// `&self` is the whole safety argument: every mutating entry point on this type
-    /// takes `&mut self`, so the borrow checker already forbids observing a
-    /// partially-stepped world. Returning `&WorldState` directly would let a caller hold
+    /// Every mutating entry point on this type takes `&mut self`, so a reader cannot
+    /// interleave with a running step. A terminal sensing failure can leave an incomplete
+    /// transition for diagnosis; inspect the world's scientific fault before treating this
+    /// live state as a completed boundary. Published snapshots retain the last completed
+    /// projection in that case. Returning `&WorldState` directly would let a caller hold
     /// that borrow across a barrier in a future refactor; a closure cannot escape.
     ///
     /// Exists because science readouts (per-island species, lineage, gene flow) need the
@@ -5666,7 +5684,62 @@ impl HostCore {
         }
     }
 
+    fn has_incomplete_scientific_step(&self) -> bool {
+        matches!(
+            self.world.scientific_fault(),
+            Some(ScientificStateError::SenseProvider { .. })
+        )
+    }
+
+    fn publish_incomplete_step_fault(&mut self) -> Result<(), HostAccessError> {
+        // Sensing can fail after interventions, aging and food have changed the live world.
+        // Keep every scientific payload and its own revisions from the last publication,
+        // which can predate the latest completed tick when snapshot cadence is sparse.
+        // Only owner health and control metadata describe this later failed attempt.
+        let mut snapshot = self.snapshots.latest().as_ref().clone();
+        let following_revision = self
+            .next_snapshot
+            .checked_next()
+            .ok_or_else(|| protocol_violation("snapshot revision exhausted"))?;
+        snapshot.revision = self.next_snapshot;
+        snapshot.revisions.control = self.revisions.control;
+        snapshot.playback = self.playback;
+        snapshot.lifecycle = self.lifecycle;
+        snapshot.health = self.health.clone();
+        (snapshot.command_queue_depth, snapshot.last_applied_command) =
+            self.snapshot_command_queue_state();
+        snapshot.build = snapshot_build_stats(
+            &snapshot.world,
+            AgentPayloadCapacities {
+                visuals: snapshot.agent_visuals.capacity(),
+                selection: snapshot.agent_selection.capacity(),
+            },
+            &snapshot.summary_history,
+            snapshot.summary_history.capacity(),
+            false,
+            &self.snapshot_layers,
+            LayerRefreshStats::default(),
+        );
+        // Cloning the publication copies only the dynamic vector; all other bulk
+        // payloads above are shared Arcs. Charge the allocation actually performed.
+        snapshot.build.bulk_allocations = usize::from(snapshot.world.agents.capacity() != 0);
+        snapshot.build.newly_allocated_capacity_bytes = snapshot
+            .world
+            .agents
+            .capacity()
+            .saturating_mul(size_of::<DynamicAgentSnapshot>());
+        account_narrative_payload(&mut snapshot.build, &snapshot.narrative_events, false);
+        snapshot.scheduled_patches = self.snapshot_scheduled(&mut snapshot.build);
+        self.snapshots.publish(Arc::new(snapshot))?;
+        self.next_snapshot = following_revision;
+        self.shared.borrow_mut().visible_boundary = self.applied_boundary();
+        Ok(())
+    }
+
     fn publish_snapshot(&mut self) -> Result<(), HostAccessError> {
+        if self.has_incomplete_scientific_step() {
+            return self.publish_incomplete_step_fault();
+        }
         self.refresh_open_genesis_origins();
         let revision = self.next_snapshot;
         let following_revision = revision
@@ -6095,8 +6168,10 @@ impl HostCore {
         admission: AdmissionSequence,
         envelope: &CommandEnvelope,
     ) -> Result<Option<ApplyResult>, HostAccessError> {
-        if self.latched_fault.is_none()
-            || !matches!(
+        let selection_on_incomplete_step = self.has_incomplete_scientific_step()
+            && matches!(&envelope.command, HostCommand::UpdateSelection(_));
+        let blocked_by_fault = selection_on_incomplete_step
+            || matches!(
                 &envelope.command,
                 HostCommand::Step
                     | HostCommand::UpdateSimulation(scriptbots_core::SimulationCommand {
@@ -6111,8 +6186,8 @@ impl HostCore {
                     | HostCommand::Immigrate { .. }
                     | HostCommand::ApplyMap { .. }
                     | HostCommand::Intervention(_)
-            )
-        {
+            );
+        if self.latched_fault.is_none() || !blocked_by_fault {
             return Ok(None);
         }
         let blocked = self.complete_failed(
@@ -6496,11 +6571,15 @@ impl HostCore {
                     "shutdown_finalization",
                     error.to_string(),
                 )?;
-                self.latched_fault = Some(HostFault::Scientific {
-                    tick: self.world.tick(),
-                    code: "shutdown_finalization".to_owned(),
-                    message: error.to_string(),
-                });
+                // A refused tail can be a consequence of the original incomplete step.
+                // Keep that first diagnosis while recording shutdown's own failed receipt.
+                if self.latched_fault.is_none() {
+                    self.latched_fault = Some(HostFault::Scientific {
+                        tick: self.world.tick(),
+                        code: "shutdown_finalization".to_owned(),
+                        message: error.to_string(),
+                    });
+                }
                 self.synchronize_health()?;
                 return Ok(ApplyResult::completed(blocked));
             }
@@ -6914,7 +6993,9 @@ impl HostCore {
         let completion = self
             .persistence
             .step_traced_outcome(&mut self.world, &mut tracer);
-        if let Some(trace) = tracer.latest() {
+        if completion.is_ok()
+            && let Some(trace) = tracer.latest()
+        {
             if self.step_traces.len() == self.options.trace_history_capacity {
                 self.step_traces.pop_front();
             }
@@ -7102,8 +7183,9 @@ impl ManualHostDriver for HostCore {
         };
         let presentation_changed = latest.revisions.control != self.revisions.control
             || !Arc::ptr_eq(&latest.scheduled_patches, &self.scheduled_patches)
-            || latest.revisions.config != self.revisions.config
-            || latest.config.closed != self.world.is_closed()
+            || (!self.has_incomplete_scientific_step()
+                && (latest.revisions.config != self.revisions.config
+                    || latest.config.closed != self.world.is_closed()))
             || latest.playback != self.playback
             || latest.lifecycle != self.lifecycle
             || latest.health != self.health
@@ -10164,6 +10246,304 @@ mod tests {
             // ubs:ignore[rust.ownership.panic-macro] — test helper requires real application.
             application => panic!("expected applied status, got {application:?}"),
         }
+    }
+
+    struct FailingSenseProvider {
+        malformed: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl scriptbots_core::sense_fixed::SenseProvider for FailingSenseProvider {
+        fn compute_accumulators(
+            &mut self,
+            _world: &WorldState,
+            _handles: &[scriptbots_core::AgentId],
+        ) -> Result<
+            Vec<scriptbots_core::sense_fixed::SenseAccum>,
+            scriptbots_core::sense_fixed::SenseProviderError,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.malformed {
+                Ok(Vec::new())
+            } else {
+                Err(scriptbots_core::sense_fixed::SenseProviderError::Execution(
+                    "injected sensing failure".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn sensing_failure_world() -> WorldState {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            rng_seed: Some(0x5e45_ef01),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            metabolism_drain: 0.0,
+            movement_drain: 0.0,
+            temperature_discomfort_rate: 0.0,
+            aging_health_decay_rate: 0.0,
+            aging_energy_penalty_rate: 0.0,
+            closed: false,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("bounded sensing fixture");
+        world
+            .try_spawn_agent(AgentData::default())
+            .expect("real founder");
+        world
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real owner journey verifies incomplete sensing, retained publication and ordered failed-shutdown evidence"
+    )]
+    fn sensing_fault_preserves_completed_publication_and_original_shutdown_diagnosis() {
+        for explicit_step in [false, true] {
+            for malformed in [false, true] {
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut configured = options(explicit_step);
+                configured.capture_agent_visuals = true;
+                configured.trace_history_capacity = 2;
+                configured.snapshot_interval_ticks = 4;
+                let mut core = HostCore::new(
+                    HostSessionId::new(0x5e45),
+                    sensing_failure_world(),
+                    configured,
+                )
+                .expect("actual owner");
+                let mut port = core.local_port();
+                core.drive(ManualInstant::from_nanos(0)).unwrap();
+                if explicit_step {
+                    submit(&mut port, 1, HostCommand::Step);
+                }
+                assert_eq!(
+                    core.drive(ManualInstant::from_nanos(10))
+                        .unwrap()
+                        .scientific_steps,
+                    1
+                );
+                core.drive(ManualInstant::from_nanos(10)).unwrap();
+                let previous = core.latest_snapshot();
+                let completed_tick = core.world_tick();
+                let completed_revision = core.revisions.scientific;
+                let events_before = core.events.published_total();
+                let traces_before = core.step_traces.clone();
+                assert_eq!(traces_before.len(), 1);
+                if !explicit_step {
+                    assert!(
+                        previous.world.tick < completed_tick.0,
+                        "exercise a publication older than the last complete tick"
+                    );
+                }
+                core.world
+                    .enqueue_intervention(scriptbots_core::Intervention::SetClosedWorld {
+                        closed: true,
+                    })
+                    .unwrap();
+                core.world.set_sense_provider(Box::new(FailingSenseProvider {
+                    malformed,
+                    calls: Arc::clone(&calls),
+                }));
+                if explicit_step {
+                    submit(&mut port, 2, HostCommand::Step);
+                }
+                let failed = core.drive(ManualInstant::from_nanos(20)).unwrap();
+                assert_eq!(failed.scientific_steps, 0);
+                assert_eq!(failed.events_published, 0);
+                assert_eq!(core.world_tick(), completed_tick);
+                assert_eq!(core.revisions.scientific, completed_revision);
+                assert_eq!(core.events.published_total(), events_before);
+                assert_eq!(core.step_traces, traces_before);
+                assert!(
+                    core.world.is_closed(),
+                    "the attempted transition really mutated state"
+                );
+                assert!(!previous.config.closed);
+                assert!(core.world.has_sense_provider());
+                if explicit_step {
+                    assert!(matches!(
+                        status(&mut port, 2).application(),
+                        ApplicationState::Failed(failure) if failure.code == "world_step"
+                    ));
+                }
+                let fault = core.health().clone();
+                assert!(matches!(
+                    &fault,
+                    HostHealth::Faulted(HostFault::Scientific { code, .. })
+                        if code == "world_step"
+                ));
+                let snapshot = core.latest_snapshot();
+                assert!(snapshot.revision > previous.revision);
+                assert_eq!(snapshot.world, previous.world);
+                assert_eq!(snapshot.revisions.scientific, previous.revisions.scientific);
+                assert_eq!(snapshot.revisions.config, previous.revisions.config);
+                assert_eq!(snapshot.completed_summary, previous.completed_summary);
+                assert_eq!(snapshot.health, fault);
+                assert!(snapshot.playback.paused);
+                assert!(Arc::ptr_eq(&snapshot.config, &previous.config));
+                assert!(Arc::ptr_eq(&snapshot.layers.food, &previous.layers.food));
+                assert!(Arc::ptr_eq(&snapshot.layers.terrain, &previous.layers.terrain));
+                assert!(Arc::ptr_eq(&snapshot.agent_visuals, &previous.agent_visuals));
+                assert!(Arc::ptr_eq(&snapshot.agent_selection, &previous.agent_selection));
+                assert!(Arc::ptr_eq(&snapshot.summary_history, &previous.summary_history));
+                assert!(Arc::ptr_eq(
+                    &snapshot.applied_interventions,
+                    &previous.applied_interventions
+                ));
+                assert!(Arc::ptr_eq(&snapshot.narrative_events, &previous.narrative_events));
+                assert!(Arc::ptr_eq(&snapshot.visual_events, &previous.visual_events));
+                assert_eq!(
+                    snapshot.build.newly_allocated_capacity_bytes,
+                    snapshot.world.agents.capacity() * size_of::<DynamicAgentSnapshot>()
+                );
+                assert_eq!(snapshot.build.bulk_allocations, 1);
+                assert!(core.capture_checkpoint_v1().is_err());
+                assert!(core.capture_host_checkpoint_v1().is_err());
+                assert!(core.scientific_digest_v1().is_err());
+                assert_eq!(
+                    core.drive(ManualInstant::from_nanos(21))
+                        .unwrap()
+                        .snapshots_published,
+                    0,
+                    "partial closure changes must not force repeated fault publications"
+                );
+                submit(
+                    &mut port,
+                    3,
+                    HostCommand::UpdateSelection(SelectionUpdate {
+                        mode: SelectionMode::Replace,
+                        agent_ids: vec![previous.world.agents[0].id],
+                        state: SelectionState::Selected,
+                    }),
+                );
+                core.drive(ManualInstant::from_nanos(22)).unwrap();
+                assert!(matches!(
+                    status(&mut port, 3).application(),
+                    ApplicationState::Failed(failure) if failure.code == "science_blocked"
+                ));
+                let shutdown = core.request_shutdown().unwrap();
+                core.drive(ManualInstant::from_nanos(23)).unwrap();
+                assert!(matches!(
+                    port.command_status(shutdown.command_id())
+                        .unwrap()
+                        .unwrap()
+                        .application(),
+                    ApplicationState::Failed(failure) if failure.code == "shutdown_finalization"
+                ));
+                assert_eq!(core.health(), &fault);
+                assert_eq!(core.latest_snapshot().health, fault);
+                assert_eq!(core.latest_snapshot().lifecycle, HostLifecycle::Stopping);
+                assert_eq!(core.latest_snapshot().world, previous.world);
+                core.drive(ManualInstant::from_nanos(24)).unwrap();
+                assert!(matches!(
+                    port.command_status(shutdown.command_id())
+                        .unwrap()
+                        .unwrap()
+                        .journal(),
+                    JournalState::CommittedVolatile
+                ));
+                assert!(core.inflight_journal.is_empty());
+                assert!(!core.persistence.has_pending_batch());
+                assert_eq!(core.drive_interest(), HostDriveInterest::Faulted);
+                assert_eq!(core.events.published_total(), events_before);
+                assert_eq!(core.step_traces, traces_before);
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn sensing_fault_refuses_live_inspections_at_the_previous_completed_tick() {
+        for malformed in [false, true] {
+            let mut core = HostCore::new(
+                HostSessionId::new(0x5e47),
+                sensing_failure_world(),
+                options(true),
+            )
+            .expect("actual inspector owner");
+            let mut port = core.local_port();
+            core.drive(ManualInstant::from_nanos(0)).unwrap();
+            submit(&mut port, 1, HostCommand::Step);
+            core.drive(ManualInstant::from_nanos(10)).unwrap();
+            core.drive(ManualInstant::from_nanos(10)).unwrap();
+            let completed = core.latest_snapshot();
+            let uid = completed.world.agents[0].uid;
+            let request = BrainProjectionRequest::focused(
+                ProjectionClientId::new(1),
+                ProjectionRequestRevision::new(1),
+                uid,
+            );
+            assert!(core.inspect_agent_basic(uid).unwrap().is_some());
+            assert!(core.inspect_agent(uid, 1).unwrap().is_some());
+            assert!(core.inspect_brains(&request).is_ok());
+            assert!(core.inspect_brain_activity(uid).is_ok());
+            assert!(core.inspect_genome_page(uid, 0, 0).is_ok());
+
+            core.world
+                .enqueue_intervention(scriptbots_core::Intervention::SetClosedWorld {
+                    closed: true,
+                })
+                .unwrap();
+            core.world.set_sense_provider(Box::new(FailingSenseProvider {
+                malformed,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }));
+            submit(&mut port, 2, HostCommand::Step);
+            core.drive(ManualInstant::from_nanos(20)).unwrap();
+            let fault = core.world.scientific_fault().cloned().unwrap();
+            assert_eq!(core.world_tick().0, completed.world.tick);
+            assert_eq!(core.revisions.scientific, completed.revisions.scientific);
+            assert!(core.with_world(WorldState::is_closed));
+            assert!(!completed.config.closed);
+
+            assert!(matches!(
+                core.inspect_agent_basic(uid),
+                Err(HostAccessError::ScientificState(error)) if error == fault
+            ));
+            assert!(matches!(
+                core.inspect_agent(uid, 1),
+                Err(HostAccessError::ScientificState(error)) if error == fault
+            ));
+            assert!(matches!(
+                core.inspect_agent_with_attribution(uid, Some(1), 0, false),
+                Err(HostAccessError::ScientificState(error)) if error == fault
+            ));
+            assert!(matches!(
+                core.inspect_brains(&request),
+                Err(BrainInspectionError::IncompleteScientificStep { detail })
+                    if detail == fault.to_string()
+            ));
+            assert!(matches!(
+                core.inspect_brain_activity(uid),
+                Err(HostAccessError::ScientificState(error)) if error == fault
+            ));
+            assert!(matches!(
+                core.inspect_genome_page(uid, 0, 0),
+                Err(HostAccessError::ScientificState(error)) if error == fault
+            ));
+        }
+    }
+
+    #[test]
+    fn host_construction_refuses_an_incomplete_sensing_transition() {
+        let mut world = sensing_failure_world();
+        world.set_sense_provider(Box::new(FailingSenseProvider {
+            malformed: false,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        assert!(world.step().is_err());
+        assert!(matches!(
+            HostCore::new(HostSessionId::new(0x5e46), world, options(true)),
+            Err(HostCoreBuildError::ScientificState(
+                ScientificStateError::SenseProvider { .. }
+            ))
+        ));
     }
 
     #[test]

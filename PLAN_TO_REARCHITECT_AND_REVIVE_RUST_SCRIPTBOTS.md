@@ -2,6 +2,33 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Sensing failure containment at the owner boundary (2026-11-24):**
+[Source implemented; execution validation pending — Codex;
+runtime repair of `bd-16g.15.2`'s error/no-fallback contract;
+`bd-16g.15.3` qualification and original complete acceptance retained]
+
+External sensing execution failures and accumulator-count mismatches now retain
+the backend and an exact typed scientific fault. The attempted transition stops
+before brain evaluation, actuation or tick completion, with no CPU fallback.
+Interventions, aging or food dynamics may already have changed state; this is an
+explicitly terminal partial transition, with no rollback or retry claim.
+
+The host retains its last completed published science payload and revisions,
+including when publication cadence predates the latest completed tick. Fault,
+control and lifecycle metadata still update. Partial state cannot become a new
+canonical digest, checkpoint, final persistence projection or completed inspector
+response. Interrupted traces stay out of completed history, and failed shutdown
+audit work drains without replacing the first scientific diagnosis. Construction
+from an already incomplete world is refused.
+
+Authored regressions cover execution/short/long responses, disabled and deferred
+persistence, unchanged brain calls and outputs, actual earlier-stage mutation,
+retained diagnosis, nonzero toroidal CPU parity, explicit and automatic host
+steps, sparse publication, bounded inspections and shutdown receipts. Independent
+source review is complete. The canonical DSR attempt failed with disk exhaustion
+before Cargo and the executor became unavailable; build, format, lint and test
+execution remain unverified. Hardware and runtime qualification gates stay open.
+
 **Delayed treatments in managed saved-world studies (2026-11-24):**
 [Currently In Progress — Codex; scoped contribution to `bd-2z0.12.2`;
 original complete acceptance retained]
