@@ -2,6 +2,30 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Ecologically effective terrain painting and exact continuation (2026-11-25):**
+[Source implemented and independently reviewed; execution validation pending —
+Codex; terrain-intervention repair and contribution to `bd-2z0.5.13`;
+original complete acceptance retained]
+
+Fertility painting now rebuilds capacity, growth, decay and nutrient density from
+the requested effective fertility. Only selected cells are replaced, so painting
+a separate region preserves earlier edits. Unrelated configuration changes retain
+those profiles; coefficient edits rebuild them using the retained fertility.
+Explicit changes to the four base fertility-formula inputs regenerate fertility
+from terrain. Default profile arithmetic and scientific digest bytes are retained.
+
+Science-only checkpoints refuse derived profiles that their payload cannot
+reconstruct. The existing full world companion retains those exact profiles,
+without a new codec or schema. Three authored regressions exercise actual food
+regrowth and coefficient/clamp values across four-lane and remainder cells,
+separate paints/config changes, raw-checkpoint refusal, serialized full-companion
+restoration and matching subsequent food values and scientific digests.
+
+Independent source reviews completed. The executor disconnected before candidate
+formatting, compiler, Clippy or test execution; the complete candidate was rebuilt
+and reviewed through GitHub. This does not qualify the full native owner/session
+checkpoint path, SIMD feature matrix or any original acceptance gate.
+
 **Saved-study bundle identity at publication and recovery (2026-11-25):**
 [Source implemented and independently reviewed; execution validation pending —
 Codex; corrective contribution to `bd-2z0.12.2` and `bd-2z0.19`;

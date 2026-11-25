@@ -5594,6 +5594,8 @@ pub enum Intervention {
         /// note on [`Intervention`]'s derive).
         terrain: TerrainKind,
         /// Additive fertility bias applied to the painted cells' recomputed profiles.
+        /// The resulting fertility controls capacity, growth, decay and nutrition. It survives
+        /// unrelated configuration updates; changing the fertility formula regenerates it.
         fertility_bias: Option<f32>,
     },
     /// Inject a cohort of new agents with a shared brain binding and seed-driven
@@ -22326,6 +22328,29 @@ impl From<&FoodCellProfile> for FoodCellProfileSnapshot {
 }
 
 impl FoodCellProfile {
+    /// Derive every food consumer's coefficients from the effective fertility. Painted
+    /// fertility is retained in this profile and in the full host checkpoint, so it must
+    /// control regrowth and nutrition as well as the value shown by the inspector.
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "preserve the established food-profile f32 operation order"
+    )]
+    fn from_fertility(config: &ScriptBotsConfig, fertility: f32) -> Self {
+        let capacity_factor =
+            (config.food_capacity_base + fertility * config.food_capacity_fertility)
+                .clamp(0.05, 1.0);
+        let growth_multiplier = (0.5 + fertility * config.food_growth_fertility).clamp(0.1, 5.0);
+        let decay_multiplier = (1.0 + (1.0 - fertility) * config.food_decay_infertility).max(0.0);
+        let nutrient_density = (0.3 + fertility * 0.7).clamp(0.0, 1.0);
+        Self {
+            capacity: config.food_max * capacity_factor,
+            growth_multiplier,
+            decay_multiplier,
+            fertility,
+            nutrient_density,
+        }
+    }
+
     // bd-tqpj: fixed-width casts and FP evaluation order pinned for determinism.
     #[allow(
         clippy::cast_precision_loss,
@@ -22346,11 +22371,6 @@ impl FoodCellProfile {
         let moisture_weight = config.food_moisture_weight;
         let elevation_weight = config.food_elevation_weight;
         let slope_weight = config.food_slope_weight;
-        let cap_base = config.food_capacity_base;
-        let cap_fertility = config.food_capacity_fertility;
-        let growth_scale = config.food_growth_fertility;
-        let decay_scale = config.food_decay_infertility;
-
         for y in 0..height {
             for x in 0..width {
                 let tile = terrain
@@ -22366,18 +22386,7 @@ impl FoodCellProfile {
                 let slope_term = slope * slope_weight;
                 let fertility_raw = base + kind_bonus + moisture_term - elevation_term - slope_term;
                 let fertility = fertility_raw.clamp(0.0, 1.0);
-                let capacity_factor = (cap_base + fertility * cap_fertility).clamp(0.05, 1.0);
-                let growth_multiplier = (0.5 + fertility * growth_scale).clamp(0.1, 5.0);
-                let decay_multiplier = (1.0 + (1.0 - fertility) * decay_scale).max(0.0);
-                let nutrient_density = (0.3 + fertility * 0.7).clamp(0.0, 1.0);
-
-                profiles.push(Self {
-                    capacity: config.food_max * capacity_factor,
-                    growth_multiplier,
-                    decay_multiplier,
-                    fertility,
-                    nutrient_density,
-                });
+                profiles.push(Self::from_fertility(config, fertility));
             }
         }
 
@@ -22429,6 +22438,26 @@ impl TickCadence {
     const fn reproduction_chance(&self) -> f32 {
         self.reproduction_chance
     }
+}
+
+/// Canonical derived-state lane shared with standalone checkpoint reconstruction guards.
+fn derived_transition_digest_v1(cadence: &TickCadence, profiles: &[FoodCellProfile]) -> String {
+    let mut encoder = CharacterizationEncoderV0::new_with_schema(
+        WORLD_DIGEST_V1_SCHEMA,
+        "derived-transition",
+    );
+    encoder.u32(cadence.aging_interval);
+    encoder.u32(cadence.reproduction_interval);
+    encoder.f32(cadence.reproduction_chance);
+    encoder.usize(profiles.len());
+    for profile in profiles {
+        encoder.f32(profile.capacity);
+        encoder.f32(profile.growth_multiplier);
+        encoder.f32(profile.decay_multiplier);
+        encoder.f32(profile.fertility);
+        encoder.f32(profile.nutrient_density);
+    }
+    encoder.finish()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -27292,24 +27321,26 @@ impl WorldState {
                             }
                         }
                     }
-                    // Recompute derived food profiles from the painted terrain, then apply
-                    // the caller's fertility bias to exactly the painted cells.
-                    self.food_profiles = FoodCellProfile::compute(&self.config, &self.terrain);
-                    if let Some(bias) = fertility_bias {
-                        let (width, height) = (self.terrain.width(), self.terrain.height());
-                        for ty in 0..height {
-                            for tx in 0..width {
-                                let (px, py) = (
-                                    (validated_world_unit_f32(tx) + 0.5) * cell_size,
-                                    (validated_world_unit_f32(ty) + 0.5) * cell_size,
-                                );
-                                if region.contains(px, py, world_width, world_height) {
-                                    let index = (ty as usize) * (width as usize) + (tx as usize);
-                                    if let Some(profile) = self.food_profiles.get_mut(index) {
-                                        profile.fertility =
-                                            (profile.fertility + bias).clamp(0.0, 1.0);
-                                    }
+                    // Painting changes the selected cells only. Replacing every profile here
+                    // would erase earlier fertility edits elsewhere in the world. Derive all
+                    // ecological coefficients after the bias, not just the displayed score.
+                    let painted_profiles = FoodCellProfile::compute(&self.config, &self.terrain);
+                    for ty in 0..height {
+                        for tx in 0..width {
+                            let (px, py) = (
+                                (validated_world_unit_f32(tx) + 0.5) * cell_size,
+                                (validated_world_unit_f32(ty) + 0.5) * cell_size,
+                            );
+                            if region.contains(px, py, world_width, world_height) {
+                                let index = (ty as usize) * (width as usize) + (tx as usize);
+                                let mut profile = painted_profiles[index];
+                                if let Some(bias) = fertility_bias {
+                                    profile = FoodCellProfile::from_fertility(
+                                        &self.config,
+                                        (profile.fertility + bias).clamp(0.0, 1.0),
+                                    );
                                 }
+                                self.food_profiles[index] = profile;
                             }
                         }
                     }
@@ -32116,22 +32147,8 @@ impl WorldState {
         effects_encoder.postcard("active effects", &self.active_effects)?;
         let effects = effects_encoder.finish();
 
-        let mut derived_encoder = CharacterizationEncoderV0::new_with_schema(
-            WORLD_DIGEST_V1_SCHEMA,
-            "derived-transition",
-        );
-        derived_encoder.u32(self.cadence.aging_interval);
-        derived_encoder.u32(self.cadence.reproduction_interval);
-        derived_encoder.f32(self.cadence.reproduction_chance);
-        derived_encoder.usize(self.food_profiles.len());
-        for profile in &self.food_profiles {
-            derived_encoder.f32(profile.capacity);
-            derived_encoder.f32(profile.growth_multiplier);
-            derived_encoder.f32(profile.decay_multiplier);
-            derived_encoder.f32(profile.fertility);
-            derived_encoder.f32(profile.nutrient_density);
-        }
-        let derived_transition = derived_encoder.finish();
+        let derived_transition =
+            derived_transition_digest_v1(&self.cadence, &self.food_profiles);
 
         let mut origins_encoder =
             CharacterizationEncoderV0::new_with_schema(WORLD_DIGEST_V1_SCHEMA, "origins");
@@ -32557,7 +32574,47 @@ impl WorldState {
             ));
         }
 
-        let food_profiles = FoodCellProfile::compute(&new_config, &self.terrain);
+        // The profile owns effective fertility, including explicit per-cell paint. Ordinary
+        // controls and changes to capacity/growth/decay coefficients must not erase it. A
+        // deliberate change to the fertility formula itself regenerates fertility from terrain.
+        let fertility_formula_changed =
+            new_config.food_fertility_base != self.config.food_fertility_base
+                || new_config.food_moisture_weight != self.config.food_moisture_weight
+                || new_config.food_elevation_weight != self.config.food_elevation_weight
+                || new_config.food_slope_weight != self.config.food_slope_weight;
+        let capacity_changed = new_config.food_max != self.config.food_max
+            || new_config.food_capacity_base != self.config.food_capacity_base
+            || new_config.food_capacity_fertility != self.config.food_capacity_fertility;
+        let growth_changed = new_config.food_growth_fertility != self.config.food_growth_fertility;
+        let decay_changed = new_config.food_decay_infertility != self.config.food_decay_infertility;
+        let food_profiles = if fertility_formula_changed {
+            FoodCellProfile::compute(&new_config, &self.terrain)
+        } else {
+            self.food_profiles
+                .iter()
+                .map(|profile| {
+                    let derived = FoodCellProfile::from_fertility(&new_config, profile.fertility);
+                    FoodCellProfile {
+                        capacity: if capacity_changed {
+                            derived.capacity
+                        } else {
+                            profile.capacity
+                        },
+                        growth_multiplier: if growth_changed {
+                            derived.growth_multiplier
+                        } else {
+                            profile.growth_multiplier
+                        },
+                        decay_multiplier: if decay_changed {
+                            derived.decay_multiplier
+                        } else {
+                            profile.decay_multiplier
+                        },
+                        ..*profile
+                    }
+                })
+                .collect()
+        };
         let scratch_len = (food_w as usize) * (food_h as usize);
         if self.food_scratch.len() != scratch_len {
             self.food_scratch.resize(scratch_len, 0.0);
@@ -39943,6 +40000,238 @@ mod tests {
             "the fertility bias must lift the painted cell's profile, got {fertility_inside}"
         );
         let _ = before_inside;
+    }
+
+    fn fertility_paint_world() -> WorldState {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 100,
+            world_height: 20,
+            food_cell_size: 20,
+            rng_seed: Some(0xf317_1179),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            initial_food: 0.0,
+            food_max: 8.0,
+            food_growth_rate: 0.125,
+            food_decay_rate: 0.0,
+            food_diffusion_rate: 0.0,
+            food_respawn_interval: 0,
+            food_fertility_base: 0.3,
+            food_moisture_weight: 0.0,
+            food_elevation_weight: 0.0,
+            food_slope_weight: 0.0,
+            food_capacity_base: 0.25,
+            food_capacity_fertility: 0.5,
+            food_growth_fertility: 2.0,
+            food_decay_infertility: 1.0,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("fertility world");
+        world
+            .enqueue_intervention(Intervention::PaintTerrain {
+                region: Region::All,
+                terrain: TerrainKind::Grass,
+                fertility_bias: None,
+            })
+            .unwrap();
+        world.step().unwrap();
+        world.try_update_food(|cells| cells.fill(0.0)).unwrap();
+        world
+    }
+
+    #[test]
+    fn fertility_paint_changes_real_regrowth_and_food_coefficients() {
+        // Four painted columns exercise a SIMD chunk; the unpainted fifth column exercises
+        // its remainder. The scalar build consumes the same independently calculated values.
+        for (bias, fertility, capacity, growth, decay, nutrient) in [
+            (0.25, 0.75, 5.0, 2.0, 1.25, 0.825),
+            (1.0, 1.0, 6.0, 2.5, 1.0, 1.0),
+            (-1.0, 0.0, 2.0, 0.5, 2.0, 0.3),
+        ] {
+            let mut world = fertility_paint_world();
+            world
+                .enqueue_intervention(Intervention::PaintTerrain {
+                    region: Region::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 80.0,
+                        h: 20.0,
+                    },
+                    terrain: TerrainKind::Grass,
+                    fertility_bias: Some(bias),
+                })
+                .unwrap();
+            world.step().unwrap();
+            for x in 0..4 {
+                let profile = world.food_profile(x, 0).unwrap();
+                assert_eq!(profile.fertility, fertility);
+                assert_eq!(profile.capacity, capacity);
+                assert_eq!(profile.growth_multiplier, growth);
+                assert_eq!(profile.decay_multiplier, decay);
+                assert!((profile.nutrient_density - nutrient).abs() < 1e-6);
+                assert_eq!(
+                    world.food().get(x, 0),
+                    Some(growth),
+                    "growth from zero is 8 * 0.125 times the effective multiplier"
+                );
+            }
+            assert_eq!(world.food().get(4, 0), Some(1.5));
+            assert_eq!(world.food_profile(4, 0).unwrap().fertility, 0.5);
+        }
+    }
+
+    #[test]
+    fn fertility_paint_survives_other_regions_and_unrelated_configuration() {
+        let mut world = fertility_paint_world();
+        world
+            .enqueue_intervention(Intervention::PaintTerrain {
+                region: Region::Disc {
+                    x: 10.0,
+                    y: 10.0,
+                    radius: 5.0,
+                },
+                terrain: TerrainKind::Grass,
+                fertility_bias: Some(0.25),
+            })
+            .unwrap();
+        world.step().unwrap();
+        let first_profile = serde_json::to_value(world.food_profiles[0]).unwrap();
+        world.try_update_food(|cells| cells.fill(0.0)).unwrap();
+        world
+            .enqueue_intervention(Intervention::PaintTerrain {
+                region: Region::Disc {
+                    x: 90.0,
+                    y: 10.0,
+                    radius: 5.0,
+                },
+                terrain: TerrainKind::Grass,
+                fertility_bias: Some(-0.25),
+            })
+            .unwrap();
+        world.step().unwrap();
+        assert_eq!(
+            serde_json::to_value(world.food_profiles[0]).unwrap(),
+            first_profile,
+            "painting another region must preserve every prior ecological coefficient"
+        );
+        assert_eq!(world.food().get(0, 0), Some(2.0));
+        assert_eq!(world.food().get(4, 0), Some(1.0));
+        let profiles = serde_json::to_value(&world.food_profiles).unwrap();
+        let mut config = world.config().clone();
+        config.history_capacity += 1;
+        config.food_growth_rate = 0.0625;
+        world.apply_config_update(config.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&world.food_profiles).unwrap(), profiles);
+
+        config.food_max = 16.0;
+        config.food_growth_fertility = 4.0;
+        config.food_decay_infertility = 2.0;
+        world.apply_config_update(config.clone()).unwrap();
+        let retained = world.food_profile(0, 0).unwrap();
+        assert_eq!(retained.fertility, 0.75);
+        assert_eq!(retained.capacity, 10.0);
+        assert_eq!(retained.growth_multiplier, 3.5);
+        assert_eq!(retained.decay_multiplier, 1.5);
+        assert!((retained.nutrient_density - 0.825).abs() < 1e-6);
+        assert_eq!(world.food_profile(4, 0).unwrap().fertility, 0.25);
+
+        // Changing the fertility formula is the explicit regeneration operation. It replaces
+        // both painted adjustments with the new terrain-derived value (0.55 + Grass 0.2).
+        config.food_fertility_base = 0.55;
+        world.apply_config_update(config).unwrap();
+        for x in 0..5 {
+            assert_eq!(world.food_profile(x, 0).unwrap().fertility, 0.75);
+        }
+    }
+
+    #[test]
+    fn fertility_paint_requires_full_checkpoint_and_continues_after_round_trip() {
+        let mut original = fertility_paint_world();
+        let plain = original.checkpoint_v1().expect("ordinary standalone capture");
+        let restored_plain =
+            WorldState::restore_checkpoint_v1(&plain, BrainRegistry::default()).unwrap();
+        assert_eq!(
+            restored_plain.world_digest_v1().unwrap(),
+            original.world_digest_v1().unwrap()
+        );
+
+        original
+            .enqueue_intervention(Intervention::PaintTerrain {
+                region: Region::Disc {
+                    x: 10.0,
+                    y: 10.0,
+                    radius: 5.0,
+                },
+                terrain: TerrainKind::Grass,
+                fertility_bias: Some(0.25),
+            })
+            .unwrap();
+        original.step().unwrap();
+        let before = original.world_digest_v1().unwrap();
+        for result in [
+            original.checkpoint_v1(),
+            original.capture_checkpoint_quiescent(),
+        ] {
+            assert!(matches!(
+                result,
+                Err(WorldCheckpointError::RequiresHostContinuity {
+                    feature: "derived transition state"
+                })
+            ));
+        }
+        assert_eq!(original.world_digest_v1().unwrap(), before);
+        let (science, companion) = original.capture_host_checkpoint_parts_v1().unwrap();
+        let science = WorldCheckpointV1::decode(&science.encode().unwrap()).unwrap();
+        assert!(matches!(
+            science.validate_standalone_restore(),
+            Err(WorldCheckpointError::RequiresHostContinuity {
+                feature: "derived transition state"
+            })
+        ));
+        assert!(matches!(
+            WorldState::restore_checkpoint_v1(&science, BrainRegistry::default()),
+            Err(WorldCheckpointError::RequiresHostContinuity {
+                feature: "derived transition state"
+            })
+        ));
+        let companion: WorldHostCheckpointV1 =
+            serde_json::from_slice(&serde_json::to_vec(&companion).unwrap()).unwrap();
+        let mut restored = WorldState::restore_host_checkpoint_v1(
+            &science,
+            &companion,
+            BrainRegistry::default(),
+        )
+        .unwrap();
+        assert_eq!(restored.world_digest_v1().unwrap(), before);
+
+        let mut config = original.config().clone();
+        config.history_capacity += 1;
+        for world in [&mut original, &mut restored] {
+            world.apply_config_update(config.clone()).unwrap();
+            world
+                .enqueue_intervention(Intervention::PaintTerrain {
+                    region: Region::Disc {
+                        x: 90.0,
+                        y: 10.0,
+                        radius: 5.0,
+                    },
+                    terrain: TerrainKind::Grass,
+                    fertility_bias: Some(-0.25),
+                })
+                .unwrap();
+        }
+        for _ in 0..4 {
+            original.step().unwrap();
+            restored.step().unwrap();
+            assert_eq!(
+                original.world_digest_v1().unwrap(),
+                restored.world_digest_v1().unwrap()
+            );
+            assert_eq!(original.food().cells(), restored.food().cells());
+            assert_eq!(original.food_profile(0, 0).unwrap().fertility, 0.75);
+            assert_eq!(restored.food_profile(0, 0).unwrap().fertility, 0.75);
+        }
     }
 
     #[test]

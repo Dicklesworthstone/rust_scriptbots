@@ -1305,7 +1305,21 @@ impl WorldCheckpointV1 {
             &self.state.config,
             self.state.map_metadata.is_some(),
             false,
-        )
+        )?;
+        // Painting can retain effective fertility that cannot be reconstructed from the
+        // terrain and configuration alone. The full host companion carries those profiles;
+        // a standalone component must refuse before it advertises a restorable artifact.
+        let terrain = self.state.terrain.restore()?;
+        let profiles = FoodCellProfile::compute(&self.state.config, &terrain);
+        let cadence = TickCadence::from_config(&self.state.config);
+        if crate::derived_transition_digest_v1(&cadence, &profiles)
+            != self.state.source_digest.derived_transition
+        {
+            return Err(WorldCheckpointError::RequiresHostContinuity {
+                feature: "derived transition state",
+            });
+        }
+        Ok(())
     }
 
     /// Complete data-only registry recipe the host must reproduce before restoration.
@@ -1770,7 +1784,9 @@ impl WorldState {
             self.map_metadata.is_some() || self.temperature.is_some(),
             self.archive.is_some() || !self.agent_stats.is_empty() || self.novelty_state.is_some(),
         )?;
-        self.capture_checkpoint_inner(self.config.clone())
+        let checkpoint = self.capture_checkpoint_inner(self.config.clone())?;
+        checkpoint.validate_standalone_restore()?;
+        Ok(checkpoint)
     }
 
     /// Capture the science component and required host continuity at one quiescent boundary.
@@ -1801,7 +1817,9 @@ impl WorldState {
             self.map_metadata.is_some() || self.temperature.is_some(),
             self.archive.is_some() || !self.agent_stats.is_empty() || self.novelty_state.is_some(),
         )?;
-        self.capture_checkpoint_component_quiescent()
+        let checkpoint = self.capture_checkpoint_component_quiescent()?;
+        checkpoint.validate_standalone_restore()?;
+        Ok(checkpoint)
     }
 
     fn capture_checkpoint_component_quiescent(
