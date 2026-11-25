@@ -4600,6 +4600,22 @@ pub enum NarrativeInputStreamError {
         /// Run named by the cursor.
         actual: RunId,
     },
+    /// An explicit island selection has no unique, valid construction record.
+    #[error("narrative input island {island:?} is unavailable: {reason}")]
+    IslandUnavailable {
+        /// Requested island.
+        island: IslandId,
+        /// Missing or inconsistent construction evidence.
+        reason: String,
+    },
+    /// The cursor belongs to another island or another construction record.
+    #[error("narrative cursor does not match island {island:?} at tick {tick}")]
+    CursorIslandMismatch {
+        /// Explicitly selected island.
+        island: IslandId,
+        /// Cursor tick.
+        tick: u64,
+    },
     /// The cursor's configuration digest disagrees with the selected run.
     #[error("narrative cursor config digest does not match the selected run at tick {tick}")]
     CursorConfigDigestMismatch {
@@ -4746,6 +4762,46 @@ pub struct NarrativeInputPageV1 {
     pub inputs: Vec<NarrativeInputRecordV1>,
     /// Exclusive cursor for the next page, if another page remains.
     pub next_after: Option<NarrativeInputCursorV1>,
+}
+
+/// Complete detector-input provenance for one explicitly selected archipelago island.
+///
+/// The inner binding retains the enclosing run's manifest/configuration identity. The
+/// separate island digest binds the exact effective construction configuration; it must
+/// never be substituted for the enclosing run's configuration digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IslandNarrativeInputBindingV1 {
+    /// Explicitly selected island, including island zero in an archipelago.
+    pub island_id: IslandId,
+    /// Original FNV-1a64 construction hash, checked against canonical configuration bytes.
+    pub island_config_hash: u64,
+    /// BLAKE3 of the canonical effective island configuration.
+    pub island_config_digest: String,
+    /// Run provenance, detector contract, and this island's complete tick boundary.
+    pub stream: NarrativeInputBindingV1,
+}
+
+/// Forward-page token bound to one run, island, construction configuration and input row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IslandNarrativeInputCursorV1 {
+    /// Complete immutable source binding.
+    pub binding: IslandNarrativeInputBindingV1,
+    /// Exact row and policy at the last delivered tick.
+    pub input: NarrativeInputCursorV1,
+}
+
+/// One bounded page from a selected island's complete detector-input stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IslandNarrativeInputPageV1 {
+    /// Validated selected-island provenance and continuity.
+    pub binding: IslandNarrativeInputBindingV1,
+    /// Complete, consecutive input records in ascending tick order.
+    pub inputs: Vec<NarrativeInputRecordV1>,
+    /// Exclusive cursor, absent only when this island's complete stream is exhausted.
+    pub next_after: Option<IslandNarrativeInputCursorV1>,
 }
 
 /// Storage error wrapper.
@@ -5856,11 +5912,17 @@ impl RunEventIdentity {
     /// Build the identity for a record from a single-world (island zero) run.
     #[must_use]
     pub fn from_record(record: &EventRecord) -> Self {
+        Self::from_island_record(record, IslandId(0))
+    }
+
+    /// Build the identity for a record emitted by one explicitly identified island.
+    #[must_use]
+    pub fn from_island_record(record: &EventRecord, island: IslandId) -> Self {
         Self {
             tick: record.tick,
             kind: record.kind,
             metric: record.metric.clone(),
-            island: IslandId(0),
+            island,
         }
     }
 
@@ -11025,6 +11087,72 @@ pub struct StorageReader {
     _finished_run_lease: Option<FinishedRunReaderLease>,
 }
 
+/// Borrowed, explicitly island-scoped detector-input reader over one finished run.
+///
+/// Construction validates the selected island's retained configuration. The first page
+/// validates its complete stream and caches that immutable binding; later pages retain
+/// bounded result allocation without rescanning the whole history. Other islands are
+/// never merged into this stream. Database execution time remains unbounded.
+pub struct FinishedIslandNarrativeInputs<'reader> {
+    reader: &'reader StorageReader,
+    island_id: IslandId,
+    island_config_hash: u64,
+    island_config_digest: String,
+    binding: OnceLock<NarrativeInputBindingV1>,
+}
+
+impl FinishedIslandNarrativeInputs<'_> {
+    /// Read the next bounded page, refusing cursors from another island or source cut.
+    pub fn page_v1(
+        &self,
+        after: Option<&IslandNarrativeInputCursorV1>,
+        record_limit: usize,
+        required_complete_history: u64,
+    ) -> Result<IslandNarrativeInputPageV1, StorageError> {
+        if record_limit == 0 || record_limit > MAX_STORAGE_QUERY_PAGE {
+            return Err(NarrativeInputStreamError::InvalidPageSize {
+                limit: record_limit,
+                max: MAX_STORAGE_QUERY_PAGE,
+            }
+            .into());
+        }
+        let stream = self.reader.narrative_input_binding_for_scope(
+            required_complete_history,
+            Some(self.island_id),
+            &self.binding,
+        )?;
+        let binding = IslandNarrativeInputBindingV1 {
+            island_id: self.island_id,
+            island_config_hash: self.island_config_hash,
+            island_config_digest: self.island_config_digest.clone(),
+            stream,
+        };
+        if let Some(cursor) = after
+            && cursor.binding != binding
+        {
+            return Err(NarrativeInputStreamError::CursorIslandMismatch {
+                island: self.island_id,
+                tick: cursor.input.tick,
+            }
+            .into());
+        }
+        let page = self.reader.narrative_input_page_for_scope(
+            after.map(|cursor| &cursor.input),
+            record_limit,
+            binding.stream.clone(),
+            Some(self.island_id),
+        )?;
+        Ok(IslandNarrativeInputPageV1 {
+            next_after: page.next_after.map(|input| IslandNarrativeInputCursorV1 {
+                binding: binding.clone(),
+                input,
+            }),
+            binding,
+            inputs: page.inputs,
+        })
+    }
+}
+
 /// A run-scoped endpoint view borrowing one finished reader's connection and file lease.
 ///
 /// Select it with [`StorageReader::select_finished_run`]. Several views can inspect different
@@ -13066,23 +13194,98 @@ impl StorageReader {
         Ok(events)
     }
 
+    /// Select one configured island's complete narrative inputs without reopening the file.
+    ///
+    /// The selection requires the finished-run lease and an exact retained construction
+    /// record. Missing metadata, malformed configurations and hash disagreements refuse;
+    /// an arbitrary island number never aliases the single-world stream.
+    pub fn island_narrative_inputs(
+        &self,
+        island: IslandId,
+    ) -> Result<FinishedIslandNarrativeInputs<'_>, StorageError> {
+        if self._finished_run_lease.is_none() {
+            return Err(NarrativeInputStreamError::FinishedReaderRequired.into());
+        }
+        let unavailable = |reason: String| {
+            StorageError::NarrativeInputStream(NarrativeInputStreamError::IslandUnavailable {
+                island,
+                reason,
+            })
+        };
+        let rows = self.finished_connection()?.query_with_params(
+            "SELECT config_hash, config_json FROM islands
+             WHERE run_id = ?1 AND island_id = ?2 LIMIT 2",
+            &[sqlite_run_id(self.run_id), i64::from(island.0).into()],
+        )?;
+        let [row] = rows.as_slice() else {
+            return Err(unavailable("expected one retained construction record".to_owned()));
+        };
+        let hash_bytes: Vec<u8> = decode(row, 0, "islands.config_hash")?;
+        let hash_bytes: [u8; 8] = hash_bytes.try_into().map_err(|_| {
+            unavailable("construction hash must contain exactly eight bytes".to_owned())
+        })?;
+        let island_config_hash = u64::from_be_bytes(hash_bytes);
+        let config_json: String = decode(row, 1, "islands.config_json")?;
+        let config: scriptbots_core::ScriptBotsConfig =
+            serde_json::from_str(&config_json).map_err(|error| unavailable(error.to_string()))?;
+        config.validate().map_err(|error| unavailable(error.to_string()))?;
+        let canonical =
+            serde_json::to_vec(&config).map_err(|error| unavailable(error.to_string()))?;
+        // The archipelago construction record uses this pinned FNV-1a64 byte walk.
+        let actual_hash = canonical.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        if actual_hash != island_config_hash || canonical != config_json.as_bytes() {
+            return Err(unavailable(
+                "effective configuration is noncanonical or disagrees with its construction hash"
+                    .to_owned(),
+            ));
+        }
+        Ok(FinishedIslandNarrativeInputs {
+            reader: self,
+            island_id: island,
+            island_config_hash,
+            island_config_digest: blake3::hash(&canonical).to_hex().to_string(),
+            binding: OnceLock::new(),
+        })
+    }
+
     fn narrative_input_binding_v1(
         &self,
         required_complete_history: u64,
     ) -> Result<NarrativeInputBindingV1, StorageError> {
+        self.narrative_input_binding_for_scope(
+            required_complete_history,
+            None,
+            &self.narrative_input_binding_v1,
+        )
+    }
+
+    fn narrative_input_binding_for_scope(
+        &self,
+        required_complete_history: u64,
+        island: Option<IslandId>,
+        cache: &OnceLock<NarrativeInputBindingV1>,
+    ) -> Result<NarrativeInputBindingV1, StorageError> {
         if self._finished_run_lease.is_none() {
             return Err(NarrativeInputStreamError::FinishedReaderRequired.into());
         }
-        if let Some(binding) = self.narrative_input_binding_v1.get() {
+        if let Some(binding) = cache.get() {
             Self::require_narrative_history(binding, required_complete_history)?;
             return Ok(binding.clone());
         }
         let connection = self.finished_connection()?;
         Storage::validate_narrative_input_reserved_identities(connection, self.run_id)?;
-        let terminal_row = connection.query_row_with_params(
-            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
-            &[sqlite_run_id(self.run_id)],
-        )?;
+        let terminal_row = match island {
+            Some(island) => connection.query_row_with_params(
+                "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1 AND island_id = ?2",
+                &[sqlite_run_id(self.run_id), i64::from(island.0).into()],
+            )?,
+            None => connection.query_row_with_params(
+                "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
+                &[sqlite_run_id(self.run_id)],
+            )?,
+        };
         let terminal_tick =
             decode::<Option<i64>>(&terminal_row, 0, "narrative_input.tick_summaries.max_tick")?
                 .map(|tick| checked_u64("narrative_input.tick_summaries.max_tick", tick))
@@ -13107,14 +13310,21 @@ impl StorageReader {
         let mut first_contract = None;
         let mut minimum_history_capacity = u64::MAX;
         loop {
+            let mut parameters = vec![
+                sqlite_run_id(self.run_id),
+                NARRATIVE_INPUT_EVENT_TYPE.into(),
+                encode_u64("narrative_input.coverage.after_tick", after_tick)?.into(),
+                page_limit.into(),
+            ];
+            let query = if let Some(island) = island {
+                parameters.push(i64::from(island.0).into());
+                NARRATIVE_INPUT_SELECT_AFTER_FOR_ISLAND
+            } else {
+                NARRATIVE_INPUT_SELECT_AFTER
+            };
             let rows = connection.query_with_params(
-                NARRATIVE_INPUT_SELECT_AFTER,
-                &[
-                    sqlite_run_id(self.run_id),
-                    NARRATIVE_INPUT_EVENT_TYPE.into(),
-                    encode_u64("narrative_input.coverage.after_tick", after_tick)?.into(),
-                    page_limit.into(),
-                ],
+                query,
+                &parameters,
             )?;
             if rows.is_empty() {
                 break;
@@ -13122,12 +13332,13 @@ impl StorageReader {
             for row in &rows {
                 let replay_row = replay_event_row_from_query_row(row)?;
                 let row_tick = checked_u64("narrative_input.tick", replay_row.tick)?;
-                if replay_row.island_id != 0 {
+                let expected_island = island.map_or(0, |selected| i64::from(selected.0));
+                if replay_row.island_id != expected_island {
                     return Err(NarrativeInputStreamError::InvalidRecord {
                         tick: row_tick,
                         reason: format!(
-                            "single-world narrative input stream requires island 0, found island {}",
-                            replay_row.island_id
+                            "narrative input stream requires island {expected_island}, found island {}",
+                            replay_row.island_id,
                         ),
                     }
                     .into());
@@ -13246,7 +13457,7 @@ impl StorageReader {
             terminal_tick,
             input_count: count,
         };
-        let _ = self.narrative_input_binding_v1.set(binding.clone());
+        let _ = cache.set(binding.clone());
         Self::require_narrative_history(&binding, required_complete_history)?;
         Ok(binding)
     }
@@ -13278,10 +13489,6 @@ impl StorageReader {
     /// history requirement. That binding is cached for the immutable reader lease, so later pages
     /// perform only their bounded row query. A cursor must name an exact retained row and repeat
     /// the selected run's configuration and build/manifest bindings.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the public scientific page boundary validates global continuity, provenance-bound cursor identity, and every returned typed record"
-    )]
     pub fn narrative_input_page_v1(
         &self,
         after: Option<&NarrativeInputCursorV1>,
@@ -13295,8 +13502,22 @@ impl StorageReader {
             }
             .into());
         }
-        let query_limit = checked_query_limit("narrative_input.record_limit", record_limit)?;
         let binding = self.narrative_input_binding_v1(required_complete_history)?;
+        self.narrative_input_page_for_scope(after, record_limit, binding, None)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "shared single-world and island page validation keeps provenance-bound cursor checks and exact input decoding in one boundary"
+    )]
+    fn narrative_input_page_for_scope(
+        &self,
+        after: Option<&NarrativeInputCursorV1>,
+        record_limit: usize,
+        binding: NarrativeInputBindingV1,
+        island: Option<IslandId>,
+    ) -> Result<NarrativeInputPageV1, StorageError> {
+        let query_limit = checked_query_limit("narrative_input.record_limit", record_limit)?;
         let after_tick = match after {
             None => 0,
             Some(cursor) => {
@@ -13329,22 +13550,31 @@ impl StorageReader {
                     }
                     .into());
                 }
-                let rows = self.finished_connection()?.query_with_params(
-                    NARRATIVE_INPUT_SELECT_EXACT,
-                    &[
-                        sqlite_run_id(self.run_id),
-                        NARRATIVE_INPUT_EVENT_TYPE.into(),
-                        encode_u64("narrative_input.cursor.tick", cursor.tick)?.into(),
-                        encode_u64("narrative_input.cursor.seq", NARRATIVE_INPUT_REPLAY_SEQ)?
-                            .into(),
-                    ],
-                )?;
+                let mut parameters = vec![
+                    sqlite_run_id(self.run_id),
+                    NARRATIVE_INPUT_EVENT_TYPE.into(),
+                    encode_u64("narrative_input.cursor.tick", cursor.tick)?.into(),
+                    encode_u64("narrative_input.cursor.seq", NARRATIVE_INPUT_REPLAY_SEQ)?.into(),
+                ];
+                let query = if let Some(island) = island {
+                    parameters.push(i64::from(island.0).into());
+                    NARRATIVE_INPUT_SELECT_EXACT_FOR_ISLAND
+                } else {
+                    NARRATIVE_INPUT_SELECT_EXACT
+                };
+                let rows = self.finished_connection()?.query_with_params(query, &parameters)?;
                 let [row] = rows.as_slice() else {
                     return Err(
                         NarrativeInputStreamError::CursorNotFound { tick: cursor.tick }.into(),
                     );
                 };
                 let replay_row = replay_event_row_from_query_row(row)?;
+                if replay_row.island_id != island.map_or(0, |selected| i64::from(selected.0)) {
+                    return Err(NarrativeInputStreamError::CursorContractMismatch {
+                        tick: cursor.tick,
+                    }
+                    .into());
+                }
                 let event = replay_event_from_row(&replay_row)?;
                 let ReplayEventKind::NarrativeInputV1 { record } = event.kind else {
                     return Err(
@@ -13366,19 +13596,30 @@ impl StorageReader {
             }
         };
 
-        let rows = self.finished_connection()?.query_with_params(
-            NARRATIVE_INPUT_SELECT_AFTER,
-            &[
-                sqlite_run_id(self.run_id),
-                NARRATIVE_INPUT_EVENT_TYPE.into(),
-                encode_u64("narrative_input.after_tick", after_tick)?.into(),
-                query_limit.into(),
-            ],
-        )?;
+        let mut parameters = vec![
+            sqlite_run_id(self.run_id),
+            NARRATIVE_INPUT_EVENT_TYPE.into(),
+            encode_u64("narrative_input.after_tick", after_tick)?.into(),
+            query_limit.into(),
+        ];
+        let query = if let Some(island) = island {
+            parameters.push(i64::from(island.0).into());
+            NARRATIVE_INPUT_SELECT_AFTER_FOR_ISLAND
+        } else {
+            NARRATIVE_INPUT_SELECT_AFTER
+        };
+        let rows = self.finished_connection()?.query_with_params(query, &parameters)?;
         let mut inputs = Vec::with_capacity(rows.len());
         let mut previous = after_tick;
         for row in &rows {
             let replay_row = replay_event_row_from_query_row(row)?;
+            if replay_row.island_id != island.map_or(0, |selected| i64::from(selected.0)) {
+                return Err(NarrativeInputStreamError::InvalidRecord {
+                    tick: checked_u64("narrative_input.tick", replay_row.tick)?,
+                    reason: "row does not belong to the selected island".to_owned(),
+                }
+                .into());
+            }
             let event = replay_event_from_row(&replay_row)?;
             let ReplayEventKind::NarrativeInputV1 { record } = event.kind else {
                 unreachable!("narrative query decoded to another replay variant");
@@ -29517,6 +29758,14 @@ const NARRATIVE_INPUT_SELECT_EXACT: &str = concat!(
      LIMIT 2"
 );
 
+const NARRATIVE_INPUT_SELECT_EXACT_FOR_ISLAND: &str = concat!(
+    "SELECT ",
+    replay_event_columns!(),
+    " FROM replay_events
+     WHERE run_id = ?1 AND event_type = ?2 AND tick = ?3 AND seq = ?4 AND island_id = ?5
+     LIMIT 2"
+);
+
 const NARRATIVE_INPUT_SELECT_LAST: &str = concat!(
     "SELECT ",
     replay_event_columns!(),
@@ -42151,6 +42400,206 @@ mod tests {
                 ..
             }))
         ));
+        reader.close()?;
+        Ok(())
+    }
+
+    fn narrative_island_page_fixture() -> Result<String, Box<dyn std::error::Error>> {
+        use scriptbots_runtime::{Archipelago, ArchipelagoConfig, IslandSpec, Topology};
+
+        let path = temp_db_path("storage-selected-island-narrative");
+        let path = path.to_str().ok_or("UTF-8 fixture path")?.to_owned();
+        let config = ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            closed: true,
+            persistence_interval: 1,
+            narrative_interval: 3,
+            narrative_capacity: 32,
+            history_capacity: 8,
+            ..ScriptBotsConfig::default()
+        };
+        let archipelago = Archipelago::new(ArchipelagoConfig {
+            islands: vec![
+                IslandSpec::new(IslandId(0), "short", config.clone()),
+                IslandSpec::new(IslandId(7), "long", config),
+            ],
+            topology: Topology::Ring,
+            barrier_interval: std::num::NonZeroU64::MIN,
+            master_seed: 0x16_29_07,
+            host_options: HostCoreOptions::default(),
+            migration: None,
+        })?;
+        let mut storage = Storage::create_unattributed_file(&path)?;
+        storage.persist_islands(&archipelago.islands().cloned().collect::<Vec<_>>())?;
+        // Deliberately different terminal cuts prove that an island reader does not use
+        // the run-wide MAX(tick). Every stored input comes from the production batch codec.
+        for tick in 1..=7 {
+            let short = sample_narrative_batch(tick, 1.0, 0, 8);
+            let long = sample_narrative_batch(tick, 7.0, 0, 8);
+            if tick <= 5 {
+                storage.persist_barrier(&[(IslandId(7), &long), (IslandId(0), &short)])?;
+            } else {
+                storage.persist_barrier(&[(IslandId(7), &long)])?;
+            }
+        }
+        storage.close()?;
+        Ok(path)
+    }
+
+    #[test]
+    fn finished_island_narrative_pages_bind_selection_and_independent_terminal_cuts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = narrative_island_page_fixture()?;
+        let live = StorageReader::open(&path)?;
+        assert!(matches!(
+            live.island_narrative_inputs(IslandId(7)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::FinishedReaderRequired
+            ))
+        ));
+        live.close()?;
+        let reader = StorageReader::open_finished(&path)?;
+        assert!(reader.narrative_input_page_v1(None, 1, 0).is_err());
+        assert!(matches!(
+            reader.island_narrative_inputs(IslandId(99)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::IslandUnavailable { island: IslandId(99), .. }
+            ))
+        ));
+        for (id, terminal, energy) in [(0, 5, 1.0), (7, 7, 7.0)] {
+            let selected = reader.island_narrative_inputs(IslandId(id))?;
+            for limit in [1, 3, 7, MAX_STORAGE_QUERY_PAGE] {
+                let mut cursor = None;
+                let mut ticks = Vec::new();
+                loop {
+                    let page = selected.page_v1(cursor.as_ref(), limit, 5)?;
+                    assert_eq!(page.binding.island_id, IslandId(id));
+                    assert_eq!(page.binding.stream.run_id, reader.run_id());
+                    assert_eq!(page.binding.stream.terminal_tick, terminal);
+                    assert_eq!(page.binding.stream.input_count, terminal);
+                    assert_eq!(page.binding.island_config_digest.len(), 64);
+                    assert!(page.inputs.len() <= limit);
+                    for record in page.inputs {
+                        assert_eq!(record.input.average_energy, energy);
+                        ticks.push(record.input.tick.0);
+                    }
+                    cursor = page.next_after;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(ticks, (1..=terminal).collect::<Vec<_>>());
+            }
+            assert!(selected.binding.get().is_some());
+            for limit in [0, MAX_STORAGE_QUERY_PAGE + 1] {
+                assert!(matches!(
+                    selected.page_v1(None, limit, 0),
+                    Err(StorageError::NarrativeInputStream(
+                        NarrativeInputStreamError::InvalidPageSize { .. }
+                    ))
+                ));
+            }
+        }
+        let short = reader.island_narrative_inputs(IslandId(0))?;
+        let long = reader.island_narrative_inputs(IslandId(7))?;
+        let cursor = short.page_v1(None, 1, 0)?.next_after.ok_or("forward cursor")?;
+        let encoded = serde_json::to_vec(&cursor)?;
+        let decoded: IslandNarrativeInputCursorV1 = serde_json::from_slice(&encoded)?;
+        assert_eq!(cursor, decoded);
+        assert_eq!(short.page_v1(Some(&decoded), 1, 0)?.inputs[0].input.tick, Tick(2));
+        assert!(matches!(
+            long.page_v1(Some(&cursor), 1, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::CursorIslandMismatch { island: IslandId(7), tick: 1 }
+            ))
+        ));
+        let mut forged = cursor.clone();
+        forged.binding.island_config_digest.push('0');
+        assert!(matches!(
+            short.page_v1(Some(&forged), 1, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::CursorIslandMismatch { .. }
+            ))
+        ));
+        let mut forged = cursor.clone();
+        forged.binding.stream.run_id = RunId::new(999);
+        assert!(matches!(
+            short.page_v1(Some(&forged), 1, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::CursorIslandMismatch { .. }
+            ))
+        ));
+        let mut forged = cursor.clone();
+        forged.input.run_id = RunId::new(999);
+        assert!(matches!(
+            short.page_v1(Some(&forged), 1, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::CursorRunMismatch { .. }
+            ))
+        ));
+        let mut forged = cursor;
+        forged.input.config_revision += 1;
+        assert!(matches!(
+            short.page_v1(Some(&forged), 1, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::CursorContractMismatch { tick: 1 }
+            ))
+        ));
+        assert!(matches!(
+            short.page_v1(None, 1, 6),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::InsufficientHistory { available: 5, required: 6, .. }
+            ))
+        ));
+        drop(short);
+        drop(long);
+        reader.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn selected_island_narrative_refuses_corrupt_metadata_and_missing_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = narrative_island_page_fixture()?;
+        let connection = Connection::open_existing(&path)?;
+        connection.execute("UPDATE islands SET config_hash = X'00' WHERE island_id = 7")?;
+        connection.close()?;
+        let reader = StorageReader::open_finished(&path)?;
+        assert!(matches!(
+            reader.island_narrative_inputs(IslandId(7)),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::IslandUnavailable { .. }
+            ))
+        ));
+        assert_eq!(
+            reader.island_narrative_inputs(IslandId(0))?.page_v1(None, 1, 0)?.inputs.len(),
+            1
+        );
+        reader.close()?;
+
+        let path = narrative_island_page_fixture()?;
+        let connection = Connection::open_existing(&path)?;
+        connection.execute(
+            "DELETE FROM replay_events
+             WHERE island_id = 7 AND tick = 3 AND event_type = 'narrative_input_v1'",
+        )?;
+        connection.close()?;
+        let reader = StorageReader::open_finished(&path)?;
+        let selected = reader.island_narrative_inputs(IslandId(7))?;
+        assert!(matches!(
+            selected.page_v1(None, 1, 0),
+            Err(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::TickGap { expected: 3, actual: 4, .. }
+            ))
+        ));
+        assert_eq!(
+            reader.island_narrative_inputs(IslandId(0))?.page_v1(None, 5, 0)?.inputs.len(),
+            5,
+            "another island's healthy input stream cannot fill the selected island's gap"
+        );
+        drop(selected);
         reader.close()?;
         Ok(())
     }

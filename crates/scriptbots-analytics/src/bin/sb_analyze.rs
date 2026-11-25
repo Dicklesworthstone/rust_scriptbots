@@ -10,6 +10,7 @@
 //!   sb-analyze runs/scriptbots-123.sqlite export --format parquet --out-dir ./exports --verify
 //!   sb-analyze runs/scriptbots-123.sqlite summarize --epoch-size 100 --rolling-window 10 --md summary.md
 //!   sb-analyze runs/scriptbots-123.sqlite verify-narrative --json verification.json
+//!   sb-analyze runs/archipelago.sqlite verify-narrative --island-id 2 --json island-2.json
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -18,7 +19,9 @@ use clap::{Parser, Subcommand};
 use scriptbots_analytics::dataframe::{
     AnalyticsExportFormat, export_database_table, summarize_run,
 };
-use scriptbots_analytics::{AnalyticsError, ReaderCtx, Registry, ReportParams, verify_narrative};
+use scriptbots_analytics::{
+    AnalyticsError, ReaderCtx, Registry, ReportParams, verify_island_narrative, verify_narrative,
+};
 use scriptbots_storage::{ExportTable, StorageReader};
 
 #[derive(Parser)]
@@ -63,6 +66,10 @@ enum Command {
     /// Compare every saved narrative event with an independent replay of all detector inputs.
     /// Writes the complete comparison before returning failure on any difference.
     VerifyNarrative {
+        /// Select one island's complete input/event stream in an archipelago run.
+        /// Without this selector, mixed-island recordings are refused.
+        #[arg(long)]
+        island_id: Option<u32>,
         /// Write the source-bound verdict, counts, digests, and first difference as JSON.
         #[arg(long)]
         json: Option<PathBuf>,
@@ -222,12 +229,32 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             println!("{}", output.human_md);
             Ok(())
         }
-        Command::VerifyNarrative { json, md } => {
+        Command::VerifyNarrative { island_id, json, md } => {
             let reader = open_reader()?;
-            let comparison = verify_narrative(&reader)?;
-            let markdown = comparison.markdown();
+            let (payload, markdown, comparison, verdict) = if let Some(island_id) = island_id {
+                let scoped = verify_island_narrative(
+                    &reader,
+                    scriptbots_core::rng_domains::IslandId(*island_id),
+                )?;
+                let verdict = scoped.require_equivalent();
+                (
+                    serde_json::to_vec_pretty(&scoped)?,
+                    scoped.markdown(),
+                    scoped.verification,
+                    verdict,
+                )
+            } else {
+                let comparison = verify_narrative(&reader)?;
+                let verdict = comparison.require_equivalent();
+                (
+                    serde_json::to_vec_pretty(&comparison)?,
+                    comparison.markdown(),
+                    comparison,
+                    verdict,
+                )
+            };
             if let Some(path) = json {
-                std::fs::write(path, serde_json::to_vec_pretty(&comparison)?)?;
+                std::fs::write(path, payload)?;
             }
             if let Some(path) = md {
                 std::fs::write(path, &markdown)?;
@@ -235,6 +262,7 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             println!("{markdown}");
             tracing::info!(
                 run_id = %comparison.input_binding.run_id,
+                island_id = ?island_id,
                 inputs = comparison.inputs_replayed,
                 reconstructed = comparison.events_reconstructed,
                 persisted = comparison.events_persisted,
@@ -242,7 +270,7 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
                 equivalent = comparison.equivalent,
                 "complete saved narrative comparison finished"
             );
-            comparison.require_equivalent()?;
+            verdict?;
             Ok(())
         }
         Command::Export {

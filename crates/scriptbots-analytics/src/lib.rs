@@ -27,10 +27,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use scriptbots_core::narrative::{EventRecord, NarrativeInputRecordV1, NarrativeReplay};
+use scriptbots_core::rng_domains::IslandId;
 use scriptbots_core::{AgentUid, Tick};
 use scriptbots_runtime::RunId;
 use scriptbots_storage::{
-    FinishedRunView, NarrativeInputBindingV1, NarrativeInputPolicyV1, NarrativeInputStreamError,
+    FinishedIslandNarrativeInputs, FinishedRunView, IslandNarrativeInputBindingV1,
+    IslandNarrativeInputCursorV1, NarrativeInputBindingV1, NarrativeInputCursorV1,
+    NarrativeInputPageV1, NarrativeInputPolicyV1, NarrativeInputStreamError,
     PersistedAgentObservation, PersistedInteraction, PersistedInteractionCapture, PersistedMetric,
     PersistedRunEvent, PersistenceBatchId, RunEventBindingV1, RunEventCursorV1, RunEventIdentity,
     RunManifestRecord, StorageError, StorageReader,
@@ -3650,18 +3653,119 @@ impl NarrativeVerificationV1 {
     }
 }
 
+/// Complete comparison for one selected island, with its independent construction identity.
+///
+/// The inner comparison traverses every input and every saved event belonging to this island.
+/// It does not certify other islands or claim that an archipelago is one detector stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IslandNarrativeVerificationV1 {
+    /// Version of this explicitly scoped result contract.
+    pub schema_version: u32,
+    /// Selected island, construction configuration and complete input boundary.
+    pub input_binding: IslandNarrativeInputBindingV1,
+    /// Exact per-island input/output comparison.
+    pub verification: NarrativeVerificationV1,
+}
+
+impl IslandNarrativeVerificationV1 {
+    /// Render the selected island's provenance before the complete comparison.
+    #[must_use]
+    pub fn markdown(&self) -> String {
+        format!(
+            "# Island {} narrative verification\n\nIsland configuration digest: `{}`\n\n{}",
+            self.input_binding.island_id.0,
+            self.input_binding.island_config_digest,
+            self.verification.markdown(),
+        )
+    }
+
+    /// Require coherent selected-island evidence and exact event equality.
+    pub fn require_equivalent(&self) -> Result<(), NarrativeVerificationError> {
+        if self.schema_version != 1
+            || self.input_binding.stream != self.verification.input_binding
+            || self
+                .verification
+                .first_difference
+                .as_ref()
+                .is_some_and(|difference| {
+                    difference.identity.island() != self.input_binding.island_id
+                })
+        {
+            return Err(NarrativeVerificationError::IncoherentResult);
+        }
+        self.verification.require_equivalent()
+    }
+}
+
+struct NarrativeInputPages<'a> {
+    reader: &'a StorageReader,
+    island: Option<FinishedIslandNarrativeInputs<'a>>,
+    island_binding: Option<IslandNarrativeInputBindingV1>,
+    next_after: Option<NarrativeInputCursorV1>,
+    next_island_after: Option<IslandNarrativeInputCursorV1>,
+}
+
+impl<'a> NarrativeInputPages<'a> {
+    fn new(reader: &'a StorageReader, island: Option<IslandId>) -> Result<Self, AnalyticsError> {
+        Ok(Self {
+            reader,
+            island: island
+                .map(|id| reader.island_narrative_inputs(id))
+                .transpose()?,
+            island_binding: None,
+            next_after: None,
+            next_island_after: None,
+        })
+    }
+
+    fn next(&mut self) -> Result<NarrativeInputPageV1, AnalyticsError> {
+        if let Some(island) = &self.island {
+            let page = island.page_v1(
+                self.next_island_after.as_ref(),
+                NARRATIVE_RECONSTRUCT_PAGE_SIZE,
+                0,
+            )?;
+            if let Some(previous) = &self.island_binding
+                && previous != &page.binding
+            {
+                return Err(NarrativeVerificationError::SourceBinding.into());
+            }
+            self.island_binding = Some(page.binding.clone());
+            self.next_island_after = page.next_after;
+            Ok(NarrativeInputPageV1 {
+                binding: page.binding.stream,
+                inputs: page.inputs,
+                next_after: self
+                    .next_island_after
+                    .as_ref()
+                    .map(|cursor| cursor.input.clone()),
+            })
+        } else {
+            let page = self.reader.narrative_input_page_v1(
+                self.next_after.as_ref(),
+                NARRATIVE_RECONSTRUCT_PAGE_SIZE,
+                0,
+            )?;
+            self.next_after = page.next_after.clone();
+            Ok(page)
+        }
+    }
+}
+
 struct StoredNarrativeEvents<'a> {
     reader: &'a StorageReader,
     binding: RunEventBindingV1,
     events: std::vec::IntoIter<PersistedRunEvent>,
     next_after: Option<RunEventCursorV1>,
     pages: u64,
+    island: Option<IslandId>,
 }
 
 impl<'a> StoredNarrativeEvents<'a> {
     fn new(
         reader: &'a StorageReader,
         input_binding: &NarrativeInputBindingV1,
+        island: Option<IslandId>,
     ) -> Result<Self, AnalyticsError> {
         let page = reader.run_event_page_v1(None, NARRATIVE_RECONSTRUCT_PAGE_SIZE)?;
         if page.binding.run_id != input_binding.run_id
@@ -3676,13 +3780,18 @@ impl<'a> StoredNarrativeEvents<'a> {
             events: page.events.into_iter(),
             next_after: page.next_after,
             pages: 1,
+            island,
         })
     }
 
     fn next(&mut self) -> Result<Option<PersistedRunEvent>, AnalyticsError> {
         loop {
             if let Some(event) = self.events.next() {
-                if event.identity().island().0 != 0 {
+                if let Some(island) = self.island {
+                    if event.identity().island() != island {
+                        continue;
+                    }
+                } else if event.identity().island().0 != 0 {
                     return Err(NarrativeVerificationError::UnsupportedIsland {
                         island: event.identity().island().0,
                     }
@@ -3899,10 +4008,6 @@ fn verify_narrative_policy(record: NarrativeInputRecordV1) -> Result<(), Analyti
 /// Refuses missing/corrupt inputs, unauthenticated policy changes, invalid event pages,
 /// non-default islands, and recorded capacities above [`NARRATIVE_VERIFICATION_CAPACITY`].
 /// Observed record differences return a complete result with `equivalent = false`.
-#[allow(
-    clippy::too_many_lines,
-    reason = "keep the independent complete-stream replay and canonical merge boundary together"
-)]
 pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV1, AnalyticsError> {
     for island in reader.archipelago_islands()? {
         if island.island_id != 0 {
@@ -3912,7 +4017,38 @@ pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV
             .into());
         }
     }
-    let mut page = reader.narrative_input_page_v1(None, NARRATIVE_RECONSTRUCT_PAGE_SIZE, 0)?;
+    verify_narrative_inputs(reader, None).map(|(verification, _)| verification)
+}
+
+/// Independently reconstruct and compare every narrative event from one configured island.
+///
+/// Requires complete consecutive inputs through that island's own terminal tick, retained
+/// construction metadata, and one immutable finished-run lease. Saved events from other
+/// islands are traversed and validated but never attributed to the selected detector.
+/// The complete selected event stream is compared, independently of display output limits.
+pub fn verify_island_narrative(
+    reader: &StorageReader,
+    island: IslandId,
+) -> Result<IslandNarrativeVerificationV1, AnalyticsError> {
+    let (verification, binding) = verify_narrative_inputs(reader, Some(island))?;
+    let input_binding = binding.ok_or(NarrativeVerificationError::SourceBinding)?;
+    Ok(IslandNarrativeVerificationV1 {
+        schema_version: 1,
+        input_binding,
+        verification,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the independent complete-stream replay and canonical merge boundary together"
+)]
+fn verify_narrative_inputs(
+    reader: &StorageReader,
+    island: Option<IslandId>,
+) -> Result<(NarrativeVerificationV1, Option<IslandNarrativeInputBindingV1>), AnalyticsError> {
+    let mut inputs = NarrativeInputPages::new(reader, island)?;
+    let mut page = inputs.next()?;
     let binding = page.binding.clone();
     let first = page
         .inputs
@@ -3925,7 +4061,7 @@ pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV
     verify_narrative_policy(*first)?;
     let mut replay = NarrativeReplay::new(first.replay_policy()?)?;
     let mut policy = NarrativeInputPolicyV1::from(*first);
-    let mut stored = StoredNarrativeEvents::new(reader, &binding)?;
+    let mut stored = StoredNarrativeEvents::new(reader, &binding, island)?;
     let next_stored = stored.next()?;
     let mut comparison = NarrativeComparison {
         stored,
@@ -3985,7 +4121,8 @@ pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV
                     }
                     .into());
                 }
-                let identity = RunEventIdentity::from_record(&event);
+                let identity =
+                    RunEventIdentity::from_island_record(&event, island.unwrap_or(IslandId(0)));
                 if pending.contains_key(&identity) {
                     return Err(NarrativeVerificationError::EventOrder { identity }.into());
                 }
@@ -4014,10 +4151,10 @@ pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV
                 }
             }
         }
-        let Some(cursor) = page.next_after else {
+        if page.next_after.is_none() {
             break;
-        };
-        page = reader.narrative_input_page_v1(Some(&cursor), NARRATIVE_RECONSTRUCT_PAGE_SIZE, 0)?;
+        }
+        page = inputs.next()?;
         if page.binding != binding {
             return Err(NarrativeVerificationError::SourceBinding.into());
         }
@@ -4047,7 +4184,7 @@ pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV
     if comparison.result.equivalent {
         comparison.result.require_equivalent()?;
     }
-    Ok(comparison.result)
+    Ok((comparison.result, inputs.island_binding))
 }
 
 /// `narrative-reconstruct`: independently replay the complete persisted detector input stream.
@@ -4056,6 +4193,8 @@ struct NarrativeReconstruct;
 #[derive(Debug, Serialize)]
 struct NarrativeReconstructionMachine {
     input_binding: NarrativeInputBindingV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    island_input_binding: Option<IslandNarrativeInputBindingV1>,
     policy_changes: u64,
     final_policy: NarrativeInputPolicyV1,
     inputs_replayed: u64,
@@ -4079,15 +4218,36 @@ impl Report for NarrativeReconstruct {
     }
 
     fn run(&self, cx: &ReaderCtx, params: &ReportParams) -> Result<ReportOutput, AnalyticsError> {
-        let limit = timeline_limit(params, NARRATIVE_TIMELINE_MAX_LIMIT)?;
+        params.validate_keys(&["limit", "island_id"])?;
+        let island = params
+            .get_u64("island_id")?
+            .map(|id| {
+                u32::try_from(id)
+                    .map(IslandId)
+                    .map_err(|error| AnalyticsError::BadParam {
+                        name: "island_id".to_owned(),
+                        reason: error.to_string(),
+                    })
+            })
+            .transpose()?;
+        let mut limit_params = params.clone();
+        limit_params.0.remove("island_id");
+        let limit = timeline_limit(&limit_params, NARRATIVE_TIMELINE_MAX_LIMIT)?;
         let read_started = Instant::now();
-        let machine = reconstruct_narrative(&cx.reader, limit)?;
+        let machine = reconstruct_narrative(&cx.reader, limit, island)?;
         log_report_stage("reconstruct", &read_started, machine.events.len());
 
         let render_started = Instant::now();
         let mut md = String::from("# Narrative reconstruction\n\n");
         let binding = &machine.input_binding;
         let _ = writeln!(md, "Run: `{}`\n", binding.run_id);
+        if let Some(selected) = &machine.island_input_binding {
+            let _ = writeln!(
+                md,
+                "Selected island: **{}**. Effective configuration digest: `{}`. Every input and reconstructed event below belongs to this island.\n",
+                selected.island_id.0, selected.island_config_digest,
+            );
+        }
         let _ = writeln!(
             md,
             "Replayed all {} detector inputs from tick {} through {} in {} bounded pages. The initial recorded policy uses an interval of {} ticks, {} history entries, and an event ring of {}.\n",
@@ -4109,8 +4269,13 @@ impl Report for NarrativeReconstruct {
         );
         let _ = writeln!(
             md,
-            "Reconstructed {} events with the current detector implementation, independently of persisted narrative output rows. Event counts cover the complete run; historical equivalence across different source revisions is not asserted.\n",
+            "Reconstructed {} events with the current detector implementation, independently of persisted narrative output rows. Event counts cover the {}; historical equivalence across different source revisions is not asserted.\n",
             machine.events_reconstructed,
+            if machine.island_input_binding.is_some() {
+                "complete selected island"
+            } else {
+                "complete run"
+            },
         );
         if machine.events_reconstructed == 0 {
             let _ = writeln!(
@@ -4159,10 +4324,12 @@ impl Report for NarrativeReconstruct {
 fn reconstruct_narrative(
     reader: &StorageReader,
     limit: usize,
+    island: Option<IslandId>,
 ) -> Result<NarrativeReconstructionMachine, AnalyticsError> {
     // This finished-reader API validates the entire input stream before returning
     // its first page. A missing stream is a scientific refusal, not a quiet run.
-    let mut page = reader.narrative_input_page_v1(None, NARRATIVE_RECONSTRUCT_PAGE_SIZE, 0)?;
+    let mut inputs = NarrativeInputPages::new(reader, island)?;
+    let mut page = inputs.next()?;
     let binding = page.binding.clone();
     let first = page
         .inputs
@@ -4201,19 +4368,27 @@ fn reconstruct_narrative(
                 }
             }
         }
-        let Some(cursor) = page.next_after else {
+        if page.next_after.is_none() {
             break;
-        };
-        page = reader.narrative_input_page_v1(Some(&cursor), NARRATIVE_RECONSTRUCT_PAGE_SIZE, 0)?;
+        }
+        page = inputs.next()?;
+        if page.binding != binding {
+            return Err(NarrativeVerificationError::SourceBinding.into());
+        }
     }
     Ok(NarrativeReconstructionMachine {
         input_binding: binding,
+        island_input_binding: inputs.island_binding,
         policy_changes,
         final_policy,
         inputs_replayed,
         input_pages,
         events_reconstructed,
-        event_counts_scope: "complete_run",
+        event_counts_scope: if island.is_some() {
+            "complete_island"
+        } else {
+            "complete_run"
+        },
         event_counts: counts
             .into_iter()
             .map(|(kind, count)| (kind.to_owned(), count))

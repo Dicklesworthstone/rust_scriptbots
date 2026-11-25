@@ -14,7 +14,7 @@ use scriptbots_analytics::{
     AnalyticsError, NARRATIVE_RECONSTRUCT_SCHEMA_VERSION, NARRATIVE_TIMELINE_SCHEMA_VERSION,
     NARRATIVE_VERIFICATION_SCHEMA_VERSION, NarrativeDifferenceKind, NarrativeVerificationError,
     NarrativeVerificationV1, REPLAY_TIMELINE_SCHEMA_VERSION, REPORT_SCHEMA_VERSION, ReaderCtx,
-    Registry, ReportParams, verify_narrative,
+    Registry, ReportParams, verify_island_narrative, verify_narrative,
 };
 use scriptbots_core::narrative::{EventKind, EventRecord, NarrativeInputRecordV1, SubjectRef};
 use scriptbots_core::{
@@ -202,6 +202,105 @@ fn real_narrative_db_seeded(dir: &tempfile::TempDir, seed: u64) -> (String, u64)
 
 fn synth_narrative_input_db(dir: &tempfile::TempDir, interval: u32) -> String {
     synth_narrative_input_db_ticks(dir, interval, 4)
+}
+
+/// Two actual worlds emit distinct narratives into real fused island persistence batches.
+/// The null session sinks acknowledge only after the explicit shared storage admission;
+/// they are test orchestration, not a replacement detector or durable owner-journal proof.
+fn real_island_narrative_db(
+    dir: &tempfile::TempDir,
+) -> (String, std::collections::BTreeMap<u32, Vec<EventRecord>>) {
+    use scriptbots_core::NullPersistence;
+    use scriptbots_core::rng_domains::IslandId;
+    use scriptbots_runtime::{
+        Archipelago, ArchipelagoConfig, HostCoreOptions, IslandSpec, Topology,
+    };
+
+    let path = dir.path().join("island-narrative.sqlite").display().to_string();
+    let config = ScriptBotsConfig {
+        world_width: 200,
+        world_height: 200,
+        food_cell_size: 20,
+        closed: true,
+        population_spawn_interval: 0,
+        metabolism_drain: 0.0,
+        movement_drain: 0.0,
+        temperature_discomfort_rate: 0.0,
+        aging_health_decay_rate: 0.0,
+        spike_damage: 0.0,
+        spike_energy_cost: 0.0,
+        reproduction_energy_threshold: f32::MAX,
+        persistence_interval: 1,
+        narrative_interval: 16,
+        history_capacity: 128,
+        narrative_capacity: 1,
+        ..ScriptBotsConfig::default()
+    };
+    let construction = Archipelago::new(ArchipelagoConfig {
+        islands: vec![
+            IslandSpec::new(IslandId(0), "early extinction", config.clone()),
+            IslandSpec::new(IslandId(7), "late extinction", config),
+        ],
+        topology: Topology::Ring,
+        barrier_interval: std::num::NonZeroU64::MIN,
+        master_seed: 0x16_29_05,
+        host_options: HostCoreOptions::default(),
+        migration: None,
+    })
+    .expect("island construction metadata");
+    let metadata: Vec<_> = construction.islands().cloned().collect();
+    let mut storage = Storage::create_unattributed_file(&path).expect("island run file");
+    storage.persist_islands(&metadata).expect("persist construction identity");
+    let mut worlds = Vec::new();
+    for meta in &metadata {
+        let (mut world, session) =
+            WorldState::with_persistence(meta.effective_config.clone(), Box::new(NullPersistence))
+                .expect("actual world and admission session");
+        for index in 0..12_u16 {
+            world
+                .try_spawn_agent(AgentData {
+                    position: Position::new(f32::from(index).mul_add(10.0, 20.0), 20.0),
+                    health: 2.0,
+                    ..AgentData::default()
+                })
+                .expect("actual founder");
+        }
+        worlds.push((meta.id, world, session));
+    }
+    let mut online = std::collections::BTreeMap::<u32, Vec<EventRecord>>::new();
+    for tick in 1..=320 {
+        let mut batches = Vec::new();
+        for (island, world, session) in &mut worlds {
+            if tick == if island.0 == 0 { 97 } else { 161 } {
+                world
+                    .enqueue_intervention(Intervention::Meteor {
+                        region: Region::All,
+                        lethality: 10.0,
+                        scorch: 0.0,
+                    })
+                    .expect("island-specific extinction");
+            }
+            let completion = session.step_outcome(world).expect("real scientific transition");
+            assert!(completion.fault.is_none());
+            let batch = completion
+                .outcome
+                .persistence
+                .into_batch()
+                .expect("every-tick projection");
+            online.entry(island.0).or_default().extend(batch.narrative_events.clone());
+            batches.push((*island, batch));
+        }
+        let borrowed: Vec<_> = batches.iter().map(|(island, batch)| (*island, batch.as_ref())).collect();
+        storage.persist_barrier(&borrowed).expect("real shared outbox admission");
+        for (_, world, session) in &mut worlds {
+            session.admit_pending(world).expect("acknowledge admitted exact batch");
+        }
+    }
+    for (_, world, _) in worlds {
+        assert!(world.narrative_dropped_events() > 0, "display rings must wrap");
+    }
+    storage.close().expect("durable island shutdown");
+    (path, online)
 }
 
 fn synth_narrative_input_db_ticks(dir: &tempfile::TempDir, interval: u32, ticks: u64) -> String {
@@ -1192,6 +1291,155 @@ fn narrative_verification_matches_three_real_scoped_runs_after_display_ring_wrap
             "seed {seed}: verdict and digests must be deterministic"
         );
     }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one immutable two-world recording proves selected reconstruction, complete comparison, CLI output, and cross-island negative controls"
+)]
+fn island_narrative_reconstruction_and_verification_follow_independent_real_worlds() {
+    use scriptbots_analytics::IslandNarrativeVerificationV1;
+    use scriptbots_core::rng_domains::IslandId;
+    use scriptbots_storage::RunEventIdentity;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, mut online) = real_island_narrative_db(&dir);
+    let cx = ReaderCtx::open(&path).expect("finished island recording");
+    assert!(matches!(
+        verify_narrative(&cx.reader),
+        Err(AnalyticsError::NarrativeVerification(
+            NarrativeVerificationError::UnsupportedIsland { island: 7 }
+        ))
+    ));
+    let registry = Registry::builtin();
+    assert!(registry.run("narrative-reconstruct", &cx, &ReportParams::default()).is_err());
+    let mut input_digests = Vec::new();
+    for id in [0, 7] {
+        let expected = online.get_mut(&id).expect("online detector records");
+        expected.sort_by_key(RunEventIdentity::from_record);
+        assert!(expected.len() > 1, "complete output must exceed the one-event display ring");
+        assert!(expected.iter().any(|event| event.kind == EventKind::Extinction));
+        let report = verify_island_narrative(&cx.reader, IslandId(id))
+            .expect("complete selected-island comparison");
+        report.require_equivalent().expect("independent reconstruction matches live output");
+        assert_eq!(report.input_binding.island_id, IslandId(id));
+        assert_eq!(report.input_binding.stream.terminal_tick, 320);
+        assert_eq!(report.verification.inputs_replayed, 320);
+        assert_eq!(report.verification.input_pages, 2);
+        assert_eq!(report.verification.events_persisted, expected.len() as u64);
+        assert_eq!(report.verification.events_reconstructed, expected.len() as u64);
+        input_digests.push(report.verification.input_digest.clone());
+        for limit in [4096, 1, 0] {
+            let params = ReportParams::from_pairs([
+                format!("island_id={id}"),
+                format!("limit={limit}"),
+            ])
+            .expect("island reconstruction parameters");
+            let reconstructed = registry.run("narrative-reconstruct", &cx, &params)
+                .expect("selected reconstruction");
+            assert_eq!(reconstructed.machine["island_input_binding"]["island_id"], id);
+            assert_eq!(reconstructed.machine["inputs_replayed"], 320);
+            assert_eq!(reconstructed.machine["event_counts_scope"], "complete_island");
+            assert_eq!(reconstructed.machine["events_reconstructed"], expected.len());
+            let retained = limit.min(expected.len());
+            assert_eq!(
+                reconstructed.machine["events"],
+                serde_json::to_value(&expected[expected.len() - retained..]).unwrap()
+            );
+        }
+    }
+    assert_ne!(input_digests[0], input_digests[1], "islands must have distinct histories");
+    for invalid in ["island_id=4294967296", "island_id=-1", "island_id=oops"] {
+        let params = ReportParams::from_pairs([invalid.to_owned()]).expect("parameter pair");
+        assert!(matches!(
+            registry.run("narrative-reconstruct", &cx, &params),
+            Err(AnalyticsError::BadParam { .. })
+        ));
+    }
+    assert!(matches!(
+        verify_island_narrative(&cx.reader, IslandId(99)),
+        Err(AnalyticsError::Storage(StorageError::NarrativeInputStream(
+            NarrativeInputStreamError::IslandUnavailable { .. }
+        )))
+    ));
+    drop(cx);
+
+    let executable = env!("CARGO_BIN_EXE_sb-analyze");
+    let json_path = dir.path().join("island-equivalent.json");
+    let md_path = dir.path().join("island-equivalent.md");
+    let command = Command::new(executable)
+        .args([&path, "verify-narrative", "--island-id", "7", "--json"])
+        .arg(&json_path)
+        .arg("--md")
+        .arg(&md_path)
+        .output()
+        .expect("selected-island CLI");
+    assert!(command.status.success(), "{}", String::from_utf8_lossy(&command.stderr));
+    let cli_report: IslandNarrativeVerificationV1 =
+        serde_json::from_slice(&std::fs::read(&json_path).expect("scoped JSON"))
+            .expect("scoped result envelope");
+    cli_report.require_equivalent().expect("CLI exact island comparison");
+    assert_eq!(cli_report.input_binding.island_id, IslandId(7));
+    assert_eq!(std::fs::read_to_string(&md_path).unwrap(), cli_report.markdown());
+
+    let connection = Connection::open_existing(&path).expect("negative output control");
+    assert!(connection
+        .execute("UPDATE run_events SET magnitude = magnitude + 1.0 WHERE island_id = 7")
+        .expect("change only island seven outputs") > 0);
+    connection.close().expect("close changed output");
+    let cx = ReaderCtx::open(&path).expect("typed changed narrative evidence");
+    verify_island_narrative(&cx.reader, IslandId(0)).expect("unmodified island").require_equivalent()
+        .expect("another island's changed events cannot contaminate this comparison");
+    let changed = verify_island_narrative(&cx.reader, IslandId(7)).expect("complete changed comparison");
+    assert!(!changed.verification.equivalent);
+    let difference = changed.verification.first_difference.as_ref().expect("typed first difference");
+    assert_eq!(difference.identity.island(), IslandId(7));
+    assert_eq!(difference.kind, NarrativeDifferenceKind::ChangedRecord);
+    assert_eq!(difference.field.as_deref(), Some("magnitude"));
+    drop(cx);
+    let changed_path = dir.path().join("island-diverged.json");
+    let command = Command::new(executable)
+        .args([&path, "verify-narrative", "--island-id", "7", "--json"])
+        .arg(&changed_path)
+        .output()
+        .expect("divergent selected-island CLI");
+    assert_eq!(command.status.code(), Some(1));
+    let retained: IslandNarrativeVerificationV1 =
+        serde_json::from_slice(&std::fs::read(changed_path).expect("report retained before failure"))
+            .expect("retained scoped divergence");
+    assert_eq!(retained, changed);
+
+    let connection = Connection::open_existing(&path).expect("negative input control");
+    assert_eq!(connection
+        .execute("DELETE FROM replay_events WHERE island_id = 7 AND tick = 3 AND event_type = 'narrative_input_v1'")
+        .expect("remove one selected input"), 1);
+    connection.close().expect("close missing input");
+    let cx = ReaderCtx::open(&path).expect("finished structurally valid source");
+    verify_island_narrative(&cx.reader, IslandId(0)).expect("healthy independent stream").require_equivalent()
+        .expect("unmodified island remains complete");
+    assert!(matches!(
+        verify_island_narrative(&cx.reader, IslandId(7)),
+        Err(AnalyticsError::Storage(StorageError::NarrativeInputStream(
+            NarrativeInputStreamError::TickGap { expected: 3, actual: 4, .. }
+        )))
+    ));
+    drop(cx);
+
+    // Selection must not conceal malformed persisted records encountered while
+    // traversing the complete saved-event stream.
+    let connection = Connection::open_existing(&path).expect("corrupt other-island output");
+    assert!(connection
+        .execute("UPDATE run_events SET schema_version = 999 WHERE island_id = 7")
+        .expect("invalidate other-island event schema") > 0);
+    connection.close().expect("close corrupt event control");
+    let cx = ReaderCtx::open(&path).expect("finished typed-event source");
+    assert!(matches!(
+        verify_island_narrative(&cx.reader, IslandId(0)),
+        Err(AnalyticsError::Storage(StorageError::RunEvent(
+            RunEventDecodeError::UnsupportedSchemaVersion { found: 999, .. }
+        )))
+    ));
 }
 
 #[test]
