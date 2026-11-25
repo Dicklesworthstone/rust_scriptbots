@@ -613,6 +613,7 @@ pub const INTERACTION_REPLAY_SEQ_BASE: u64 = 1 << 62;
 /// the replay-events primary key.
 pub const NARRATIVE_INPUT_REPLAY_SEQ: u64 = 1 << 61;
 const NARRATIVE_INPUT_EVENT_TYPE: &str = "narrative_input_v1";
+const ISLAND_SPARKLINE_CAPACITY: usize = 32;
 const NARRATIVE_INPUT_SCOPE: &str = "world:narrative";
 
 #[cfg(test)]
@@ -6543,36 +6544,6 @@ impl AnalyticsSnapshotProvider {
                 islands: Arc::clone(&pending.islands),
                 migration_arcs: Arc::clone(&pending.migration_arcs),
                 barrier_epoch: pending.barrier_epoch,
-                last_error: None,
-                last_failure: None,
-                stopped: false,
-            })
-        });
-    }
-
-    /// Atomically publish an archipelago barrier snapshot containing per-island and migration telemetry.
-    pub fn publish_barrier_snapshot(
-        &self,
-        islands: &[IslandSnapshot],
-        migration_arcs: &[MigrationSnapshotArc],
-        barrier_epoch: Option<u64>,
-        tick: u64,
-        total_agent_count: usize,
-    ) {
-        self.inner.rcu(|current| {
-            if current.stopped {
-                return Arc::clone(current);
-            }
-            Arc::new(AnalyticsSnapshot {
-                run_id: current.run_id,
-                revision: current.revision.saturating_add(1),
-                committed_tick: Some(tick),
-                committed_agent_count: Some(total_agent_count),
-                watermarks: current.watermarks,
-                readings: Arc::clone(&current.readings),
-                islands: Arc::from(islands),
-                migration_arcs: Arc::from(migration_arcs),
-                barrier_epoch,
                 last_error: None,
                 last_failure: None,
                 stopped: false,
@@ -16776,6 +16747,7 @@ pub struct Storage {
     death_flush_threshold: usize,
     replay_flush_threshold: usize,
     analytics: Option<AnalyticsSnapshotProvider>,
+    pending_barrier_analytics: BTreeMap<PersistenceBatchId, PendingAnalytics>,
     island_sparklines: BTreeMap<u32, VecDeque<f32>>,
     checkpoint_limits: CheckpointRetentionLimits,
 }
@@ -16783,6 +16755,7 @@ pub struct Storage {
 impl Storage {
     /// Attach an analytics snapshot provider so barrier persistence updates frontends lock-free.
     pub fn attach_analytics_provider(&mut self, provider: AnalyticsSnapshotProvider) {
+        provider.bind_run(self.run_id);
         self.analytics = Some(provider);
     }
 
@@ -17630,6 +17603,7 @@ impl Storage {
             death_flush_threshold: DEFAULT_LIFECYCLE_BUFFER,
             replay_flush_threshold: DEFAULT_REPLAY_BUFFER,
             analytics: None,
+            pending_barrier_analytics: BTreeMap::new(),
             island_sparklines: BTreeMap::new(),
             checkpoint_limits: CheckpointRetentionLimits::default(),
         };
@@ -23222,17 +23196,17 @@ impl Storage {
             });
         }
 
-        if let Some(analytics) = &self.analytics {
+        let pending_analytics = if let Some(analytics) = &self.analytics {
             let mut snapshots = Vec::with_capacity(ordered.len());
             let mut total_agents = 0usize;
             for (island, payload) in &ordered {
-                total_agents += payload.summary.agent_count;
-                let history = self.island_sparklines.entry(island.0).or_default();
-                history.push_back(payload.summary.agent_count as f32);
-                if history.len() > 32 {
-                    history.pop_front();
-                }
-                let sparkline: Arc<[f32]> = Arc::from(history.iter().copied().collect::<Vec<_>>());
+                total_agents = total_agents.checked_add(payload.summary.agent_count).ok_or(
+                    StorageError::InvalidData {
+                        context: "analytics.agent_count",
+                        reason: "archipelago population total exceeds the platform count range"
+                            .to_owned(),
+                    },
+                )?;
                 snapshots.push(IslandSnapshot {
                     island_id: island.0,
                     label: Arc::from(format!("Island {}", island.0)),
@@ -23241,7 +23215,8 @@ impl Storage {
                     average_energy: f64::from(payload.summary.average_energy),
                     births: payload.summary.births,
                     deaths: payload.summary.deaths,
-                    sparkline,
+                    // History changes only when this exact batch reaches application.
+                    sparkline: Arc::from([]),
                 });
             }
             let mut arc_counts = BTreeMap::new();
@@ -23258,18 +23233,60 @@ impl Storage {
                     count,
                 })
                 .collect();
-            analytics.publish_barrier_snapshot(
-                &snapshots,
-                &migration_arcs,
-                ordered.first().map(|(_, p)| p.epoch),
+            Some(PendingAnalytics {
                 tick,
-                total_agents,
-            );
-        }
+                agent_count: total_agents,
+                readings: Arc::clone(&analytics.snapshot().readings),
+                islands: Arc::from(snapshots),
+                migration_arcs: Arc::from(migration_arcs),
+                barrier_epoch: ordered.first().map(|(_, payload)| payload.epoch),
+            })
+        } else {
+            None
+        };
 
         let (receipt, newly_admitted) = self.stage_outbox(tick, &fused)?;
         if newly_admitted {
+            if let Some(pending) = pending_analytics {
+                self.pending_barrier_analytics.insert(receipt.batch_id, pending);
+            }
             self.enqueue_staged(receipt.batch_id, fused)?;
+        }
+        Ok(())
+    }
+
+    /// Publish only barriers whose scientific rows have actually committed. Admission and
+    /// exact retries do not advance frontend observations or append population history.
+    fn publish_applied_barrier_analytics(&mut self) -> Result<(), StorageError> {
+        if self.pending_barrier_analytics.is_empty() {
+            return Ok(());
+        }
+        let watermarks = self.persistence_watermarks()?;
+        let Some(applied) = watermarks.applied else {
+            return Ok(());
+        };
+        let Some(analytics) = &self.analytics else {
+            return Ok(());
+        };
+        while self
+            .pending_barrier_analytics
+            .first_key_value()
+            .is_some_and(|(batch_id, _)| *batch_id <= applied)
+        {
+            let Some((_, mut pending)) = self.pending_barrier_analytics.pop_first() else {
+                break;
+            };
+            let mut islands = pending.islands.to_vec();
+            for island in &mut islands {
+                let history = self.island_sparklines.entry(island.island_id).or_default();
+                history.push_back(island.agent_count as f32);
+                if history.len() > ISLAND_SPARKLINE_CAPACITY {
+                    history.pop_front();
+                }
+                island.sparkline = Arc::from(history.iter().copied().collect::<Vec<_>>());
+            }
+            pending.islands = Arc::from(islands);
+            analytics.publish_committed(pending, watermarks);
         }
         Ok(())
     }
@@ -24284,7 +24301,7 @@ impl Storage {
             return Err(StorageError::TerminallyFailed);
         }
         while self.flush_one()? {}
-        Ok(())
+        self.publish_applied_barrier_analytics()
     }
 
     /// Apply all buffered batches, finalize their persistence markers, and read them back.
@@ -24420,6 +24437,7 @@ impl Storage {
                     self.buffer.archive_cells.drain(..span.archive_cells);
                     self.buffered_outbox_ids.remove(0);
                     self.buffered_batch_spans.remove(0);
+                    self.publish_applied_barrier_analytics()?;
                     return Ok(true);
                 }
                 Err(error) if should_retry_transaction(&error, attempt) => {
@@ -24532,7 +24550,11 @@ impl Storage {
             )?;
             Ok(())
         })?;
-        self.persistence_watermarks()
+        let watermarks = self.persistence_watermarks()?;
+        if let Some(analytics) = &self.analytics {
+            analytics.publish_progress(watermarks);
+        }
+        Ok(watermarks)
     }
 
     /// Compact storage after first durably flushing every buffered row.
@@ -24819,10 +24841,10 @@ impl Storage {
 
     fn latest_pending_analytics(&self) -> Result<Option<PendingAnalytics>, StorageError> {
         let rows = self.connection()?.query_with_params(
-            "SELECT tick, agent_count
+            "SELECT tick, epoch
              FROM tick_summaries
              WHERE run_id = ?1
-             ORDER BY tick DESC
+             ORDER BY tick DESC, island_id ASC
              LIMIT 1",
             &[sqlite_run_id(self.run_id)],
         )?;
@@ -24833,9 +24855,9 @@ impl Storage {
             "tick_summaries.tick",
             decode(row, 0, "tick_summaries.tick")?,
         )?;
-        let agent_count = checked_usize(
-            "tick_summaries.agent_count",
-            decode(row, 1, "tick_summaries.agent_count")?,
+        let epoch = checked_u64(
+            "tick_summaries.epoch",
+            decode(row, 1, "tick_summaries.epoch")?,
         )?;
         let metric_rows = self.connection()?.query_with_params(
             "SELECT name, value
@@ -24876,6 +24898,13 @@ impl Storage {
             ],
         )?;
         let mut islands = Vec::with_capacity(island_rows.len());
+        let mut agent_count = 0usize;
+        let history_limit = i64::try_from(ISLAND_SPARKLINE_CAPACITY).map_err(|error| {
+            StorageError::InvalidData {
+                context: "analytics.sparkline",
+                reason: error.to_string(),
+            }
+        })?;
         for row in island_rows {
             let id = checked_u32(
                 "tick_summaries.island_id",
@@ -24885,6 +24914,36 @@ impl Storage {
                 "tick_summaries.agent_count",
                 decode(&row, 1, "tick_summaries.agent_count")?,
             )?;
+            agent_count = agent_count.checked_add(count).ok_or(StorageError::InvalidData {
+                context: "analytics.agent_count",
+                reason: "archipelago population total exceeds the platform count range".to_owned(),
+            })?;
+            let history_rows = self.connection()?.query_with_params(
+                "SELECT agent_count
+                 FROM tick_summaries
+                 WHERE run_id = ?1 AND island_id = ?2 AND tick <= ?3
+                 ORDER BY tick DESC
+                 LIMIT ?4",
+                &[
+                    sqlite_run_id(self.run_id),
+                    i64::from(id).into(),
+                    i64::try_from(tick)
+                        .map_err(|error| StorageError::InvalidData {
+                            context: "tick_summaries.tick",
+                            reason: error.to_string(),
+                        })?
+                        .into(),
+                    history_limit.into(),
+                ],
+            )?;
+            let mut history = Vec::with_capacity(history_rows.len());
+            for history_row in history_rows {
+                history.push(checked_usize(
+                    "tick_summaries.agent_count",
+                    decode(&history_row, 0, "tick_summaries.agent_count")?,
+                )? as f32);
+            }
+            history.reverse();
             let total_energy: f64 = decode(&row, 2, "tick_summaries.total_energy")?;
             let average_energy: f64 = decode(&row, 3, "tick_summaries.average_energy")?;
             let births = checked_usize(
@@ -24903,7 +24962,7 @@ impl Storage {
                 average_energy,
                 births,
                 deaths,
-                sparkline: Arc::from([count as f32]),
+                sparkline: Arc::from(history),
             });
         }
         let migration_rows = self.connection()?.query_with_params(
@@ -24939,13 +24998,23 @@ impl Storage {
                 count,
             });
         }
+        // A configured archipelago can contain only island zero. Retained construction
+        // metadata distinguishes it from an ordinary single-world run after a restart.
+        let configured_islands = self.connection()?.query_with_params(
+            "SELECT island_id FROM islands WHERE run_id = ?1 LIMIT 1",
+            &[sqlite_run_id(self.run_id)],
+        )?;
+        let barrier_epoch = (!configured_islands.is_empty()
+            || islands.len() > 1
+            || islands.iter().any(|island| island.island_id != 0))
+        .then_some(epoch);
         Ok(Some(PendingAnalytics {
             tick,
             agent_count,
             readings: Arc::from(readings),
             islands: Arc::from(islands),
             migration_arcs: Arc::from(migration_arcs),
-            barrier_epoch: None,
+            barrier_epoch,
         }))
     }
 }
@@ -27244,24 +27313,6 @@ impl StoragePipeline {
     #[must_use]
     pub fn analytics_provider(&self) -> AnalyticsSnapshotProvider {
         self.sink.analytics.clone()
-    }
-
-    /// Publish an archipelago barrier snapshot containing per-island and migration telemetry lock-free.
-    pub fn publish_barrier_snapshot(
-        &self,
-        islands: &[IslandSnapshot],
-        migration_arcs: &[MigrationSnapshotArc],
-        barrier_epoch: Option<u64>,
-        tick: u64,
-        total_agent_count: usize,
-    ) {
-        self.sink.analytics.publish_barrier_snapshot(
-            islands,
-            migration_arcs,
-            barrier_epoch,
-            tick,
-            total_agent_count,
-        );
     }
 
     /// Durable run identity bound to this pipeline.
@@ -48936,12 +48987,16 @@ mod tests {
             count: 2,
         };
 
-        provider.publish_barrier_snapshot(
-            &[island0, island1],
-            std::slice::from_ref(&arc),
-            Some(42),
-            100,
-            22,
+        provider.publish_committed(
+            PendingAnalytics {
+                tick: 100,
+                agent_count: 22,
+                readings: Arc::from([]),
+                islands: Arc::from([island0, island1]),
+                migration_arcs: Arc::from([arc.clone()]),
+                barrier_epoch: Some(42),
+            },
+            PersistenceWatermarks::default(),
         );
 
         let published = provider.snapshot();
@@ -48959,13 +49014,19 @@ mod tests {
     }
 
     #[test]
-    fn storage_persist_barrier_updates_attached_analytics_provider() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one barrier fixture covers admission, conflicting retries, application and durable publication"
+    )]
+    fn storage_persist_barrier_publishes_only_applied_analytics() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("archipelago_analytics.sqlite");
         let mut storage =
             Storage::create_unattributed_file(path.to_str().unwrap()).expect("create storage");
         let analytics = AnalyticsSnapshotProvider::empty();
         storage.attach_analytics_provider(analytics.clone());
+        let initial = analytics.snapshot();
+        assert_eq!(initial.run_id, Some(storage.run_id));
 
         let batch0 = PersistenceBatch {
             summary: TickSummary {
@@ -49031,11 +49092,43 @@ mod tests {
         storage
             .persist_barrier_with_migrations(
                 &[(IslandId(0), &batch0), (IslandId(1), &batch1)],
-                &[migration],
+                std::slice::from_ref(&migration),
             )
             .expect("persist barrier");
+        let admission = storage.persistence_watermarks().expect("admitted barrier");
+        assert!(admission.admitted.is_some());
+        assert_eq!(admission.applied, None);
+        assert_eq!(admission.durable, None);
+        assert!(Arc::ptr_eq(&initial, &analytics.snapshot()));
+        assert!(storage.island_sparklines.is_empty());
 
+        storage
+            .persist_barrier_with_migrations(
+                &[(IslandId(1), &batch1), (IslandId(0), &batch0)],
+                std::slice::from_ref(&migration),
+            )
+            .expect("identical admitted retry");
+        assert_eq!(storage.pending_barrier_analytics.len(), 1);
+        assert!(Arc::ptr_eq(&initial, &analytics.snapshot()));
+
+        let mut conflicting = batch1.clone();
+        conflicting.summary.total_energy += 1.0;
+        assert_invalid_data_context(
+            storage.persist_barrier_with_migrations(
+                &[(IslandId(0), &batch0), (IslandId(1), &conflicting)],
+                std::slice::from_ref(&migration),
+            ),
+            "storage_batch_ledger.payload_digest",
+        );
+        assert!(Arc::ptr_eq(&initial, &analytics.snapshot()));
+        assert!(storage.island_sparklines.is_empty());
+
+        storage.flush().expect("apply retained barrier");
         let snap = analytics.snapshot();
+        assert_eq!(snap.watermarks.admitted, admission.admitted);
+        assert_eq!(snap.watermarks.applied, admission.admitted);
+        assert_eq!(snap.watermarks.durable, None);
+        assert!(storage.pending_barrier_analytics.is_empty());
         assert_eq!(snap.committed_tick, Some(1));
         assert_eq!(snap.committed_agent_count, Some(80));
         assert_eq!(snap.barrier_epoch, Some(7));
@@ -49055,6 +49148,141 @@ mod tests {
                 count: 1,
             }
         );
+
+        storage
+            .persist_barrier_with_migrations(
+                &[(IslandId(0), &batch0), (IslandId(1), &batch1)],
+                std::slice::from_ref(&migration),
+            )
+            .expect("identical applied retry");
+        assert!(Arc::ptr_eq(&snap, &analytics.snapshot()));
+        let durable = storage.flush_with_watermarks().expect("finalize barrier");
+        assert_eq!(durable.durable, admission.admitted);
+        let finalized = analytics.snapshot();
+        assert_eq!(finalized.watermarks, durable);
+        assert_eq!(finalized.committed_tick, snap.committed_tick);
+        assert_eq!(finalized.islands, snap.islands);
+    }
+
+    #[test]
+    fn rolled_back_barrier_preserves_analytics_and_recovers_bounded_island_histories()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path("barrier-analytics-rollback-recovery");
+        let path_string = path.to_string_lossy().into_owned();
+        let mut storage =
+            Storage::create_unattributed_file_with_thresholds(&path_string, 1, 1, 1, 1)?;
+        let analytics = storage.analytics_provider();
+        for tick in 1..=33 {
+            let mut first = sample_batch(tick, 1.0);
+            first.summary.agent_count = usize::try_from(tick)?;
+            let mut second = sample_batch(tick, 2.0);
+            second.summary.agent_count = usize::try_from(tick * 10)?;
+            storage.persist_barrier(&[(IslandId(0), &first), (IslandId(1), &second)])?;
+        }
+        storage.flush_with_watermarks()?;
+        let committed = analytics.snapshot();
+        assert_eq!(committed.committed_tick, Some(33));
+        assert_eq!(committed.committed_agent_count, Some(363));
+        assert_eq!(committed.islands[0].sparkline.len(), ISLAND_SPARKLINE_CAPACITY);
+        assert_eq!(committed.islands[0].sparkline[0], 2.0);
+        assert_eq!(committed.islands[1].sparkline[0], 20.0);
+
+        let mut next_zero = sample_batch(34, 2.0);
+        next_zero.epoch = 17;
+        next_zero.summary.agent_count = 13;
+        let mut next_one = sample_batch(34, 3.0);
+        next_one.epoch = 17;
+        next_one.summary.agent_count = 29;
+        arm_host_journal_fault(&path_string, HostJournalFaultPoint::PersistenceAfterTicks);
+        let error = storage
+            .persist_barrier(&[(IslandId(1), &next_one), (IslandId(0), &next_zero)])
+            .expect_err("injected application failure");
+        assert!(matches!(
+            error,
+            StorageError::Transaction {
+                commit_state: FailureCommitState::RolledBack,
+                ..
+            }
+        ));
+        assert!(Arc::ptr_eq(&committed, &analytics.snapshot()));
+        let row = storage.connection()?.query_row_with_params(
+            "SELECT MAX(tick) FROM tick_summaries WHERE run_id = ?1",
+            &[sqlite_run_id(storage.run_id)],
+        )?;
+        assert_eq!(decode::<i64>(&row, 0, "test.max_tick")?, 33);
+        assert_eq!(storage.island_sparklines[&0].len(), ISLAND_SPARKLINE_CAPACITY);
+        assert_eq!(storage.island_sparklines[&1].len(), ISLAND_SPARKLINE_CAPACITY);
+        let admitted = storage.persistence_watermarks()?.admitted;
+        assert_ne!(admitted, committed.watermarks.applied);
+        storage.abandon_after_error();
+
+        let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+        let restored = recovered.analytics_provider().snapshot();
+        assert_eq!(restored.committed_tick, Some(34));
+        assert_eq!(restored.committed_agent_count, Some(42));
+        assert_eq!(restored.barrier_epoch, Some(17));
+        assert_eq!(restored.watermarks.applied, admitted);
+        assert_eq!(restored.watermarks.durable, admitted);
+        assert_eq!(restored.islands.len(), 2);
+        assert_eq!(restored.islands[0].island_id, 0);
+        assert_eq!(restored.islands[0].agent_count, 13);
+        assert_eq!(restored.islands[1].island_id, 1);
+        assert_eq!(restored.islands[1].agent_count, 29);
+        let expected_zero: Vec<f32> = (3..=33).map(|count| count as f32).chain([13.0]).collect();
+        let expected_one: Vec<f32> =
+            (3..=33).map(|count| (count * 10) as f32).chain([29.0]).collect();
+        assert_eq!(restored.islands[0].sparkline.as_ref(), expected_zero.as_slice());
+        assert_eq!(restored.islands[1].sparkline.as_ref(), expected_one.as_slice());
+        recovered.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_analytics_distinguishes_single_world_and_configured_single_island()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use scriptbots_runtime::{Archipelago, ArchipelagoConfig, IslandSpec, Topology};
+
+        for is_archipelago in [false, true] {
+            let path = temp_db_path("analytics-single-island-recovery");
+            let path_string = path.to_string_lossy().into_owned();
+            let mut storage = Storage::create_unattributed_file(&path_string)?;
+            if is_archipelago {
+                let config = ScriptBotsConfig {
+                    world_width: 64,
+                    world_height: 64,
+                    food_cell_size: 16,
+                    closed: true,
+                    ..ScriptBotsConfig::default()
+                };
+                let archipelago = Archipelago::new(ArchipelagoConfig {
+                    islands: vec![IslandSpec::new(IslandId(0), "singleton", config)],
+                    topology: Topology::Ring,
+                    barrier_interval: std::num::NonZeroU64::MIN,
+                    master_seed: 0x16_29_07,
+                    host_options: HostCoreOptions::default(),
+                    migration: None,
+                })?;
+                storage.persist_islands(&archipelago.islands().cloned().collect::<Vec<_>>())?;
+            }
+            let batch = sample_batch(1, 1.0);
+            if is_archipelago {
+                storage.persist_barrier(&[(IslandId(0), &batch)])?;
+            } else {
+                storage.persist(&batch)?;
+            }
+            storage.close()?;
+
+            let mut recovered = StoragePipeline::recover_existing(&path_string)?;
+            let snapshot = recovered.analytics_provider().snapshot();
+            assert_eq!(snapshot.committed_tick, Some(1));
+            assert_eq!(snapshot.committed_agent_count, Some(1));
+            assert_eq!(snapshot.barrier_epoch, is_archipelago.then_some(3));
+            assert_eq!(snapshot.islands.len(), 1);
+            assert_eq!(snapshot.islands[0].island_id, 0);
+            assert_eq!(snapshot.islands[0].sparkline.as_ref(), &[1.0]);
+            recovered.shutdown()?;
+        }
+        Ok(())
     }
 
     #[test]

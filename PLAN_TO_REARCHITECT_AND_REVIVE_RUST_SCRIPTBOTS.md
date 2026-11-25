@@ -2,6 +2,31 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Committed archipelago analytics and recovery (2026-11-25):**
+[Source implemented; execution validation pending — Codex;
+corrective contribution to `bd-16g.5`; original complete acceptance retained]
+
+Direct barrier persistence retains telemetry under the admitted batch identity
+and publishes it only after the scientific transaction applies. Buffered
+admission, rejected payload changes, identical retries and rolled-back writes
+leave committed observations and island histories unchanged. Durable
+finalization advances its separate watermark without appending history again.
+
+Recovery totals the latest population across every island, restores up to 32
+chronological population samples per island, and retains the barrier epoch.
+Persisted construction metadata distinguishes a configured singleton archipelago
+from an ordinary single-world run. The unused public publication bypasses were
+removed. Late attachment to an already-used direct Storage instance does not
+retroactively hydrate prior observations.
+
+Authored regressions exercise buffered and conflicting admissions, exact retry,
+application versus durability, injected transaction rollback, retained-outbox
+restart, bounded island histories and singleton recovery. Independent source
+review is complete. DSR diagnostic attempts were interrupted by executor resets;
+the Cargo attempt also encountered a dependency-fetch proxy failure. The pinned
+toolchain was lost with the reset. Native compilation, formatting, Clippy and
+test execution remain unverified, and no original qualification gate is closed.
+
 **Saved-study report request binding (2026-11-25):**
 [Implemented and focused DSR regressions passed — Codex; corrective contribution to `bd-2z0.12.2`;
 original acceptance retained]
