@@ -65,6 +65,7 @@ pub enum ShellEffect {
         branch_name: String,
         ticks: u64,
         intervention: Option<crate::branch_study::StudyIntervention>,
+        intervention_delay_ticks: u64,
     },
     CancelCheckpointBranch,
     CompareExperiments {
@@ -418,6 +419,7 @@ pub enum ShellMessage {
         branch_name: String,
         ticks: u64,
         intervention: Option<crate::branch_study::StudyIntervention>,
+        intervention_delay_ticks: u64,
     },
     /// Run statistical comparison between two experiment arms.
     CompareExperiments {
@@ -506,9 +508,26 @@ pub struct FrankenTuiModel {
 #[derive(Debug, Clone)]
 pub(super) struct CheckpointBranchDraft {
     pub checkpoint_id: String,
+    pub source_tick: u64,
     pub branch_name: String,
     pub ticks: u64,
+    pub intervention_delay_ticks: u64,
     treatment: BranchTreatment,
+}
+
+impl CheckpointBranchDraft {
+    fn timing_error(&self) -> Option<&'static str> {
+        if self.intervention_delay_ticks >= self.ticks {
+            Some("Treatment delay must be shorter than the study horizon.")
+        } else if self.intervention_delay_ticks != 0 && self.treatment == BranchTreatment::Unchanged
+        {
+            Some("Choose a treatment or reset the delay to zero for an unchanged future.")
+        } else if self.source_tick.checked_add(self.ticks).is_none() {
+            Some("Saved tick plus study horizon exceeds the tick counter.")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,7 +551,7 @@ impl BranchTreatment {
     fn label(self) -> &'static str {
         match self {
             Self::Unchanged => "Unchanged future (one control branch)",
-            Self::Drought => "Drought (halt growth for the horizon) + control",
+            Self::Drought => "Drought (halt growth from treatment through finish) + control",
             Self::FoodBloom => "Food bloom (+0.5 per cell) + control",
             Self::ClosedWorld => "Close world (disable restocking) + control",
         }
@@ -980,12 +999,23 @@ impl Model for FrankenTuiModel {
                             Some("Branch draft cancelled; no work submitted".into());
                     }
                     KeyCode::Enter => {
+                        if let Some(reason) = self
+                            .branch_draft
+                            .as_ref()
+                            .and_then(CheckpointBranchDraft::timing_error)
+                        {
+                            self.status_message = Some(reason.into());
+                            return Cmd::none();
+                        }
                         let draft = self.branch_draft.take().expect("guarded branch draft");
                         return self.update(ShellMessage::BranchCheckpoint {
                             checkpoint_id: draft.checkpoint_id,
                             branch_name: draft.branch_name,
                             ticks: draft.ticks,
-                            intervention: draft.treatment.intervention(draft.ticks),
+                            intervention: draft
+                                .treatment
+                                .intervention(draft.ticks - draft.intervention_delay_ticks),
+                            intervention_delay_ticks: draft.intervention_delay_ticks,
                         });
                     }
                     KeyCode::Left | KeyCode::Right => {
@@ -1002,6 +1032,28 @@ impl Model for FrankenTuiModel {
                     KeyCode::Char('-') | KeyCode::Down => {
                         let draft = self.branch_draft.as_mut().expect("guarded branch draft");
                         draft.ticks = draft.ticks.saturating_sub(120).max(1);
+                    }
+                    KeyCode::Char('[' | '{') => {
+                        let draft = self.branch_draft.as_mut().expect("guarded branch draft");
+                        let step = if key.code == KeyCode::Char('{') {
+                            120
+                        } else {
+                            1
+                        };
+                        draft.intervention_delay_ticks =
+                            draft.intervention_delay_ticks.saturating_sub(step);
+                    }
+                    KeyCode::Char(']' | '}') => {
+                        let draft = self.branch_draft.as_mut().expect("guarded branch draft");
+                        let step = if key.code == KeyCode::Char('}') {
+                            120
+                        } else {
+                            1
+                        };
+                        draft.intervention_delay_ticks = draft
+                            .intervention_delay_ticks
+                            .saturating_add(step)
+                            .min(crate::control::MAX_CHECKPOINT_BRANCH_TICKS - 1);
                     }
                     _ => {}
                 }
@@ -1429,8 +1481,10 @@ impl Model for FrankenTuiModel {
                 if let Some(checkpoint) = selected {
                     self.branch_draft = Some(CheckpointBranchDraft {
                         checkpoint_id: checkpoint.checkpoint_id.clone(),
+                        source_tick: checkpoint.tick,
                         branch_name: format!("branch-rev-{}", self.control_revision),
                         ticks: 240,
+                        intervention_delay_ticks: 0,
                         treatment: BranchTreatment::Unchanged,
                     });
                     self.status_message =
@@ -1446,7 +1500,17 @@ impl Model for FrankenTuiModel {
                 branch_name,
                 ticks,
                 intervention,
+                intervention_delay_ticks,
             } => {
+                if ticks == 0
+                    || ticks > crate::control::MAX_CHECKPOINT_BRANCH_TICKS
+                    || intervention_delay_ticks >= ticks
+                    || (intervention_delay_ticks != 0 && intervention.is_none())
+                {
+                    self.status_message =
+                        Some("Branch not requested: invalid horizon or treatment delay".into());
+                    return Cmd::none();
+                }
                 if self.branch_request_pending
                     || self
                         .checkpoint_branch
@@ -1469,6 +1533,7 @@ impl Model for FrankenTuiModel {
                     branch_name,
                     ticks,
                     intervention,
+                    intervention_delay_ticks,
                 }) {
                     return Cmd::none();
                 }
@@ -1850,10 +1915,26 @@ impl Model for FrankenTuiModel {
                 format!("Name: {}", draft.branch_name),
                 format!("Horizon: {} ticks after the saved boundary", draft.ticks),
                 format!("Treatment: {}", draft.treatment.label()),
-                "".into(),
+                if draft.treatment == BranchTreatment::Unchanged {
+                    format!(
+                        "Treatment delay: {} ticks (unchanged requires zero)",
+                        draft.intervention_delay_ticks
+                    )
+                } else if let Some(tick) = draft
+                    .source_tick
+                    .checked_add(draft.intervention_delay_ticks)
+                {
+                    format!(
+                        "Apply after {} ticks, at saved-world tick {tick}",
+                        draft.intervention_delay_ticks
+                    )
+                } else {
+                    "Treatment boundary exceeds the tick counter".into()
+                },
                 "Left/Right: treatment    +/- or Up/Down: horizon".into(),
+                "[/]: delay -/+1 tick    {/}: delay -/+120 ticks".into(),
                 "Enter: start    Esc/X: discard draft".into(),
-                "".into(),
+                draft.timing_error().unwrap_or("").into(),
                 "Runs an independent scientific future; the live run stays attached.".into(),
                 "Treatments include an unchanged control from the same saved state.".into(),
                 "Reports compare trajectories; one source is not independent replication.".into(),
@@ -2326,6 +2407,102 @@ mod tests {
         assert!(harness.model().branch_draft.is_none());
         assert_eq!(harness.model_mut().drain_effects().count(), 0);
         assert!(harness.model().receipts.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_branch_delay_is_presented_and_invalid_timing_never_spends_an_identity() {
+        let mut harness = checkpoint_branch_harness();
+        harness.inject_key(KeyCode::Char('n'));
+        harness.inject_key(KeyCode::Char('}'));
+        harness.inject_key(KeyCode::Enter);
+        assert!(harness.model().branch_draft.is_some());
+        assert_eq!(harness.model().command_counter, 0);
+        assert_eq!(harness.model_mut().drain_effects().count(), 0);
+        assert!(
+            harness
+                .capture_frame_str(120, 24)
+                .contains("Choose a treatment")
+        );
+
+        harness.inject_key(KeyCode::Right);
+        harness.inject_key(KeyCode::Down);
+        harness.inject_key(KeyCode::Enter);
+        let draft = harness.model().branch_draft.as_ref().unwrap();
+        assert_eq!(draft.source_tick, 12);
+        assert_eq!(draft.ticks, 120);
+        assert_eq!(draft.intervention_delay_ticks, 120);
+        assert_eq!(harness.model().command_counter, 0);
+        assert!(harness.model().receipts.is_empty());
+        assert_eq!(harness.model_mut().drain_effects().count(), 0);
+        let frame = harness.capture_frame_str(120, 24);
+        assert!(frame.contains("at saved-world tick 132"));
+        assert!(frame.contains("delay must be shorter"));
+
+        // Keep the chosen horizon/source and explicitly move treatment to the
+        // last boundary that still has an observed scientific transition.
+        harness.inject_key(KeyCode::Char('['));
+        assert!(
+            harness
+                .capture_frame_str(120, 24)
+                .contains("at saved-world tick 131")
+        );
+        harness.inject_key(KeyCode::Enter);
+        let effects: Vec<_> = harness.model_mut().drain_effects().collect();
+        let [
+            ShellEffect::BranchCheckpoint {
+                checkpoint_id,
+                ticks,
+                intervention_delay_ticks,
+                intervention,
+                ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("one frozen branch request expected: {effects:?}");
+        };
+        assert_eq!(checkpoint_id, "saved-source");
+        assert_eq!(*ticks, 120);
+        assert_eq!(*intervention_delay_ticks, 119);
+        assert!(matches!(
+            intervention,
+            Some(crate::branch_study::StudyIntervention::Drought {
+                duration_ticks: 1,
+                ..
+            })
+        ));
+        assert_eq!(harness.model().command_counter, 1);
+        assert!(harness.model().branch_request_pending);
+    }
+
+    #[test]
+    fn checkpoint_branch_messages_reject_invalid_delays_before_receipts_or_effects() {
+        for (ticks, delay, intervention) in [
+            (0, 0, None),
+            (3, 1, None),
+            (
+                3,
+                3,
+                Some(crate::branch_study::StudyIntervention::ClosedWorld { closed: true }),
+            ),
+            (
+                3,
+                u64::MAX,
+                Some(crate::branch_study::StudyIntervention::ClosedWorld { closed: true }),
+            ),
+        ] {
+            let mut harness = checkpoint_branch_harness();
+            harness.dispatch(ShellMessage::BranchCheckpoint {
+                checkpoint_id: "saved-source".into(),
+                branch_name: "invalid-timing".into(),
+                ticks,
+                intervention,
+                intervention_delay_ticks: delay,
+            });
+            assert_eq!(harness.model().command_counter, 0);
+            assert!(harness.model().receipts.is_empty());
+            assert!(!harness.model().branch_request_pending);
+            assert_eq!(harness.model_mut().drain_effects().count(), 0);
+        }
     }
 
     #[test]

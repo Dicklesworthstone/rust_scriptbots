@@ -1995,7 +1995,7 @@ fn branch_composer_rows(
             LabBranchCreationState::Created { .. } => {}
         }
         rows.push(PanelRow::text(if current_source {
-            "Retry preserves this exact saved source, treatment, horizon and request. Abandon clears the local retry only; an admitted study may still exist in the catalog."
+            "Retry preserves this exact saved source, treatment, delay, horizon and request. Abandon clears the local retry only; an admitted study may still exist in the catalog."
         } else {
             "This previous-source request cannot be retried here. Abandon clears the local retry only; an admitted study may still exist in the catalog."
         }));
@@ -2081,6 +2081,52 @@ fn branch_composer_rows(
                 .checked_add(1)
                 .is_some_and(|ticks| ticks <= capabilities.max_ticks),
     ));
+    rows.push(PanelRow::text(format!(
+        "Treatment delay: {} completed future ticks",
+        draft.intervention_delay_ticks,
+    )));
+    rows.push(PanelRow::workflow(
+        "Apply treatment one tick earlier",
+        LabAction::BranchDelay(draft.intervention_delay_ticks.saturating_sub(1)),
+        editing && draft.intervention_delay_ticks > 0,
+    ));
+    for delay in [0, 1, 10, 100, 1_000] {
+        if delay < draft.ticks {
+            rows.push(PanelRow::workflow(
+                format!(
+                    "{}{}",
+                    if draft.intervention_delay_ticks == delay {
+                        "Selected: "
+                    } else {
+                        ""
+                    },
+                    if delay == 0 {
+                        "Apply immediately".to_owned()
+                    } else {
+                        format!("Apply after {delay} future ticks")
+                    },
+                ),
+                LabAction::BranchDelay(delay),
+                editing && (delay == 0 || draft.treatment != LabBranchTreatment::Unchanged),
+            ));
+        }
+    }
+    rows.push(PanelRow::workflow(
+        "Apply treatment one tick later",
+        LabAction::BranchDelay(
+            draft
+                .intervention_delay_ticks
+                .checked_add(1)
+                .unwrap_or(draft.intervention_delay_ticks),
+        ),
+        editing
+            && draft.treatment != LabBranchTreatment::Unchanged
+            && draft
+                .intervention_delay_ticks
+                .checked_add(1)
+                .is_some_and(|delay| delay < draft.ticks),
+    ));
+    rows.push(PanelRow::text(draft.timing_description()));
     let target = draft.checkpoint.tick.checked_add(draft.ticks);
     let total_ticks = draft.treatment.branch_count().checked_mul(draft.ticks);
     rows.push(PanelRow::text(format!(
@@ -2093,7 +2139,7 @@ fn branch_composer_rows(
         total_ticks.map(|ticks| ticks.to_string()).unwrap_or_else(|| "overflow".into()),
     )));
     rows.push(PanelRow::text(
-        "Outcomes describe one saved starting state. Repeated ticks are not independent seed replicates. Any selected intervention applies at the saved boundary before its next tick.",
+        "Outcomes describe one saved starting state. Repeated ticks are not independent seed replicates. Recovery and extinction observations start at each arm's reported baseline.",
     ));
     if let Err(reason) = draft.validate(capabilities) {
         rows.push(PanelRow::text(format!("Plan needs attention: {reason}")));
@@ -2186,6 +2232,15 @@ fn checkpoint_study_rows(
             rows.push(PanelRow::text(format!(
                 "Requested target tick: {}. Source and target describe the plan; they are not a live progress counter.",
                 branch.target_tick,
+            )));
+            rows.push(PanelRow::text(branch.intervention_tick.map_or_else(
+                || "No intervention requested; unchanged future only.".into(),
+                |tick| {
+                    format!(
+                        "Requested intervention boundary: tick {tick}, after {} future ticks.",
+                        tick - branch.source_tick
+                    )
+                },
             )));
             rows.push(PanelRow::workflow(
                 "Request study cancellation",
@@ -5074,6 +5129,7 @@ mod tests {
             status: "completed".into(),
             source_tick: checkpoint.tick,
             target_tick: 18,
+            intervention_tick: Some(checkpoint.tick + 4),
             world_digest: checkpoint.world_digest.clone(),
             artifact_id: Some("retained-report-1".into()),
             error_reason: None,
@@ -5100,6 +5156,7 @@ mod tests {
                 command_applied_tick: None,
                 minimum_population: 3,
                 extinction_tick: None,
+                baseline_tick: branch.source_tick,
                 baseline_population: 3,
                 recovery_ratio: Some(1.0),
                 first_divergence: None,
@@ -5111,17 +5168,18 @@ mod tests {
                 total_energy: 4.0,
                 average_health: Some(0.7),
                 final_digest: "3333333333333333".into(),
-                command_applied_tick: Some(branch.source_tick),
+                command_applied_tick: branch.intervention_tick,
                 minimum_population: 2,
                 extinction_tick: None,
+                baseline_tick: branch.intervention_tick.unwrap(),
                 baseline_population: 3,
                 recovery_ratio: Some(2.0 / 3.0),
                 first_divergence: Some(LabBranchDivergence {
-                    tick: 8,
+                    tick: branch.intervention_tick.unwrap() + 1,
                     stage: "food".into(),
                     control_digest: "4444444444444444".into(),
                     branch_digest: "5555555555555555".into(),
-                    command_applied_tick: branch.source_tick,
+                    command_applied_tick: branch.intervention_tick.unwrap(),
                     details: "Fixture's first differing food lane.".into(),
                 }),
             }),
@@ -5185,6 +5243,7 @@ mod tests {
                         status: "running".into(),
                         source_tick: draft.checkpoint.tick,
                         target_tick: draft.checkpoint.tick + draft.ticks,
+                        intervention_tick: draft.intervention_tick(),
                         world_digest: draft.checkpoint.world_digest.clone(),
                         artifact_id: None,
                         error_reason: None,
@@ -5299,6 +5358,7 @@ mod tests {
         ));
         assert!(press(&mut app, LabAction::BranchTicks(10)));
         assert!(press(&mut app, LabAction::BranchTicks(11)));
+        assert!(press(&mut app, LabAction::BranchDelay(10)));
         let rows = panel_rows(
             app.world().non_send_resource::<LabWorkflows>(),
             app.world().resource::<LabPresentation>(),
@@ -5308,6 +5368,14 @@ mod tests {
                 && row.text.contains("source tick 7 -> target tick 18")
                 && row.text.contains("22 total scientific transitions")
         }));
+        assert!(rows.iter().any(|row| {
+            row.text
+                .contains("Treatment after 10 future ticks, at completed tick 17")
+        }));
+        assert!(
+            rows.iter()
+                .any(|row| row.text == "Apply treatment one tick later" && !row.enabled)
+        );
         assert!(press(&mut app, LabAction::CreateCheckpointBranch));
         wait(&mut app, &|model| {
             !model.is_busy()
@@ -5323,6 +5391,7 @@ mod tests {
             LabAction::BranchTreatment(LabBranchTreatment::FoodBloom)
         ));
         assert!(!press(&mut app, LabAction::BranchTicks(1_000)));
+        assert!(!press(&mut app, LabAction::BranchDelay(0)));
         assert!(press(&mut app, LabAction::BackToCheckpoints));
         wait(&mut app, &|model| {
             model.checkpoints.is_some() && !model.is_busy()
@@ -5382,7 +5451,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .tick,
-            8
+            12
         );
         let rows = panel_rows(model, app.world().resource::<LabPresentation>());
         assert!(rows.len() <= MAX_PANEL_ROWS);
@@ -5399,6 +5468,7 @@ mod tests {
         assert_eq!(recorded[0].2.checkpoint, study_checkpoint_fixture());
         assert_eq!(recorded[0].2.treatment, LabBranchTreatment::Drought);
         assert_eq!(recorded[0].2.ticks, 11);
+        assert_eq!(recorded[0].2.intervention_delay_ticks, 10);
         assert_eq!(
             app.world()
                 .resource::<SnapshotState>()
@@ -5433,6 +5503,7 @@ mod tests {
             },
             ticks: 10_000,
             treatment: LabBranchTreatment::Unchanged,
+            intervention_delay_ticks: 0,
         });
         let rows = panel_rows(&model, &presentation);
         assert!(rows.len() <= MAX_PANEL_ROWS);
@@ -5455,6 +5526,7 @@ mod tests {
                 checkpoint: study_checkpoint_fixture(),
                 ticks: 11,
                 treatment: LabBranchTreatment::FoodBloom,
+                intervention_delay_ticks: 4,
             },
             state: LabBranchCreationState::Pending,
         });
@@ -5473,13 +5545,19 @@ mod tests {
                 && row.text.contains(LabBranchTreatment::FoodBloom.label())
                 && row.text.contains("source tick 7 -> target tick 18")
         }));
+        assert!(rows.iter().any(|row| {
+            row.text
+                .contains("Treatment after 4 future ticks, at completed tick 11")
+        }));
         assert!(
             rows.iter()
                 .filter(|row| {
                     matches!(
                         &row.action,
                         Some(PanelAction::Workflow(
-                            LabAction::BranchTreatment(_) | LabAction::BranchTicks(_)
+                            LabAction::BranchTreatment(_)
+                                | LabAction::BranchTicks(_)
+                                | LabAction::BranchDelay(_)
                         ))
                     )
                 })

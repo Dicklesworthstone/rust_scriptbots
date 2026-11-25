@@ -4236,27 +4236,27 @@ pub mod renderer {
                 } => create_lab_checkpoint_branch(&control, request_id, session_id, draft),
                 LabWorkflowRequest::ListCheckpointBranches { cursor } => control
                     .list_checkpoint_branches(Some(LAB_PAGE_SIZE), cursor.as_deref())
-                    .map(|page| {
-                        LabWorkflowResponse::CheckpointBranches(
+                    .and_then(|page| {
+                        Ok(LabWorkflowResponse::CheckpointBranches(
                             scriptbots_runtime::lab_workflows::LabCheckpointBranchPage {
                                 items: page
                                     .items
                                     .into_iter()
-                                    .map(project_lab_checkpoint_branch)
-                                    .collect(),
+                                    .map(|branch| project_lab_checkpoint_branch(&control, branch))
+                                    .collect::<Result<Vec<_>, _>>()?,
                                 total: page.total,
                                 offset: page.offset,
                                 next_cursor: page.next_cursor,
                             },
-                        )
+                        ))
                     }),
                 LabWorkflowRequest::GetCheckpointBranch { branch_id } => control
                     .get_checkpoint_branch(&branch_id)
-                    .map(project_lab_checkpoint_branch)
+                    .and_then(|branch| project_lab_checkpoint_branch(&control, branch))
                     .map(LabWorkflowResponse::CheckpointBranch),
                 LabWorkflowRequest::CancelCheckpointBranch { branch_id } => control
                     .cancel_checkpoint_branch(&branch_id)
-                    .map(project_lab_checkpoint_branch)
+                    .and_then(|branch| project_lab_checkpoint_branch(&control, branch))
                     .map(LabWorkflowResponse::CheckpointBranch),
                 LabWorkflowRequest::GetCheckpointBranchReport { branch_id } => {
                     read_lab_checkpoint_branch_report(&control, &branch_id)
@@ -4556,21 +4556,25 @@ pub mod renderer {
     }
 
     fn project_lab_checkpoint_branch(
+        control: &crate::control::ControlHandle,
         branch: crate::control::CheckpointBranchStatusDto,
-    ) -> scriptbots_runtime::lab_workflows::LabCheckpointBranch {
-        scriptbots_runtime::lab_workflows::LabCheckpointBranch {
+    ) -> Result<scriptbots_runtime::lab_workflows::LabCheckpointBranch, crate::control::ControlError>
+    {
+        let intervention_tick = control.checkpoint_branch_intervention_tick(&branch.branch_id)?;
+        Ok(scriptbots_runtime::lab_workflows::LabCheckpointBranch {
             branch_id: branch.branch_id,
             checkpoint_id: branch.checkpoint_id,
             branch_name: branch.branch_name,
             status: branch.status,
             source_tick: branch.source_tick,
             target_tick: branch.target_tick,
+            intervention_tick,
             world_digest: branch.world_digest_v1,
             artifact_id: branch.artifact_id,
             error_reason: branch
                 .error_reason
                 .map(|reason| reason.chars().take(512).collect()),
-        }
+        })
     }
 
     fn create_lab_checkpoint_branch(
@@ -4604,9 +4608,12 @@ pub mod renderer {
             LabBranchTreatment::Unchanged => None,
             LabBranchTreatment::Drought => Some(StudyIntervention::Drought {
                 region: None,
-                duration_ticks: u32::try_from(draft.ticks).map_err(|_| {
-                    ControlError::BadRequest("drought duration exceeds the core tick range".into())
-                })?,
+                duration_ticks: u32::try_from(draft.ticks - draft.intervention_delay_ticks)
+                    .map_err(|_| {
+                        ControlError::BadRequest(
+                            "drought duration exceeds the core tick range".into(),
+                        )
+                    })?,
                 growth_scale: 0.0,
             }),
             LabBranchTreatment::FoodBloom => Some(StudyIntervention::ResourceShock {
@@ -4652,7 +4659,7 @@ pub mod renderer {
             branch_name: draft.treatment.key().into(),
             ticks: draft.ticks,
             intervention,
-            intervention_delay_ticks: 0,
+            intervention_delay_ticks: draft.intervention_delay_ticks,
             idempotency_key,
         })?;
         if control.read_snapshot()?.session_id != session_id
@@ -4662,6 +4669,8 @@ pub mod renderer {
             || branch.source_tick != draft.checkpoint.tick
             || branch.world_digest_v1 != draft.checkpoint.world_digest
             || draft.checkpoint.tick.checked_add(draft.ticks) != Some(branch.target_tick)
+            || control.checkpoint_branch_intervention_tick(&branch.branch_id)?
+                != draft.intervention_tick()
         {
             return Err(ControlError::Conflict(
                 "admitted checkpoint study does not match its source session and frozen request"
@@ -4671,7 +4680,7 @@ pub mod renderer {
         Ok(LabWorkflowResponse::CheckpointBranchCreated {
             request_id,
             session_id,
-            branch: project_lab_checkpoint_branch(branch),
+            branch: project_lab_checkpoint_branch(control, branch)?,
         })
     }
 
@@ -4685,6 +4694,7 @@ pub mod renderer {
     fn project_lab_branch_outcome(
         outcome: crate::branch_study::BranchOutcomeReport,
         status: &crate::control::CheckpointBranchStatusDto,
+        intervention_tick: Option<u64>,
         is_control: bool,
     ) -> Result<scriptbots_runtime::lab_workflows::LabBranchOutcome, crate::control::ControlError>
     {
@@ -4692,8 +4702,10 @@ pub mod renderer {
         use scriptbots_runtime::lab_workflows::{LabBranchDivergence, LabBranchOutcome};
 
         let sample = outcome.terminal_sample;
-        let expected_command = (!is_control).then_some(status.source_tick);
+        let expected_command = if is_control { None } else { intervention_tick };
+        let baseline_tick = expected_command.unwrap_or(status.source_tick);
         if sample.tick != status.target_tick
+            || (!is_control && expected_command.is_none())
             || outcome.command_applied_tick != expected_command
             || !outcome.bundle_verified
             || outcome.final_digest != sample.digest_overall
@@ -4703,7 +4715,7 @@ pub mod renderer {
             || !sample.average_health.is_finite()
             || outcome.extinction.final_population != sample.population
             || outcome.recovery.final_population != sample.population
-            || outcome.recovery.baseline_tick != status.source_tick
+            || outcome.recovery.baseline_tick != baseline_tick
             || outcome.extinction.min_population > sample.population
             || !outcome.recovery.recovery_ratio.is_finite()
             || outcome.recovery.recovery_ratio < 0.0
@@ -4711,7 +4723,7 @@ pub mod renderer {
             || outcome
                 .extinction
                 .extinction_tick
-                .is_some_and(|tick| tick < status.source_tick || tick > status.target_tick)
+                .is_some_and(|tick| tick < baseline_tick || tick > status.target_tick)
             || (is_control && outcome.first_divergence.is_some())
         {
             return Err(ControlError::Conflict(
@@ -4723,7 +4735,7 @@ pub mod renderer {
             .first_divergence
             .map(|divergence| {
                 if divergence.branch_id != outcome.branch_id
-                    || divergence.tick < status.source_tick
+                    || divergence.tick <= baseline_tick
                     || divergence.tick > status.target_tick
                     || Some(divergence.command_applied_tick) != expected_command
                     || divergence.stage.is_empty()
@@ -4760,6 +4772,7 @@ pub mod renderer {
             command_applied_tick: outcome.command_applied_tick,
             minimum_population: outcome.extinction.min_population,
             extinction_tick: outcome.extinction.extinction_tick,
+            baseline_tick,
             baseline_population: outcome.recovery.pre_intervention_population,
             recovery_ratio: (outcome.recovery.pre_intervention_population > 0)
                 .then_some(outcome.recovery.recovery_ratio),
@@ -4769,6 +4782,7 @@ pub mod renderer {
 
     fn project_lab_branch_report(
         status: &crate::control::CheckpointBranchStatusDto,
+        intervention_tick: Option<u64>,
         metadata: crate::control::ArtifactMetadataDto,
         report: crate::branch_study::BranchStudyReport,
     ) -> Result<scriptbots_runtime::lab_workflows::LabBranchReport, crate::control::ControlError>
@@ -4798,7 +4812,9 @@ pub mod renderer {
             )
             || !report.pre_intervention_digest_verified_for_all_branches
             || report.control_branch_id != "control"
-            || !(1..=2).contains(&report.branch_reports.len())
+            || report.branch_reports.len() != 1 + usize::from(intervention_tick.is_some())
+            || intervention_tick
+                .is_some_and(|tick| tick < status.source_tick || tick >= status.target_tick)
         {
             return Err(ControlError::Conflict(
                 "checkpoint study report does not match its verified artifact and saved-source receipt"
@@ -4828,9 +4844,19 @@ pub mod renderer {
         let mut treatment = None;
         for outcome in report.branch_reports {
             if outcome.branch_id == "control" && control.is_none() {
-                control = Some(project_lab_branch_outcome(outcome, status, true)?);
+                control = Some(project_lab_branch_outcome(
+                    outcome,
+                    status,
+                    intervention_tick,
+                    true,
+                )?);
             } else if outcome.branch_id == "treatment" && treatment.is_none() {
-                treatment = Some(project_lab_branch_outcome(outcome, status, false)?);
+                treatment = Some(project_lab_branch_outcome(
+                    outcome,
+                    status,
+                    intervention_tick,
+                    false,
+                )?);
             } else {
                 return Err(ControlError::Conflict(
                     "checkpoint study report contains duplicate or unrequested branches".into(),
@@ -4840,9 +4866,11 @@ pub mod renderer {
         let control = control.ok_or_else(|| {
             ControlError::Conflict("checkpoint study report has no unchanged control".into())
         })?;
-        if treatment.as_ref().is_some_and(|outcome| {
-            outcome.final_digest != control.final_digest && outcome.first_divergence.is_none()
-        }) {
+        if treatment.is_some() != intervention_tick.is_some()
+            || treatment.as_ref().is_some_and(|outcome| {
+                outcome.final_digest != control.final_digest && outcome.first_divergence.is_none()
+            })
+        {
             return Err(ControlError::Conflict(
                 "checkpoint study has differing terminal digests without divergence evidence"
                     .into(),
@@ -4874,6 +4902,7 @@ pub mod renderer {
         use scriptbots_runtime::lab_workflows::LAB_MAX_BRANCH_REPORT_BYTES;
 
         let status = control.get_checkpoint_branch(branch_id)?;
+        let intervention_tick = control.checkpoint_branch_intervention_tick(branch_id)?;
         let artifact_id = status
             .artifact_id
             .as_deref()
@@ -4900,7 +4929,8 @@ pub mod renderer {
         }
         let report = serde_json::from_slice(&bytes)
             .map_err(|error| ControlError::Serialization(error.to_string()))?;
-        let projected = project_lab_branch_report(&status, verified_metadata, report)?;
+        let projected =
+            project_lab_branch_report(&status, intervention_tick, verified_metadata, report)?;
         if control.get_checkpoint_branch(branch_id)? != status {
             return Err(ControlError::Conflict(
                 "study receipt changed while its report was being read".into(),
@@ -6054,9 +6084,18 @@ pub mod renderer {
         }
 
         #[test]
+        fn native_lab_checkpoint_study_preserves_its_saved_source_and_verified_outcome() {
+            native_lab_checkpoint_study_preserves_timing(0);
+        }
+
+        #[test]
+        fn native_lab_delayed_checkpoint_study_preserves_timing_retries_and_observed_baseline() {
+            native_lab_checkpoint_study_preserves_timing(1);
+        }
+
         // Real saved source, isolated treatment, exact retry and verified outcome reader.
         #[allow(clippy::too_many_lines)]
-        fn native_lab_checkpoint_study_preserves_its_saved_source_and_verified_outcome() {
+        fn native_lab_checkpoint_study_preserves_timing(delay: u64) {
             use scriptbots_runtime::lab_workflows::{
                 LabAction, LabBranchDraft, LabBranchTreatment, LabCheckpointView, LabPanel,
                 LabWorkflowRequest as Request, LabWorkflowResponse as Response, LabWorkflows,
@@ -6143,9 +6182,11 @@ pub mod renderer {
             assert!(finish_native_lab_request(&mut model).is_none());
             model.dispatch(LabAction::BranchTreatment(LabBranchTreatment::FoodBloom));
             model.dispatch(LabAction::BranchTicks(2));
+            model.dispatch(LabAction::BranchDelay(delay));
             let draft = model.branch_draft.as_ref().unwrap().clone();
             assert_eq!(draft.checkpoint.tick, saved.tick);
             assert_eq!(draft.checkpoint.world_digest, saved.world_digest_v1);
+            assert_eq!(draft.intervention_delay_ticks, delay);
             assert!(model.can_create_checkpoint_branch());
 
             assert!(
@@ -6168,6 +6209,15 @@ pub mod renderer {
                 },
                 LabBranchDraft {
                     ticks: crate::control::MAX_CHECKPOINT_BRANCH_TICKS + 1,
+                    ..draft.clone()
+                },
+                LabBranchDraft {
+                    intervention_delay_ticks: draft.ticks,
+                    ..draft.clone()
+                },
+                LabBranchDraft {
+                    treatment: LabBranchTreatment::Unchanged,
+                    intervention_delay_ticks: 1,
                     ..draft.clone()
                 },
             ]
@@ -6196,6 +6246,7 @@ pub mod renderer {
             assert_eq!(admitted.total, 1);
             let branch_id = admitted.items[0].branch_id.clone();
             model.dispatch(LabAction::BranchTicks(10));
+            model.dispatch(LabAction::BranchDelay(1 - delay));
             assert_eq!(model.branch_draft.as_ref(), Some(&draft));
 
             // Retained study identity outlives the original cut's availability.
@@ -6229,6 +6280,26 @@ pub mod renderer {
             .expect("retry must retain the complete scientific request");
             assert!(conflict.contains("different request"), "{conflict}");
 
+            let changed_timing = provider(Request::CreateCheckpointBranch {
+                request_id: model
+                    .latest_branch_creation
+                    .as_ref()
+                    .unwrap()
+                    .request_id
+                    .clone(),
+                session_id: live.session_id,
+                draft: LabBranchDraft {
+                    intervention_delay_ticks: 1 - delay,
+                    ..draft.clone()
+                },
+            })
+            .err()
+            .expect("retry must retain the treatment boundary");
+            assert!(
+                changed_timing.contains("different request"),
+                "{changed_timing}"
+            );
+
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             let completed = loop {
                 let status = handle.get_checkpoint_branch(&branch_id).unwrap();
@@ -6256,6 +6327,16 @@ pub mod renderer {
             assert_eq!(report.target_tick, saved.tick + 2);
             assert_eq!(report.source_world_digest, saved.world_digest_v1);
             let treatment = report.treatment.as_ref().unwrap();
+            let intervention_tick = Some(saved.tick + delay);
+            assert_eq!(treatment.command_applied_tick, intervention_tick);
+            assert_eq!(treatment.baseline_tick, saved.tick + delay);
+            assert_eq!(report.control.baseline_tick, saved.tick);
+            assert_eq!(
+                handle
+                    .checkpoint_branch_intervention_tick(&branch_id)
+                    .unwrap(),
+                intervention_tick
+            );
             assert!(treatment.total_food > report.control.total_food);
             assert!(treatment.first_divergence.is_some());
             assert_eq!(report.control.population, treatment.population);
@@ -6270,32 +6351,41 @@ pub mod renderer {
                 raw.branch_reports[0].terminal_sample.food_total
             );
             assert_eq!(treatment.final_digest, raw.branch_reports[1].final_digest);
+            let project = |report| {
+                project_lab_branch_report(&completed, intervention_tick, metadata.clone(), report)
+            };
             let mut wrong_source = raw.clone();
             wrong_source.checkpoint_tick += 1;
-            assert!(project_lab_branch_report(&completed, metadata.clone(), wrong_source).is_err());
+            assert!(project(wrong_source).is_err());
             let mut duplicate = raw.clone();
             duplicate.branch_reports[1] = duplicate.branch_reports[0].clone();
-            assert!(project_lab_branch_report(&completed, metadata.clone(), duplicate).is_err());
+            assert!(project(duplicate).is_err());
             let mut invalid_metric = raw.clone();
             invalid_metric.branch_reports[1].terminal_sample.food_total = f64::NAN;
-            assert!(
-                project_lab_branch_report(&completed, metadata.clone(), invalid_metric).is_err()
-            );
+            assert!(project(invalid_metric).is_err());
             let mut untraced_difference = raw.clone();
             assert_ne!(
                 untraced_difference.branch_reports[0].final_digest,
                 untraced_difference.branch_reports[1].final_digest
             );
             untraced_difference.branch_reports[1].first_divergence = None;
-            assert!(
-                project_lab_branch_report(&completed, metadata.clone(), untraced_difference)
-                    .is_err()
-            );
+            assert!(project(untraced_difference).is_err());
+            let mut wrong_timing = raw.clone();
+            wrong_timing.branch_reports[1].command_applied_tick = Some(saved.tick + 1 - delay);
+            assert!(project(wrong_timing).is_err());
+            let mut premature_divergence = raw.clone();
+            premature_divergence.branch_reports[1]
+                .first_divergence
+                .as_mut()
+                .unwrap()
+                .tick = saved.tick + delay;
+            assert!(project(premature_divergence).is_err());
+            let mut wrong_baseline = raw.clone();
+            wrong_baseline.branch_reports[1].recovery.baseline_tick = saved.tick + 1 - delay;
+            assert!(project(wrong_baseline).is_err());
             let mut wrong_boundary = raw;
             wrong_boundary.branch_reports[1].terminal_sample.tick += 1;
-            assert!(
-                project_lab_branch_report(&completed, metadata.clone(), wrong_boundary).is_err()
-            );
+            assert!(project(wrong_boundary).is_err());
 
             model.dispatch(LabAction::CheckpointBranchesPage(None));
             assert!(finish_native_lab_request(&mut model).is_none());

@@ -1072,11 +1072,11 @@ pub enum LabBranchTreatment {
     /// One unchanged scientific future.
     #[default]
     Unchanged,
-    /// Halt food growth throughout the world for the selected horizon.
+    /// Halt food growth throughout the world from the chosen treatment boundary.
     Drought,
-    /// Add 0.5 food units per world cell at the source boundary.
+    /// Add 0.5 food units per world cell at the chosen treatment boundary.
     FoodBloom,
-    /// Disable newcomer restocking from the source boundary.
+    /// Disable newcomer restocking from the chosen treatment boundary.
     ClosedWorld,
 }
 
@@ -1117,13 +1117,13 @@ impl LabBranchTreatment {
         match self {
             Self::Unchanged => "One unchanged control future from the saved scientific state.",
             Self::Drought => {
-                "Treatment halts food growth throughout the world for the full selected horizon; an unchanged control uses the same saved source."
+                "Treatment halts food growth throughout the world from the chosen intervention boundary through the remaining horizon; an unchanged control uses the same saved source."
             }
             Self::FoodBloom => {
-                "Treatment adds 0.5 food units per world cell at the saved boundary, with no scorch; an unchanged control uses the same source."
+                "Treatment adds 0.5 food units per world cell at the chosen intervention boundary, with no scorch; an unchanged control uses the same source."
             }
             Self::ClosedWorld => {
-                "Treatment disables newcomer restocking at the saved boundary; an unchanged control uses the same source."
+                "Treatment disables newcomer restocking at the chosen intervention boundary; an unchanged control uses the same source."
             }
         }
     }
@@ -1175,6 +1175,8 @@ pub struct LabBranchDraft {
     pub ticks: u64,
     /// Explicit bounded treatment; treatments include an unchanged control.
     pub treatment: LabBranchTreatment,
+    /// Completed future transitions before applying the treatment; zero is immediate.
+    pub intervention_delay_ticks: u64,
 }
 
 impl LabBranchDraft {
@@ -1203,10 +1205,45 @@ impl LabBranchDraft {
                 capabilities.max_ticks
             ));
         }
+        if self.intervention_delay_ticks >= self.ticks {
+            return Err(
+                "Treatment delay must be shorter than the horizon, leaving an observed transition after application.".into(),
+            );
+        }
+        if self.treatment == LabBranchTreatment::Unchanged && self.intervention_delay_ticks != 0 {
+            return Err("An unchanged future has no intervention; select an immediate delay or a treatment.".into());
+        }
         if self.checkpoint.tick.checked_add(self.ticks).is_none() {
             return Err("Saved tick plus study horizon overflows the tick counter.".into());
         }
         Ok(())
+    }
+
+    /// Requested absolute treatment boundary, absent for an unchanged future or overflow.
+    #[must_use]
+    pub fn intervention_tick(&self) -> Option<u64> {
+        if self.treatment == LabBranchTreatment::Unchanged {
+            None
+        } else {
+            self.checkpoint
+                .tick
+                .checked_add(self.intervention_delay_ticks)
+        }
+    }
+
+    /// Exact timing disclosed by native composers, including invalid drafts.
+    #[must_use]
+    pub fn timing_description(&self) -> String {
+        if self.treatment == LabBranchTreatment::Unchanged {
+            return "No intervention is scheduled for this unchanged future.".into();
+        }
+        let boundary = self
+            .intervention_tick()
+            .map_or_else(|| "overflow".into(), |tick| tick.to_string());
+        format!(
+            "Treatment after {} future ticks, at completed tick {boundary}. Both futures evolve unchanged until that boundary; the next transition first uses the treatment.",
+            self.intervention_delay_ticks,
+        )
     }
 }
 
@@ -1255,6 +1292,8 @@ pub struct LabCheckpointBranch {
     pub source_tick: u64,
     /// Admitted terminal boundary, not a current progress observation.
     pub target_tick: u64,
+    /// Requested treatment boundary from the retained admission; absent for an unchanged study.
+    pub intervention_tick: Option<u64>,
     /// Scientific digest of the saved source.
     pub world_digest: String,
     /// Verified report identity exposed only for completed work.
@@ -1287,7 +1326,7 @@ pub struct LabBranchDivergence {
     pub control_digest: String,
     /// Actual bounded treatment lane evidence.
     pub branch_digest: String,
-    /// Source boundary at which the intervention was applied.
+    /// Actual boundary at which the intervention was applied.
     pub command_applied_tick: u64,
     /// Bounded explanation retained from the report.
     pub details: String,
@@ -1310,13 +1349,16 @@ pub struct LabBranchOutcome {
     pub final_digest: String,
     /// Intervention boundary; absent for the unchanged control.
     pub command_applied_tick: Option<u64>,
-    /// Minimum population from the source through the final boundary.
+    /// Minimum population from the outcome's baseline through the final boundary.
     pub minimum_population: usize,
     /// First zero-population boundary, if observed.
     pub extinction_tick: Option<u64>,
-    /// Living population at the source before the intervention.
+    /// Boundary from which recovery and extinction observations are measured.
+    /// Controls use the source; treatments use their actual intervention boundary.
+    pub baseline_tick: u64,
+    /// Living population at the baseline before the intervention.
     pub baseline_population: usize,
-    /// Final/source population ratio, unavailable for an empty source population.
+    /// Final/baseline population ratio, unavailable for an empty baseline population.
     pub recovery_ratio: Option<f64>,
     /// First observed divergence against control, absent for control.
     pub first_divergence: Option<LabBranchDivergence>,
@@ -1549,6 +1591,8 @@ pub enum LabAction {
     BranchTreatment(LabBranchTreatment),
     /// Set the exact post-checkpoint horizon.
     BranchTicks(u64),
+    /// Set the exact completed-tick wait before the saved-study treatment.
+    BranchDelay(u64),
     /// Submit or exactly retry the frozen saved-source study.
     CreateCheckpointBranch,
     /// Forget only the local retry identity after its worker has finished.
@@ -1821,6 +1865,9 @@ fn branch_is_bounded(branch: &LabCheckpointBranch) -> bool {
             .target_tick
             .checked_sub(branch.source_tick)
             .is_some_and(|ticks| ticks > 0 && u32::try_from(ticks).is_ok())
+        && branch
+            .intervention_tick
+            .is_none_or(|tick| (branch.source_tick..branch.target_tick).contains(&tick))
         && lowercase_hex_is_valid(&branch.world_digest, std::mem::size_of::<u64>() * 2)
         && branch
             .artifact_id
@@ -1839,6 +1886,7 @@ fn branch_matches_draft(branch: &LabCheckpointBranch, draft: &LabBranchDraft) ->
         && branch.branch_name == draft.treatment.key()
         && branch.source_tick == draft.checkpoint.tick
         && Some(branch.target_tick) == draft.checkpoint.tick.checked_add(draft.ticks)
+        && branch.intervention_tick == draft.intervention_tick()
         && branch.world_digest == draft.checkpoint.world_digest
 }
 
@@ -1848,6 +1896,7 @@ fn branch_has_same_source(previous: &LabCheckpointBranch, next: &LabCheckpointBr
         && previous.branch_name == next.branch_name
         && previous.source_tick == next.source_tick
         && previous.target_tick == next.target_tick
+        && previous.intervention_tick == next.intervention_tick
         && previous.world_digest == next.world_digest
 }
 
@@ -1864,7 +1913,7 @@ fn branch_outcome_is_bounded(
     outcome: &LabBranchOutcome,
     source_tick: u64,
     target_tick: u64,
-    treatment: bool,
+    intervention_tick: Option<u64>,
 ) -> bool {
     let (Ok(population), Ok(baseline_population)) = (
         u32::try_from(outcome.population),
@@ -1897,19 +1946,19 @@ fn branch_outcome_is_bounded(
         && outcome.total_energy >= 0.0
         && health_valid
         && lowercase_hex_is_valid(&outcome.final_digest, std::mem::size_of::<u64>() * 2)
-        && outcome.command_applied_tick == treatment.then_some(source_tick)
+        && outcome.command_applied_tick == intervention_tick
+        && outcome.baseline_tick == intervention_tick.unwrap_or(source_tick)
         && outcome.minimum_population <= outcome.population
         && outcome.minimum_population <= outcome.baseline_population
         && (outcome.minimum_population == 0) == outcome.extinction_tick.is_some()
         && outcome
             .extinction_tick
-            .is_none_or(|tick| (source_tick..=target_tick).contains(&tick))
+            .is_none_or(|tick| (outcome.baseline_tick..=target_tick).contains(&tick))
         && ratio_valid
         && outcome.first_divergence.as_ref().is_none_or(|divergence| {
-            treatment
-                && divergence.tick > source_tick
+            intervention_tick.is_some_and(|tick| divergence.tick > tick)
                 && divergence.tick <= target_tick
-                && divergence.command_applied_tick == source_tick
+                && Some(divergence.command_applied_tick) == intervention_tick
                 && identity_is_bounded(&divergence.stage)
                 && divergence.stage.len() <= 128
                 && !divergence.control_digest.is_empty()
@@ -1943,17 +1992,19 @@ pub(crate) fn branch_report_matches_receipt(
             &report.control,
             report.source_tick,
             report.target_tick,
-            false,
+            None,
         )
+        && report.treatment.is_some() == branch.intervention_tick.is_some()
         && report.treatment.as_ref().is_none_or(|treatment| {
-            treatment.baseline_population == report.control.baseline_population
+            (branch.intervention_tick != Some(report.source_tick)
+                || treatment.baseline_population == report.control.baseline_population)
                 && (treatment.final_digest == report.control.final_digest
                     || treatment.first_divergence.is_some())
                 && branch_outcome_is_bounded(
                     treatment,
                     report.source_tick,
                     report.target_tick,
-                    true,
+                    branch.intervention_tick,
                 )
         })
 }
@@ -2509,6 +2560,7 @@ impl LabWorkflows {
                     checkpoint: checkpoint.clone(),
                     ticks: 100,
                     treatment: LabBranchTreatment::Unchanged,
+                    intervention_delay_ticks: 0,
                 })
         };
         let Some(draft) = draft else {
@@ -4449,6 +4501,7 @@ impl LabWorkflows {
             LabAction::SelectCheckpointBranch(id) => self.select_checkpoint_branch(id),
             action @ (LabAction::BranchTreatment(_)
             | LabAction::BranchTicks(_)
+            | LabAction::BranchDelay(_)
             | LabAction::TreatmentPercent(_)
             | LabAction::TreatmentTick(_)
             | LabAction::FirstSeed(_)
@@ -4567,6 +4620,14 @@ impl LabWorkflows {
                 if self.allow_branch_draft_edit() {
                     if let Some(draft) = &mut self.branch_draft {
                         draft.ticks = *ticks;
+                    }
+                    self.report_branch_draft_validation();
+                }
+            }
+            LabAction::BranchDelay(ticks) => {
+                if self.allow_branch_draft_edit() {
+                    if let Some(draft) = &mut self.branch_draft {
+                        draft.intervention_delay_ticks = *ticks;
                     }
                     self.report_branch_draft_validation();
                 }
@@ -4847,7 +4908,8 @@ pub fn branch_report_lines(report: &LabBranchReport) -> Vec<String> {
             |health| format!("{label} mean live-agent health: {health:.3} health units."),
         ));
         lines.push(format!(
-            "{label} population: source {}; minimum {}; first zero population tick {}.",
+            "{label} population baseline at tick {}: {}; minimum since baseline {}; first zero population tick since baseline {}.",
+            outcome.baseline_tick,
             outcome.baseline_population,
             outcome.minimum_population,
             outcome
@@ -4857,10 +4919,10 @@ pub fn branch_report_lines(report: &LabBranchReport) -> Vec<String> {
         lines.push(outcome.recovery_ratio.map_or_else(
             || {
                 format!(
-                    "{label} final/source population ratio: unavailable (empty source population)."
+                    "{label} final/baseline population ratio: unavailable (empty baseline population)."
                 )
             },
-            |ratio| format!("{label} final/source population ratio: {ratio:.3}."),
+            |ratio| format!("{label} final/baseline population ratio: {ratio:.3}."),
         ));
         lines.push(format!(
             "{label} terminal scientific digest: {}.",
@@ -4869,6 +4931,12 @@ pub fn branch_report_lines(report: &LabBranchReport) -> Vec<String> {
     }
     if let Some(treatment) = &report.treatment {
         let control = &report.control;
+        if let Some(tick) = treatment.command_applied_tick {
+            lines.push(format!(
+                "Treatment applied at completed tick {tick}, after {} future ticks.",
+                tick.saturating_sub(report.source_tick),
+            ));
+        }
         let population_difference = if treatment.population >= control.population {
             format!("+{}", treatment.population - control.population)
         } else {
@@ -4885,7 +4953,7 @@ pub fn branch_report_lines(report: &LabBranchReport) -> Vec<String> {
         });
         if let Some(divergence) = &treatment.first_divergence {
             lines.push(format!(
-                "First observed divergence: tick {}, digest lane {}; intervention applied at saved boundary {}.",
+                "First observed divergence: tick {}, digest lane {}; intervention applied at completed boundary {}.",
                 divergence.tick, divergence.stage, divergence.command_applied_tick,
             ));
             lines.push(format!(
@@ -5731,6 +5799,7 @@ mod tests {
             checkpoint: saved_checkpoint(),
             ticks: 11,
             treatment: LabBranchTreatment::FoodBloom,
+            intervention_delay_ticks: 0,
         }
     }
 
@@ -5742,6 +5811,7 @@ mod tests {
             status: status.into(),
             source_tick: draft.checkpoint.tick,
             target_tick: draft.checkpoint.tick.checked_add(draft.ticks).unwrap(),
+            intervention_tick: draft.intervention_tick(),
             world_digest: draft.checkpoint.world_digest.clone(),
             artifact_id: (status == "completed").then(|| "verified-study-report".into()),
             error_reason: None,
@@ -5800,6 +5870,7 @@ mod tests {
             command_applied_tick: None,
             minimum_population: 3,
             extinction_tick: None,
+            baseline_tick: receipt.source_tick,
             baseline_population: 3,
             recovery_ratio: Some(1.0),
             first_divergence: None,
@@ -5910,6 +5981,90 @@ mod tests {
     }
 
     #[test]
+    fn saved_study_delay_requires_an_intervention_and_a_remaining_observed_transition() {
+        let capabilities = branch_test_capabilities();
+        let mut draft = branch_test_draft();
+        for delay in [0, 1, draft.ticks - 1] {
+            draft.intervention_delay_ticks = delay;
+            assert!(draft.validate(&capabilities).is_ok());
+            assert_eq!(
+                draft.intervention_tick(),
+                Some(draft.checkpoint.tick + delay)
+            );
+            assert!(
+                draft
+                    .timing_description()
+                    .contains(&format!("after {delay} future ticks"))
+            );
+        }
+        for delay in [draft.ticks, draft.ticks + 1, u64::MAX] {
+            draft.intervention_delay_ticks = delay;
+            assert!(draft.validate(&capabilities).is_err());
+            assert_eq!(
+                draft.intervention_delay_ticks, delay,
+                "invalid timing is not clamped"
+            );
+        }
+        draft.intervention_delay_ticks = 1;
+        draft.treatment = LabBranchTreatment::Unchanged;
+        assert!(draft.validate(&capabilities).is_err());
+        assert_eq!(draft.intervention_tick(), None);
+        draft.intervention_delay_ticks = 0;
+        assert!(draft.validate(&capabilities).is_ok());
+        assert!(draft.timing_description().contains("No intervention"));
+
+        draft.treatment = LabBranchTreatment::Drought;
+        draft.intervention_delay_ticks = draft.ticks - 1;
+        draft.checkpoint.tick = u64::MAX - draft.ticks;
+        assert!(draft.validate(&capabilities).is_ok());
+        assert_eq!(draft.intervention_tick(), Some(u64::MAX - 1));
+        draft.checkpoint.tick = u64::MAX;
+        assert!(draft.validate(&capabilities).is_err());
+        assert_eq!(draft.intervention_tick(), None);
+        assert!(draft.timing_description().contains("overflow"));
+    }
+
+    #[test]
+    fn saved_study_delay_edits_preserve_invalid_intent_without_admitting_science() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let mut state = open_branch_test_composer(Arc::new(move |request| {
+            if request == LabWorkflowRequest::BranchCapabilities {
+                return Ok(LabWorkflowResponse::BranchCapabilities(
+                    branch_test_capabilities(),
+                ));
+            }
+            observed.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(branch_test_creation_response(&request))
+        }));
+        state.dispatch(LabAction::BranchTreatment(LabBranchTreatment::Drought));
+        state.dispatch(LabAction::BranchTicks(11));
+        state.dispatch(LabAction::BranchDelay(10));
+        assert!(state.can_create_checkpoint_branch());
+        state.dispatch(LabAction::BranchTicks(10));
+        assert_eq!(
+            state
+                .branch_draft
+                .as_ref()
+                .unwrap()
+                .intervention_delay_ticks,
+            10
+        );
+        assert!(!state.can_create_checkpoint_branch());
+        state.dispatch(LabAction::CreateCheckpointBranch);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        state.dispatch(LabAction::BranchTicks(11));
+        state.dispatch(LabAction::BranchTreatment(LabBranchTreatment::Unchanged));
+        assert!(!state.can_create_checkpoint_branch());
+        state.dispatch(LabAction::BranchDelay(0));
+        assert!(state.can_create_checkpoint_branch());
+        state.dispatch(LabAction::CreateCheckpointBranch);
+        drain_worker(&mut state);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(state.branch.as_ref().unwrap().intervention_tick, None);
+    }
+
+    #[test]
     fn saved_study_uncertain_admission_keeps_full_source_through_owner_changes() {
         for abandon_elsewhere in [false, true] {
             let calls = Arc::new(Mutex::new(Vec::new()));
@@ -5934,13 +6089,21 @@ mod tests {
             );
             state.dispatch(LabAction::BranchTreatment(LabBranchTreatment::FoodBloom));
             state.dispatch(LabAction::BranchTicks(11));
+            state.dispatch(LabAction::BranchDelay(7));
             state.dispatch(LabAction::CreateCheckpointBranch);
             drain_worker(&mut state);
             let frozen = state.latest_branch_creation.clone().unwrap();
-            assert_eq!(frozen.draft, branch_test_draft());
+            assert_eq!(
+                frozen.draft,
+                LabBranchDraft {
+                    intervention_delay_ticks: 7,
+                    ..branch_test_draft()
+                }
+            );
             assert!(state.will_retry_branch_creation());
             state.dispatch(LabAction::BranchTreatment(LabBranchTreatment::ClosedWorld));
             state.dispatch(LabAction::BranchTicks(1));
+            state.dispatch(LabAction::BranchDelay(0));
             assert_eq!(state.branch_draft.as_ref(), Some(&frozen.draft));
 
             state.synchronize(HostSessionId::new(2), LabPanel::Checkpoints);
@@ -5962,6 +6125,7 @@ mod tests {
                 );
                 assert!(state.can_edit_branch_draft());
                 state.dispatch(LabAction::BranchTicks(1));
+                state.dispatch(LabAction::BranchDelay(0));
             } else {
                 state.synchronize(HostSessionId::new(1), LabPanel::Checkpoints);
                 state.dispatch(LabAction::NewCheckpointBranch);
@@ -5982,7 +6146,7 @@ mod tests {
             } else {
                 assert_eq!(
                     calls[0], calls[1],
-                    "source, horizon, treatment and retry identity remain exact"
+                    "source, horizon, treatment, delay and retry identity remain exact"
                 );
             }
             assert_eq!(state.checkpoint_view, LabCheckpointView::BranchDetail);
@@ -6051,7 +6215,7 @@ mod tests {
 
     #[test]
     fn saved_study_creation_receipts_bind_the_original_source_horizon_and_treatment() {
-        for mismatch in 0..11 {
+        for mismatch in 0..12 {
             let mut state = LabWorkflows::default();
             let session = HostSessionId::new(1);
             state.synchronize(session, LabPanel::Checkpoints);
@@ -6098,6 +6262,7 @@ mod tests {
                         .checkpoint
                         .byte_size += 1;
                 }
+                11 => branch.intervention_tick = Some(branch.source_tick + 1),
                 _ => unreachable!(),
             }
             assert!(deliver(&mut state, request, response).is_none());
@@ -6238,7 +6403,7 @@ mod tests {
         );
         assert!(rendered.contains("First observed divergence: tick 43"));
 
-        for mismatch in 0..18 {
+        for mismatch in 0..19 {
             let mut state = LabWorkflows::default();
             state.synchronize(HostSessionId::new(1), LabPanel::Checkpoints);
             state.checkpoint_view = LabCheckpointView::BranchDetail;
@@ -6302,6 +6467,7 @@ mod tests {
                         .details = "x".repeat(2049);
                 }
                 17 => changed.treatment.as_mut().unwrap().first_divergence = None,
+                18 => changed.treatment.as_mut().unwrap().baseline_tick += 1,
                 _ => unreachable!(),
             }
             deliver(
@@ -6315,6 +6481,86 @@ mod tests {
                 state.branch_report.is_none(),
                 "malformed report {mismatch} must clear the previous preview"
             );
+        }
+    }
+
+    #[test]
+    fn saved_study_delayed_reports_use_the_actual_intervention_baseline_and_receipt() {
+        let mut draft = branch_test_draft();
+        draft.intervention_delay_ticks = draft.ticks - 1;
+        let receipt = branch_test_receipt(&draft, "completed");
+        let due = receipt.intervention_tick.unwrap();
+        let mut report = branch_test_report();
+        let treatment = report.treatment.as_mut().unwrap();
+        treatment.command_applied_tick = Some(due);
+        treatment.baseline_tick = due;
+        treatment.baseline_population = 4;
+        treatment.recovery_ratio = Some(0.5);
+        let divergence = treatment.first_divergence.as_mut().unwrap();
+        divergence.tick = due + 1;
+        divergence.command_applied_tick = due;
+        assert!(branch_report_matches_receipt(&report, &receipt));
+        let lines = branch_report_lines(&report).join("\n");
+        assert!(lines.contains(&format!("Treatment population baseline at tick {due}: 4")));
+        assert!(lines.contains("Treatment final/baseline population ratio: 0.500"));
+        assert!(lines.contains(&format!(
+            "Treatment applied at completed tick {due}, after 10 future ticks"
+        )));
+
+        // A cold catalog consumer has no local draft. The retained admission
+        // still owns the timing; a report cannot quietly move it to another tick.
+        let mut state = LabWorkflows::default();
+        state.synchronize(HostSessionId::new(1), LabPanel::Checkpoints);
+        state.checkpoint_view = LabCheckpointView::BranchDetail;
+        state.selected_branch = Some(receipt.branch_id.clone());
+        state.branch = Some(receipt.clone());
+        let request = LabWorkflowRequest::GetCheckpointBranchReport {
+            branch_id: receipt.branch_id.clone(),
+        };
+        deliver(
+            &mut state,
+            request.clone(),
+            LabWorkflowResponse::CheckpointBranchReport(Box::new(report.clone())),
+        );
+        assert_eq!(state.branch_report.as_ref(), Some(&report));
+        for mismatch in 0..6 {
+            let mut changed = report.clone();
+            let treatment = changed.treatment.as_mut().unwrap();
+            match mismatch {
+                0 => treatment.command_applied_tick = Some(due - 1),
+                1 => treatment.baseline_tick = changed.source_tick,
+                2 => treatment.first_divergence.as_mut().unwrap().tick = due,
+                3 => {
+                    treatment
+                        .first_divergence
+                        .as_mut()
+                        .unwrap()
+                        .command_applied_tick = due - 1
+                }
+                4 => {
+                    treatment.minimum_population = 0;
+                    treatment.extinction_tick = Some(due - 1);
+                }
+                5 => changed.treatment = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                !branch_report_matches_receipt(&changed, &receipt),
+                "mismatch {mismatch}"
+            );
+            deliver(
+                &mut state,
+                request.clone(),
+                LabWorkflowResponse::CheckpointBranchReport(Box::new(changed)),
+            );
+            assert!(state.branch_report.is_none());
+        }
+        let mut changed_receipt = receipt.clone();
+        changed_receipt.intervention_tick = Some(due - 1);
+        assert!(!branch_transition_is_valid(&receipt, &changed_receipt));
+        for tick in [receipt.source_tick - 1, receipt.target_tick, u64::MAX] {
+            changed_receipt.intervention_tick = Some(tick);
+            assert!(!branch_is_bounded(&changed_receipt));
         }
     }
 
@@ -6371,7 +6617,7 @@ mod tests {
         assert!(
             branch_report_lines(&empty_source)
                 .iter()
-                .any(|line| line.contains("unavailable (empty source population)"))
+                .any(|line| line.contains("unavailable (empty baseline population)"))
         );
     }
 

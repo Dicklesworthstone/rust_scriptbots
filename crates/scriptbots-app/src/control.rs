@@ -6895,6 +6895,49 @@ impl ControlHandle {
             .status_dto()
     }
 
+    /// Read the requested treatment boundary from the immutable admission, including
+    /// recovered studies. A receipt's display name is never a treatment authority.
+    pub(crate) fn checkpoint_branch_intervention_tick(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<u64>, ControlError> {
+        if !valid_checkpoint_branch_identifier(branch_id) {
+            return Err(ControlError::BadRequest(
+                "invalid checkpoint branch identifier".to_owned(),
+            ));
+        }
+        let mut jobs = self
+            .data_services
+            .checkpoint_branches
+            .lock()
+            .map_err(|_| ControlError::Lock)?;
+        self.data_services
+            .recover_checkpoint_branches_locked(&mut jobs, Some(branch_id))?;
+        let definition = &jobs
+            .get(branch_id)
+            .ok_or_else(|| {
+                ControlError::NotFound(format!("checkpoint branch '{branch_id}' not found"))
+            })?
+            .definition;
+        definition
+            .request
+            .intervention
+            .as_ref()
+            .map(|_| {
+                definition
+                    .source_tick
+                    .checked_add(definition.request.intervention_delay_ticks)
+                    .filter(|tick| *tick < definition.target_tick)
+                    .ok_or_else(|| {
+                        ControlError::Conflict(
+                            "checkpoint branch treatment boundary is outside its admitted horizon"
+                                .into(),
+                        )
+                    })
+            })
+            .transpose()
+    }
+
     /// Discover admitted studies from bounded metadata, without reading bundle
     /// payloads or advancing science. Completion is a historical terminal receipt;
     /// artifact download separately revalidates the exact retained bytes.
@@ -16313,6 +16356,12 @@ pub(crate) mod tests {
         request.intervention_delay_ticks = request.ticks - 1;
         let due = checkpoint.tick + request.intervention_delay_ticks;
         let admitted = handle.create_checkpoint_branch(request.clone()).unwrap();
+        assert_eq!(
+            handle
+                .checkpoint_branch_intervention_tick(&admitted.branch_id)
+                .unwrap(),
+            Some(due)
+        );
         let completed = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
         assert_eq!(completed.status, "completed", "{completed:?}");
         assert_eq!(
@@ -16396,6 +16445,11 @@ pub(crate) mod tests {
 
         let cold = host.handle().with_artifacts_dir(directory).unwrap();
         assert_eq!(cold.create_checkpoint_branch(request).unwrap(), completed);
+        assert_eq!(
+            cold.checkpoint_branch_intervention_tick(&completed.branch_id)
+                .unwrap(),
+            Some(due)
+        );
         assert!(matches!(
             cold.create_checkpoint_branch(changed),
             Err(ControlError::Conflict(_))

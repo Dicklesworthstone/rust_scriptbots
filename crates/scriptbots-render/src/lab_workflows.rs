@@ -1902,7 +1902,7 @@ impl SimulationView {
             }));
             panel = panel
                 .child(div().text_xs().child(if current_source {
-                    "Retry preserves this exact saved source, treatment, horizon and request. Abandon clears the local retry only; an admitted study may still exist in the catalog."
+                    "Retry preserves this exact saved source, treatment, delay, horizon and request. Abandon clears the local retry only; an admitted study may still exist in the catalog."
                 } else {
                     "This previous-source request cannot be retried here. Abandon clears the local retry only; an admitted study may still exist in the catalog."
                 }))
@@ -1998,11 +1998,63 @@ impl SimulationView {
                 cx,
             ),
         );
+        let mut delays = div().flex().flex_wrap().gap_2().child(self.lab_button(
+            "lab-branch-delay-prev".into(),
+            "Apply treatment one tick earlier".into(),
+            LabAction::BranchDelay(draft.intervention_delay_ticks.saturating_sub(1)),
+            editing && draft.intervention_delay_ticks > 0,
+            cx,
+        ));
+        for delay in [0, 1, 10, 100, 1_000] {
+            if delay < draft.ticks {
+                delays = delays.child(self.lab_button(
+                    format!("lab-branch-delay-{delay}"),
+                    format!(
+                        "{}{}",
+                        if draft.intervention_delay_ticks == delay {
+                            "Selected: "
+                        } else {
+                            ""
+                        },
+                        if delay == 0 {
+                            "Apply immediately".to_owned()
+                        } else {
+                            format!("Apply after {delay} future ticks")
+                        },
+                    ),
+                    LabAction::BranchDelay(delay),
+                    editing && (delay == 0 || draft.treatment != LabBranchTreatment::Unchanged),
+                    cx,
+                ));
+            }
+        }
+        delays = delays.child(
+            self.lab_button(
+                "lab-branch-delay-next".into(),
+                "Apply treatment one tick later".into(),
+                LabAction::BranchDelay(
+                    draft
+                        .intervention_delay_ticks
+                        .checked_add(1)
+                        .unwrap_or(draft.intervention_delay_ticks),
+                ),
+                editing
+                    && draft.treatment != LabBranchTreatment::Unchanged
+                    && draft
+                        .intervention_delay_ticks
+                        .checked_add(1)
+                        .is_some_and(|delay| delay < draft.ticks),
+                cx,
+            ),
+        );
         let target = draft.checkpoint.tick.checked_add(draft.ticks);
         let total_ticks = draft.treatment.branch_count().checked_mul(draft.ticks);
         panel = panel
             .child(div().text_sm().child(format!("Future horizon: {} ticks", draft.ticks)))
             .child(horizons)
+            .child(div().text_sm().child(format!("Treatment delay: {} completed future ticks", draft.intervention_delay_ticks)))
+            .child(delays)
+            .child(div().text_xs().child(draft.timing_description()))
             .child(
                 div()
                     .id("lab-branch-preview")
@@ -2019,7 +2071,7 @@ impl SimulationView {
                     )),
             )
             .child(div().text_xs().child(
-                "Outcomes describe one saved starting state. Repeated ticks are not independent seed replicates. Any selected intervention applies at the saved boundary before its next tick.",
+                "Outcomes describe one saved starting state. Repeated ticks are not independent seed replicates. Recovery and extinction observations start at each arm's reported baseline.",
             ));
         if let Err(reason) = draft.validate(capabilities) {
             panel = panel.child(
@@ -2144,6 +2196,10 @@ impl SimulationView {
                     .child(div().text_xs().child(format!(
                         "Requested target tick: {}. Source and target describe the plan; they are not a live progress counter.",
                         branch.target_tick,
+                    )))
+                    .child(div().text_xs().child(branch.intervention_tick.map_or_else(
+                        || "No intervention requested; unchanged future only.".into(),
+                        |tick| format!("Requested intervention boundary: tick {tick}, after {} future ticks.", tick - branch.source_tick),
                     )))
                     .child(self.lab_button(
                         "lab-branch-cancel".into(),
@@ -3378,6 +3434,7 @@ mod tests {
             status: "completed".into(),
             source_tick: checkpoint.tick,
             target_tick: target,
+            intervention_tick: draft.intervention_tick(),
             world_digest: checkpoint.world_digest.clone(),
             artifact_id: Some("native-study-report-1".into()),
             error_reason: None,
@@ -3396,6 +3453,7 @@ mod tests {
             command_applied_tick: None,
             minimum_population: checkpoint.agent_count,
             extinction_tick: (checkpoint.agent_count == 0).then_some(checkpoint.tick),
+            baseline_tick: checkpoint.tick,
             baseline_population: checkpoint.agent_count,
             recovery_ratio: (checkpoint.agent_count > 0).then_some(1.0),
             first_divergence: None,
@@ -3416,13 +3474,16 @@ mod tests {
                 LabBranchOutcome {
                     total_food: 6.0,
                     final_digest: "2222222222222222".into(),
-                    command_applied_tick: Some(checkpoint.tick),
+                    command_applied_tick: draft.intervention_tick(),
+                    baseline_tick: draft.intervention_tick().unwrap(),
+                    extinction_tick: (checkpoint.agent_count == 0)
+                        .then_some(draft.intervention_tick().unwrap()),
                     first_divergence: Some(LabBranchDivergence {
-                        tick: checkpoint.tick + 1,
+                        tick: draft.intervention_tick().unwrap() + 1,
                         stage: "food".into(),
                         control_digest: "3333333333333333".into(),
                         branch_digest: "4444444444444444".into(),
-                        command_applied_tick: checkpoint.tick,
+                        command_applied_tick: draft.intervention_tick().unwrap(),
                         details: "Fixture's first differing food lane.".into(),
                     }),
                     ..control.clone()
@@ -3590,6 +3651,7 @@ mod tests {
         click(&mut lab, "lab-branch-treatment-food-bloom");
         click(&mut lab, "lab-branch-ticks-10");
         click(&mut lab, "lab-branch-ticks-next");
+        click(&mut lab, "lab-branch-delay-10");
         draw(&mut lab);
         assert!(lab.debug_bounds("lab-branch-preview").is_some());
         context.update(|app| {
@@ -3597,6 +3659,7 @@ mod tests {
             assert_eq!(draft.checkpoint, expected_checkpoint);
             assert_eq!(draft.ticks, 11);
             assert_eq!(draft.treatment, LabBranchTreatment::FoodBloom);
+            assert_eq!(draft.intervention_delay_ticks, 10);
         });
         click(&mut lab, "lab-branch-create");
         wait(&mut lab, &|state| {
@@ -3610,11 +3673,13 @@ mod tests {
         });
         click(&mut lab, "lab-branch-treatment-drought");
         click(&mut lab, "lab-branch-ticks-1000");
+        click(&mut lab, "lab-branch-delay-0");
         context.update(|app| {
             let state = &hud.read(app).lab_workflows;
             let draft = state.branch_draft.as_ref().unwrap();
             assert_eq!(draft.ticks, 11);
             assert_eq!(draft.treatment, LabBranchTreatment::FoodBloom);
+            assert_eq!(draft.intervention_delay_ticks, 10);
         });
         click(&mut lab, "lab-branch-create");
         wait(&mut lab, &|state| {
@@ -3637,6 +3702,11 @@ mod tests {
             assert_eq!(report.source_tick, expected_checkpoint.tick);
             assert_eq!(report.target_tick, expected_checkpoint.tick + 11);
             let treatment = report.treatment.as_ref().unwrap();
+            assert_eq!(
+                treatment.command_applied_tick,
+                Some(expected_checkpoint.tick + 10)
+            );
+            assert_eq!(treatment.baseline_tick, expected_checkpoint.tick + 10);
             assert_eq!(treatment.total_food - report.control.total_food, 2.0);
             assert_eq!(treatment.first_divergence.as_ref().unwrap().stage, "food");
         });
@@ -3663,6 +3733,7 @@ mod tests {
             "retry must preserve every request input"
         );
         assert_eq!(recorded[0].2.checkpoint, expected_checkpoint);
+        assert_eq!(recorded[0].2.intervention_delay_ticks, 10);
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
         assert_eq!(host.snapshot().world.tick, live_tick);
     }

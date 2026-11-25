@@ -2683,6 +2683,7 @@ impl LiveTerminalModel<'_> {
                     branch_name,
                     ticks,
                     intervention,
+                    intervention_delay_ticks,
                 } => {
                     if self
                         .branch_study
@@ -2703,7 +2704,7 @@ impl LiveTerminalModel<'_> {
                                 branch_name,
                                 ticks,
                                 intervention,
-                                intervention_delay_ticks: 0,
+                                intervention_delay_ticks,
                                 idempotency_key,
                             },
                             branch_id: None,
@@ -20591,6 +20592,7 @@ for case in ('panic', 'subscription', 'renderer'):
                 branch_name: "close-during-handoff".into(),
                 ticks: crate::control::MAX_CHECKPOINT_BRANCH_TICKS,
                 intervention: None,
+                intervention_delay_ticks: 0,
             });
             let mut model = LiveTerminalModel::new(app).unwrap();
             model.cancelled_service_route = Some(ShellRoute::Replay);
@@ -22916,6 +22918,7 @@ for case in ('panic', 'subscription', 'renderer'):
             status: "completed".into(),
             source_tick: index as u64 + 10,
             target_tick: index as u64 + 12,
+            intervention_tick: Some(index as u64 + 10),
             world_digest: format!("{index:016x}"),
             artifact_id: Some(format!("report-{index:02}")),
             error_reason: None,
@@ -23588,6 +23591,7 @@ for case in ('panic', 'subscription', 'renderer'):
             command_applied_tick: None,
             minimum_population: 2,
             extinction_tick: None,
+            baseline_tick: branch.source_tick,
             baseline_population: 2,
             recovery_ratio: Some(1.0),
             first_divergence: None,
