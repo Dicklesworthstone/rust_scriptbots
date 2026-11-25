@@ -6137,6 +6137,84 @@ struct ReservedAgentInsertion {
     rng_counters: AgentRngCountersV1,
 }
 
+struct PreparedInterventionAgent {
+    data: AgentData,
+    runtime: AgentRuntime,
+    reservation: ReservedAgentInsertion,
+}
+
+/// Detached cohort construction keeps failed protocol calls out of the live world.
+/// The retained bindings own their evaluators: cloning a binding would drop that state.
+struct PreparedInterventionCohorts {
+    cohorts: VecDeque<Vec<PreparedInterventionAgent>>,
+    rng: DomainStreams,
+    next_agent_uid: u64,
+    next_spawn_ordinal: u64,
+}
+
+impl PreparedInterventionCohorts {
+    fn prepare_agent(
+        &mut self,
+        position: Position,
+        herbivore_tendency: f32,
+        kind: &str,
+        make_brain: impl FnOnce(&mut dyn RandomStream) -> Result<BrainBinding, BrainSpawnError>,
+    ) -> Result<PreparedInterventionAgent, BrainSpawnError> {
+        let next_agent_uid = self.next_agent_uid.checked_add(1).ok_or_else(|| {
+            BrainSpawnError::new(
+                kind.to_owned(),
+                WorldStateError::InvalidConfig("agent UID space exhausted"),
+            )
+        })?;
+        let next_spawn_ordinal = self.next_spawn_ordinal.checked_add(1).ok_or_else(|| {
+            BrainSpawnError::new(
+                kind.to_owned(),
+                WorldStateError::InvalidConfig("agent spawn ordinal space exhausted"),
+            )
+        })?;
+        let data = AgentData {
+            position,
+            ..AgentData::default()
+        };
+        data.validate()
+            .map_err(|error| BrainSpawnError::new(kind.to_owned(), error))?;
+        let mut runtime = AgentRuntime::new_random(self.rng.stream(RngDomain::Population));
+        runtime.herbivore_tendency = herbivore_tendency;
+        let identity = AgentIdentity {
+            uid: AgentUid(self.next_agent_uid),
+            spawn_ordinal: self.next_spawn_ordinal,
+            birth_ordinal: None,
+        };
+        let mut rng_counters = AgentRngCountersV1::default();
+        let ordinal = rng_counters.take_brain_initialization().map_err(|error| {
+            BrainSpawnError::new(
+                kind.to_owned(),
+                WorldState::agent_rng_counter_error(identity.uid, error),
+            )
+        })?;
+        let mut brain_rng = agent_substream(
+            self.rng.root_seed(),
+            identity.uid,
+            AgentRngOperationV1::BrainInitialization,
+            ordinal,
+        );
+        runtime.brain = make_brain(&mut brain_rng)?;
+        runtime
+            .validate()
+            .map_err(|error| BrainSpawnError::new(kind.to_owned(), error))?;
+        self.next_agent_uid = next_agent_uid;
+        self.next_spawn_ordinal = next_spawn_ordinal;
+        Ok(PreparedInterventionAgent {
+            data,
+            runtime,
+            reservation: ReservedAgentInsertion {
+                identity,
+                rng_counters,
+            },
+        })
+    }
+}
+
 struct PopulationSpawnReceipt {
     inserted: Vec<AgentId>,
     arena_checkpoint: (SlotMap<AgentId, usize>, usize),
@@ -26762,22 +26840,25 @@ impl WorldState {
                     );
                     return Err(error.into());
                 };
-                if let Err(BrainProtocolError::SchemaVersionMismatch {
-                    found, expected, ..
-                }) = adapter.validate_genome(&entry.genome)
-                {
-                    let error = InterventionError::UnsupportedGenomeVersion {
-                        supported: expected,
-                        requested: found,
-                    };
-                    diag_error!(
-                        target: "scriptbots::intervention",
-                        tick = self.tick.0,
-                        kind = intervention.kind_label(),
-                        %error,
-                        "intervention rejected"
-                    );
-                    return Err(error.into());
+                match adapter.validate_genome(&entry.genome) {
+                    Ok(()) => {}
+                    Err(BrainProtocolError::SchemaVersionMismatch {
+                        found, expected, ..
+                    }) => {
+                        let error = InterventionError::UnsupportedGenomeVersion {
+                            supported: expected,
+                            requested: found,
+                        };
+                        diag_error!(
+                            target: "scriptbots::intervention",
+                            tick = self.tick.0,
+                            kind = intervention.kind_label(),
+                            %error,
+                            "intervention rejected"
+                        );
+                        return Err(error.into());
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
         }
@@ -26903,6 +26984,167 @@ impl WorldState {
         count
     }
 
+    /// Construct every queued cohort before the step mutates any world-owned state.
+    ///
+    /// A later member's founder, state, or evaluator failure discards every prepared
+    /// member and leaves the queue, identity allocators and RNG continuation intact.
+    /// Family callbacks may have their own interior state; this does not roll back
+    /// external callback side effects. The successful bindings are moved, never rebuilt.
+    #[allow(clippy::too_many_lines)]
+    fn prepare_intervention_cohorts(
+        &self,
+    ) -> Result<Option<PreparedInterventionCohorts>, BrainSpawnError> {
+        if !self.pending_interventions.iter().any(|intervention| {
+            matches!(
+                intervention,
+                Intervention::InjectCohort { .. } | Intervention::SpawnFromArchive { .. }
+            )
+        }) {
+            return Ok(None);
+        }
+        let mut prepared = PreparedInterventionCohorts {
+            cohorts: VecDeque::new(),
+            rng: self.rng.clone(),
+            next_agent_uid: self.next_agent_uid,
+            next_spawn_ordinal: self.next_spawn_ordinal,
+        };
+        let world_width = validated_world_unit_f32(self.config.world_width);
+        let world_height = validated_world_unit_f32(self.config.world_height);
+        for intervention in &self.pending_interventions {
+            match intervention {
+                Intervention::InjectCohort {
+                    count,
+                    genome: CohortSource::RegisteredBrain { key },
+                    placement: Placement::Seeded { region, seed },
+                    herbivore_tendency,
+                } => {
+                    let kind = intervention.kind_label();
+                    intervention
+                        .validate_for_world(self.config.world_width, self.config.world_height)
+                        .map_err(|error| BrainSpawnError::new(kind, error))?;
+                    self.validate_external_arrival_boundary()
+                        .map_err(|error| BrainSpawnError::new(kind, error))?;
+                    if self.brain_registry.family(*key).is_none() {
+                        return Err(BrainSpawnError::new(
+                            kind,
+                            InterventionError::UnknownBrainKey { key: *key },
+                        ));
+                    }
+                    let mut placement_rng = SmallRngStream::seed_from_u64(*seed);
+                    let mut cohort = Vec::with_capacity(usize::from(*count));
+                    for _ in 0..*count {
+                        let position = Self::sample_position_in_region(
+                            *region,
+                            &mut placement_rng,
+                            world_width,
+                            world_height,
+                        );
+                        cohort.push(prepared.prepare_agent(
+                            position,
+                            *herbivore_tendency,
+                            kind,
+                            |rng| {
+                                self.prepare_registered_brain(*key, self.tick, rng)?
+                                    .ok_or_else(|| {
+                                        BrainSpawnError::new(
+                                            kind,
+                                            InterventionError::UnknownBrainKey { key: *key },
+                                        )
+                                    })
+                            },
+                        )?);
+                    }
+                    prepared.cohorts.push_back(cohort);
+                }
+                Intervention::SpawnFromArchive {
+                    selector,
+                    placement: Placement::Seeded { region, seed },
+                    herbivore_tendency,
+                    headroom,
+                } => {
+                    let kind = intervention.kind_label();
+                    intervention
+                        .validate_for_world(self.config.world_width, self.config.world_height)
+                        .map_err(|error| BrainSpawnError::new(kind, error))?;
+                    let archive = self.archive.as_ref().ok_or_else(|| {
+                        BrainSpawnError::new(kind, InterventionError::ArchiveDisabled)
+                    })?;
+                    // Archive and registry edits since enqueue must not bypass this limit
+                    // or admit a corrupt genome at the actual application boundary.
+                    let entries = archive.select_entries(selector);
+                    let requested = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+                    let limit = headroom.unwrap_or(MAX_COHORT_INJECTION);
+                    if requested > limit {
+                        return Err(BrainSpawnError::new(
+                            kind,
+                            InterventionError::PopulationCapExceeded {
+                                requested,
+                                headroom: limit,
+                            },
+                        ));
+                    }
+                    let mut placement_rng = SmallRngStream::seed_from_u64(*seed);
+                    let mut cohort = Vec::with_capacity(entries.len());
+                    if !entries.is_empty() {
+                        self.validate_external_arrival_boundary()
+                            .map_err(|error| BrainSpawnError::new(kind, error))?;
+                    }
+                    for entry in entries {
+                        let family_id = entry.genome.family_id();
+                        let (key, adapter) = self
+                            .brain_registry
+                            .key_and_family_by_id(family_id)
+                            .ok_or_else(|| {
+                                BrainSpawnError::new(
+                                    kind,
+                                    InterventionError::UnknownBrainFamily {
+                                        family: family_id.clone(),
+                                    },
+                                )
+                            })?;
+                        adapter.validate_genome(&entry.genome).map_err(|error| {
+                            BrainSpawnError::new(family_id.to_string(), error)
+                        })?;
+                        let family_kind = self.brain_registry.kind(key).ok_or_else(|| {
+                            BrainSpawnError::new(
+                                kind,
+                                InterventionError::UnknownBrainKey { key },
+                            )
+                        })?;
+                        let position = Self::sample_position_in_region(
+                            *region,
+                            &mut placement_rng,
+                            world_width,
+                            world_height,
+                        );
+                        cohort.push(prepared.prepare_agent(
+                            position,
+                            herbivore_tendency.unwrap_or(0.5),
+                            family_kind,
+                            |rng| {
+                                let state = adapter
+                                    .initial_state(&entry.genome, rng)
+                                    .map_err(|error| {
+                                        BrainSpawnError::new(family_kind.to_owned(), error)
+                                    })?;
+                                Self::instantiate_protocol_binding(
+                                    adapter,
+                                    key,
+                                    family_kind.to_owned(),
+                                    entry.genome.clone(),
+                                    &state,
+                                )
+                            },
+                        )?);
+                    }
+                    prepared.cohorts.push_back(cohort);
+                }
+                _ => {}
+            }
+        }
+        Ok(Some(prepared))
+    }
+
     /// Apply queued interventions and age the timed ones.
     ///
     /// Runs at the TOP of the tick, before food dynamics and sensing, so a
@@ -26914,7 +27156,18 @@ impl WorldState {
     /// command sequence against the same seed produces the same world.
     // bd-tqpj: mirrors legacy C++ parity layout; reviewed as a unit.
     #[allow(clippy::too_many_lines)]
-    fn stage_interventions(&mut self) -> ResourceAmounts {
+    fn stage_interventions(
+        &mut self,
+        prepared: Option<PreparedInterventionCohorts>,
+    ) -> ResourceAmounts {
+        let mut cohorts = if let Some(prepared) = prepared {
+            self.rng = prepared.rng;
+            self.next_agent_uid = prepared.next_agent_uid;
+            self.next_spawn_ordinal = prepared.next_spawn_ordinal;
+            prepared.cohorts
+        } else {
+            VecDeque::new()
+        };
         let mut rejected = ResourceAmounts::default();
         let queued = std::mem::take(&mut self.pending_interventions);
         let world_width = validated_world_unit_f32(self.config.world_width);
@@ -27067,85 +27320,25 @@ impl WorldState {
                     self.record_intervention("set_closed_world", Region::All, 0, 0, None, false);
                 }
                 Intervention::InjectCohort {
-                    count,
-                    genome,
-                    placement,
-                    herbivore_tendency,
+                    placement: Placement::Seeded { region, .. },
+                    ..
                 } => {
-                    let CohortSource::RegisteredBrain { key } = genome;
-                    let Placement::Seeded { region, seed } = placement;
-                    let placement_region = region;
-                    let mut rng = SmallRngStream::seed_from_u64(seed);
-                    let mut spawned: Vec<AgentId> = Vec::with_capacity(usize::from(count));
-                    let mut breach_count = 0_u32;
-                    let mut first_breach: Option<ScientificStateError> = None;
-                    for _ in 0..count {
-                        let position = Self::sample_position_in_region(
-                            region,
-                            &mut rng,
-                            world_width,
-                            world_height,
-                        );
-                        // Validated at enqueue, so these cannot fail for any validation
-                        // reason; an internal invariant breach is counted, never panicked
-                        // over, and leaves the already-spawned members intact rather than
-                        // fabricating a rollback through a test-only removal path.
-                        // `_with`, not the bare form: the bare form passes an
-                        // empty runtime closure, which is exactly how every
-                        // injected cohort silently kept the neutral 0.5 default
-                        // and failed to be the predators it was asked for
-                        // (bd-7akp).
-                        //
-                        // INJECT, not spawn (bd-i328). An intervention exists to
-                        // perturb a RUNNING world, so a cohort member is never a
-                        // founding arrival. `try_spawn_agent_with` is the
-                        // tick-zero-only founding path its own doc says it is:
-                        // it stamps `BirthOrigin::Seeded`, which
-                        // `try_insert_agent_with_origin` refuses after bootstrap
-                        // with `SeededArrivalAfterBootstrap`. Every member of a
-                        // mid-run cohort was therefore rejected, counted as an
-                        // anonymous breach, and recorded as an applied
-                        // intervention affecting zero agents.
-                        match self.try_inject_agent_with(
-                            AgentData {
-                                position,
-                                ..AgentData::default()
-                            },
-                            |runtime| {
-                                runtime.herbivore_tendency = herbivore_tendency;
-                            },
-                        ) {
-                            Ok(id) => spawned.push(id),
-                            Err(error) => {
-                                breach_count += 1;
-                                // Keep the typed cause. A bare counter is how a
-                                // categorical refusal of every member read as an
-                                // internal hiccup for as long as it did.
-                                if first_breach.is_none() {
-                                    first_breach = Some(error);
-                                }
-                            }
-                        }
-                    }
-                    let spawned_count = spawned.len();
-                    for id in spawned {
-                        if self.bind_agent_brain(id, key).is_err() {
-                            breach_count += 1;
-                        }
-                    }
-                    if breach_count > 0 {
-                        let cause = first_breach
-                            .map_or_else(|| "unknown".to_owned(), |error| error.to_string());
-                        diag_warn!(
-                            breach_count,
-                            key,
-                            cause = cause.as_str(),
-                            "cohort injection hit an internal breach after enqueue validation"
+                    let cohort = cohorts
+                        .pop_front()
+                        .expect("each queued cohort was prepared before the step");
+                    let spawned_count = cohort.len();
+                    for member in cohort {
+                        self.insert_reserved_agent(
+                            member.data,
+                            member.runtime,
+                            self.tick,
+                            BirthOrigin::Injected,
+                            member.reservation,
                         );
                     }
                     self.record_intervention(
                         "inject_cohort",
-                        placement_region,
+                        region,
                         spawned_count,
                         0,
                         None,
@@ -27154,22 +27347,13 @@ impl WorldState {
                 }
                 Intervention::SpawnFromArchive {
                     selector,
-                    placement,
-                    herbivore_tendency,
+                    placement: Placement::Seeded { region, .. },
                     ..
                 } => {
-                    let Some(entries) = self.archive.as_ref().map(|archive| {
-                        archive
-                            .select_entries(&selector)
-                            .into_iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    }) else {
-                        continue;
-                    };
-                    let Placement::Seeded { region, seed } = placement;
-                    let placement_region = region;
-                    let cells_matched = entries.len();
+                    let cohort = cohorts
+                        .pop_front()
+                        .expect("each queued archive cohort was prepared before the step");
+                    let cells_matched = cohort.len();
                     let cells_requested = match &selector {
                         CellSelector::Explicit(ids) => ids.len(),
                         CellSelector::TopKByQuality(k) => usize::from(*k),
@@ -27185,37 +27369,15 @@ impl WorldState {
                             "resurrection selector matched fewer cells than requested"
                         );
                     }
-                    let mut rng = SmallRngStream::seed_from_u64(seed);
-                    let mut spawned_count = 0_usize;
-                    let mut breach_count = 0_u32;
-                    let diet = herbivore_tendency.unwrap_or(0.5);
-                    for entry in entries {
-                        let position = Self::sample_position_in_region(
-                            region,
-                            &mut rng,
-                            world_width,
-                            world_height,
+                    let spawned_count = cohort.len();
+                    for member in cohort {
+                        self.insert_reserved_agent(
+                            member.data,
+                            member.runtime,
+                            self.tick,
+                            BirthOrigin::Injected,
+                            member.reservation,
                         );
-                        let Ok(id) = self.try_inject_agent_with(
-                            AgentData {
-                                position,
-                                ..AgentData::default()
-                            },
-                            |runtime| {
-                                runtime.herbivore_tendency = diet;
-                            },
-                        ) else {
-                            breach_count += 1;
-                            continue;
-                        };
-                        match self.bind_agent_brain_genome(id, &entry.genome) {
-                            Ok(true) => {
-                                spawned_count += 1;
-                            }
-                            _ => {
-                                breach_count += 1;
-                            }
-                        }
                     }
                     tracing::info!(
                         target: "scriptbots::qd",
@@ -27224,17 +27386,13 @@ impl WorldState {
                         cells_requested,
                         cells_matched,
                         agents_spawned = spawned_count,
-                        agents_rejected = breach_count,
-                        reason = if breach_count > 0 {
-                            "internal_breach"
-                        } else {
-                            "ok"
-                        },
+                        agents_rejected = 0,
+                        reason = "ok",
                         "resurrection applied"
                     );
                     self.record_intervention(
                         "spawn_from_archive",
-                        placement_region,
+                        region,
                         spawned_count,
                         cells_matched,
                         None,
@@ -31041,12 +31199,13 @@ impl WorldState {
             .into());
         }
 
-        self.visual_events.clear();
-        self.visual_dropped_events_this_tick = 0;
         self.validate_live_agent_companions()?;
-        self.canonicalize_agent_execution_order()?;
         let next_tick = self.tick.next();
         self.validate_step_generation_headroom(next_tick)?;
+        let prepared_cohorts = self.prepare_intervention_cohorts()?;
+        self.visual_events.clear();
+        self.visual_dropped_events_this_tick = 0;
+        self.canonicalize_agent_execution_order()?;
         #[cfg(feature = "parallel")]
         tracing::debug!(
             target: "scriptbots_core::parallelism",
@@ -31094,7 +31253,7 @@ impl WorldState {
 
         observed_stage!(WorldStepStage::Interventions, {
             let before = self.capture_resource_amounts();
-            let intervention_rejection = self.stage_interventions();
+            let intervention_rejection = self.stage_interventions(prepared_cohorts);
             self.record_resource_change(ResourceFlowKind::ScenarioIntervention, before);
             self.resource_ledger.record(
                 ResourceFlowKind::CapacityRejection,
@@ -39811,6 +39970,534 @@ mod tests {
         assert!(!world.config().closed, "reopened after the next boundary");
     }
 
+    fn cohort_intervention_world(family: FixtureBrainFamily) -> (WorldState, u64) {
+        let genome = family.genome(1, 0, BrainProvenance::default());
+        let config = ScriptBotsConfig {
+            archive_enabled: true,
+            archive_space: BehaviorSpaceV0 {
+                version: qd::BEHAVIOR_SPACE_SCHEMA_VERSION_V0,
+                axes: vec![
+                    Axis::new("speed", PhenotypeFeature::MeanSpeed, (0.0, 4.0), 4)
+                        .expect("archive axis"),
+                ],
+            },
+            ..quiet_trace_config(0xC040_4710, 0)
+        };
+        let mut world = WorldState::new(config).expect("cohort world");
+        let key = world
+            .register_brain_family("cohort-atomicity", Box::new(family))
+            .expect("register cohort family");
+        for slot in 0..2 {
+            insert_cohort_archive_entry(&mut world, genome.clone(), slot);
+        }
+        world.step_outcome().expect("advance past bootstrap");
+        world
+            .try_inject_agent(AgentData::default())
+            .expect("existing arrival and visual event");
+        world.set_resource_ledger_enabled(true);
+        (world, key)
+    }
+
+    fn insert_cohort_archive_entry(
+        world: &mut WorldState,
+        genome: BrainGenomeEnvelope,
+        slot: u16,
+    ) {
+        world
+            .archive_mut()
+            .expect("archive enabled")
+            .insert(ArchiveEntry {
+                uid: AgentUid(10_000 + u64::from(slot)),
+                tick_inserted: Tick::zero(),
+                descriptor: BehaviorDescriptor::new(vec![f32::from(slot) + 0.5]),
+                quality: f32::from(slot) + 1.0,
+                genome,
+                provenance: ArchiveProvenance {
+                    run_id: "cohort-atomicity".to_owned(),
+                    parent_uid: None,
+                    generation: Generation(0),
+                },
+            })
+            .expect("insert archive fixture");
+    }
+
+    fn cohort_intervention_command(key: u64, from_archive: bool) -> Intervention {
+        let placement = Placement::Seeded {
+            region: Region::All,
+            seed: 0xA11C_E123,
+        };
+        if from_archive {
+            Intervention::SpawnFromArchive {
+                selector: CellSelector::All,
+                placement,
+                headroom: Some(2),
+                herbivore_tendency: Some(0.2),
+            }
+        } else {
+            Intervention::InjectCohort {
+                count: 2,
+                genome: CohortSource::RegisteredBrain { key },
+                placement,
+                herbivore_tendency: 0.2,
+            }
+        }
+    }
+
+    fn cohort_intervention_state(world: &WorldState) -> (WorldDigestV1, serde_json::Value) {
+        (
+            world
+                .world_digest_v1_inner(false)
+                .expect("digest with undelivered commands"),
+            serde_json::json!({
+                "queue": world.pending_interventions,
+                "births": world.pending_birth_records,
+                "deaths": world.pending_death_records,
+                "genomes": world.pending_genomes,
+                "reported": world.reported_lifecycle_records,
+                "audit": world.applied_interventions,
+                "next_seq": world.next_intervention_seq,
+                "visual": world.visual_events,
+                "visual_dropped": world.visual_dropped_events_this_tick,
+                "ledger": world.resource_ledger(),
+                "boundary": world.persistence_boundary,
+                "archive": world.archive,
+                "rng": world.random_streams_checkpoint(),
+                "identity": world.identity_sequence_state(),
+                "order": world.agents.iter_handles()
+                    .map(|id| id.data().as_ffi()).collect::<Vec<_>>(),
+                "canonical_order": world.agent_execution_order_canonical,
+            }),
+        )
+    }
+
+    #[test]
+    fn cohort_intervention_protocol_failures_leave_the_whole_queue_unapplied() {
+        for from_archive in [false, true] {
+            for phase in [
+                FixtureConstructionPhase::Founder,
+                FixtureConstructionPhase::State,
+                FixtureConstructionPhase::Evaluator,
+            ] {
+                if from_archive && phase == FixtureConstructionPhase::Founder {
+                    continue;
+                }
+                let remaining = Arc::new(AtomicUsize::new(usize::MAX));
+                let mut family = FixtureBrainFamily::new("cohort-atomicity");
+                family.construction_failure = Some((phase, Arc::clone(&remaining)));
+                let (mut world, key) = cohort_intervention_world(family);
+                let existing: Vec<_> = world.agents.iter_handles().collect();
+                world
+                    .enqueue_intervention(Intervention::Bloom {
+                        region: Region::All,
+                        amount: 0.25,
+                    })
+                    .unwrap();
+                world
+                    .enqueue_intervention(Intervention::InjectCohort {
+                        count: 1,
+                        genome: CohortSource::RegisteredBrain { key },
+                        placement: Placement::Seeded {
+                            region: Region::All,
+                            seed: 11,
+                        },
+                        herbivore_tendency: 0.9,
+                    })
+                    .unwrap();
+                world
+                    .enqueue_intervention(cohort_intervention_command(key, from_archive))
+                    .unwrap();
+                // One complete earlier cohort and one member of the later cohort
+                // construct successfully before the final member fails.
+                remaining.store(2, AtomicUsizeOrdering::Relaxed);
+                let before = cohort_intervention_state(&world);
+                for _ in 0..2 {
+                    let WorldStepError::BrainSpawn(error) =
+                        world.step_outcome().expect_err("reject failed construction")
+                    else {
+                        panic!("construction failure must retain its typed brain cause");
+                    };
+                    assert!(matches!(
+                        std::error::Error::source(&error)
+                            .and_then(|source| source.downcast_ref::<BrainProtocolError>()),
+                        Some(BrainProtocolError::InvalidPayload { detail, .. })
+                            if detail.contains("fixture construction failed")
+                    ));
+                    assert_eq!(cohort_intervention_state(&world), before);
+                    assert!(world.resource_ledger.working.is_none());
+                    assert!(world.brain_fault().is_none());
+                    assert!(world.scientific_fault().is_none());
+                }
+                // This is a preflight refusal, so the same queued request can succeed
+                // after the external factory recovers, without leaked IDs or bodies.
+                remaining.store(usize::MAX, AtomicUsizeOrdering::Relaxed);
+                world.step_outcome().expect("retry after factory recovery");
+                assert_eq!(world.agent_count(), existing.len() + 3);
+                assert!(world.pending_interventions.is_empty());
+                for id in world.agents.iter_handles().filter(|id| !existing.contains(id)) {
+                    assert!(world.agent_brain_genome(id).is_some());
+                    assert!(world.agent_runtime(id).unwrap().brain.is_bound());
+                }
+                assert_eq!(world.applied_interventions.len(), 3);
+                assert_eq!(world.resource_ledger().completed_ticks, 1);
+                assert_eq!(world.resource_ledger().latest.as_ref().unwrap().tick, Tick(2));
+            }
+        }
+    }
+
+    #[test]
+    fn cohort_intervention_rejects_corrupt_archive_payloads_and_codecs_at_enqueue() {
+        for (codec, payload) in [
+            (FIXTURE_GENOME_CODEC, vec![1]),
+            (FIXTURE_GENOME_CODEC + 1, vec![1, 0]),
+        ] {
+            let (mut world, key) =
+                cohort_intervention_world(FixtureBrainFamily::new("cohort-atomicity"));
+            let invalid = BrainGenomeEnvelope::new(
+                BrainFamilyId::new("cohort-atomicity").unwrap(),
+                FIXTURE_GENOME_SCHEMA,
+                codec,
+                payload,
+                BrainProvenance::default(),
+            )
+            .unwrap();
+            world
+                .archive_mut()
+                .unwrap()
+                .cells
+                .values_mut()
+                .next()
+                .unwrap()
+                .genome = invalid;
+            let before = cohort_intervention_state(&world);
+            assert!(matches!(
+                world.enqueue_intervention(cohort_intervention_command(key, true)),
+                Err(WorldStateError::BrainProtocol(_))
+            ));
+            assert_eq!(cohort_intervention_state(&world), before);
+        }
+    }
+
+    #[test]
+    fn cohort_intervention_revalidates_archive_and_registry_at_the_due_boundary() {
+        for change in ["payload", "headroom", "family", "disabled"] {
+            let (mut world, key) =
+                cohort_intervention_world(FixtureBrainFamily::new("cohort-atomicity"));
+            world
+                .enqueue_intervention(cohort_intervention_command(key, true))
+                .unwrap();
+            match change {
+                "payload" => {
+                    world
+                        .archive_mut()
+                        .unwrap()
+                        .cells
+                        .values_mut()
+                        .last()
+                        .unwrap()
+                        .genome = BrainGenomeEnvelope::new(
+                        BrainFamilyId::new("cohort-atomicity").unwrap(),
+                        FIXTURE_GENOME_SCHEMA,
+                        FIXTURE_GENOME_CODEC,
+                        vec![1],
+                        BrainProvenance::default(),
+                    )
+                    .unwrap();
+                }
+                "headroom" => {
+                    let genome = world
+                        .archive()
+                        .unwrap()
+                        .cells
+                        .values()
+                        .next()
+                        .unwrap()
+                        .genome
+                        .clone();
+                    insert_cohort_archive_entry(&mut world, genome, 2);
+                }
+                "family" => assert!(world.brain_registry.unregister(key)),
+                "disabled" => {
+                    let mut config = world.config().clone();
+                    config.archive_enabled = false;
+                    world.apply_config_update(config).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = cohort_intervention_state(&world);
+            let WorldStepError::BrainSpawn(error) = world
+                .step_outcome()
+                .expect_err("changed archive must be revalidated")
+            else {
+                panic!("archive preflight must retain its typed cause");
+            };
+            let source = std::error::Error::source(&error).unwrap();
+            match change {
+                "payload" => assert!(matches!(
+                    source.downcast_ref::<BrainProtocolError>(),
+                    Some(BrainProtocolError::InvalidPayload { .. })
+                )),
+                "headroom" => assert!(matches!(
+                    source.downcast_ref::<InterventionError>(),
+                    Some(InterventionError::PopulationCapExceeded {
+                        requested: 3,
+                        headroom: 2,
+                    })
+                )),
+                "family" => assert!(matches!(
+                    source.downcast_ref::<InterventionError>(),
+                    Some(InterventionError::UnknownBrainFamily { .. })
+                )),
+                "disabled" => assert!(matches!(
+                    source.downcast_ref::<InterventionError>(),
+                    Some(InterventionError::ArchiveDisabled)
+                )),
+                _ => unreachable!(),
+            }
+            assert_eq!(cohort_intervention_state(&world), before, "{change}");
+            assert!(world.resource_ledger.working.is_none());
+        }
+
+        let (mut world, key) =
+            cohort_intervention_world(FixtureBrainFamily::new("cohort-atomicity"));
+        world
+            .enqueue_intervention(cohort_intervention_command(key, false))
+            .unwrap();
+        assert!(world.brain_registry.unregister(key));
+        let before = cohort_intervention_state(&world);
+        assert!(matches!(world.step_outcome(), Err(WorldStepError::BrainSpawn(_))));
+        assert_eq!(cohort_intervention_state(&world), before);
+    }
+
+    #[test]
+    fn cohort_intervention_preserves_sealed_arrival_boundaries() {
+        for from_archive in [false, true] {
+            let constructions = Arc::new(AtomicUsize::new(0));
+            let family = FixtureBrainFamily::with_behavior_probe(
+                "cohort-atomicity",
+                0,
+                Arc::clone(&constructions),
+            );
+            let (mut world, key) = cohort_intervention_world(family);
+            let mut config = world.config().clone();
+            config.persistence_interval = 1;
+            world.apply_config_update(config).unwrap();
+            let mut session = world.bind_persistence(Box::new(NullPersistence)).unwrap();
+            session.step(&mut world).expect("admit a completed boundary");
+            let tick = world.tick();
+            assert_eq!(
+                world.persistence_boundary,
+                PersistenceBoundaryStatus::Sealed { tick }
+            );
+            world
+                .enqueue_intervention(cohort_intervention_command(key, from_archive))
+                .unwrap();
+            let before = cohort_intervention_state(&world);
+            let WorldStepError::BrainSpawn(error) = session
+                .step(&mut world)
+                .expect_err("sealed arrival must remain refused")
+            else {
+                panic!("sealed arrival must retain its typed boundary cause");
+            };
+            assert_eq!(
+                std::error::Error::source(&error)
+                    .and_then(|source| source.downcast_ref::<ScientificStateError>()),
+                Some(&sealed_agent_boundary(tick.0))
+            );
+            assert_eq!(constructions.load(AtomicUsizeOrdering::Relaxed), 0);
+            assert_eq!(cohort_intervention_state(&world), before);
+            assert_eq!(session.last_admitted_tick(), Some(tick));
+            assert!(!session.has_pending_batch());
+        }
+    }
+
+    #[test]
+    fn cohort_intervention_identity_exhaustion_is_an_atomic_refusal() {
+        for uid_exhausted in [false, true] {
+            let (mut world, key) =
+                cohort_intervention_world(FixtureBrainFamily::new("cohort-atomicity"));
+            // Leave one identity available: the second member must not leak the first.
+            if uid_exhausted {
+                world.next_agent_uid = u64::MAX - 1;
+            } else {
+                world.next_spawn_ordinal = u64::MAX - 1;
+            }
+            world
+                .enqueue_intervention(cohort_intervention_command(key, false))
+                .unwrap();
+            let before = cohort_intervention_state(&world);
+            assert!(matches!(world.step_outcome(), Err(WorldStepError::BrainSpawn(_))));
+            assert_eq!(cohort_intervention_state(&world), before);
+        }
+    }
+
+    /// Independent successful-path reference: the former public insert-then-bind
+    /// sequence, including its distinct cohort and archive binding order.
+    fn apply_cohort_reference(world: &mut WorldState, command: Intervention) -> ResourceAmounts {
+        match command {
+            Intervention::InjectCohort {
+                count,
+                genome: CohortSource::RegisteredBrain { key },
+                placement: Placement::Seeded { region, seed },
+                herbivore_tendency,
+            } => {
+                let mut rng = SmallRngStream::seed_from_u64(seed);
+                let mut ids = Vec::new();
+                for _ in 0..count {
+                    let position = WorldState::sample_position_in_region(
+                        region,
+                        &mut rng,
+                        validated_world_unit_f32(world.config.world_width),
+                        validated_world_unit_f32(world.config.world_height),
+                    );
+                    ids.push(
+                        world
+                            .try_inject_agent_with(
+                                AgentData {
+                                    position,
+                                    ..AgentData::default()
+                                },
+                                |runtime| runtime.herbivore_tendency = herbivore_tendency,
+                            )
+                            .unwrap(),
+                    );
+                }
+                for id in ids {
+                    assert!(world.bind_agent_brain(id, key).unwrap());
+                }
+                world.record_intervention(
+                    "inject_cohort",
+                    region,
+                    usize::from(count),
+                    0,
+                    None,
+                    false,
+                );
+                ResourceAmounts::default()
+            }
+            Intervention::SpawnFromArchive {
+                selector,
+                placement: Placement::Seeded { region, seed },
+                herbivore_tendency,
+                ..
+            } => {
+                let entries: Vec<_> = world
+                    .archive()
+                    .unwrap()
+                    .select_entries(&selector)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                let matched = entries.len();
+                let mut rng = SmallRngStream::seed_from_u64(seed);
+                for entry in entries {
+                    let position = WorldState::sample_position_in_region(
+                        region,
+                        &mut rng,
+                        validated_world_unit_f32(world.config.world_width),
+                        validated_world_unit_f32(world.config.world_height),
+                    );
+                    let id = world
+                        .try_inject_agent_with(
+                            AgentData {
+                                position,
+                                ..AgentData::default()
+                            },
+                            |runtime| {
+                                runtime.herbivore_tendency = herbivore_tendency.unwrap_or(0.5);
+                            },
+                        )
+                        .unwrap();
+                    assert!(world.bind_agent_brain_genome(id, &entry.genome).unwrap());
+                }
+                world.record_intervention(
+                    "spawn_from_archive",
+                    region,
+                    matched,
+                    matched,
+                    None,
+                    false,
+                );
+                ResourceAmounts::default()
+            }
+            other => {
+                world.enqueue_intervention(other).unwrap();
+                world.stage_interventions(None)
+            }
+        }
+    }
+
+    #[test]
+    fn cohort_intervention_success_preserves_mixed_queue_science_and_continuation() {
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let (mut actual, key) =
+            cohort_intervention_world(FixtureBrainFamily::with_behavior_probe(
+                "cohort-atomicity",
+                0,
+                Arc::clone(&constructions),
+            ));
+        let (mut reference, reference_key) =
+            cohort_intervention_world(FixtureBrainFamily::new("cohort-atomicity"));
+        assert_eq!(key, reference_key);
+        let commands = vec![
+            cohort_intervention_command(key, false),
+            Intervention::Meteor {
+                region: Region::All,
+                lethality: 0.25,
+                scorch: 0.5,
+            },
+            Intervention::PaintTerrain {
+                region: Region::All,
+                terrain: TerrainKind::Rock,
+                fertility_bias: Some(-0.1),
+            },
+            Intervention::SetClosedWorld { closed: false },
+            cohort_intervention_command(key, true),
+            Intervention::Drought {
+                region: Region::All,
+                ticks: 3,
+                growth_scale: 0.5,
+            },
+            Intervention::InjectCohort {
+                count: 1,
+                genome: CohortSource::RegisteredBrain { key },
+                placement: Placement::Seeded {
+                    region: Region::All,
+                    seed: 91,
+                },
+                herbivore_tendency: 0.9,
+            },
+        ];
+        for command in &commands {
+            actual.enqueue_intervention(command.clone()).unwrap();
+        }
+        let before = cohort_intervention_state(&actual);
+        let prepared = actual.prepare_intervention_cohorts().unwrap();
+        assert_eq!(cohort_intervention_state(&actual), before);
+        assert_eq!(constructions.load(AtomicUsizeOrdering::Relaxed), 5);
+        let actual_rejected = actual.stage_interventions(prepared);
+        assert_eq!(constructions.load(AtomicUsizeOrdering::Relaxed), 5);
+        let mut reference_rejected = ResourceAmounts::default();
+        for command in commands {
+            reference_rejected.add_assign(apply_cohort_reference(&mut reference, command));
+        }
+        assert_eq!(actual_rejected, reference_rejected);
+        assert_eq!(cohort_intervention_state(&actual), cohort_intervention_state(&reference));
+        assert_eq!(actual.agent_count(), 6);
+        assert_eq!(actual.pending_genomes.len(), 5);
+        assert!(
+            actual
+                .pending_birth_records
+                .iter()
+                .all(|birth| birth.origin == BirthOrigin::Injected)
+        );
+        let healths = actual.agents.columns().health();
+        assert_eq!(healths[1], AgentData::default().health - 0.25);
+        assert_eq!(healths[3], AgentData::default().health);
+        actual.step_outcome().expect("prepared continuation");
+        reference.step_outcome().expect("reference continuation");
+        assert_eq!(cohort_intervention_state(&actual), cohort_intervention_state(&reference));
+    }
+
     /// A predator injection must actually produce predators.
     ///
     /// The regression this bead exists for (bd-7akp): every cohort member used to
@@ -40712,7 +41399,10 @@ mod tests {
                 assert!(world.has_sense_provider());
                 assert_eq!(brain_calls.load(AtomicUsizeOrdering::Relaxed), 0);
                 assert_eq!(world.tick(), Tick::zero());
-                assert_eq!(world.agents.columns().positions(), positions_before.as_slice());
+                assert_eq!(
+                    world.agents.columns().positions(),
+                    positions_before.as_slice()
+                );
                 for id in ids {
                     let runtime = world.agent_runtime(id).expect("live runtime");
                     assert_eq!(runtime.sensors, [0.125; INPUT_SIZE]);
@@ -40856,7 +41546,9 @@ mod tests {
             .zip([0.375, 0.125])
         {
             let cpu_runtime = cpu.agent_runtime(cpu_id).expect("CPU runtime");
-            let provided_runtime = provided.agent_runtime(provided_id).expect("provider runtime");
+            let provided_runtime = provided
+                .agent_runtime(provided_id)
+                .expect("provider runtime");
             assert_eq!(provided_runtime.sensors, cpu_runtime.sensors);
             assert_eq!(provided_runtime.outputs, cpu_runtime.outputs);
             assert_eq!(provided_runtime.sensors.sensor(hearing), expected_hearing);
@@ -44861,6 +45553,13 @@ mod tests {
         Malformed,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FixtureConstructionPhase {
+        Founder,
+        State,
+        Evaluator,
+    }
+
     #[derive(Debug)]
     // bd-tqpj: the independent batch/evaluation bool flags mirror the fixture family's orthogonal failure modes.
     #[allow(clippy::struct_excessive_bools)]
@@ -44871,6 +45570,7 @@ mod tests {
         evaluation_fails: bool,
         evaluation_offset: i16,
         evaluator_constructions: Option<Arc<AtomicUsize>>,
+        construction_failure: Option<(FixtureConstructionPhase, Arc<AtomicUsize>)>,
         batch_opt_in: bool,
         batch_returns_none: bool,
         batch_fail_at_lane: Option<usize>,
@@ -44892,6 +45592,7 @@ mod tests {
                 evaluation_fails: false,
                 evaluation_offset: 0,
                 evaluator_constructions: None,
+                construction_failure: None,
                 batch_opt_in: true,
                 batch_returns_none: false,
                 batch_fail_at_lane: None,
@@ -44905,6 +45606,32 @@ mod tests {
                     BrainHeredityExclusionV1::NoCanonicalLocusSchema,
                 ),
             }
+        }
+
+        fn check_construction(
+            &self,
+            phase: FixtureConstructionPhase,
+        ) -> Result<(), BrainProtocolError> {
+            if let Some((failure_phase, remaining)) = &self.construction_failure
+                && *failure_phase == phase
+            {
+                let allowed = remaining.load(AtomicUsizeOrdering::Relaxed);
+                if allowed == 0 {
+                    return Err(BrainProtocolError::InvalidPayload {
+                        kind: if phase == FixtureConstructionPhase::Founder {
+                            BrainEnvelopeKind::Genome
+                        } else {
+                            BrainEnvelopeKind::EvaluatorState
+                        },
+                        family_id: self.id.clone(),
+                        detail: format!("fixture construction failed at {phase:?}"),
+                    });
+                }
+                if allowed != usize::MAX {
+                    remaining.fetch_sub(1, AtomicUsizeOrdering::Relaxed);
+                }
+            }
+            Ok(())
         }
 
         fn with_locus_contract(
@@ -45213,6 +45940,13 @@ mod tests {
             }
             semantic_material.push(u8::from(self.evaluation_fails));
             semantic_material.extend_from_slice(&self.evaluation_offset.to_le_bytes());
+            if let Some((phase, _)) = &self.construction_failure {
+                semantic_material.push(match phase {
+                    FixtureConstructionPhase::Founder => 5,
+                    FixtureConstructionPhase::State => 6,
+                    FixtureConstructionPhase::Evaluator => 7,
+                });
+            }
             if let Some(lane) = self.batch_fail_at_lane {
                 semantic_material.push(1);
                 semantic_material.extend_from_slice(lane.to_string().as_bytes());
@@ -45240,6 +45974,7 @@ mod tests {
             &self,
             rng: &mut dyn RandomStream,
         ) -> Result<BrainGenomeMaterial, BrainProtocolError> {
+            self.check_construction(FixtureConstructionPhase::Founder)?;
             let sample = rng.next_u32().to_le_bytes();
             Ok(Self::genome_material(sample[0] as i8, sample[1] as i8))
         }
@@ -45320,6 +46055,7 @@ mod tests {
             genome: &BrainGenomeEnvelope,
             _rng: &mut dyn RandomStream,
         ) -> Result<BrainEvaluatorStateEnvelope, BrainProtocolError> {
+            self.check_construction(FixtureConstructionPhase::State)?;
             let (_, bias) = self.decode_genome(genome)?;
             Ok(self.state(i16::from(bias)))
         }
@@ -45381,6 +46117,7 @@ mod tests {
             genome: &BrainGenomeEnvelope,
             state: &BrainEvaluatorStateEnvelope,
         ) -> Result<Box<dyn BrainEvaluator>, BrainProtocolError> {
+            self.check_construction(FixtureConstructionPhase::Evaluator)?;
             if let Some(constructions) = &self.evaluator_constructions {
                 constructions.fetch_add(1, AtomicUsizeOrdering::Relaxed);
             }

@@ -2,6 +2,35 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Atomic cohort construction at the intervention boundary (2026-11-25):**
+[Source implemented; execution validation pending — Codex;
+corrective contributions to `bd-16g.10.1` and `bd-16g.6.3`;
+original complete acceptance retained]
+
+Queued cohort injection and archive resurrection construct and validate every
+due member before the step mutates world-owned state. The prepared members retain
+their actual evaluators and enter the world in command order. Founder, initial
+state or evaluator failures now return typed errors without leaving unbound
+organisms or partially applied interventions behind.
+
+Archive enqueue rejects all genome validation errors. Preparation repeats
+registry, genome and selected-cohort headroom checks at the due boundary and
+refuses identity exhaustion atomically. Refusal preserves the command queue,
+population, RNG and identity continuation, lifecycle/genome/audit/visual records
+and resource ledger. Existing sealed-arrival restrictions remain enforced.
+
+Six authored regressions cover failures after earlier successful preparations,
+factory recovery, corrupt archives, changed registry/headroom, sealed boundaries
+and identity exhaustion. A mixed-command reference compares successful science,
+records and next-tick continuation against the former insert-then-bind sequence.
+Independent source review is complete. Native compilation, formatting, Clippy
+and test execution remain unverified after DSR interruptions and executor resets.
+No original qualification gate is closed.
+
+The guarantee covers world-owned state, not arbitrary family-callback interior
+or external side effects. Failed commands remain queued; this does not add
+automatic command recovery or deferred injection into sealed persisted worlds.
+
 **Committed archipelago analytics and recovery (2026-11-25):**
 [Source implemented; execution validation pending — Codex;
 corrective contribution to `bd-16g.5`; original complete acceptance retained]
