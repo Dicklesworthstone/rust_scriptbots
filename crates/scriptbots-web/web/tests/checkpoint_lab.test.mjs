@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { createHash, webcrypto } from "node:crypto";
 import test from "node:test";
 import {
-  CHECKPOINT_LAB_PAGE_SIZE, MAX_LAB_ARTIFACT_BYTES, CheckpointLabController,
+  CHECKPOINT_LAB_PAGE_SIZE, MAX_LAB_ARTIFACT_BYTES, MAX_LAB_TRAJECTORY_CATALOG_ARTIFACTS, CheckpointLabController,
   renderCheckpointLab, validateLabArtifact, validateLabArtifactPage, validateLabBranchObservation, validateLabBranchPage, validateLabBranchStatus,
   validateLabCheckpoint, validateLabCheckpointPage, validateLabIntervention, validateCheckpointCanvas,
   parseReplayTarget, validateCheckpointReplay, archiveStudyTreatment,
 } from "../checkpoint-lab.js";
 import { RemoteOwnerHttpError, RemoteStreamClient } from "../remote.js";
 import { MAX_STUDY_REPORT_BYTES } from "../study-report.js";
+import { MAX_STUDY_TRAJECTORY_BYTES } from "../study-trajectories.js";
 
 const SESSION = "340282366920938463463374607431768211455";
 const DIGEST = "a".repeat(64);
@@ -95,14 +96,14 @@ function artifactPage(items = [artifact()], changes = {}) {
   return { items, total: items.length, limit: CHECKPOINT_LAB_PAGE_SIZE, offset: 0, has_more: false, ...changes };
 }
 
-async function harness({ listStudies, parseReport } = {}) {
+async function harness({ listStudies, parseReport, parseTrajectories } = {}) {
   let time = 0, nextId = 0;
   const queues = Object.fromEntries(["save", "review", "replay", "launch", "status", "cancel", "artifacts", "download"].map((kind) => [kind, []]));
   const services = Object.fromEntries(Object.keys(queues).map((kind) => [kind, (request, signal) => new Promise((resolve, reject) => {
     queues[kind].push({ request, signal, resolve, reject });
   })]));
   const reads = [];
-  const controller = new CheckpointLabController({ ...services, listStudies, parseReport,
+  const controller = new CheckpointLabController({ ...services, listStudies, parseReport, parseTrajectories,
     list: async (request) => { reads.push(request); return page(); },
     id: () => `browser-lab-${++nextId}`, now: () => time });
   controller.observe(frame(), SOURCE);
@@ -1327,6 +1328,277 @@ test("report preview rejects unrelated bytes, oversized reports and parser failu
   assert.equal(parseCalls, 1);
   assert.match(h.controller.notice, /report schema mismatch/);
   assert.equal(h.controller.reportModel, null);
+});
+
+// Controller contract fixtures; scientific CSV validation belongs to study-trajectories tests.
+const trajectoryBytes = "controller trajectory fixture\n";
+function trajectoryArtifact(armId, changes = {}) {
+  return artifact({ artifact_id: "summary-" + armId, filename: "summary.csv", content_type: "text/csv",
+    relative_path: "branches/branch-one/study/bundle_" + armId + "/exports/summary.csv",
+    byte_size: new Blob([trajectoryBytes]).size,
+    checksum_sha256: createHash("sha256").update(trajectoryBytes).digest("hex"), ...changes });
+}
+function trajectoryDownload(metadata) {
+  return { blob: new Blob([trajectoryBytes]), filename: metadata.filename, metadata };
+}
+function trajectoryFillers(count = CHECKPOINT_LAB_PAGE_SIZE) {
+  return Array.from({ length: count }, (_, index) => artifact({ artifact_id: "retained-file-" + index,
+    filename: "evidence-" + index + ".json", relative_path: "branches/branch-one/study/evidence-" + index + ".json" }));
+}
+async function trajectoryHarness({ hasTreatment = true, parseTrajectories = async () => Object.freeze({ loaded: true }) } = {}) {
+  const report = Object.freeze({ studyId: "branch-one", checkpointId: checkpoint().checkpoint_id,
+    sourceTick: 100, targetTick: 220, horizonTicks: 120, worldDigest: WORLD_DIGEST, hasTreatment,
+    arms: Object.freeze([Object.freeze({ id: "control", label: "Control" }),
+      ...(hasTreatment ? [Object.freeze({ id: "treatment", label: "Treatment" })] : [])]) });
+  const h = await harness({ parseReport: async () => report, parseTrajectories });
+  const launching = h.controller.launch({ branchName: "future", ticks: 120,
+    intervention: hasTreatment ? { type: "Drought", params: { region: null, duration_ticks: 10, growth_scale: 0.1 } } : null });
+  h.queues.launch[0].resolve(status(h.queues.launch[0].request, checkpoint(),
+    { status: "completed", artifact_id: artifact().artifact_id }));
+  await launching;
+  const preview = h.controller.previewReport();
+  h.queues.download[0].resolve({ blob: new Blob(["{}"]), filename: "study_report.json", metadata: artifact() });
+  assert.equal(await preview, report);
+  return { ...h, report };
+}
+function serveTrajectories(h, rows, transform = (value) => value) {
+  const downloads = [];
+  h.controller.services.artifacts = async () => artifactPage(rows);
+  h.controller.services.download = async (request, signal) => {
+    downloads.push({ request, signal });
+    return transform(trajectoryDownload(request.expected));
+  };
+  return downloads;
+}
+
+test("trajectory preview requires a loaded completed report and disables its action while busy", async () => {
+  const h = await harness();
+  const { panel, nodes } = labPanel();
+  assert.equal(await h.controller.previewTrajectories(), null);
+  await launch(h);
+  assert.equal(await h.controller.previewTrajectories(), null);
+  const finished = h.controller.refreshBranch(true);
+  h.queues.status[0].resolve(status(h.controller.branch.request, checkpoint(),
+    { status: "completed", artifact_id: artifact().artifact_id }));
+  await finished;
+  assert.equal(await h.controller.previewTrajectories(), null);
+  renderCheckpointLab(panel, h.controller);
+  assert.equal(nodes.get("#lab-trajectories-preview").disabled, true);
+  assert.equal(h.queues.artifacts.length, 0);
+  assert.equal(h.queues.download.length, 0);
+  const ready = await trajectoryHarness();
+  renderCheckpointLab(panel, ready.controller);
+  assert.equal(nodes.get("#lab-trajectories-preview").disabled, false);
+  const preview = ready.controller.previewTrajectories();
+  renderCheckpointLab(panel, ready.controller);
+  assert.equal(nodes.get("#lab-trajectories-preview").disabled, true);
+  ready.queues.artifacts[0].reject(new Error("catalog temporarily unavailable"));
+  assert.equal(await preview, null);
+  renderCheckpointLab(panel, ready.controller);
+  assert.equal(nodes.get("#lab-trajectories-preview").disabled, false);
+});
+
+test("trajectory discovery follows every catalog page and leaves the user's file selection intact", async () => {
+  let parsedReport, parsedDownloads;
+  const model = Object.freeze({ studyId: "branch-one", loaded: true });
+  const h = await trajectoryHarness({ parseTrajectories: async (report, downloads) => {
+    parsedReport = report; parsedDownloads = downloads; return model;
+  } });
+  const fillers = trajectoryFillers();
+  const listing = h.controller.refreshArtifacts(true);
+  h.queues.artifacts[0].resolve(artifactPage(fillers, { total: 13, has_more: true, next_cursor: "12" }));
+  await listing;
+  const next = h.controller.nextArtifactPage();
+  h.queues.artifacts[1].resolve(artifactPage([artifact()], { total: 13, offset: 12 }));
+  await next;
+  h.controller.selectArtifact(artifact().artifact_id);
+  const selected = h.controller.selectedArtifact, userPage = h.controller.artifactsPage;
+  const control = trajectoryArtifact("control"), treatment = trajectoryArtifact("treatment");
+  const downloads = [];
+  h.controller.services.download = async (request, signal) => {
+    downloads.push({ request, signal }); return trajectoryDownload(request.expected);
+  };
+  const preview = h.controller.previewTrajectories();
+  assert.deepEqual(h.queues.artifacts[2].request,
+    { sessionId: SESSION, branchId: "branch-one", cursor: null, limit: CHECKPOINT_LAB_PAGE_SIZE });
+  h.queues.artifacts[2].resolve(artifactPage(fillers, { total: 14, has_more: true, next_cursor: "12" }));
+  await flush();
+  assert.equal(h.queues.artifacts[3].request.cursor, "12");
+  h.queues.artifacts[3].resolve(artifactPage([treatment, control], { total: 14, offset: 12 }));
+  assert.equal(await preview, model);
+  assert.deepEqual(parsedReport, h.report);
+  assert.ok(Object.isFrozen(parsedReport) && Object.isFrozen(parsedReport.arms));
+  assert.deepEqual(parsedDownloads.map((row) => row.armId), ["control", "treatment"]);
+  assert.deepEqual(downloads.map(({ request }) => request), [control, treatment].map((metadata) => ({
+    sessionId: SESSION, artifactId: metadata.artifact_id, expected: metadata, maxBytes: MAX_STUDY_TRAJECTORY_BYTES,
+  })));
+  assert.equal(h.controller.trajectoryModel, model);
+  assert.equal(h.controller.reportModel, h.report);
+  assert.equal(h.controller.artifactsPage, userPage);
+  assert.equal(h.controller.artifactCursor, "12");
+  assert.equal(h.controller.selectedArtifact, selected);
+  assert.equal(h.queues.launch.length, 1);
+  assert.equal(h.queues.save.length, 0);
+});
+
+test("unchanged studies request only their control trajectory", async () => {
+  let armIds;
+  const h = await trajectoryHarness({ hasTreatment: false, parseTrajectories: async (_report, downloads) => {
+    armIds = downloads.map((row) => row.armId); return Object.freeze({ loaded: true });
+  } });
+  const downloads = serveTrajectories(h, [trajectoryArtifact("control")]);
+  assert.ok(await h.controller.previewTrajectories());
+  assert.deepEqual(armIds, ["control"]);
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].request.artifactId, "summary-control");
+});
+
+test("trajectory discovery refuses missing, duplicate, changing and oversized catalogs before downloading", async () => {
+  const control = trajectoryArtifact("control"), treatment = trajectoryArtifact("treatment");
+  const full = [control, ...trajectoryFillers(CHECKPOINT_LAB_PAGE_SIZE - 1)];
+  const first = artifactPage(full, { total: 13, has_more: true, next_cursor: "12" });
+  const cases = [
+    ["missing treatment", [artifactPage([control])]],
+    ["duplicate summary path", [artifactPage([control, { ...control, artifact_id: "duplicate-control" }, treatment])]],
+    ["duplicate identity across pages", [first,
+      artifactPage([{ ...treatment, artifact_id: control.artifact_id }], { total: 13, offset: 12 })]],
+    ["changing catalog total", [first, artifactPage([treatment, artifact()], { total: 14, offset: 12 })]],
+    ["catalog scan budget", [artifactPage(full, { total: MAX_LAB_TRAJECTORY_CATALOG_ARTIFACTS + 1,
+      has_more: true, next_cursor: "12" })]],
+  ];
+  for (const [label, pages] of cases) {
+    let parses = 0, reads = 0;
+    const h = await trajectoryHarness({ parseTrajectories: async () => { parses += 1; return {}; } });
+    const downloads = serveTrajectories(h, []);
+    h.controller.services.artifacts = async () => {
+      assert.ok(reads < pages.length, label + ": unexpected catalog request");
+      return pages[reads++];
+    };
+    assert.equal(await h.controller.previewTrajectories(), null, label);
+    assert.equal(parses, 0, label);
+    assert.equal(downloads.length, 0, label);
+    assert.equal(h.controller.trajectoryModel, null, label);
+    assert.equal(h.controller.reportModel, h.report, label);
+  }
+});
+
+test("trajectory preview refuses oversized summaries and substituted download metadata", async () => {
+  const oversized = await trajectoryHarness({ hasTreatment: false });
+  const unused = serveTrajectories(oversized,
+    [trajectoryArtifact("control", { byte_size: MAX_STUDY_TRAJECTORY_BYTES + 1 })]);
+  assert.equal(await oversized.controller.previewTrajectories(), null);
+  assert.equal(unused.length, 0, "the byte budget is checked before requesting summary bytes");
+  for (const change of [
+    { artifact_id: "another-summary" },
+    { relative_path: "branches/branch-one/study/bundle_treatment/exports/summary.csv" },
+    { filename: "other.csv", relative_path: "branches/branch-one/study/bundle_control/exports/other.csv" },
+    { content_type: "application/json" },
+    { checksum_sha256: "e".repeat(64) },
+    { checksum_blake3: "f".repeat(64) },
+    { created_at_utc: "1794000001" },
+  ]) {
+    let parses = 0;
+    const h = await trajectoryHarness({ hasTreatment: false,
+      parseTrajectories: async () => { parses += 1; return {}; } });
+    serveTrajectories(h, [trajectoryArtifact("control")], (value) => ({ ...value,
+      filename: change.filename ?? value.filename, metadata: { ...value.metadata, ...change } }));
+    assert.equal(await h.controller.previewTrajectories(), null, JSON.stringify(change));
+    assert.equal(parses, 0);
+    assert.equal(h.controller.trajectoryModel, null);
+    assert.equal(h.controller.reportModel, h.report);
+  }
+});
+
+test("trajectory parser failures preserve the readable study report and permit another attempt", async () => {
+  const h = await trajectoryHarness({ parseTrajectories: async () => { throw new Error("trajectory endpoint differs"); } });
+  serveTrajectories(h, [trajectoryArtifact("control"), trajectoryArtifact("treatment")]);
+  assert.equal(await h.controller.previewTrajectories(), null);
+  assert.match(h.controller.notice, /trajectory endpoint differs/);
+  assert.equal(h.controller.reportModel, h.report);
+  assert.equal(h.controller.trajectoryModel, null);
+  assert.equal(h.controller.canOperate, true);
+});
+
+test("closing the Lab during trajectory discovery prevents late downloads", async () => {
+  let parses = 0;
+  const h = await trajectoryHarness({ parseTrajectories: async () => { parses += 1; return {}; } });
+  const preview = h.controller.previewTrajectories();
+  h.controller.setEnabled(false);
+  assert.equal(h.queues.artifacts[0].signal.aborted, true);
+  h.queues.artifacts[0].resolve(artifactPage([trajectoryArtifact("control"), trajectoryArtifact("treatment")]));
+  assert.equal(await preview, null);
+  assert.equal(h.queues.download.length, 1, "only the earlier report download occurred");
+  assert.equal(parses, 0);
+  assert.equal(h.controller.trajectoryModel, null);
+  assert.equal(h.controller.reportModel, h.report);
+});
+
+test("a new source during trajectory download aborts the old read before another arm or parser runs", async () => {
+  let parses = 0;
+  const h = await trajectoryHarness({ parseTrajectories: async () => { parses += 1; return {}; } });
+  const preview = h.controller.previewTrajectories();
+  h.queues.artifacts[0].resolve(artifactPage([trajectoryArtifact("control"), trajectoryArtifact("treatment")]));
+  await flush();
+  const pending = h.queues.download[1];
+  assert.equal(pending.request.artifactId, "summary-control");
+  h.controller.observe(frame("7"), SOURCE);
+  assert.equal(pending.signal.aborted, true);
+  pending.resolve(trajectoryDownload(pending.request.expected));
+  assert.equal(await preview, null);
+  assert.equal(h.queues.download.length, 2, "the treatment was never fetched after source replacement");
+  assert.equal(parses, 0);
+  assert.equal(h.controller.source.sessionId, "7");
+  assert.equal(h.controller.reportModel, null);
+  assert.equal(h.controller.trajectoryModel, null);
+});
+
+test("trajectory decoding cannot publish after the Lab is disabled", async () => {
+  let finishParsing;
+  const h = await trajectoryHarness({ parseTrajectories: () => new Promise((resolve) => { finishParsing = resolve; }) });
+  const downloads = serveTrajectories(h, [trajectoryArtifact("control"), trajectoryArtifact("treatment")]);
+  const preview = h.controller.previewTrajectories();
+  await flush();
+  assert.equal(typeof finishParsing, "function");
+  assert.equal(downloads.length, 2);
+  h.controller.setEnabled(false);
+  finishParsing(Object.freeze({ studyId: "stale-study" }));
+  assert.equal(await preview, null);
+  assert.equal(h.controller.trajectoryModel, null);
+  assert.equal(h.controller.reportModel, h.report);
+});
+
+test("replacing a report or starting another study clears its previously loaded trajectories", async () => {
+  const h = await trajectoryHarness();
+  serveTrajectories(h, [trajectoryArtifact("control"), trajectoryArtifact("treatment")]);
+  assert.ok(await h.controller.previewTrajectories());
+  assert.ok(h.controller.trajectoryModel);
+  h.controller.services.download = async () => ({ blob: new Blob(["{}"]), filename: "study_report.json", metadata: artifact() });
+  assert.equal(await h.controller.previewReport(), h.report);
+  assert.equal(h.controller.trajectoryModel, null);
+  serveTrajectories(h, [trajectoryArtifact("control"), trajectoryArtifact("treatment")]);
+  assert.ok(await h.controller.previewTrajectories());
+  const next = h.controller.launch({ branchName: "next", ticks: 10 });
+  assert.equal(h.controller.reportModel, null);
+  assert.equal(h.controller.trajectoryModel, null);
+  h.queues.launch[1].resolve(status(h.queues.launch[1].request, checkpoint(), { branch_id: "branch-next" }));
+  await next;
+});
+
+test("selecting another retained study clears the previous study's trajectories without submitting science", async () => {
+  const h = await trajectoryHarness();
+  serveTrajectories(h, [trajectoryArtifact("control"), trajectoryArtifact("treatment")]);
+  assert.ok(await h.controller.previewTrajectories());
+  const receipt = study({ branch_id: "branch-two", status: "completed", artifact_id: "retained-report-two" });
+  h.controller.services.listStudies = async () => historyPage([receipt]);
+  await h.controller.refreshHistory(true);
+  const selecting = h.controller.selectStudy(receipt.branch_id);
+  h.queues.status[0].resolve(receipt);
+  await selecting;
+  assert.equal(h.controller.branch.status.branch_id, receipt.branch_id);
+  assert.equal(h.controller.branch.origin, "history");
+  assert.equal(h.controller.reportModel, null);
+  assert.equal(h.controller.trajectoryModel, null);
+  assert.equal(h.queues.launch.length, 1);
 });
 
 function client() {

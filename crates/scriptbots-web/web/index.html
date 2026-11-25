@@ -272,6 +272,18 @@
         #lab-study-report table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
         #lab-study-report th, #lab-study-report td { text-align: left; vertical-align: top; padding: 0.35rem; border-bottom: 1px solid #334155; }
         #lab-study-report ul { padding-left: 1.1rem; font-size: 0.75rem; }
+        #lab-study-trajectories { margin-top: 0.75rem; padding: 0.65rem; border: 1px solid #334155; border-radius: 0.4rem; background: #101b2e; overflow-x: auto; }
+        #lab-study-trajectories label { display: grid; gap: 0.3rem; font-size: 0.8rem; }
+        #lab-study-trajectories table { width: 100%; border-collapse: collapse; font-size: 0.72rem; font-variant-numeric: tabular-nums; }
+        #lab-study-trajectories th, #lab-study-trajectories td { text-align: left; padding: 0.35rem; border-bottom: 1px solid #334155; }
+        #lab-study-trajectories caption { text-align: left; margin: 0.7rem 0 0.3rem; }
+        #lab-study-trajectories .trajectory-chart { display: block; width: 100%; height: auto; min-width: 300px; }
+        #lab-study-trajectories .trajectory-chart text { font-size: 16px; }
+        #lab-study-trajectories input[type="range"] { width: 100%; }
+        #lab-study-trajectories .trajectory-tick-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(5rem, 1.3fr) minmax(0, 1fr); gap: 0.35rem; align-items: center; }
+        #lab-study-trajectories .trajectory-tick-controls button { padding: 0.4rem; font-size: 0.72rem; }
+        #lab-study-trajectories input[type="number"] { width: 100%; min-width: 0; box-sizing: border-box; background: #0f172a; color: #e2e8f0; border: 1px solid #475569; border-radius: 0.25rem; padding: 0.4rem; }
+        #lab-study-trajectories :focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
         #inspector-signals { max-height: 24rem; overflow: auto; }
         #inspector-signals table { width: 100%; font-size: 0.75rem; border-collapse: collapse; }
         #inspector-signals th { text-align: left; font-weight: 400; }
@@ -882,6 +894,9 @@
                     <button id="lab-report-download" type="button" disabled>Download completed study report</button>
                 </div>
                 <section id="lab-study-report" aria-label="Verified study results" hidden></section>
+                <button id="lab-trajectories-preview" type="button" disabled>Explore recorded trajectories</button>
+                <p>Read the study results, then compare every recorded tick for population, ground food, energy and health.</p>
+                <section id="lab-study-trajectories" aria-label="Recorded study trajectories" hidden></section>
                 <div class="inspector-actions">
                     <button id="lab-artifact-refresh" type="button" disabled>List study files</button>
                     <button id="lab-artifact-first" type="button" disabled>First files page</button>

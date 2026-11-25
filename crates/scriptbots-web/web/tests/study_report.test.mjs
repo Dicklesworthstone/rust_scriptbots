@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MAX_STUDY_REPORT_BYTES, parseSavedStudyReport, renderStudyReport } from "../study-report.js";
+import { MAX_STUDY_REPORT_BYTES, parseSavedStudyReport, renderStudyReport, renderStudyTrajectories } from "../study-report.js";
 
 const hash = (letter) => letter.repeat(64);
 const worldDigest = (letter) => letter.repeat(16);
@@ -377,15 +377,42 @@ test("oversized, malformed, duplicate-field and excessively nested reports fail 
 });
 
 class Element {
-  constructor(tag, ownerDocument) { this.tagName = tag; this.ownerDocument = ownerDocument; this.children = []; this.value = ""; this.hidden = false; }
-  set textContent(value) { this.value = String(value); this.children = []; }
-  get textContent() { return this.value + this.children.map((child) => child.textContent).join(" "); }
+  constructor(tag, ownerDocument, namespaceURI = null) {
+    this.tagName = tag;
+    this.ownerDocument = ownerDocument;
+    this.namespaceURI = namespaceURI;
+    this.children = [];
+    this.value = "";
+    this.hidden = false;
+    this.attributes = new Map();
+    this.listeners = new Map();
+    this.validationMessage = "";
+    this.text = "";
+  }
+  set textContent(value) { this.text = String(value); this.children = []; }
+  get textContent() { return [this.text, ...this.children.map((child) => child.textContent)].filter(Boolean).join(" "); }
   set innerHTML(_) { throw new Error("Report renderer must not execute markup"); }
   append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.value = ""; this.children = [...children]; }
+  replaceChildren(...children) { this.text = ""; this.children = [...children]; }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  }
+  dispatchEvent(event) {
+    for (const listener of this.listeners.get(event.type) ?? []) {
+      listener.call(this, { ...event, target: this, currentTarget: this });
+    }
+    return true;
+  }
+  setCustomValidity(message) { this.validationMessage = String(message); }
 }
 function containerFixture() {
-  const doc = { createElement(tag) { return new Element(tag, doc); } };
+  const doc = {
+    createElement(tag) { return new Element(tag, doc); },
+    createElementNS(namespaceURI, tag) { return new Element(tag, doc, namespaceURI); },
+  };
   return new Element("section", doc);
 }
 function descendants(node) { return [node, ...node.children.flatMap(descendants)]; }
@@ -420,4 +447,238 @@ test("control-only presentation omits the treatment column", async () => {
   assert.equal(descendants(container).filter((node) => node.tagName === "table").length, 1);
   assert.ok(!container.textContent.includes("Δ treatment"));
   assert.match(container.textContent, /one unchanged future/);
+});
+
+
+// These independent, hand-calculated samples exercise presentation only.
+// They are not a claim that a scientific run or checkpoint was executed here.
+function trajectoryFixture({ treatment = true, zero = false } = {}) {
+  const samples = (rows, finalDigest) => Object.freeze(rows.map(([tick, population, food, energy, health], index) =>
+    Object.freeze({ tick, population: zero ? 0 : population, food_total: zero ? 0 : food,
+      total_energy: zero ? 0 : energy, average_health: zero ? 0 : health,
+      births: 0, deaths: 0, spike_hits: 0,
+      digest: worldDigest(index === 2 ? finalDigest : String(index + 1)) })));
+  const arm = (id, label, rows, finalDigest, letter) => Object.freeze({
+    id, label, artifact: Object.freeze({ id: "artifact-" + id,
+      relativePath: "branches/browser-study/study/timeseries_" + id + ".csv",
+      byteSize: 512, checksumSha256: hash(letter) }),
+    samples: samples(rows, finalDigest),
+  });
+  const arms = [arm("control", "Control",
+    [[10, 3, 10.125, 3, 0.8], [11, 2, 9.5, 2.25, 0.75], [12, 2, 8.25, 1.5, 0.5]], "3", "a")];
+  if (treatment) arms.push(arm("treatment", "Treatment",
+    [[10, 3, 10.125, 3, 0.8], [11, 2, 9.5, 2.25, 0.75], [12, 1, 4.125, 1.625, 0.4]], "4", "b"));
+  return Object.freeze({ studyId: "browser-study", checkpointId: "saved-world",
+    sourceTick: 10, targetTick: 12, horizonTicks: 2,
+    interventionTick: treatment ? 11 : null, hasTreatment: treatment,
+    decimalPlaces: 4, arms: Object.freeze(arms) });
+}
+
+function trajectoryControl(container, label) {
+  const node = descendants(container).find((item) => item.getAttribute("aria-label") === label);
+  assert.ok(node, "missing accessible trajectory control: " + label);
+  return node;
+}
+function trajectoryButton(container, label) {
+  return descendants(container).find((item) => item.tagName === "button" && item.textContent === label);
+}
+function trajectoryRows(container) {
+  const body = descendants(container).find((item) => item.tagName === "tbody");
+  assert.ok(body, "the selected tick needs an exact-values table");
+  return body.children.map((row) => row.children.map((cell) => cell.textContent));
+}
+function trajectoryCurves(container) {
+  return descendants(container).filter((item) => item.getAttribute("class") === "trajectory-curve");
+}
+function trajectoryPoints(curve) {
+  const path = curve.getAttribute("d");
+  assert.equal(typeof path, "string");
+  assert.ok(!/NaN|Infinity|undefined/.test(path), "chart coordinates must remain finite");
+  return [...path.matchAll(/[ML](-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)/g)]
+    .map((match) => [Number(match[1]), Number(match[2])]);
+}
+function fixedDecimal(literal) {
+  const separator = new Intl.NumberFormat().formatToParts(1.5).find((part) => part.type === "decimal").value;
+  return literal.replace(".", separator);
+}
+function chooseTrajectoryMetric(container, key) {
+  const select = trajectoryControl(container, "Trajectory metric");
+  select.value = key;
+  select.dispatchEvent({ type: "change" });
+  return select;
+}
+
+test("trajectory explorer starts at the final recorded tick with exact values, differences and every sample", () => {
+  const model = trajectoryFixture(), container = containerFixture();
+  renderStudyTrajectories(container, model);
+  assert.equal(container.hidden, false);
+  const metric = trajectoryControl(container, "Trajectory metric");
+  assert.deepEqual(metric.children.map((option) => option.value),
+    ["population", "food_total", "total_energy", "average_health"]);
+  assert.equal(metric.value, "population");
+  const slider = trajectoryControl(container, "Recorded tick offset");
+  const tick = trajectoryControl(container, "Recorded tick");
+  assert.deepEqual([slider.min, slider.max, slider.step, slider.value], ["0", "2", "1", "2"]);
+  assert.deepEqual([tick.min, tick.max, tick.step, tick.value], ["10", "12", "1", "12"]);
+  assert.deepEqual(trajectoryRows(container), [
+    ["Population", "2", "1", "-1"],
+    ["Ground food", fixedDecimal("8.2500"), fixedDecimal("4.1250"), fixedDecimal("-4.1250")],
+    ["Total energy", fixedDecimal("1.5000"), fixedDecimal("1.6250"), fixedDecimal("+0.1250")],
+    ["Average health", fixedDecimal("0.5000"), fixedDecimal("0.4000"), fixedDecimal("-0.1000")],
+  ]);
+  const chart = descendants(container).find((node) => node.tagName === "svg");
+  assert.equal(chart.namespaceURI, "http://www.w3.org/2000/svg");
+  assert.equal(chart.getAttribute("aria-label"), "Population recorded at every tick; exact values follow the chart");
+  assert.equal(descendants(chart).find((node) => node.tagName === "title").textContent, "Population from tick 10 to 12");
+  const curves = trajectoryCurves(container);
+  assert.equal(curves.length, 2);
+  const control = trajectoryPoints(curves[0]), treatment = trajectoryPoints(curves[1]);
+  assert.equal(control.length, 3);
+  assert.equal(treatment.length, 3);
+  assert.deepEqual(control.map(([x]) => x), treatment.map(([x]) => x));
+  assert.ok(control[0][0] < control[1][0] && control[1][0] < control[2][0]);
+  assert.notEqual(control[0][1], control[1][1], "the second recorded value must not repeat the first");
+  assert.notEqual(control[2][1], treatment[2][1], "different observed endpoints must remain distinct");
+  const selected = descendants(chart).find((node) => node.getAttribute("class") === "trajectory-selected-tick");
+  const intervention = descendants(chart).find((node) => node.getAttribute("class") === "trajectory-intervention");
+  assert.equal(Number(selected.getAttribute("x1")), control[2][0]);
+  assert.equal(Number(intervention.getAttribute("x1")), control[1][0]);
+  for (const arm of model.arms) {
+    assert.ok(container.textContent.includes(arm.artifact.relativePath));
+    assert.ok(container.textContent.includes(arm.artifact.checksumSha256));
+  }
+});
+
+test("trajectory controls inspect exact ticks, respect endpoints and preserve data while rejecting invalid tick input", () => {
+  const model = trajectoryFixture(), original = JSON.stringify(model), container = containerFixture();
+  renderStudyTrajectories(container, model);
+  const previous = trajectoryButton(container, "Previous tick"), next = trajectoryButton(container, "Next tick");
+  const slider = trajectoryControl(container, "Recorded tick offset"), tick = trajectoryControl(container, "Recorded tick");
+  assert.equal(previous.disabled, false);
+  assert.equal(next.disabled, true);
+  previous.dispatchEvent({ type: "click" });
+  assert.equal(tick.value, "11");
+  assert.deepEqual(trajectoryRows(container)[0], ["Population", "2", "2", "0"]);
+  previous.dispatchEvent({ type: "click" });
+  assert.equal(tick.value, "10");
+  assert.equal(previous.disabled, true);
+  assert.equal(next.disabled, false);
+  assert.deepEqual(trajectoryRows(container)[0], ["Population", "3", "3", "0"]);
+  previous.dispatchEvent({ type: "click" });
+  assert.equal(tick.value, "10");
+  next.dispatchEvent({ type: "click" });
+  next.dispatchEvent({ type: "click" });
+  assert.equal(tick.value, "12");
+  assert.equal(next.disabled, true);
+  slider.value = "0";
+  slider.dispatchEvent({ type: "input" });
+  assert.equal(tick.value, "10");
+  trajectoryButton(container, "Intervention tick").dispatchEvent({ type: "click" });
+  assert.equal(tick.value, "11");
+  assert.equal(slider.value, "1");
+  assert.match(container.textContent, /intervention boundary/);
+  const before = trajectoryRows(container);
+  for (const invalid of ["9", "13", "11.5", "11e0", "011", "9007199254740992", ""]) {
+    tick.value = invalid;
+    tick.dispatchEvent({ type: "change" });
+    assert.ok(tick.validationMessage.length > 0, "invalid tick needs an accessible validity error");
+    assert.equal(slider.value, "1");
+    assert.deepEqual(trajectoryRows(container), before);
+  }
+  tick.value = "12";
+  tick.dispatchEvent({ type: "change" });
+  assert.equal(tick.validationMessage, "");
+  assert.equal(slider.value, "2");
+  assert.deepEqual(trajectoryRows(container)[0], ["Population", "2", "1", "-1"]);
+  assert.equal(JSON.stringify(model), original);
+});
+
+test("changing the trajectory metric redraws its actual values without changing the inspected tick or table", () => {
+  const container = containerFixture();
+  renderStudyTrajectories(container, trajectoryFixture());
+  const slider = trajectoryControl(container, "Recorded tick offset");
+  slider.value = "1";
+  slider.dispatchEvent({ type: "input" });
+  const rows = trajectoryRows(container), paths = new Set();
+  for (const [key, label] of [["population", "Population"], ["food_total", "Ground food"],
+    ["total_energy", "Total energy"], ["average_health", "Average health"]]) {
+    chooseTrajectoryMetric(container, key);
+    const chart = descendants(container).find((node) => node.tagName === "svg");
+    assert.equal(chart.getAttribute("aria-label"), label + " recorded at every tick; exact values follow the chart");
+    assert.equal(trajectoryControl(container, "Recorded tick").value, "11");
+    assert.deepEqual(trajectoryRows(container), rows);
+    paths.add(trajectoryCurves(container)[0].getAttribute("d"));
+  }
+  assert.equal(paths.size, 4, "different metrics must not reuse one metric's curve");
+  const before = trajectoryCurves(container)[0].getAttribute("d");
+  const select = chooseTrajectoryMetric(container, "unsupported_metric");
+  assert.equal(select.value, "average_health");
+  assert.equal(trajectoryCurves(container)[0].getAttribute("d"), before);
+  assert.equal(trajectoryControl(container, "Recorded tick").value, "11");
+});
+
+test("trajectory selection survives the same model, stays local to its container, and resets for replacement or clearing", () => {
+  const model = trajectoryFixture(), container = containerFixture(), other = containerFixture();
+  renderStudyTrajectories(container, model);
+  renderStudyTrajectories(other, model);
+  chooseTrajectoryMetric(container, "average_health");
+  const tick = trajectoryControl(container, "Recorded tick");
+  tick.value = "10";
+  tick.dispatchEvent({ type: "change" });
+  renderStudyTrajectories(container, model);
+  assert.equal(trajectoryControl(container, "Trajectory metric").value, "average_health");
+  assert.equal(trajectoryControl(container, "Recorded tick").value, "10");
+  assert.equal(trajectoryControl(other, "Recorded tick").value, "12");
+  assert.equal(trajectoryControl(other, "Trajectory metric").value, "population");
+  renderStudyTrajectories(container, { ...model, studyId: "replacement-study" });
+  assert.equal(trajectoryControl(container, "Trajectory metric").value, "population");
+  assert.equal(trajectoryControl(container, "Recorded tick").value, "12");
+  renderStudyTrajectories(container, null);
+  assert.equal(container.hidden, true);
+  assert.deepEqual(container.children, []);
+  renderStudyTrajectories(container, model);
+  assert.equal(container.hidden, false);
+  assert.equal(trajectoryControl(container, "Recorded tick").value, "12");
+});
+
+test("all-zero trajectories remain finite, flat and exactly zero for every displayed metric", () => {
+  const container = containerFixture();
+  renderStudyTrajectories(container, trajectoryFixture({ zero: true }));
+  for (const key of ["population", "food_total", "total_energy", "average_health"]) {
+    chooseTrajectoryMetric(container, key);
+    for (const curve of trajectoryCurves(container)) {
+      const points = trajectoryPoints(curve);
+      assert.equal(points.length, 3);
+      assert.ok(points.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y)));
+      assert.equal(new Set(points.map(([, y]) => y)).size, 1);
+    }
+  }
+  const rows = trajectoryRows(container);
+  assert.deepEqual(rows[0], ["Population", "0", "0", "0"]);
+  for (const row of rows.slice(1)) assert.deepEqual(row.slice(1),
+    [fixedDecimal("0.0000"), fixedDecimal("0.0000"), fixedDecimal("0.0000")]);
+});
+
+test("control-only trajectories expose no treatment column, effect or intervention control", () => {
+  const container = containerFixture();
+  renderStudyTrajectories(container, trajectoryFixture({ treatment: false }));
+  assert.equal(trajectoryCurves(container).length, 1);
+  assert.equal(trajectoryButton(container, "Intervention tick"), undefined);
+  assert.ok(!descendants(container).some((node) => node.getAttribute("class") === "trajectory-intervention"));
+  assert.ok(trajectoryRows(container).every((row) => row.length === 2));
+  assert.deepEqual(trajectoryRows(container)[0], ["Population", "2"]);
+  assert.ok(!container.textContent.includes("Treatment"));
+  assert.ok(!container.textContent.includes("Δ treatment"));
+});
+
+test("trajectory labels and artifact provenance remain literal text, never executable markup", () => {
+  const model = structuredClone(trajectoryFixture()), container = containerFixture();
+  const marker = "<img src=x onerror=unexpected()>";
+  model.arms[0].label = "Control " + marker;
+  model.arms[0].artifact.relativePath = "branches/" + marker + "/timeseries_control.csv";
+  renderStudyTrajectories(container, model);
+  assert.ok(container.textContent.includes(marker));
+  assert.ok(container.textContent.includes(model.arms[0].artifact.relativePath));
+  assert.ok(descendants(container).every((node) => !["img", "script", "iframe", "a"].includes(node.tagName)));
+  assert.equal(trajectoryCurves(container).length, 2);
 });

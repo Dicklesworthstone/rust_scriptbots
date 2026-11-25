@@ -13,7 +13,7 @@ import { validateContinuationBrains, validateLaunchInfo, launchInfoText, renderB
 import { CheckpointLabController, renderCheckpointLab, archiveStudyTreatment } from "./checkpoint-lab.js";
 import { ExperimentController } from "./experiments.js";
 import { readExperimentForm, renderExperimentLab, experimentObservationExport } from "./experiment-view.js";
-import { renderStudyReport } from "./study-report.js";
+import { renderStudyReport, renderStudyTrajectories } from "./study-report.js";
 import { WorldViewport, WorldDrag, MIN_WORLD_ZOOM, MAX_WORLD_ZOOM } from "./world-view.js";
 
 const {
@@ -293,6 +293,7 @@ const labForm = document.getElementById("lab-branch-form");
 const labFormError = document.getElementById("lab-form-error");
 const labDownloadStatus = document.getElementById("lab-download-status");
 const labReportPanel = document.getElementById("lab-study-report");
+const labTrajectoryPanel = document.getElementById("lab-study-trajectories");
 let labDownloadUrl = null;
 let labPollTimer = null;
 const checkpointLab = new CheckpointLabController({
@@ -316,6 +317,7 @@ const checkpointLab = new CheckpointLabController({
     renderCheckpointLab(checkpointLabPanel, controller);
     updateLocalTransferControl(controller);
     renderStudyReport(labReportPanel, controller.reportModel);
+    renderStudyTrajectories(labTrajectoryPanel, controller.trajectoryModel);
     synchronizeCheckpointView(controller);
   },
 });
@@ -526,6 +528,7 @@ for (const [id, action] of [
   ["lab-branch-refresh", () => checkpointLab.refreshBranch(true)],
   ["lab-branch-cancel", () => checkpointLab.cancelBranch()],
   ["lab-report-preview", () => checkpointLab.previewReport()],
+  ["lab-trajectories-preview", () => checkpointLab.previewTrajectories()],
   ["lab-artifact-refresh", () => checkpointLab.refreshArtifacts(true)],
   ["lab-artifact-first", () => checkpointLab.firstArtifactPage()],
   ["lab-artifact-next", () => checkpointLab.nextArtifactPage()],
@@ -558,6 +561,7 @@ window.addEventListener("pageshow", () => { updateRemoteOwnerPolling(); updateCh
 updateLabTreatmentFields();
 renderCheckpointLab(checkpointLabPanel, checkpointLab);
 renderStudyReport(labReportPanel, checkpointLab.reportModel);
+renderStudyTrajectories(labTrajectoryPanel, checkpointLab.trajectoryModel);
 startLabPolling();
 
 const narrativePanel = document.getElementById("narrative-timeline");

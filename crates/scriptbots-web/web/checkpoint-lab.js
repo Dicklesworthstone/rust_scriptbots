@@ -3,9 +3,12 @@
 import { exactIdentity } from "./inspector.js";
 import { interventionRequestId, validateInterventionAction } from "./interventions.js";
 import { MAX_STUDY_REPORT_BYTES, parseSavedStudyReport } from "./study-report.js";
+import { MAX_STUDY_TRAJECTORY_BYTES, parseSavedStudyTrajectories, studyTrajectorySources } from "./study-trajectories.js";
 
 export const CHECKPOINT_LAB_PAGE_SIZE = 12;
 export const MAX_LAB_ARTIFACT_BYTES = 64 * 1024 * 1024;
+// Independent browser scan budget; discovery never follows an unbounded catalog.
+export const MAX_LAB_TRAJECTORY_CATALOG_ARTIFACTS = 256;
 const MAX_BRANCH_TICKS = 10000;
 const POLL_MS = 2000;
 // WorldDigestV1 uses FNV-1a64. Artifact integrity uses BLAKE3/SHA-256;
@@ -292,12 +295,14 @@ function validateDownload(result, artifactId, expected, branchId) {
 /** One bounded request slot, with explicit retries for potentially admitted mutations. */
 export class CheckpointLabController {
   constructor({ list, listStudies, save, review, replay, launch, status, cancel, artifacts, download, onChange = () => {},
-    id = interventionRequestId, now = () => performance.now(), parseReport = parseSavedStudyReport }) {
+    id = interventionRequestId, now = () => performance.now(), parseReport = parseSavedStudyReport,
+    parseTrajectories = parseSavedStudyTrajectories }) {
     this.services = { list, listStudies, save, review, replay, launch, status, cancel, artifacts, download };
     this.onChange = onChange;
     this.id = id;
     this.now = now;
     this.parseReport = parseReport;
+    this.parseTrajectories = parseTrajectories;
     this.enabled = false;
     this.ownerWritable = true;
     this.source = null;
@@ -320,6 +325,7 @@ export class CheckpointLabController {
     this.historyPage = null;
     this.historyCursor = null;
     this.reportModel = null;
+    this.trajectoryModel = null;
     this.artifactsPage = null;
     this.artifactCursor = null;
     this.selectedArtifact = null;
@@ -606,6 +612,7 @@ export class CheckpointLabController {
       this.acceptStatus(value, branch);
       this.branch = branch;
       this.reportModel = null;
+      this.trajectoryModel = null;
       this.artifactsPage = null;
       this.selectedArtifact = null;
       this.artifactCursor = null;
@@ -671,6 +678,7 @@ export class CheckpointLabController {
         idempotency_key: key });
       this.branch = { request, checkpoint: this.selected, status: null };
       this.reportModel = null;
+      this.trajectoryModel = null;
       this.artifactsPage = null;
       this.selectedArtifact = null;
       this.artifactCursor = null;
@@ -825,7 +833,83 @@ export class CheckpointLabController {
       return this.parseReport(result.blob, { status, checkpoint, request: submittedRequest, artifact: result.metadata });
     }, (model) => {
       this.reportModel = model;
+      this.trajectoryModel = null;
       this.notice = "Verified saved-study report loaded. These descriptive trajectories come from one saved source.";
+      return model;
+    });
+  }
+
+
+  /** Discover and inspect the complete recorded curves without changing file-browser state. */
+  previewTrajectories() {
+    if (!this.canOperate || this.branch?.status?.status !== "completed" || !this.reportModel
+        || typeof this.services.artifacts !== "function" || typeof this.services.download !== "function") {
+      return Promise.resolve(null);
+    }
+    const retainedReport = this.reportModel, report = copy(retainedReport);
+    const status = this.branch.status, sessionId = this.source.sessionId;
+    this.notice = "Loading recorded study timepoints from the completed study.";
+    return this.run("Study trajectories unavailable", async (signal) => {
+      signal.throwIfAborted();
+      if (report.studyId !== status.branch_id || report.checkpointId !== status.checkpoint_id
+          || report.sourceTick !== status.source_tick || report.targetTick !== status.target_tick
+          || report.worldDigest !== status.world_digest_v1) {
+        throw new Error("The report no longer matches the selected study");
+      }
+      const sources = studyTrajectorySources(report);
+      const catalog = new Map(), ids = new Set();
+      let cursor = null, total = null;
+      do {
+        const page = await this.services.artifacts({ sessionId, branchId: status.branch_id,
+          cursor, limit: CHECKPOINT_LAB_PAGE_SIZE }, signal);
+        signal.throwIfAborted();
+        validateLabArtifactPage(page, status.branch_id, cursor);
+        if (page.total > MAX_LAB_TRAJECTORY_CATALOG_ARTIFACTS
+            || (total !== null && page.total !== total)) {
+          throw new Error("The study artifact catalog exceeds the inspection bound or changed while loading");
+        }
+        total = page.total;
+        for (const row of page.items) {
+          if (ids.has(row.artifact_id) || catalog.has(row.relative_path)) {
+            throw new Error("The study artifact catalog repeats an identity or path");
+          }
+          ids.add(row.artifact_id);
+          catalog.set(row.relative_path, copy(row));
+        }
+        cursor = page.next_cursor;
+      } while (cursor != null);
+      const selected = sources.map((source) => {
+        const metadata = catalog.get(source.relativePath);
+        if (!metadata || metadata.content_type !== "text/csv") {
+          throw new Error("The " + source.label.toLowerCase() + " trajectory CSV is missing from the completed study");
+        }
+        if (metadata.byte_size < 1 || metadata.byte_size > MAX_STUDY_TRAJECTORY_BYTES) {
+          throw new Error("A trajectory CSV exceeds the browser inspection byte limit");
+        }
+        return { source, metadata };
+      });
+      const downloads = [];
+      for (const { source, metadata } of selected) {
+        signal.throwIfAborted();
+        const result = validateDownload(await this.services.download({ sessionId,
+          artifactId: metadata.artifact_id, expected: metadata, maxBytes: MAX_STUDY_TRAJECTORY_BYTES }, signal),
+        metadata.artifact_id, metadata, status.branch_id);
+        signal.throwIfAborted();
+        if (["relative_path", "filename", "content_type", "created_at_utc"]
+          .some((key) => result.metadata[key] !== metadata[key])) {
+          throw new Error("Downloaded trajectory does not match its catalog identity");
+        }
+        downloads.push({ armId: source.armId, blob: result.blob, metadata });
+      }
+      const model = await this.parseTrajectories(report, downloads);
+      signal.throwIfAborted();
+      return model;
+    }, (model) => {
+      if (this.reportModel !== retainedReport || this.branch?.status?.branch_id !== report.studyId) {
+        throw new Error("The selected study changed while trajectories were loading");
+      }
+      this.trajectoryModel = model;
+      this.notice = "Recorded trajectories loaded. Select a metric and inspect any completed tick.";
       return model;
     });
   }
@@ -924,6 +1008,7 @@ export function renderCheckpointLab(panel, controller) {
   disable("lab-branch-cancel", !ready || controller.canvasPreview !== null || !status || TERMINAL.has(status.status));
   disable("lab-report-download", !ready || status?.status !== "completed");
   disable("lab-report-preview", !ready || status?.status !== "completed");
+  disable("lab-trajectories-preview", !ready || status?.status !== "completed" || !controller.reportModel);
   const studyDesign = branch?.request
     ? branch.request.intervention
       ? `Treatment and unchanged control start from the identical saved state. Treatment requested at tick ${branch.checkpoint.tick + (branch.request.intervention_delay_ticks ?? 0)}, after ${branch.request.intervention_delay_ticks ?? 0} future ticks.`

@@ -2,6 +2,34 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser saved-study trajectory inspection (2026-11-25):**
+[Implemented; focused and browser-unit DSR checks passed — Codex; functional
+extension of `bd-2z0.12.2`; original qualification criteria retained]
+
+After reading a verified report, the browser can explicitly load recorded control
+and treatment summary CSVs, select population/food/energy/health, inspect every
+completed tick and jump to the actual intervention boundary. Control-only studies
+retain one curve. The view includes per-tick differences and exact artifact
+provenance without seeking or advancing the live world.
+
+Discovery scans bounded catalogue pages without changing the selected file.
+Transfers retain checksum/size verification and a 4 MiB per-summary bound. The
+reader requires contiguous source-to-target samples, source/terminal digest and
+metric agreement at the CSV's four-place precision, actual treatment population
+baselines, trough/extinction observations and matching first divergence.
+Scientific digest equality after a command does not invent equality of historical
+per-tick event counts. Source changes and panel closure abort stale loading.
+
+DSR 0.2.3 ran the exact browser candidate in an isolated worktree: 162 focused
+report/controller/trajectory tests and four JavaScript syntax checks passed.
+The complete `web/tests/*.test.mjs` unit scope then passed 366 tests with zero
+failures or skips; both runs retained identical before/after source fingerprints.
+Regressions cover the full 10,001-sample horizon, delayed treatments, f32 precision,
+catalogue substitution, cancellation and interactive tick/metric controls.
+Independent source reviews completed. The two real-browser DOM entrypoints still
+lack usable Chromium/generated-WASM prerequisites in this environment; these unit
+results do not close that acceptance or any original qualification gate.
+
 **Atomic cohort construction at the intervention boundary (2026-11-25):**
 [Source implemented; execution validation pending — Codex;
 corrective contributions to `bd-16g.10.1` and `bd-16g.6.3`;

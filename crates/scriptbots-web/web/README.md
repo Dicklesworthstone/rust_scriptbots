@@ -344,6 +344,17 @@ The preview requires the selected study's schema-4 saved-source report and
 enforces a 1 MiB limit before downloading it; ordinary file downloads retain
 their separate 64 MiB bound.
 
+After reading the report, choose **Explore recorded trajectories** to load its
+retained control and treatment timepoints. Select population, ground food, total
+energy or average health, then use the tick slider, exact tick input or step
+buttons to compare both arms at the same recorded boundary. **Intervention tick**
+jumps to the treatment boundary marked on the chart. Every recorded tick remains
+available, including short peaks or troughs; an unchanged study shows one curve.
+The values table uses the CSV's four decimal places. Source and final digests,
+endpoint metrics, delayed population baselines and first divergence must agree
+with the report before the curves appear. Each summary is limited to 4 MiB.
+Loading or inspecting these observations does not seek or advance the live world.
+
 A saved scientific fork retains its genomes, evaluator state and scientific
 source, but does not continue the original host session, journal, schedules or
 omitted auxiliary histories. One saved trajectory and its matched control are

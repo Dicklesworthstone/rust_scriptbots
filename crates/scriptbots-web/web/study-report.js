@@ -1,3 +1,5 @@
+import { STUDY_TRAJECTORY_METRICS } from "./study-trajectories.js";
+
 // Saved-study presentation consumes schema 4 reports after the transport verifies
 // the downloaded artifact. It never executes report content or reconstructs a world.
 export const MAX_STUDY_REPORT_BYTES = 1024 * 1024;
@@ -428,4 +430,186 @@ export function renderStudyReport(container, model) {
   nodes.push(element("p", "Bundle verification establishes retained artifact integrity. A saved scientific study does not restore the source host's session or scheduled commands."));
   container.replaceChildren(...nodes);
   container.hidden = false;
+}
+
+const trajectoryViews = new WeakMap();
+
+/** Inspect recorded timepoints; chart interactions never mutate or seek a live world. */
+export function renderStudyTrajectories(container, model) {
+  if (!container) return;
+  if (!model) {
+    trajectoryViews.delete(container);
+    container.replaceChildren();
+    container.hidden = true;
+    return;
+  }
+  if (trajectoryViews.get(container) === model) return;
+  const doc = container.ownerDocument;
+  const element = (tag, text) => {
+    const node = doc.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const svg = (tag, attributes = {}, text) => {
+    const node = doc.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const button = (text, action) => {
+    const node = element("button", text);
+    node.type = "button";
+    node.addEventListener("click", action);
+    return node;
+  };
+  const number = (value, integral = false, signed = false) =>
+    (signed && value > 0 ? "+" : "") + new Intl.NumberFormat(undefined, integral
+      ? { maximumFractionDigits: 0 } : { minimumFractionDigits: 4, maximumFractionDigits: 4 }).format(value);
+  const axisNumber = (value) => new Intl.NumberFormat(undefined, {
+    notation: value >= 100000 || (value > 0 && value < 0.001) ? "scientific" : "standard",
+    maximumSignificantDigits: 4,
+  }).format(value);
+  const metricLabel = element("label", "Compare a metric");
+  const metricSelect = element("select");
+  metricSelect.setAttribute("aria-label", "Trajectory metric");
+  for (const metric of STUDY_TRAJECTORY_METRICS) {
+    const option = element("option", metric.label);
+    option.value = metric.key;
+    metricSelect.append(option);
+  }
+  metricSelect.value = STUDY_TRAJECTORY_METRICS[0].key;
+  metricLabel.append(metricSelect);
+  const chart = svg("svg", { viewBox: "0 0 640 264", role: "img", class: "trajectory-chart" });
+  const legend = element("p", model.hasTreatment
+    ? "Control: solid blue · Treatment: dashed orange · Intervention: vertical amber line"
+    : "Control: solid blue");
+  const tickLabel = element("p");
+  tickLabel.setAttribute("aria-live", "polite");
+  const slider = element("input");
+  slider.type = "range";
+  slider.min = "0";
+  slider.max = String(model.horizonTicks);
+  slider.step = "1";
+  slider.setAttribute("aria-label", "Recorded tick offset");
+  const tickInput = element("input");
+  tickInput.type = "number";
+  tickInput.min = String(model.sourceTick);
+  tickInput.max = String(model.targetTick);
+  tickInput.step = "1";
+  tickInput.setAttribute("aria-label", "Recorded tick");
+  const tickControls = element("div");
+  tickControls.className = "trajectory-tick-controls";
+  let selectedIndex = model.horizonTicks, selectedMetric = metricSelect.value;
+  let selectionLine, selectionDots = [], yPosition;
+  const xPosition = (offset) => 58 + (offset / model.horizonTicks) * 562;
+  const previous = button("Previous tick", () => inspect(selectedIndex - 1));
+  const next = button("Next tick", () => inspect(selectedIndex + 1));
+  tickControls.append(previous, tickInput, next);
+  const table = element("table");
+  table.append(element("caption", "Recorded values at the selected tick"));
+  const head = element("thead"), headings = element("tr");
+  for (const text of ["Metric", "Control", ...(model.hasTreatment ? ["Treatment", "Δ treatment − control"] : [])]) {
+    const cell = element("th", text);
+    cell.scope = "col";
+    headings.append(cell);
+  }
+  head.append(headings);
+  const body = element("tbody");
+  table.append(head, body);
+  const digests = element("p");
+  const inspect = (index) => {
+    if (!Number.isSafeInteger(index) || index < 0 || index > model.horizonTicks) return;
+    selectedIndex = index;
+    const tick = model.sourceTick + index;
+    slider.value = String(index);
+    tickInput.value = String(tick);
+    tickInput.setCustomValidity("");
+    previous.disabled = index === 0;
+    next.disabled = index === model.horizonTicks;
+    tickLabel.textContent = "Recorded tick " + tick + " · " + index + " ticks after the saved source"
+      + (tick === model.interventionTick ? " · intervention boundary" : "");
+    selectionLine.setAttribute("x1", String(xPosition(index)));
+    selectionLine.setAttribute("x2", String(xPosition(index)));
+    selectionDots.forEach((dot, armIndex) => {
+      dot.setAttribute("cx", String(xPosition(index)));
+      dot.setAttribute("cy", String(yPosition(model.arms[armIndex].samples[index][selectedMetric])));
+    });
+    body.replaceChildren(...STUDY_TRAJECTORY_METRICS.map((metric) => {
+      const control = model.arms[0].samples[index][metric.key];
+      const treatment = model.hasTreatment ? model.arms[1].samples[index][metric.key] : null;
+      const row = element("tr"), title = element("th", metric.label);
+      title.scope = "row";
+      row.append(title, element("td", number(control, metric.integral)));
+      if (model.hasTreatment) row.append(element("td", number(treatment, metric.integral)),
+        element("td", number(treatment - control, metric.integral, true)));
+      return row;
+    }));
+    digests.textContent = model.arms.map((arm) => arm.label + " digest: " + arm.samples[index].digest).join(" · ");
+  };
+  const draw = () => {
+    const metric = STUDY_TRAJECTORY_METRICS.find((item) => item.key === selectedMetric);
+    let maximum = 0;
+    for (const arm of model.arms) for (const sample of arm.samples) maximum = Math.max(maximum, sample[selectedMetric]);
+    const scale = maximum || 1;
+    yPosition = (value) => 222 - (value / scale) * 196;
+    const nodes = [svg("title", {}, metric.label + " from tick " + model.sourceTick + " to " + model.targetTick)];
+    chart.setAttribute("aria-label", metric.label + " recorded at every tick; exact values follow the chart");
+    for (const fraction of [0, 0.5, 1]) {
+      const y = yPosition(scale * fraction);
+      nodes.push(svg("line", { x1: 58, x2: 620, y1: y, y2: y, stroke: "#334155" }),
+        svg("text", { x: 50, y: y + 4, "text-anchor": "end", fill: "#cbd5e1", "font-size": 12 }, axisNumber(scale * fraction)));
+    }
+    nodes.push(svg("text", { x: 58, y: 247, fill: "#cbd5e1", "font-size": 12 }, String(model.sourceTick)),
+      svg("text", { x: 620, y: 247, "text-anchor": "end", fill: "#cbd5e1", "font-size": 12 }, String(model.targetTick)));
+    model.arms.forEach((arm, index) => {
+      // The bounded study has at most 10,001 points; retain all peaks and troughs.
+      const path = arm.samples.map((sample, offset) => (offset === 0 ? "M" : "L")
+        + xPosition(offset).toFixed(2) + " " + yPosition(sample[selectedMetric]).toFixed(2)).join(" ");
+      nodes.push(svg("path", { d: path, fill: "none", stroke: index === 0 ? "#38bdf8" : "#fb923c",
+        "stroke-width": 2, "stroke-dasharray": index === 0 ? "none" : "6 4", class: "trajectory-curve" }));
+    });
+    if (model.interventionTick !== null) {
+      const x = xPosition(model.interventionTick - model.sourceTick);
+      nodes.push(svg("line", { x1: x, x2: x, y1: 26, y2: 222, stroke: "#fbbf24",
+        "stroke-dasharray": "3 4", class: "trajectory-intervention" }));
+    }
+    selectionLine = svg("line", { y1: 26, y2: 222, stroke: "#e2e8f0", "stroke-opacity": 0.5,
+      class: "trajectory-selected-tick" });
+    selectionDots = model.arms.map((_, index) => svg("circle", { r: 4, fill: index === 0 ? "#38bdf8" : "#fb923c" }));
+    nodes.push(selectionLine, ...selectionDots);
+    chart.replaceChildren(...nodes);
+    inspect(selectedIndex);
+  };
+  metricSelect.addEventListener("change", () => {
+    if (!STUDY_TRAJECTORY_METRICS.some((metric) => metric.key === metricSelect.value)) {
+      metricSelect.value = selectedMetric;
+      return;
+    }
+    selectedMetric = metricSelect.value;
+    draw();
+  });
+  slider.addEventListener("input", () => inspect(Number(slider.value)));
+  tickInput.addEventListener("change", () => {
+    const tick = /^(0|[1-9][0-9]*)$/.test(tickInput.value) ? Number(tickInput.value) : NaN;
+    if (!Number.isSafeInteger(tick) || tick < model.sourceTick || tick > model.targetTick) {
+      tickInput.setCustomValidity("Choose a whole recorded tick from " + model.sourceTick + " through " + model.targetTick);
+      return;
+    }
+    inspect(tick - model.sourceTick);
+  });
+  const controls = element("div");
+  controls.append(tickLabel, slider, tickControls);
+  if (model.interventionTick !== null) controls.append(button("Intervention tick",
+    () => inspect(model.interventionTick - model.sourceTick)));
+  const provenance = element("details");
+  provenance.append(element("summary", "Recorded data"));
+  for (const arm of model.arms) provenance.append(element("p", arm.label + ": " + arm.artifact.relativePath
+    + " · " + arm.artifact.byteSize + " bytes · SHA-256 " + arm.artifact.checksumSha256));
+  draw();
+  container.replaceChildren(element("h3", "Explore recorded trajectories"), metricLabel, legend, chart,
+    controls, table, digests,
+    element("p", "Every completed tick is shown. Decimal CSV values were recorded to four decimal places; differences use those recorded values. These trajectories share one saved source and do not estimate variation across independent seeds."),
+    provenance);
+  container.hidden = false;
+  trajectoryViews.set(container, model);
 }
