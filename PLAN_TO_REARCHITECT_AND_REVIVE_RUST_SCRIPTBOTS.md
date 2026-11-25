@@ -13,13 +13,21 @@ requested horizon and a nonzero delay requires a treatment. Immediate requests
 retain their canonical bytes. Timing participates in exact retry identity,
 retained plans, offline reproduction and cold catalog recovery.
 
-REST, MCP and the JSON control CLI use the shared request and runner. Authored
-regressions cover delayed real-world effects, identical pre-command observations,
-last-boundary application, changed-delay retry conflicts, malformed and overflowing
-timing, recovery and unchanged live-owner science. Source review is complete.
-The canonical DSR baseline stopped before Cargo with a full workspace disk;
-the executor then became unavailable. Native compilation, formatting, Clippy and
-the new executable regressions remain unverified, and no original gate is closed.
+REST, MCP and the JSON control CLI use the shared request and runner. The
+browser Checkpoint Lab exposes the delay for treatment branches, shows both the
+relative wait and requested absolute source tick, validates before admission,
+and preserves the exact saved cut and timing across uncertain-response retries.
+Existing native and terminal studies remain immediate.
+
+Authored regressions cover actual delayed treatment effects, identical
+pre-command observations, last-boundary application, changed-delay retry conflicts,
+malformed and overflowing timing, recovery and unchanged live-owner science.
+Browser controller and transport cases cover boundary validation, zero-delay
+wire compatibility and immutable retries after form or source changes. Independent
+source review is complete. The canonical DSR baseline stopped before Cargo with
+a full workspace disk; the executor then became unavailable. Native compilation,
+formatting, Clippy and the new Rust and JavaScript regressions remain unverified,
+and no original gate is closed.
 
 **Archive-resurrection studies and persistence progress (2026-11-24):**
 [Currently In Progress — Codex; scoped contributions to `bd-2z0.12.2`,

@@ -282,6 +282,14 @@ late responses, while the same endpoint/session can retain an uncertain retry.
 Closing the panel does not cancel a running server study; use **Cancel study**
 and observe its final status.
 
+For a treatment study, **Wait before treatment (ticks)** sets how many completed
+transitions both futures take before the intervention. Zero applies it at the
+saved boundary; a delay must be smaller than **Future scientific ticks**, leaving
+at least one transition after treatment. For example, a checkpoint at tick 100
+with horizon 120 and delay 30 requests treatment at tick 130 and ends at tick 220.
+The delay is part of the immutable retry request and retained study plan.
+An unchanged-only future has no treatment delay. The live owner is unaffected.
+
 Select a checkpoint and choose **Review saved world** to draw its saved agents
 and environment on the main canvas. A persistent banner identifies its checkpoint,
 tick and world digest, with **Return to live** available even after closing the Lab

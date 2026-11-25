@@ -499,8 +499,10 @@ labForm?.addEventListener("submit", async (event) => {
   if (!labForm.reportValidity()) return;
   try {
     labFormError.textContent = "";
+    const intervention = readLabTreatment();
     await checkpointLab.launch({ branchName: document.getElementById("lab-branch-name").value,
-      ticks: Number(document.getElementById("lab-branch-ticks").value), intervention: readLabTreatment() });
+      ticks: Number(document.getElementById("lab-branch-ticks").value), intervention,
+      interventionDelayTicks: intervention === null ? 0 : Number(document.getElementById("lab-treatment-delay").value) });
   } catch (error) {
     labFormError.textContent = String(error.message || error).slice(0, 512);
   }

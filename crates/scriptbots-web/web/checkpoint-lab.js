@@ -208,6 +208,17 @@ export function validateLabIntervention(value) {
   return value;
 }
 
+/** A delay counts completed source transitions and must leave a treatment transition. */
+export function validateLabTreatmentDelay(delay, ticks, intervention) {
+  if (!integer(ticks, 1, MAX_BRANCH_TICKS) || !integer(delay, 0, ticks - 1)) {
+    throw new Error("Treatment delay must be a whole number from zero through one less than the future tick horizon");
+  }
+  if (delay > 0 && intervention === null) {
+    throw new Error("Choose a treatment before delaying its application");
+  }
+  return delay;
+}
+
 /** A retained receipt describes observed science without reconstructing its request. */
 export function validateLabBranchObservation(value, previous = null) {
   if (!object(value) || !identifier(value.branch_id) || !identifier(value.checkpoint_id)
@@ -641,12 +652,13 @@ export class CheckpointLabController {
     });
   }
 
-  launch({ branchName, ticks, intervention = null }) {
+  launch({ branchName, ticks, intervention = null, interventionDelayTicks = 0 }) {
     if (!this.canLaunch) return Promise.resolve(null);
     try {
       if (typeof branchName !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(branchName)) throw new Error("Study name needs 1–64 letters, digits, underscores or hyphens");
       if (!integer(ticks, 1, MAX_BRANCH_TICKS) || !integer(this.selected.tick + ticks)) throw new Error("Choose 1–10,000 future ticks within the exact browser integer range");
       validateLabIntervention(intervention);
+      validateLabTreatmentDelay(interventionDelayTicks, ticks, intervention);
       if (intervention?.type === "Core" && intervention.params.kind === "spawn_from_archive"
           && this.selected.schema !== HOST_CHECKPOINT_SCHEMA) {
         throw new Error("Archive resurrection requires a complete checkpoint with a retained behavioral archive");
@@ -654,7 +666,9 @@ export class CheckpointLabController {
       const key = this.id();
       if (!text(key, 1024) || !key.trim()) throw new Error("A stable study retry identity is unavailable");
       const request = copy({ sessionId: this.source.sessionId, checkpoint_id: this.selected.checkpoint_id,
-        branch_name: branchName, ticks, intervention, idempotency_key: key });
+        branch_name: branchName, ticks, intervention,
+        ...(interventionDelayTicks > 0 ? { intervention_delay_ticks: interventionDelayTicks } : {}),
+        idempotency_key: key });
       this.branch = { request, checkpoint: this.selected, status: null };
       this.reportModel = null;
       this.artifactsPage = null;
@@ -909,8 +923,13 @@ export function renderCheckpointLab(panel, controller) {
   disable("lab-branch-cancel", !ready || controller.canvasPreview !== null || !status || TERMINAL.has(status.status));
   disable("lab-report-download", !ready || status?.status !== "completed");
   disable("lab-report-preview", !ready || status?.status !== "completed");
+  const studyDesign = branch?.request
+    ? branch.request.intervention
+      ? `Treatment and unchanged control start from the identical saved state. Treatment requested at tick ${branch.checkpoint.tick + (branch.request.intervention_delay_ticks ?? 0)}, after ${branch.request.intervention_delay_ticks ?? 0} future ticks.`
+      : "One unchanged scientific future."
+    : "Selected from retained history. The original treatment is unknown from this receipt; inspect the verified plan or report for its design.";
   write("lab-branch-detail", branch
-    ? `${status ? `Study ${status.branch_id}: ${status.status}` : controller.branchState === "refused" ? "Study request refused; no job admitted by this request" : "Study admission is unconfirmed"}. Saved tick ${status?.source_tick ?? branch.checkpoint.tick} → target ${status?.target_tick ?? branch.checkpoint.tick + branch.request.ticks}. Source ${status?.checkpoint_id ?? branch.request.checkpoint_id}; world digest ${status?.world_digest_v1 ?? branch.checkpoint.world_digest_v1}. ${branch.request ? branch.request.intervention ? "Treatment and unchanged control start from the identical saved state." : "One unchanged scientific future." : "Selected from retained history. The original treatment is unknown from this receipt; inspect the verified plan or report for its design."} These are bounds, not live progress. One source gives a descriptive trajectory comparison, not independent-seed statistical inference.`
+    ? `${status ? `Study ${status.branch_id}: ${status.status}` : controller.branchState === "refused" ? "Study request refused; no job admitted by this request" : "Study admission is unconfirmed"}. Saved tick ${status?.source_tick ?? branch.checkpoint.tick} → target ${status?.target_tick ?? branch.checkpoint.tick + branch.request.ticks}. Source ${status?.checkpoint_id ?? branch.request.checkpoint_id}; world digest ${status?.world_digest_v1 ?? branch.checkpoint.world_digest_v1}. ${studyDesign} These are bounds, not live progress. One source gives a descriptive trajectory comparison, not independent-seed statistical inference.`
     : "Choose a horizon and, optionally, a treatment beside an unchanged control. The remote live world is neither advanced nor replaced by this study.");
   updateSelect(find("lab-artifact-select"), controller.artifactsPage?.items ?? [], controller.selectedArtifact?.artifact_id,
     "artifact_id", (row) => `${row.relative_path.split("/").slice(2).join("/")} · ${row.byte_size} bytes`);

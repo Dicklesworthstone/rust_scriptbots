@@ -524,6 +524,69 @@ test("archive studies require a complete source and retain the exact request acr
   assert.equal(h.controller.branch.checkpoint.checkpoint_id, source.checkpoint_id);
 });
 
+test("treatment timing refuses invalid delays before request identity or admission", async () => {
+  const h = await harness();
+  const intervention = { type: "Drought", params: { region: null, duration_ticks: 3, growth_scale: 0.1 } };
+  for (const interventionDelayTicks of [-1, 0.5, "1", null, NaN, Infinity, 25, 26, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(await h.controller.launch({ branchName: "delayed", ticks: 25, intervention, interventionDelayTicks }), null);
+    assert.match(h.controller.notice, /Treatment delay/);
+    assert.equal(h.controller.branch, null);
+  }
+  assert.equal(await h.controller.launch({ branchName: "unchanged", ticks: 25, interventionDelayTicks: 1 }), null);
+  assert.match(h.controller.notice, /Choose a treatment/);
+  assert.equal(h.identities(), 0);
+  assert.equal(h.queues.launch.length, 0);
+});
+
+test("zero and last-transition treatment delays preserve their exact bounded requests", async () => {
+  const intervention = { type: "ClosedWorld", params: { closed: true } };
+  for (const [ticks, interventionDelayTicks] of [[1, 0], [25, 0], [25, 24], [10000, 9999]]) {
+    const h = await harness();
+    const pending = h.controller.launch({ branchName: "timed", ticks, intervention, interventionDelayTicks });
+    const request = h.queues.launch[0].request;
+    assert.equal(request.ticks, ticks);
+    assert.equal(request.intervention_delay_ticks, interventionDelayTicks === 0 ? undefined : interventionDelayTicks);
+    assert.equal(Object.hasOwn(request, "intervention_delay_ticks"), interventionDelayTicks > 0,
+      "immediate requests retain their original canonical representation");
+    h.queues.launch[0].resolve(status(request));
+    await pending;
+    const { panel, nodes } = labPanel();
+    renderCheckpointLab(panel, h.controller);
+    assert.ok(nodes.get("#lab-branch-detail").textContent.includes(
+      `Treatment requested at tick ${100 + interventionDelayTicks}, after ${interventionDelayTicks} future ticks.`));
+    assert.equal(h.controller.branch.status.target_tick, 100 + ticks);
+  }
+});
+
+test("a delayed study retry retains its original timing and source after form and selection changes", async () => {
+  const h = await harness();
+  const draft = { branchName: "delayed_drought", ticks: 25, interventionDelayTicks: 10,
+    intervention: { type: "Drought", params: { region: null, duration_ticks: 3, growth_scale: 0.1 } } };
+  const pending = h.controller.launch(draft);
+  const request = h.queues.launch[0].request;
+  draft.interventionDelayTicks = 20;
+  draft.intervention.params.duration_ticks = 8;
+  assert.equal(request.intervention_delay_ticks, 10);
+  assert.equal(request.intervention.params.duration_ticks, 3);
+  assert.equal(Object.isFrozen(request), true);
+  h.queues.launch[0].reject(new Error("admission reply lost"));
+  await pending;
+  assert.equal(h.controller.branchState, "unconfirmed");
+  assert.equal(await h.controller.launch(draft), null);
+  h.controller.page = page([checkpoint({ checkpoint_id: "later-source", tick: 200 })]);
+  h.controller.select("later-source");
+  const retry = h.controller.retryLaunch();
+  assert.equal(h.queues.launch[1].request, request);
+  h.queues.launch[1].resolve(status(request));
+  await retry;
+  assert.equal(h.controller.branch.checkpoint.tick, 100);
+  assert.equal(h.identities(), 1);
+  const { panel, nodes } = labPanel();
+  renderCheckpointLab(panel, h.controller);
+  assert.match(nodes.get("#lab-branch-detail").textContent, /Treatment requested at tick 110, after 10 future ticks/);
+  assert.match(nodes.get("#lab-branch-detail").textContent, /target 125/);
+});
+
 test("branch observations bind the saved digest and horizon and cannot regress a terminal state", () => {
   const request = { checkpoint_id: checkpoint().checkpoint_id, branch_name: "future", ticks: 120 };
   const running = status(request);
@@ -1258,7 +1321,8 @@ test("Lab transport preserves reverse-proxy prefixes and exact server-checked se
     const value = client();
     const save = { sessionId: SESSION, description: "Saved source", idempotency_key: "save-one" };
     const branch = { sessionId: SESSION, checkpoint_id: checkpoint().checkpoint_id, branch_name: "dry", ticks: 120,
-      intervention: { type: "Drought", params: { region: null, duration_ticks: 20, growth_scale: 0.1 } }, idempotency_key: "branch-one" };
+      intervention: { type: "Drought", params: { region: null, duration_ticks: 20, growth_scale: 0.1 } },
+      intervention_delay_ticks: 30, idempotency_key: "branch-one" };
     await value.listCheckpoints({ sessionId: SESSION });
     await value.saveCheckpoint(save);
     await value.saveCheckpoint(save);
@@ -1283,13 +1347,18 @@ test("Lab transport preserves reverse-proxy prefixes and exact server-checked se
     assert.equal(requests[3].body, requests[4].body);
     assert.equal(JSON.parse(requests[3].body).sessionId, undefined);
     assert.equal(JSON.parse(requests[3].body).idempotency_key, "branch-one");
+    assert.equal(JSON.parse(requests[3].body).intervention_delay_ticks, 30);
     assert.equal(requests[7].url.search, "?limit=12&cursor=12");
     const count = requests.length;
     await assert.rejects(value.listCheckpoints({ sessionId: "7" }));
     await assert.rejects(value.listCheckpoints({ sessionId: SESSION, cursor: "01" }));
     await assert.rejects(value.checkpointBranchStatus("../escape", { sessionId: SESSION }));
     await assert.rejects(value.launchCheckpointBranch({ ...branch, ticks: 10001 }));
-    assert.equal(requests.length, count);
+    for (const intervention_delay_ticks of [-1, 0.5, "30", null, NaN, Infinity, 120, 121]) {
+      await assert.rejects(value.launchCheckpointBranch({ ...branch, intervention_delay_ticks }), /Treatment delay/);
+    }
+    await assert.rejects(value.launchCheckpointBranch({ ...branch, intervention: null }), /Choose a treatment/);
+    assert.equal(requests.length, count, "invalid timing must be refused before any HTTP request");
   } finally { globalThis.fetch = previous; }
 });
 

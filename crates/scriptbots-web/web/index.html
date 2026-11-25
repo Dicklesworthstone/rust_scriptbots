@@ -812,6 +812,13 @@
                             <option value="archive">Archived genomes versus unchanged control</option>
                         </select>
                     </label>
+                    <fieldset data-lab-kinds="drought resource_shock temperature closed_world archive" hidden disabled>
+                        <legend>Treatment timing</legend>
+                        <label for="lab-treatment-delay">Wait before treatment (ticks)
+                            <input id="lab-treatment-delay" type="number" min="0" max="9999" step="1" value="0" aria-describedby="lab-treatment-delay-help" required />
+                        </label>
+                        <p id="lab-treatment-delay-help">Zero applies the treatment at the saved tick. A delay lets both futures evolve first and must be shorter than the future tick horizon.</p>
+                    </fieldset>
                     <fieldset data-lab-kinds="drought" hidden disabled>
                         <legend>Whole-world drought</legend>
                         <label for="lab-drought-ticks">Drought duration (ticks)

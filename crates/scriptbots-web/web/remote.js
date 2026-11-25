@@ -2,7 +2,7 @@
 // supplied by the shared Rust/WASM protocol; this module owns connection and
 // consumer cursors, with no queue of historical canvas frames.
 import { MAX_LAB_ARTIFACT_BYTES, parseReplayTarget, validateCheckpointCanvas, validateCheckpointReplay,
-  validateLabArtifact, validateLabCheckpoint, validateLabIntervention } from "./checkpoint-lab.js";
+  validateLabArtifact, validateLabCheckpoint, validateLabIntervention, validateLabTreatmentDelay } from "./checkpoint-lab.js";
 import { EXPERIMENT_LIMITS, EXPERIMENT_ENDPOINT_METRICS, parseExperimentJson,
   prepareExperimentRequest } from "./experiment-protocol.js";
 
@@ -675,6 +675,8 @@ export class RemoteStreamClient {
         || typeof payload.idempotency_key !== "string" || !payload.idempotency_key.trim()
         || encoder.encode(payload.idempotency_key).length > 1024) throw new Error("Invalid bounded checkpoint study request");
     validateLabIntervention(payload.intervention ?? null);
+    validateLabTreatmentDelay(payload.intervention_delay_ticks === undefined ? 0 : payload.intervention_delay_ticks,
+      payload.ticks, payload.intervention ?? null);
     const body = JSON.stringify(payload);
     if (encoder.encode(body).length > 16 * 1024) throw new Error("Checkpoint study request exceeds 16 KiB");
     return this.labJson("/api/v1/checkpoints/branches", sessionId, 16 * 1024, { signal, method: "POST", body });
