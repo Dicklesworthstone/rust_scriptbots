@@ -2703,6 +2703,7 @@ impl LiveTerminalModel<'_> {
                                 branch_name,
                                 ticks,
                                 intervention,
+                                intervention_delay_ticks: 0,
                                 idempotency_key,
                             },
                             branch_id: None,

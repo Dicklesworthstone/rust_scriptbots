@@ -2,6 +2,25 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Delayed treatments in managed saved-world studies (2026-11-24):**
+[Currently In Progress — Codex; scoped contribution to `bd-2z0.12.2`;
+original complete acceptance retained]
+
+Managed checkpoint studies accept an optional `intervention_delay_ticks`.
+Both futures evolve from the saved source before the treatment is applied at
+the checked source-plus-delay boundary. The delay must be shorter than the
+requested horizon and a nonzero delay requires a treatment. Immediate requests
+retain their canonical bytes. Timing participates in exact retry identity,
+retained plans, offline reproduction and cold catalog recovery.
+
+REST, MCP and the JSON control CLI use the shared request and runner. Authored
+regressions cover delayed real-world effects, identical pre-command observations,
+last-boundary application, changed-delay retry conflicts, malformed and overflowing
+timing, recovery and unchanged live-owner science. Source review is complete.
+The canonical DSR baseline stopped before Cargo with a full workspace disk;
+the executor then became unavailable. Native compilation, formatting, Clippy and
+the new executable regressions remain unverified, and no original gate is closed.
+
 **Archive-resurrection studies and persistence progress (2026-11-24):**
 [Currently In Progress — Codex; scoped contributions to `bd-2z0.12.2`,
 `bd-16g.6.3`, `bd-16g.5`, `bd-kgob` and `bd-w1oi`;

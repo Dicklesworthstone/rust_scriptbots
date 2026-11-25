@@ -4652,6 +4652,7 @@ pub mod renderer {
             branch_name: draft.treatment.key().into(),
             ticks: draft.ticks,
             intervention,
+            intervention_delay_ticks: 0,
             idempotency_key,
         })?;
         if control.read_snapshot()?.session_id != session_id

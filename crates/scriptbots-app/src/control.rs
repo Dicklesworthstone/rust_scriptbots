@@ -912,8 +912,17 @@ pub struct CheckpointBranchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object)]
     pub intervention: Option<crate::branch_study::StudyIntervention>,
+    /// Completed transitions after the saved cut before applying the intervention.
+    /// Zero applies at the saved boundary. Must be less than `ticks`; a nonzero
+    /// delay requires an intervention and leaves an observed transition afterward.
+    #[serde(default, skip_serializing_if = "checkpoint_branch_delay_is_zero")]
+    pub intervention_delay_ticks: u64,
     /// Required retry identity. A changed request cannot reuse an admitted key.
     pub idempotency_key: String,
+}
+
+const fn checkpoint_branch_delay_is_zero(delay: &u64) -> bool {
+    *delay == 0
 }
 
 impl CheckpointBranchRequest {
@@ -939,6 +948,16 @@ impl CheckpointBranchRequest {
             return Err(ControlError::BadRequest(format!(
                 "ticks must be in 1..={MAX_CHECKPOINT_BRANCH_TICKS}"
             )));
+        }
+        if self.intervention_delay_ticks >= self.ticks {
+            return Err(ControlError::BadRequest(
+                "intervention_delay_ticks must be less than ticks so the intervention has an observed transition".to_owned(),
+            ));
+        }
+        if self.intervention_delay_ticks != 0 && self.intervention.is_none() {
+            return Err(ControlError::BadRequest(
+                "a nonzero intervention_delay_ticks requires an intervention".to_owned(),
+            ));
         }
         if self.idempotency_key.trim().is_empty()
             || self.idempotency_key.len() > MAX_CHECKPOINT_BRANCH_KEY_BYTES
@@ -1789,9 +1808,10 @@ fn valid_world_digest_v1(value: &str) -> bool {
 fn checkpoint_branch_specs(
     request: &CheckpointBranchRequest,
     source_tick: u64,
-) -> Vec<crate::branch_study::StudyBranchSpec> {
+) -> Result<Vec<crate::branch_study::StudyBranchSpec>, ControlError> {
     use crate::branch_study::StudyBranchSpec;
 
+    request.validate_shape()?;
     let mut branches = vec![StudyBranchSpec {
         branch_id: "control".to_owned(),
         description: format!("{}: unchanged scientific future", request.branch_name),
@@ -1799,14 +1819,21 @@ fn checkpoint_branch_specs(
         scheduled_tick: None,
     }];
     if let Some(intervention) = request.intervention.clone() {
+        let scheduled_tick = source_tick
+            .checked_add(request.intervention_delay_ticks)
+            .ok_or_else(|| {
+                ControlError::BadRequest(
+                    "saved checkpoint tick plus intervention delay overflows".to_owned(),
+                )
+            })?;
         branches.push(StudyBranchSpec {
             branch_id: "treatment".to_owned(),
             description: format!("{}: requested intervention", request.branch_name),
             intervention: Some(intervention),
-            scheduled_tick: Some(source_tick),
+            scheduled_tick: Some(scheduled_tick),
         });
     }
-    branches
+    Ok(branches)
 }
 
 fn write_checkpoint_branch_record(
@@ -1924,7 +1951,7 @@ impl CheckpointBranchDefinitionV1 {
             || self.plan.source_checkpoint.as_deref()
                 != Some(directory.join("study/source_checkpoint.bin").as_path())
             || serde_json::to_vec(&self.plan.branches).map_err(ControlError::serialization)?
-                != serde_json::to_vec(&checkpoint_branch_specs(&self.request, self.source_tick))
+                != serde_json::to_vec(&checkpoint_branch_specs(&self.request, self.source_tick)?)
                     .map_err(ControlError::serialization)?
         {
             return Err(checkpoint_branch_catalog_error(
@@ -6742,7 +6769,7 @@ impl ControlHandle {
         let root = self.artifacts_dir();
         let directory = root.join("branches").join(&branch_id);
         let output = directory.join("study");
-        let branches = checkpoint_branch_specs(&request, source_tick);
+        let branches = checkpoint_branch_specs(&request, source_tick)?;
         let runner = BranchStudyOrchestrator::new(
             BranchStudyPlan {
                 study_id: branch_id.clone(),
@@ -16003,6 +16030,7 @@ pub(crate) mod tests {
             branch_name: "saved-future".to_owned(),
             ticks: 3,
             intervention: None,
+            intervention_delay_ticks: 0,
             idempotency_key: key.to_owned(),
         }
     }
@@ -16214,6 +16242,166 @@ pub(crate) mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn checkpoint_branch_delay_preserves_zero_delay_identity_and_rejects_invalid_timing() {
+        let original = br#"{"checkpoint_id":"source","branch_name":"future","ticks":3,"idempotency_key":"legacy"}"#;
+        let request: CheckpointBranchRequest = serde_json::from_slice(original).unwrap();
+        assert_eq!(request.intervention_delay_ticks, 0);
+        assert_eq!(request.bounded_payload().unwrap().as_slice(), original);
+        let mut explicit_zero = serde_json::to_value(&request).unwrap();
+        explicit_zero["intervention_delay_ticks"] = serde_json::json!(0);
+        let explicit_zero: CheckpointBranchRequest =
+            serde_json::from_value(explicit_zero).unwrap();
+        assert_eq!(explicit_zero.bounded_payload().unwrap().as_slice(), original);
+
+        let mut delayed = request.clone();
+        delayed.intervention =
+            Some(crate::branch_study::StudyIntervention::ClosedWorld { closed: true });
+        for delay in 0..delayed.ticks {
+            delayed.intervention_delay_ticks = delay;
+            delayed.validate_shape().unwrap();
+            let branches = checkpoint_branch_specs(&delayed, 17).unwrap();
+            assert_eq!(branches[0].scheduled_tick, None);
+            assert_eq!(branches[1].scheduled_tick, Some(17 + delay));
+        }
+        for delay in [delayed.ticks, delayed.ticks + 1, u64::MAX] {
+            delayed.intervention_delay_ticks = delay;
+            assert!(matches!(
+                delayed.validate_shape(),
+                Err(ControlError::BadRequest(_))
+            ));
+        }
+        delayed.intervention_delay_ticks = 1;
+        assert!(matches!(
+            checkpoint_branch_specs(&delayed, u64::MAX),
+            Err(ControlError::BadRequest(_))
+        ));
+        delayed.intervention = None;
+        assert!(matches!(
+            delayed.validate_shape(),
+            Err(ControlError::BadRequest(_))
+        ));
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(0.5),
+            serde_json::json!("1"),
+            serde_json::Value::Null,
+        ] {
+            let mut malformed = serde_json::to_value(&request).unwrap();
+            malformed["intervention_delay_ticks"] = invalid;
+            assert!(serde_json::from_value::<CheckpointBranchRequest>(malformed).is_err());
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real saved-source study proves delayed effects, exact retry, offline reproduction and cold recovery"
+    )]
+    fn managed_delayed_treatment_preserves_pre_command_science_and_recovered_timing() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 2);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let mut request = checkpoint_branch_request(&checkpoint.checkpoint_id, "delayed-treatment");
+        request.intervention = Some(crate::branch_study::StudyIntervention::Drought {
+            region: None,
+            duration_ticks: 2,
+            growth_scale: 0.0,
+        });
+        request.intervention_delay_ticks = request.ticks - 1;
+        let due = checkpoint.tick + request.intervention_delay_ticks;
+        let admitted = handle.create_checkpoint_branch(request.clone()).unwrap();
+        let completed = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        assert_eq!(
+            handle.create_checkpoint_branch(request.clone()).unwrap(),
+            completed
+        );
+        let (_, bytes) = handle
+            .read_artifact_bytes(completed.artifact_id.as_deref().unwrap())
+            .unwrap();
+        let report: crate::branch_study::BranchStudyReport =
+            serde_json::from_slice(&bytes).unwrap();
+        let treatment = report
+            .branch_reports
+            .iter()
+            .find(|branch| branch.branch_id == "treatment")
+            .unwrap();
+        assert_eq!(treatment.command_applied_tick, Some(due));
+        assert_eq!(treatment.first_divergence.as_ref().unwrap().tick, due + 1);
+        assert_eq!(treatment.terminal_sample.tick, completed.target_tick);
+        let rows = |id: &str| {
+            let branch = report
+                .branch_reports
+                .iter()
+                .find(|branch| branch.branch_id == id)
+                .unwrap();
+            assert!(branch.bundle_verified);
+            fs::read_to_string(
+                Path::new(branch.bundle_path.as_deref().unwrap()).join("exports/summary.csv"),
+            )
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        };
+        let control_rows = rows("control");
+        let treatment_rows = rows("treatment");
+        let before_command = usize::try_from(request.intervention_delay_ticks).unwrap() + 1;
+        assert_eq!(
+            control_rows.len(),
+            usize::try_from(request.ticks).unwrap() + 1
+        );
+        assert_eq!(
+            control_rows[..before_command],
+            treatment_rows[..before_command]
+        );
+        assert_ne!(control_rows.last(), treatment_rows.last());
+
+        let plan: crate::branch_study::BranchStudyPlan = serde_json::from_slice(
+            &fs::read(
+                directory
+                    .join("branches")
+                    .join(&completed.branch_id)
+                    .join("study/study_plan.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plan.branches[1].scheduled_tick, Some(due));
+        let reproduced = crate::branch_study::BranchStudyOrchestrator::new(
+            plan,
+            directory.join("delayed-offline-reproduction"),
+        )
+        .execute_study(None)
+        .unwrap();
+        assert_eq!(reproduced.source, report.source);
+        for (original, replayed) in report.branch_reports.iter().zip(&reproduced.branch_reports) {
+            assert_eq!(original.terminal_sample, replayed.terminal_sample);
+            assert_eq!(original.command_applied_tick, replayed.command_applied_tick);
+            assert_eq!(original.first_divergence, replayed.first_divergence);
+        }
+        let mut changed = request.clone();
+        changed.intervention_delay_ticks -= 1;
+        assert!(matches!(
+            handle.create_checkpoint_branch(changed.clone()),
+            Err(ControlError::Conflict(_))
+        ));
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
+        handle.data_services.shutdown_experiments().unwrap();
+        drop(handle);
+
+        let cold = host.handle().with_artifacts_dir(directory).unwrap();
+        assert_eq!(cold.create_checkpoint_branch(request).unwrap(), completed);
+        assert!(matches!(
+            cold.create_checkpoint_branch(changed),
+            Err(ControlError::Conflict(_))
+        ));
+        assert_eq!(cold.list_checkpoint_branches(None, None).unwrap().total, 1);
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
 
     #[test]

@@ -330,6 +330,8 @@ enum CheckpointBranchSubcommand {
     Create {
         /// CheckpointBranchRequest JSON file or '-' for stdin (at most 16 KiB).
         /// Must include checkpoint_id, branch_name, ticks and idempotency_key.
+        /// Optional intervention_delay_ticks applies a treatment after that many
+        /// completed transitions from the saved cut (default 0; strictly less than ticks).
         #[arg(long, short)]
         file: PathBuf,
     },
@@ -3217,6 +3219,7 @@ mod tests {
         let original = serde_json::json!({
             "checkpoint_id": "checkpoint-1", "branch_name": "food-treatment", "ticks": 2,
             "intervention": {"type": "ConfigPatch", "params": {"food_growth_rate": 0.0}},
+            "intervention_delay_ticks": 1,
             "idempotency_key": "branch-retry"
         });
         let mut bytes = serde_json::to_vec(&original)?;
@@ -3234,6 +3237,10 @@ mod tests {
             ("branch_name", serde_json::json!("../escape")),
             ("ticks", serde_json::json!(0)),
             ("ticks", serde_json::json!(MAX_CHECKPOINT_BRANCH_TICKS + 1)),
+            ("intervention_delay_ticks", serde_json::json!(2)),
+            ("intervention_delay_ticks", serde_json::json!(-1)),
+            ("intervention_delay_ticks", serde_json::json!(0.5)),
+            ("intervention_delay_ticks", serde_json::json!("1")),
             ("idempotency_key", serde_json::json!("  ")),
             ("interventon", serde_json::json!({})),
         ] {
@@ -3253,6 +3260,10 @@ mod tests {
             fs::write(&path, bytes)?;
             assert!(read_checkpoint_branch_request(&path, Some("retry")).is_err());
         }
+        let mut without_treatment = original;
+        without_treatment.as_object_mut().unwrap().remove("intervention");
+        fs::write(&path, serde_json::to_vec(&without_treatment)?)?;
+        assert!(read_checkpoint_branch_request(&path, None).is_err());
         assert!(read_checkpoint_branch_request(directory.path(), None).is_err());
         Ok(())
     }
@@ -4493,6 +4504,7 @@ mod tests {
                 "checkpoint_id": checkpoint.checkpoint_id,
                 "branch_name": "food-treatment", "ticks": 2,
                 "intervention": {"type": "ConfigPatch", "params": {"food_growth_rate": 0.0}},
+                "intervention_delay_ticks": 1,
                 "idempotency_key": "cli-branch-retry"
             }))?,
         )?;
@@ -4572,6 +4584,16 @@ mod tests {
         assert_eq!(report.checkpoint_tick, checkpoint.tick);
         assert_eq!(report.horizon_ticks, 2);
         assert_eq!(report.branch_reports.len(), 2);
+        let treatment = report
+            .branch_reports
+            .iter()
+            .find(|branch| branch.branch_id == "treatment")
+            .unwrap();
+        assert_eq!(treatment.command_applied_tick, Some(checkpoint.tick + 1));
+        assert_eq!(
+            treatment.first_divergence.as_ref().unwrap().tick,
+            checkpoint.tick + 2
+        );
         for branch in &report.branch_reports {
             assert_eq!(branch.terminal_sample.tick, completed.target_tick);
             assert!(branch.bundle_verified);

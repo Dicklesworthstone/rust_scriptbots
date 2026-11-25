@@ -6159,7 +6159,7 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "checkpoint_branch_create",
-        "Run a bounded independent future from a saved checkpoint, preserving the live owner. With an intervention, compare matched control and treatment futures. Reuse the exact idempotency key and payload after an uncertain response. Admission is not completion; poll checkpoint_branch_status and download artifact_id only after completion.",
+        "Run a bounded independent future from a saved checkpoint, preserving the live owner. With an intervention, compare matched control and treatment futures; intervention_delay_ticks selects the completed boundary after the saved cut (default 0, strictly less than ticks). Reuse the exact idempotency key and payload after an uncertain response. Admission is not completion; poll checkpoint_branch_status and download artifact_id only after completion.",
         json!({
             "type": "object",
             "properties": {
@@ -6177,6 +6177,12 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
                     "type": "integer", "minimum": 1,
                     "maximum": MAX_CHECKPOINT_BRANCH_TICKS,
                     "description": "Additional scientific ticks from the saved cut"
+                },
+                "intervention_delay_ticks": {
+                    "type": "integer", "minimum": 0,
+                    "maximum": MAX_CHECKPOINT_BRANCH_TICKS - 1,
+                    "default": 0,
+                    "description": "Completed transitions from the saved cut before treatment; must be less than ticks and nonzero requires intervention. Application precedes the next transition."
                 },
                 "intervention": {
                     "description": "Optional existing StudyIntervention; ConfigPatch uses its config object as params. Service validates parameters against the actual saved world.",
@@ -10064,6 +10070,10 @@ mod tests {
         for (field, invalid) in [
             ("ticks", json!(0)),
             ("ticks", json!(MAX_CHECKPOINT_BRANCH_TICKS + 1)),
+            ("intervention_delay_ticks", json!(1)),
+            ("intervention_delay_ticks", json!(2)),
+            ("intervention_delay_ticks", json!(-1)),
+            ("intervention_delay_ticks", json!(0.5)),
             ("branch_name", json!("../escape")),
             ("idempotency_key", json!(" ")),
             (
@@ -10160,6 +10170,10 @@ mod tests {
         };
         let input = json!({
             "checkpoint_id": saved.checkpoint_id, "branch_name": "transport-future", "ticks": 2,
+            "intervention": {"type": "Drought", "params": {
+                "duration_ticks": 2, "growth_scale": 0.0
+            }},
+            "intervention_delay_ticks": 1,
             "idempotency_key": "transport-branch-retry"
         });
         let mut headers = HeaderMap::new();
@@ -10225,6 +10239,11 @@ mod tests {
             MAX_CHECKPOINT_BRANCH_KEY_BYTES
         );
         assert_eq!(
+            schema["properties"]["intervention_delay_ticks"]["maximum"],
+            MAX_CHECKPOINT_BRANCH_TICKS - 1
+        );
+        assert_eq!(schema["properties"]["intervention_delay_ticks"]["default"], 0);
+        assert_eq!(
             schema["required"],
             json!(["checkpoint_id", "branch_name", "ticks", "idempotency_key"])
         );
@@ -10282,6 +10301,19 @@ mod tests {
             .get_artifact(completed.artifact_id.as_ref().unwrap())
             .unwrap();
         assert!(artifact.byte_size > 0);
+        let (_, bytes) = handle.read_artifact_bytes(&artifact.artifact_id).unwrap();
+        let report: crate::branch_study::BranchStudyReport =
+            serde_json::from_slice(&bytes).unwrap();
+        let treatment = report
+            .branch_reports
+            .iter()
+            .find(|branch| branch.branch_id == "treatment")
+            .unwrap();
+        assert_eq!(treatment.command_applied_tick, Some(saved.tick + 1));
+        assert_eq!(
+            treatment.first_divergence.as_ref().unwrap().tick,
+            saved.tick + 2
+        );
         let Json(inventory) = get_v1_checkpoint_branch_artifacts(
             State(state.clone()),
             axum::extract::Path(created.branch_id.clone()),
@@ -10320,10 +10352,13 @@ mod tests {
             .unwrap();
             assert_eq!(status, completed);
         }
+        let mut changed_delay = input.clone();
+        changed_delay["intervention_delay_ticks"] = json!(0);
         let mut changed = input;
         changed["ticks"] = json!(3);
         for (name, arguments, schema_error) in [
             ("checkpoint_branch_create", changed, false),
+            ("checkpoint_branch_create", changed_delay, false),
             ("checkpoint_branch_create", json!([]), true),
             (
                 "checkpoint_branch_status",
@@ -10372,6 +10407,7 @@ mod tests {
                 branch_name: "transport-second".to_owned(),
                 ticks: 1,
                 intervention: None,
+                intervention_delay_ticks: 0,
                 idempotency_key: "transport-second-retry".to_owned(),
             })
             .unwrap();
