@@ -132,6 +132,89 @@ test("control-only report produces no invented treatment, differences, or signif
   assert.ok(model.endpoints.every((row) => row.treatment === null && row.difference === null));
 });
 
+function submittedRequest(changes = {}) {
+  return { checkpoint_id: status.checkpoint_id, branch_name: status.branch_name,
+    ticks: status.target_tick - status.source_tick,
+    intervention: { type: "Drought", params: { region: null, duration_ticks: 1, growth_scale: 0.1 } },
+    ...changes };
+}
+
+function delayedReportFixture() {
+  const report = reportFixture(), treatment = report.branch_reports[1];
+  treatment.command_applied_tick = 11;
+  treatment.first_divergence.command_applied_tick = 11;
+  treatment.first_divergence.tick = 12;
+  treatment.recovery.baseline_tick = 11;
+  treatment.recovery.trough_tick = 12;
+  treatment.effect_sizes = {};
+  return report;
+}
+
+test("submitted request binds treatment presence and the exact application boundary", async () => {
+  assert.equal((await parse(reportFixture(), { request: submittedRequest() })).arms[1].interventionTick, 10);
+  assert.equal((await parse(reportFixture(), { request: submittedRequest({ intervention_delay_ticks: 0 }) })).arms[1].interventionTick, 10);
+  const delayed = delayedReportFixture();
+  assert.equal((await parse(delayed, { request: submittedRequest({ intervention_delay_ticks: 1 }) })).arms[1].interventionTick, 11);
+  await assert.rejects(parse(reportFixture(), { request: submittedRequest({ intervention_delay_ticks: 1 }) }), /application boundary differ from the submitted request/);
+  await assert.rejects(parse(delayed, { request: submittedRequest() }), /application boundary differ from the submitted request/);
+  const controlOnly = reportFixture();
+  controlOnly.branch_reports.length = 1;
+  assert.equal((await parse(controlOnly, { request: submittedRequest({ intervention: null }) })).hasTreatment, false);
+  await assert.rejects(parse(controlOnly, { request: submittedRequest() }), /treatment and application boundary/);
+  await assert.rejects(parse(reportFixture(), { request: submittedRequest({ intervention: null }) }), /treatment and application boundary/);
+});
+
+test("submitted request source, horizon and delay cannot be substituted", async (t) => {
+  const cases = [
+    ["different checkpoint", { checkpoint_id: "ckpt-another" }],
+    ["different study name", { branch_name: "another-study" }],
+    ["missing study name", { branch_name: undefined }],
+    ["different horizon", { ticks: 3 }],
+    ["string horizon", { ticks: "2" }],
+    ["negative delay", { intervention_delay_ticks: -1 }],
+    ["fractional delay", { intervention_delay_ticks: 0.5 }],
+    ["string delay", { intervention_delay_ticks: "0" }],
+    ["null delay", { intervention_delay_ticks: null }],
+    ["delay outside horizon", { intervention_delay_ticks: 2 }],
+    ["delay without treatment", { intervention: null, intervention_delay_ticks: 1 }],
+    ["missing treatment declaration", { intervention: undefined }],
+    ["invalid treatment declaration", { intervention: [] }],
+  ];
+  for (const [label, changes] of cases) await t.test(label, async () => {
+    await assert.rejects(parse(reportFixture(), { request: submittedRequest(changes) }), /submitted request differs from the retained study/);
+  });
+  const undeclared = submittedRequest();
+  delete undeclared.intervention;
+  await assert.rejects(parse(reportFixture(), { request: undeclared }), /submitted request differs from the retained study/);
+  await assert.rejects(parse(reportFixture(), { request: "unknown" }), /submitted request differs from the retained study/);
+});
+
+test("retained history accepts observed timing without inventing an original request", async () => {
+  for (const request of [null, undefined]) {
+    const model = await parse(delayedReportFixture(), { checkpoint: null, request });
+    assert.equal(model.arms[1].interventionTick, 11);
+    const controlOnly = reportFixture();
+    controlOnly.branch_reports.length = 1;
+    assert.equal((await parse(controlOnly, { checkpoint: null, request })).hasTreatment, false);
+  }
+});
+
+test("report parsing captures requested timing before an asynchronous byte read", async () => {
+  for (const originalDelay of [0, 1]) {
+    const request = submittedRequest({ intervention_delay_ticks: originalDelay });
+    const { blob, context } = input(reportFixture(), { request });
+    const bytes = await blob.arrayBuffer();
+    let release;
+    Object.defineProperty(blob, "arrayBuffer", { value: () => new Promise((resolve) => { release = resolve; }) });
+    const pending = parseSavedStudyReport(blob, context);
+    assert.equal(typeof release, "function");
+    request.intervention_delay_ticks = 1 - originalDelay;
+    release(bytes);
+    if (originalDelay === 0) assert.equal((await pending).arms[1].interventionTick, 10);
+    else await assert.rejects(pending, /application boundary differ from the submitted request/);
+  }
+});
+
 test("arm order is immaterial, while duplicates and absent controls are refused", async () => {
   const report = reportFixture();
   report.branch_reports.reverse();

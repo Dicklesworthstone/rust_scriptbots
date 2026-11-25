@@ -267,6 +267,24 @@ function readArm(value, status, rootSeed) {
  */
 export async function parseSavedStudyReport(blob, context) {
   const status = contextIdentity(context);
+  // History entries do not retain the original browser request. When available,
+  // capture its expected arm and application boundary before reading any bytes.
+  let expectedTreatmentTick;
+  if (context.request != null) {
+    const request = context.request;
+    if (!object(request)) refuse("submitted request differs from the retained study");
+    const delay = request.intervention_delay_ticks === undefined ? 0 : request.intervention_delay_ticks;
+    if (request.checkpoint_id !== status.checkpoint_id
+        || typeof request.branch_name !== "string" || request.branch_name !== status.branch_name
+        || request.ticks !== status.target_tick - status.source_tick
+        || !Object.hasOwn(request, "intervention")
+        || (request.intervention !== null && !object(request.intervention))
+        || !safeInteger(delay) || delay >= request.ticks
+        || (request.intervention === null && delay !== 0)) {
+      refuse("submitted request differs from the retained study");
+    }
+    expectedTreatmentTick = request.intervention === null ? null : status.source_tick + delay;
+  }
   if (!(blob instanceof Blob) || blob.size < 1 || blob.size > MAX_STUDY_REPORT_BYTES) refuse("JSON exceeds the 1 MiB report preview bound");
   const buffer = await blob.arrayBuffer();
   if (buffer.byteLength !== blob.size || buffer.byteLength > MAX_STUDY_REPORT_BYTES) refuse("report byte count changed");
@@ -299,6 +317,9 @@ export async function parseSavedStudyReport(blob, context) {
   const arms = report.branch_reports.map((arm) => readArm(arm, status, rootSeed));
   const control = arms.find((arm) => arm.id === "control"), treatment = arms.find((arm) => arm.id === "treatment");
   if (!control || new Set(arms.map((arm) => arm.id)).size !== arms.length) refuse("missing or duplicate study arm");
+  if (expectedTreatmentTick !== undefined && (treatment?.interventionTick ?? null) !== expectedTreatmentTick) {
+    refuse("report treatment and application boundary differ from the submitted request");
+  }
   if (checkpoint != null && (control.baselinePopulation !== checkpoint.agent_count
       || (treatment?.interventionTick === status.source_tick && treatment.baselinePopulation !== checkpoint.agent_count))) {
     refuse("study population baseline differs from the selected checkpoint");

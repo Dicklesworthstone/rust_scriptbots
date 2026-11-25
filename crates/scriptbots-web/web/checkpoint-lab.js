@@ -814,6 +814,7 @@ export class CheckpointLabController {
   previewReport() {
     if (!this.canOperate || this.branch?.status?.status !== "completed") return Promise.resolve(null);
     const status = this.branch.status, checkpoint = this.branch.checkpoint;
+    const submittedRequest = this.branch.request == null ? null : copy(this.branch.request);
     const request = { sessionId: this.source.sessionId, artifactId: status.artifact_id,
       expected: null, maxBytes: MAX_STUDY_REPORT_BYTES };
     return this.run("Study report unavailable", async (signal) => {
@@ -821,7 +822,7 @@ export class CheckpointLabController {
         status.artifact_id, null, status.branch_id);
       signal.throwIfAborted();
       if (result.blob.size > MAX_STUDY_REPORT_BYTES) throw new Error("Study report exceeds the browser preview byte limit");
-      return this.parseReport(result.blob, { status, checkpoint, artifact: result.metadata });
+      return this.parseReport(result.blob, { status, checkpoint, request: submittedRequest, artifact: result.metadata });
     }, (model) => {
       this.reportModel = model;
       this.notice = "Verified saved-study report loaded. These descriptive trajectories come from one saved source.";

@@ -1124,6 +1124,7 @@ test("selecting completed history reads exact retained status and downloads with
   h.queues.download[1].resolve({ blob: new Blob(["{}"]), filename: "study_report.json", metadata: artifact() });
   assert.equal(await preview, parsed);
   assert.equal(parsedContext.checkpoint, null);
+  assert.equal(parsedContext.request, null);
   assert.equal(parsedContext.status.branch_id, receipt.branch_id);
   assert.equal(parsedContext.artifact.artifact_id, receipt.artifact_id);
   assert.equal(h.queues.launch.length, 0);
@@ -1261,6 +1262,30 @@ test("report preview binds verified bytes to the exact source and clears when a 
   assert.equal(h.controller.reportModel, null);
   h.queues.launch[1].resolve(status(h.queues.launch[1].request, checkpoint(), { branch_id: "branch-next" }));
   await next;
+});
+
+test("report preview retains the immutable submitted request while its download is pending", async () => {
+  let context;
+  const model = Object.freeze({ studyId: "browser-study", sourceTick: 100 });
+  const h = await harness({ parseReport: async (_blob, value) => { context = value; return model; } });
+  const draft = { branchName: "delayed", ticks: 120, interventionDelayTicks: 30,
+    intervention: { type: "Drought", params: { region: null, duration_ticks: 10, growth_scale: 0.1 } } };
+  const launching = h.controller.launch(draft);
+  const submitted = h.queues.launch[0].request;
+  h.queues.launch[0].resolve(status(submitted, checkpoint(), { status: "completed", artifact_id: artifact().artifact_id }));
+  await launching;
+  const preview = h.controller.previewReport();
+  draft.interventionDelayTicks = 60;
+  draft.intervention.params.growth_scale = 0.8;
+  h.controller.branch.request = { ...submitted, intervention_delay_ticks: 60, intervention: draft.intervention };
+  h.queues.download[0].resolve({ blob: new Blob(["{}"]), filename: "study_report.json", metadata: artifact() });
+  assert.equal(await preview, model);
+  assert.deepEqual(context.request, submitted);
+  assert.equal(context.request.intervention_delay_ticks, 30);
+  assert.equal(context.request.intervention.params.growth_scale, 0.1);
+  assert.ok(Object.isFrozen(context.request));
+  assert.ok(Object.isFrozen(context.request.intervention.params));
+  assert.throws(() => { context.request.intervention_delay_ticks = 60; }, TypeError);
 });
 
 test("report decoding that finishes after disconnection cannot publish a stale preview", async () => {

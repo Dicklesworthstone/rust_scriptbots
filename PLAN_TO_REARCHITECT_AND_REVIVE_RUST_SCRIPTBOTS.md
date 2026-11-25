@@ -2,6 +2,28 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Saved-study report request binding (2026-11-25):**
+[Implemented and focused DSR regressions passed — Codex; corrective contribution to `bd-2z0.12.2`;
+original acceptance retained]
+
+Browser report previews retain the submitted request before downloading bytes
+and compare the report's treatment presence and actual application boundary
+with that request. Source, study name, horizon and delay must agree. Immediate
+requests keep their zero-delay behavior. Retained history without a request
+continues to display observed report timing without inventing original intent.
+The report does not encode the treatment payload, so this check does not claim
+to independently compare that payload.
+
+Authored regressions cover immediate/delayed and control-only reports, mismatched
+arms and timing, malformed request metadata, retained history and request changes
+during asynchronous reads. Independent source review completed. DSR 0.2.3 ran
+the two focused Node suites against a frozen candidate: 114 tests passed,
+zero failed or skipped, with unchanged source fingerprints before and after
+execution. The new tests reject the previous production implementation. A broader
+browser invocation passed 318 tests but could not load two DOM entrypoints because
+Playwright was unavailable; that combined invocation is not a passing suite.
+No original qualification gate is closed.
+
 **Sensing failure containment at the owner boundary (2026-11-24):**
 [Source implemented; execution validation pending — Codex;
 runtime repair of `bd-16g.15.2`'s error/no-fallback contract;
