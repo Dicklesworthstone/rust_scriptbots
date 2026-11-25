@@ -2,6 +2,30 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Saved-study bundle identity at publication and recovery (2026-11-25):**
+[Source implemented and independently reviewed; execution validation pending —
+Codex; corrective contribution to `bd-2z0.12.2` and `bd-2z0.19`;
+original complete acceptance retained]
+
+Managed study artifacts now bind each branch's complete run manifest, terminal
+tick and required summary/evidence roster to its admitted study and exact saved
+source. Producer and verifier share the existing deterministic identity
+constructor. Recovery verifies and bounded-decodes the retained source envelope
+without restoring a world or advancing the live owner.
+
+An authored real-study regression covers ten internally checksum-valid changes:
+run, study, branch, scenario, terminal tick, source revision, seed metadata,
+missing summary, missing evidence and wrong artifact role. Publication and cold
+recovery must refuse even after outer receipt checksums are recomputed; the
+original artifact set remains downloadable and live science remains unchanged.
+
+Independent source reviews completed and the local candidate passed
+`git diff --check`. DSR 0.2.3's clean baseline application check was killed
+with exit 137 during dependency fetching, before compiler diagnostics. The
+executor then disconnected before candidate formatting and regression execution.
+The patch was reconstructed from the complete reviewed diff through GitHub.
+Compilation, formatting, Clippy, tests and original qualification remain unverified.
+
 **Browser saved-study trajectory inspection (2026-11-25):**
 [Implemented; focused and browser-unit DSR checks passed — Codex; functional
 extension of `bd-2z0.12.2`; original qualification criteria retained]

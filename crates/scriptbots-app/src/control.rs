@@ -2764,6 +2764,40 @@ fn stage_checkpoint_branch_artifacts(
         output.join(artifact_path),
         Some((*byte_size, checksum_blake3.clone())),
     );
+    // The report retains only the overall source digest. Derive the full run-ID
+    // input from the exact admitted envelope, rather than trusting a bundle's
+    // self-consistent manifest or reconstructing missing digest lanes.
+    let source_bytes = read_artifact_file_bounded(
+        &output.join(artifact_path),
+        usize::try_from(*byte_size)
+            .map_err(|error| ControlError::PayloadTooLarge(error.to_string()))?,
+    )?;
+    if source_bytes.len() as u64 != *byte_size || compute_blake3(&source_bytes) != *checksum_blake3 {
+        return Err(ControlError::InvalidPatch(
+            "checkpoint branch source differs from its immutable admission".to_owned(),
+        ));
+    }
+    let source =
+        CatalogCheckpoint::decode(scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA, &source_bytes)
+            .or_else(|_| {
+                CatalogCheckpoint::decode(
+                    scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA,
+                    &source_bytes,
+                )
+            })?;
+    let science = source.science();
+    if science.tick().0 != definition.source_tick
+        || science.source_digest().overall != definition.world_digest_v1
+        || serde_json::to_vec(science.config()).map_err(ControlError::serialization)?
+            != serde_json::to_vec(&definition.plan.config).map_err(ControlError::serialization)?
+    {
+        return Err(ControlError::InvalidPatch(
+            "checkpoint branch source does not describe its admitted plan".to_owned(),
+        ));
+    }
+    let source_digest = science.source_digest().clone();
+    drop(source);
+    drop(source_bytes);
     for (branch, spec) in report.branch_reports.iter().zip(&definition.plan.branches) {
         let bundle = output.join(format!("bundle_{}", branch.branch_id));
         if !branch.bundle_verified
@@ -2797,6 +2831,26 @@ fn stage_checkpoint_branch_artifacts(
         {
             return Err(ControlError::PayloadTooLarge(
                 "checkpoint branch bundle contains too many artifacts".to_owned(),
+            ));
+        }
+        let expected_manifest = definition
+            .plan
+            .bundle_manifest(spec, &source_digest, &report.source)
+            .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
+        if parsed.manifest != expected_manifest
+            || parsed.digests.max_tick != definition.target_tick
+            || parsed.artifacts.len() != crate::branch_study::STUDY_BRANCH_ARTIFACTS.len()
+            || crate::branch_study::STUDY_BRANCH_ARTIFACTS
+                .iter()
+                .any(|(path, artifact_type)| {
+                    !parsed.artifacts.iter().any(|artifact| {
+                        artifact.relative_path == *path && artifact.artifact_type == *artifact_type
+                    })
+                })
+        {
+            return Err(ControlError::InvalidPatch(
+                "checkpoint branch bundle identity or artifact roster differs from its admitted study"
+                    .to_owned(),
             ));
         }
         // Bundle checksums alone cannot bind an intact bundle copied from another
@@ -17053,6 +17107,156 @@ pub(crate) mod tests {
         assert!(cold.data_services.artifacts.lock().unwrap().is_empty());
         assert_eq!(fs::read(&evidence).unwrap(), b"damaged evidence");
         fs::write(evidence, original).unwrap();
+    }
+
+    #[test]
+    fn managed_checkpoint_branch_rejects_self_consistent_bundle_relabelling_and_omissions() {
+        let (handle, host, checkpoint, directory) =
+            checkpoint_branch_fixture(Some(crate::BrainPreset::Mlp), 0);
+        let before = host.port.scientific_digest_v1().unwrap();
+        let admitted = handle
+            .create_checkpoint_branch(checkpoint_branch_request(
+                &checkpoint.checkpoint_id,
+                "bundle-semantic-identity",
+            ))
+            .unwrap();
+        let completed = wait_for_checkpoint_branch(&handle, &admitted.branch_id);
+        assert_eq!(completed.status, "completed", "{completed:?}");
+        let artifact_id = completed.artifact_id.as_ref().unwrap().clone();
+        let definition = handle.data_services.checkpoint_branches.lock().unwrap()
+            [&admitted.branch_id]
+            .definition
+            .clone();
+        handle.data_services.shutdown_experiments().unwrap();
+        let branch = directory.join("branches").join(&admitted.branch_id);
+        let output = branch.join("study");
+        let bundle = output.join("bundle_control");
+        let manifest_path = bundle.join("bundle_manifest.json");
+        let receipt_path = branch.join("receipt.json");
+        let manifest_bytes = fs::read(&manifest_path).unwrap();
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        let report_bytes = fs::read(output.join("study_report.json")).unwrap();
+        let report = serde_json::from_slice(&report_bytes).unwrap();
+        let original: scriptbots_storage::RunBundleV1 =
+            serde_json::from_slice(&manifest_bytes).unwrap();
+        assert!(stage_checkpoint_branch_artifacts(&directory, &output, &report, &definition).is_ok());
+        drop(handle);
+
+        for case in [
+            "run",
+            "study",
+            "arm",
+            "scenario",
+            "target",
+            "source_revision",
+            "root_seed",
+            "missing_trajectory",
+            "missing_evidence",
+            "wrong_artifact_role",
+        ] {
+            let mut changed = original.clone();
+            match case {
+                "run" => {
+                    let run_id =
+                        scriptbots_runtime::RunId::new(if changed.manifest.run_id.get() == 1 {
+                            2
+                        } else {
+                            1
+                        });
+                    changed.manifest.run_id = run_id;
+                    changed.digests.run_id = run_id.to_string();
+                    let mut manifest: Value =
+                        serde_json::from_str(&changed.manifest.manifest_json).unwrap();
+                    manifest["run_id"] = json!(run_id);
+                    changed.manifest.manifest_json = serde_json::to_string(&manifest).unwrap();
+                }
+                "study" => changed.manifest.experiment_id = Some("another-study".to_owned()),
+                "arm" => changed.manifest.variant_id = Some("another-arm".to_owned()),
+                "scenario" => changed.manifest.scenario_id = "another-scenario".to_owned(),
+                "target" => changed.digests.max_tick += 1,
+                "source_revision" => {
+                    changed.manifest.source_revision = Some("another-source".to_owned());
+                    changed.digests.source_revision = changed.manifest.source_revision.clone();
+                }
+                "root_seed" => changed.manifest.root_seed = changed.manifest.root_seed.wrapping_add(1),
+                "missing_trajectory" => changed
+                    .artifacts
+                    .retain(|artifact| artifact.relative_path != "exports/summary.csv"),
+                "missing_evidence" => changed
+                    .artifacts
+                    .retain(|artifact| artifact.relative_path != "evidence/branch_evidence.json"),
+                "wrong_artifact_role" => changed.artifacts[0].artifact_type = "evidence".to_owned(),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec_pretty(&changed).unwrap();
+            fs::write(&manifest_path, &bytes).unwrap();
+            // Each mutation remains a valid, internally consistent artifact-only
+            // bundle. The missing proof is its join to this admitted scientific arm.
+            scriptbots_storage::bundle::verify_run_bundle_bounded(
+                &bundle,
+                crate::branch_study::STUDY_BUNDLE_VERIFICATION_LIMITS,
+            )
+            .unwrap_or_else(|error| panic!("{case} failed generic integrity: {error}"));
+            assert!(
+                matches!(
+                    stage_checkpoint_branch_artifacts(&directory, &output, &report, &definition),
+                    Err(ControlError::InvalidPatch(reason))
+                        if reason.contains("bundle identity or artifact roster")
+                ),
+                "{case} escaped publication identity validation"
+            );
+
+            // Re-seal the exact changed manifest and roster to get beyond outer
+            // receipt checksums on cold recovery. No artifact bytes are changed.
+            let mut receipt: CheckpointBranchReceiptRecord =
+                serde_json::from_slice(&receipt_bytes).unwrap();
+            let prefix = format!("branches/{}/study/bundle_control/", admitted.branch_id);
+            receipt.receipt.artifacts.retain(|artifact| {
+                artifact
+                    .relative_path
+                    .strip_prefix(&prefix)
+                    .is_none_or(|relative| {
+                        relative == "bundle_manifest.json"
+                            || changed
+                                .artifacts
+                                .iter()
+                                .any(|entry| entry.relative_path == relative)
+                    })
+            });
+            let metadata = receipt
+                .receipt
+                .artifacts
+                .iter_mut()
+                .find(|artifact| artifact.relative_path == format!("{prefix}bundle_manifest.json"))
+                .unwrap();
+            metadata.byte_size = bytes.len() as u64;
+            metadata.checksum_blake3 = compute_blake3(&bytes);
+            metadata.checksum_sha256 = compute_sha256(&bytes);
+            receipt.receipt.validate(&definition).unwrap();
+            receipt.checksum = compute_blake3(&serde_json::to_vec(&receipt.receipt).unwrap());
+            fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            let cold = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+            assert_eq!(
+                cold.get_checkpoint_branch(&admitted.branch_id).unwrap().status,
+                "completed",
+                "{case}: history remains a terminal observation"
+            );
+            assert!(cold.read_artifact_bytes(&artifact_id).is_err(), "{case}");
+            assert!(
+                cold.data_services.artifacts.lock().unwrap().is_empty(),
+                "{case}"
+            );
+            assert_eq!(fs::read(&manifest_path).unwrap(), bytes, "{case}");
+        }
+        fs::write(&manifest_path, manifest_bytes).unwrap();
+        fs::write(&receipt_path, receipt_bytes).unwrap();
+        let cold = host.handle().with_artifacts_dir(directory.clone()).unwrap();
+        assert_eq!(
+            cold.read_artifact_bytes(&artifact_id).unwrap().1,
+            report_bytes
+        );
+        assert!(stage_checkpoint_branch_artifacts(&directory, &output, &report, &definition).is_ok());
+        assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
 
     #[test]

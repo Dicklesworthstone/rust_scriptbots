@@ -89,6 +89,12 @@ const MAX_STUDY_DESCRIPTION_BYTES: usize = 4096;
 const MAX_STUDY_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 const SOURCE_CHECKPOINT_ARTIFACT: &str = "source_checkpoint.bin";
 
+/// Complete artifact roster emitted for each scientific branch.
+pub(crate) const STUDY_BRANCH_ARTIFACTS: [(&str, &str); 2] = [
+    ("exports/summary.csv", "export"),
+    ("evidence/branch_evidence.json", "evidence"),
+];
+
 /// The producer and managed download catalog verify the same bundle contract.
 pub(crate) const STUDY_BUNDLE_VERIFICATION_LIMITS: RunBundleVerificationLimits =
     RunBundleVerificationLimits {
@@ -514,6 +520,23 @@ impl BranchStudyPlan {
             due,
         ))?;
         Ok(crate::experiment_runner::MatchedSeedExperimentRunner::bundle_run_id(&identity))
+    }
+
+    /// Derive the branch manifest from the exact admitted study and source cut.
+    /// Publication and cold recovery use the same constructor as the producer;
+    /// valid artifact checksums alone do not establish this scientific identity.
+    pub(crate) fn bundle_manifest(
+        &self,
+        branch: &StudyBranchSpec,
+        checkpoint_digest: &WorldDigestV1,
+        source: &BranchStudySource,
+    ) -> Result<RunManifestRecord, BranchStudyError> {
+        let mut manifest =
+            RunManifestRecord::unattributed(self.bundle_run_id(branch, checkpoint_digest, source)?);
+        manifest.scenario_id = format!("branch_study_{}", branch.branch_id);
+        manifest.experiment_id = Some(self.study_id.clone());
+        manifest.variant_id = Some(branch.branch_id.clone());
+        Ok(manifest)
     }
 
     fn final_tick(&self) -> Result<u64, BranchStudyError> {
@@ -2377,7 +2400,7 @@ impl BranchStudyOrchestrator {
         // Create and verify run bundle for branch.
         let (bundle_path, bundle_verified) = self.create_and_verify_bundle(
             self.plan
-                .bundle_run_id(branch, checkpoint.science().source_digest(), source)?,
+                .bundle_manifest(branch, checkpoint.science().source_digest(), source)?,
             branch,
             source,
             &samples,
@@ -2497,7 +2520,7 @@ impl BranchStudyOrchestrator {
     #[allow(clippy::too_many_arguments)]
     fn create_and_verify_bundle(
         &self,
-        run_id: RunId,
+        manifest: RunManifestRecord,
         branch: &StudyBranchSpec,
         source: &BranchStudySource,
         samples: &[BranchObservation],
@@ -2570,12 +2593,7 @@ impl BranchStudyOrchestrator {
         let bundle_dir = self.output_dir.join(format!("bundle_{}", branch.branch_id));
         fs::create_dir(&bundle_dir).map_err(|error| study_output_error(&bundle_dir, error))?;
 
-        // 3. Manifest
-        let mut manifest = RunManifestRecord::unattributed(run_id);
-        manifest.scenario_id = format!("branch_study_{}", branch.branch_id);
-        manifest.experiment_id = Some(self.plan.study_id.clone());
-        manifest.variant_id = Some(branch.branch_id.clone());
-
+        // 3. Source-bound manifest and complete branch artifact roster.
         let max_tick = self.plan.final_tick()?;
 
         let _bundle: RunBundleV1 = create_run_bundle_from_artifacts(
@@ -2583,8 +2601,16 @@ impl BranchStudyOrchestrator {
             manifest,
             max_tick,
             &[
-                ("exports/summary.csv", "export", &csv_buf),
-                ("evidence/branch_evidence.json", "evidence", &evidence_json),
+                (
+                    STUDY_BRANCH_ARTIFACTS[0].0,
+                    STUDY_BRANCH_ARTIFACTS[0].1,
+                    &csv_buf,
+                ),
+                (
+                    STUDY_BRANCH_ARTIFACTS[1].0,
+                    STUDY_BRANCH_ARTIFACTS[1].1,
+                    &evidence_json,
+                ),
             ],
         )
         .map_err(|e| BranchStudyError::Bundle(e.to_string()))?;
