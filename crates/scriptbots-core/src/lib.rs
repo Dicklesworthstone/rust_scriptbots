@@ -13854,6 +13854,8 @@ pub struct ScriptBotsConfig {
     #[serde(default = "default_communication_scramble")]
     pub communication_scramble: bool,
     /// Dedicated seed for the communication scramble stream (bd-16g.7.3).
+    /// Without an override, use the world's already-resolved root seed. Changing the effective
+    /// seed resets only this stream at the configuration boundary; unrelated edits preserve it.
     #[serde(default = "default_communication_scramble_seed")]
     pub communication_scramble_seed: Option<u64>,
     }
@@ -23500,7 +23502,7 @@ impl WorldState {
         let communication_scramble_stream = if config.communication_scramble {
             let scramble_seed = config
                 .communication_scramble_seed
-                .unwrap_or_else(|| config.resolved_rng_seed() ^ 0x5C8A_3B1E_C044_5EED);
+                .unwrap_or_else(|| rng.root_seed() ^ 0x5C8A_3B1E_C044_5EED);
             Some(SmallRngStream::seed_from_u64(scramble_seed))
         } else {
             None
@@ -32699,11 +32701,15 @@ impl WorldState {
             self.realized_hearing_capture_enabled = true;
         }
         if self.config.communication_scramble {
-            if self.communication_scramble_stream.is_none() {
-                let scramble_seed = self
-                    .config
-                    .communication_scramble_seed
-                    .unwrap_or_else(|| self.config.resolved_rng_seed() ^ 0x5C8A_3B1E_C044_5EED);
+            let scramble_seed = self
+                .config
+                .communication_scramble_seed
+                .unwrap_or_else(|| self.rng.root_seed() ^ 0x5C8A_3B1E_C044_5EED);
+            if self
+                .communication_scramble_stream
+                .as_ref()
+                .is_none_or(|stream| stream.seed() != scramble_seed)
+            {
                 self.communication_scramble_stream =
                     Some(SmallRngStream::seed_from_u64(scramble_seed));
             }
@@ -42599,6 +42605,101 @@ mod tests {
             world_scramble.random_streams_checkpoint(),
             "communication scramble stream must be completely isolated and not draw from world RNG"
         );
+    }
+
+    #[test]
+    fn communication_scramble_seed_updates_reset_only_the_dedicated_stream() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            communication_scramble: true,
+            communication_scramble_seed: Some(11),
+            ..quiet_trace_config(0x5343_5241_4d42, 0)
+        })
+        .unwrap();
+        for i in 0..5 {
+            world.spawn_agent(sample_agent(i));
+        }
+        for requested_seed in [Some(23), None, Some(47)] {
+            world.step().unwrap();
+            let before = world.communication_scramble_stream().unwrap().checkpoint();
+            let domains = world.random_streams_checkpoint();
+            let tick = world.tick();
+            let expected_seed =
+                requested_seed.unwrap_or(world.rng.root_seed() ^ 0x5C8A_3B1E_C044_5EED);
+            let expected = SmallRngStream::seed_from_u64(expected_seed).checkpoint();
+            assert_ne!(before, expected, "this case must distinguish reseeding from retention");
+
+            let mut config = world.config().clone();
+            config.communication_scramble_seed = requested_seed;
+            world.apply_config_update(config).unwrap();
+            assert_eq!(
+                world.communication_scramble_stream().unwrap().checkpoint(),
+                expected,
+                "an accepted seed change must affect the next hearing permutation"
+            );
+            assert_eq!(world.random_streams_checkpoint(), domains);
+            assert_eq!(world.tick(), tick);
+        }
+    }
+
+    #[test]
+    fn communication_scramble_unrelated_and_equivalent_updates_preserve_consumed_state() {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            communication_scramble: true,
+            ..quiet_trace_config(0x5343_5241_4d42, 0)
+        })
+        .unwrap();
+        for i in 0..5 {
+            world.spawn_agent(sample_agent(i));
+        }
+        world.step().unwrap();
+        world.step().unwrap();
+        let effective_seed = world.rng.root_seed() ^ 0x5C8A_3B1E_C044_5EED;
+        let consumed = world.communication_scramble_stream().unwrap().checkpoint();
+        assert_ne!(consumed, SmallRngStream::seed_from_u64(effective_seed).checkpoint());
+        let domains = world.random_streams_checkpoint();
+
+        for requested_seed in [None, Some(effective_seed), None] {
+            let mut config = world.config().clone();
+            config.history_capacity += 1;
+            config.communication_scramble_seed = requested_seed;
+            world.apply_config_update(config).unwrap();
+            assert_eq!(
+                world.communication_scramble_stream().unwrap().checkpoint(),
+                consumed,
+                "ordinary edits and equivalent seed spellings must not rewind hearing"
+            );
+            assert_eq!(world.random_streams_checkpoint(), domains);
+        }
+    }
+
+    #[test]
+    fn communication_scramble_fallback_reuses_the_resolved_root_across_enable_cycles() {
+        let mut config = quiet_trace_config(0, 0);
+        config.rng_seed = None;
+        config.communication_scramble = true;
+        let mut world = WorldState::new(config).unwrap();
+        let resolved_root = world.rng.root_seed();
+        let expected_seed = resolved_root ^ 0x5C8A_3B1E_C044_5EED;
+        assert_eq!(
+            world.communication_scramble_stream().unwrap().seed(),
+            expected_seed,
+            "unseeded construction must resolve one root, not draw a second one for hearing"
+        );
+        let domains = world.random_streams_checkpoint();
+        for _ in 0..3 {
+            let mut config = world.config().clone();
+            config.communication_scramble = false;
+            world.apply_config_update(config.clone()).unwrap();
+            assert!(world.communication_scramble_stream().is_none());
+            config.communication_scramble = true;
+            world.apply_config_update(config).unwrap();
+            assert_eq!(
+                world.communication_scramble_stream().unwrap().checkpoint(),
+                SmallRngStream::seed_from_u64(expected_seed).checkpoint()
+            );
+            assert_eq!(world.random_streams_checkpoint(), domains);
+            assert_eq!(world.rng.root_seed(), resolved_root);
+        }
     }
 
     #[test]

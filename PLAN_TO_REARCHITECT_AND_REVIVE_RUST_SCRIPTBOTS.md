@@ -2,6 +2,25 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Effective communication-scrambling seeds (2026-11-25):**
+[Source implemented and independently reviewed; execution validation pending —
+Codex; corrective contribution to `bd-16g.7.3`;
+original complete acceptance retained]
+
+Live configuration now installs a newly requested effective scrambling seed
+instead of retaining the old stream. Unrelated edits and equivalent explicit or
+fallback seeds preserve consumed state. Construction and re-enabling derive the
+fallback from the world's already-resolved root, avoiding a second entropy draw
+when the launch configuration has no explicit root seed. World-domain streams
+remain separate.
+
+Three authored regressions use completed simulation steps to distinguish a
+consumed stream from a fresh one, exercise explicit/fallback seed changes,
+preserve state across unrelated/equivalent edits, and verify unseeded-root binding
+through repeated disable/enable cycles. Source reviews completed through GitHub;
+native formatting, compilation, Clippy and test execution remain unavailable
+after the executor disconnection. No qualification gate is closed.
+
 **Ecologically effective terrain painting and exact continuation (2026-11-25):**
 [Source implemented and independently reviewed; execution validation pending —
 Codex; terrain-intervention repair and contribution to `bd-2z0.5.13`;
