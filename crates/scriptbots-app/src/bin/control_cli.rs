@@ -1969,7 +1969,7 @@ async fn set_command(
         }],
     };
     let receipt = apply_updates(client, base_url, &request).await?;
-    print_configuration_receipt(base_url, &format!("set {path}"), &receipt)
+    print_command_receipt(base_url, &format!("set {path}"), &receipt)
 }
 
 async fn patch_command(
@@ -1998,7 +1998,7 @@ async fn patch_command(
 
     let body = ConfigPatchRequest { patch: patch_value };
     let receipt = apply_patch(client, base_url, &body).await?;
-    print_configuration_receipt(base_url, "configuration patch", &receipt)
+    print_command_receipt(base_url, "configuration patch", &receipt)
 }
 
 async fn run_watch(client: Client, base_url: String, interval: Duration) -> Result<()> {
@@ -2325,20 +2325,71 @@ where
     }
 }
 
-/// Configuration mutations return owner receipts, not projected future config.
-fn print_configuration_receipt(
-    base_url: &str,
-    label: &str,
-    receipt: &CommandStatusDto,
-) -> Result<()> {
+/// Print both owner axes and preserve a failed outcome in the process exit status.
+fn print_command_receipt(base_url: &str, label: &str, receipt: &CommandStatusDto) -> Result<()> {
     println!("{label} command receipt");
     println!("{}", serde_json::to_string_pretty(receipt)?);
     println!(
         "  poll with: {}",
         command_polling_hint(base_url, &receipt.command_id)?,
     );
-    if matches!(receipt.application_state.as_str(), "rejected" | "failed") {
-        bail!("{label} command {}", receipt.application_state);
+    check_command_receipt(label, receipt)
+}
+
+fn check_command_receipt(label: &str, receipt: &CommandStatusDto) -> Result<()> {
+    let diagnosis = |failure: Option<&scriptbots_app::control::CommandFailureDto>| {
+        failure.map_or_else(
+            || "owner diagnostic unavailable".to_owned(),
+            |failure| {
+                format!(
+                    "{}: {}{}",
+                    failure.code,
+                    failure.message,
+                    if failure.diagnostic_truncated {
+                        " [diagnostic truncated]"
+                    } else {
+                        ""
+                    },
+                )
+            },
+        )
+    };
+    let mut failures = Vec::new();
+    match receipt.application_state.as_str() {
+        "rejected" => failures.push(format!(
+            "application rejected: {}",
+            receipt.rejection_reason.as_ref().map_or_else(
+                || "owner diagnostic unavailable".to_owned(),
+                Value::to_string,
+            ),
+        )),
+        "failed" => failures.push(format!(
+            "application failed: {}",
+            diagnosis(receipt.application_failure.as_ref()),
+        )),
+        _ => {}
+    }
+    if receipt.journal_state == "failed" {
+        failures.push(format!(
+            "journal failed: {}",
+            diagnosis(receipt.journal_failure.as_ref()),
+        ));
+    }
+    if !failures.is_empty() {
+        let boundary = receipt.applied_tick.map_or_else(String::new, |tick| {
+            format!(
+                "; applied at tick {tick} (control {}, scientific {}, config {})",
+                receipt.control_revision, receipt.scientific_revision, receipt.config_revision,
+            )
+        });
+        bail!(
+            "{label} command {}: application={}, journal={}{}; {}",
+            receipt.command_id,
+            receipt.application_state,
+            receipt.journal_state,
+            boundary,
+            failures.join("; "),
+        );
     }
     Ok(())
 }
@@ -2426,8 +2477,11 @@ async fn issue_control_command(
     if !status.is_success() {
         bail!("{label} failed ({status}): {body}");
     }
-    // "admitted", not "paused": this reports what the receipt supports.
-    println!("{}", format!("✔ {label} command admitted").green().bold());
+    let receipt: CommandStatusDto =
+        serde_json::from_str(&body).context("failed to deserialize owner command receipt")?;
+    // Even HTTP success may carry an owner rejection or an applied command
+    // whose independent journal failed. Do not announce admission from HTTP alone.
+    println!("{label} command receipt");
     println!("{body}");
     if let Some(command_id) = receipt_command_id(&body) {
         // `lookup-status`, not `status`: clap derives the subcommand name from
@@ -2439,7 +2493,7 @@ async fn issue_control_command(
             command_polling_hint(base_url, &command_id)?
         );
     }
-    Ok(())
+    check_command_receipt(label, &receipt)
 }
 
 async fn pause_command(
@@ -2522,17 +2576,15 @@ async fn status_command(client: &Client, base_url: &str) -> Result<()> {
 }
 
 async fn shutdown_command(client: &Client, base_url: &str) -> Result<()> {
-    let url = join_url(base_url, "/api/control/shutdown");
-    let response = client.post(url).send().await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if status.is_success() {
-        println!("{}", "✔ Shutdown command issued".green().bold());
-        println!("{body}");
-    } else {
-        bail!("shutdown failed ({status}): {body}");
-    }
-    Ok(())
+    issue_control_command(
+        client,
+        base_url,
+        "/api/control/shutdown",
+        "shutdown",
+        None,
+        None,
+    )
+    .await
 }
 
 async fn lookup_status_command(client: &Client, base_url: &str, id: &str) -> Result<()> {
@@ -2541,7 +2593,10 @@ async fn lookup_status_command(client: &Client, base_url: &str, id: &str) -> Res
     let status = response.status();
     let body = response.text().await?;
     if status.is_success() {
+        let receipt: CommandStatusDto =
+            serde_json::from_str(&body).context("failed to deserialize owner command status")?;
         println!("{body}");
+        check_command_receipt("status lookup", &receipt)?;
     } else {
         bail!("status lookup failed ({status}): {body}");
     }
@@ -2706,17 +2761,7 @@ async fn map_apply_command(
         .await
         .context("failed to parse command status response")?;
 
-    println!(
-        "{} id={}, app_state={}, journal_state={}, control_rev={}, scientific_rev={}",
-        "✔ Map apply command submitted:".green().bold(),
-        resp_status.command_id,
-        resp_status.application_state,
-        resp_status.journal_state,
-        resp_status.control_revision,
-        resp_status.scientific_revision
-    );
-
-    Ok(())
+    print_command_receipt(base_url, "map apply", &resp_status)
 }
 
 fn parse_region_cli(disc: Option<&str>, rect: Option<&str>) -> Result<scriptbots_core::Region> {
@@ -3011,7 +3056,7 @@ async fn presets_apply(client: &Client, base_url: &str, name: &str) -> Result<()
     };
     let response = client.post(url).json(&body).send().await?;
     let receipt = parse_response(response).await?;
-    print_configuration_receipt(base_url, &format!("preset {name}"), &receipt)
+    print_command_receipt(base_url, &format!("preset {name}"), &receipt)
 }
 
 async fn screenshot_request(
@@ -5011,6 +5056,90 @@ mod tests {
                 "invalid guard {invalid}"
             );
         }
+    }
+
+    fn owner_receipt_for_cli(application_state: &str, journal_state: &str) -> CommandStatusDto {
+        serde_json::from_value(serde_json::json!({
+            "command_id": "cmd-71",
+            "admission_sequence": 5,
+            "application_state": application_state,
+            "journal_state": journal_state,
+            "control_revision": 7,
+            "scientific_revision": 11,
+            "config_revision": 3,
+        }))
+        .expect("complete owner receipt fixture")
+    }
+
+    #[test]
+    fn receipt_checks_allow_pending_and_successful_owner_outcomes() {
+        for (application, journal) in [
+            ("admitted", "pending"),
+            ("applied", "pending"),
+            ("applied", "committed_volatile"),
+            ("applied", "durable"),
+        ] {
+            let mut receipt = owner_receipt_for_cli(application, journal);
+            if application == "applied" {
+                receipt.applied_tick = Some(41);
+            }
+            assert!(check_command_receipt("step", &receipt).is_ok());
+        }
+    }
+
+    #[test]
+    fn receipt_checks_keep_applied_boundary_when_only_journal_failed() {
+        let mut receipt = owner_receipt_for_cli("applied", "failed");
+        receipt.applied_tick = Some(41);
+        receipt.journal_failure = Some(scriptbots_app::control::CommandFailureDto {
+            code: "disk_full".into(),
+            message: "the journal could not commit".into(),
+            diagnostic_truncated: false,
+        });
+        let message = check_command_receipt("step", &receipt)
+            .expect_err("journal failure must fail the CLI")
+            .to_string();
+        assert!(message.contains("application=applied, journal=failed"));
+        assert!(message.contains("applied at tick 41 (control 7, scientific 11, config 3)"));
+        assert!(message.contains("journal failed: disk_full: the journal could not commit"));
+        assert!(!message.contains("application failed"));
+    }
+
+    #[test]
+    fn receipt_checks_preserve_both_failures_and_owner_rejection() {
+        let mut receipt = owner_receipt_for_cli("failed", "failed");
+        receipt.application_failure = Some(scriptbots_app::control::CommandFailureDto {
+            code: "science_refused".into(),
+            message: "transition incomplete".into(),
+            diagnostic_truncated: true,
+        });
+        receipt.journal_failure = Some(scriptbots_app::control::CommandFailureDto {
+            code: "disk_full".into(),
+            message: "journal unavailable".into(),
+            diagnostic_truncated: false,
+        });
+        let message = check_command_receipt("step", &receipt)
+            .expect_err("both failures must fail the CLI")
+            .to_string();
+        assert!(
+            message.contains(
+                "application failed: science_refused: transition incomplete [diagnostic truncated]"
+            )
+        );
+        assert!(message.contains("journal failed: disk_full: journal unavailable"));
+        assert!(!message.contains("applied at tick"));
+
+        let mut rejected = owner_receipt_for_cli("rejected", "committed_volatile");
+        rejected.rejection_reason = Some(serde_json::json!({
+            "code": "config_revision_conflict", "expected": 2, "actual": 3,
+        }));
+        let message = check_command_receipt("patch", &rejected)
+            .expect_err("owner rejection must fail the CLI")
+            .to_string();
+        assert!(message.contains("application rejected:"));
+        assert!(message.contains("config_revision_conflict"));
+        assert!(message.contains("\"expected\":2"));
+        assert!(message.contains("\"actual\":3"));
     }
 
     /// The CLI must recover the pollable id from a real receipt body.

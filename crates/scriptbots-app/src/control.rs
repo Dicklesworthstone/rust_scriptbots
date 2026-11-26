@@ -412,9 +412,13 @@ pub const JOURNAL_STATE_NOT_REQUIRED: &str = "not_required";
 ///
 /// The two axes are independent by design: application tracks
 /// `admitted`/`applied`/`rejected`/`failed`, journal tracks
-/// `not_required`/`pending`/`committed_volatile`/`durable`. Both axes come from the
-/// authoritative host receipt; admission alone does not advance either axis.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+/// `not_required`/`pending`/`committed_volatile`/`durable`/`failed`. Both axes come from
+/// the authoritative host receipt; admission alone does not advance either axis.
+///
+/// When `applied_tick` is present, all three revisions identify that command's
+/// retained application boundary. Otherwise the revisions describe the latest
+/// published observation, not a completed application or a failure boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommandStatusDto {
     pub command_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -424,9 +428,44 @@ pub struct CommandStatusDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object)]
     pub rejection_reason: Option<Value>,
+    /// Diagnosis from an admitted command whose application failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application_failure: Option<CommandFailureDto>,
     pub journal_state: String,
+    /// Independent journal failure; an applied command can still carry this failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_failure: Option<CommandFailureDto>,
+    /// Exact retained application tick, absent for admitted, rejected and failed commands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_tick: Option<u64>,
     pub control_revision: u64,
     pub scientific_revision: u64,
+    pub config_revision: u64,
+}
+
+/// Bounded diagnostic from one authoritative command-status axis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CommandFailureDto {
+    /// Owner-provided machine-readable category, at most 128 UTF-8 bytes.
+    pub code: String,
+    /// Owner-provided detail, at most 512 UTF-8 bytes.
+    pub message: String,
+    /// True when either diagnostic field was clipped at the transport boundary.
+    pub diagnostic_truncated: bool,
+}
+
+impl CommandFailureDto {
+    fn from_diagnostic(code: &str, message: &str) -> Self {
+        // Two failures plus the WebSocket envelope and a 1024-byte request ID
+        // fit its 16 KiB ceiling even under worst-case JSON escaping.
+        let (code, code_truncated) = bounded_owner_diagnostic(code, 128);
+        let (message, message_truncated) = bounded_owner_diagnostic(message, 512);
+        Self {
+            code,
+            message,
+            diagnostic_truncated: code_truncated || message_truncated,
+        }
+    }
 }
 
 /// Retry authority for exactly the observed failed experiment generation.
@@ -9214,6 +9253,13 @@ impl ControlHandle {
                 }
                 _ => None,
             },
+            application_failure: match status.application() {
+                ApplicationState::Failed(failure) => Some(CommandFailureDto::from_diagnostic(
+                    &failure.code,
+                    &failure.message,
+                )),
+                _ => None,
+            },
             journal_state: match status.journal() {
                 JournalState::NotRequired => "not_required",
                 JournalState::Pending => "pending",
@@ -9222,8 +9268,20 @@ impl ControlHandle {
                 JournalState::Failed(_) => "failed",
             }
             .to_owned(),
+            journal_failure: match status.journal() {
+                JournalState::Failed(failure) => Some(CommandFailureDto::from_diagnostic(
+                    &failure.code,
+                    &failure.message,
+                )),
+                _ => None,
+            },
+            applied_tick: match status.application() {
+                ApplicationState::Applied(applied) => Some(applied.tick.0),
+                _ => None,
+            },
             control_revision: revisions.control.get(),
             scientific_revision: revisions.scientific.get(),
+            config_revision: revisions.config.get(),
         })
     }
 
@@ -21195,6 +21253,210 @@ pub(crate) mod tests {
         );
         assert_eq!(polled.journal_state, "committed_volatile");
         assert_eq!(handle.status().expect("completed step").tick, before + 1);
+    }
+
+    #[test]
+    fn command_receipt_preserves_real_failure_and_original_applied_boundary() {
+        let owner = TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                rng_seed: Some(42),
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("receipt world"),
+        );
+        let handle = owner.handle();
+        let mut port = owner.port.clone();
+        let admitted = handle
+            .submit_command(
+                ControlCommand::SpawnCrossover {
+                    parent_a: scriptbots_core::AgentUid(900),
+                    parent_b: scriptbots_core::AgentUid(901),
+                },
+                Some("missing-crossover-parents"),
+            )
+            .expect("actual owner admission");
+        assert!(admitted.applied_tick.is_none());
+        assert!(admitted.application_failure.is_none());
+        let failed = owner.wait_finished(&admitted.command_id);
+        let command_id = serde_json::from_value(Value::String(admitted.command_id.clone()))
+            .expect("command identity");
+        let raw = port
+            .command_status(command_id)
+            .expect("raw owner lookup")
+            .expect("retained actual failure");
+        let ApplicationState::Failed(source) = raw.application() else {
+            panic!("missing parents must produce an actual application failure");
+        };
+        assert!(!source.code.is_empty());
+        assert!(!source.message.is_empty());
+        assert_eq!(failed.application_state, "failed");
+        assert_eq!(failed.journal_state, "committed_volatile");
+        assert_eq!(
+            failed.application_failure,
+            Some(CommandFailureDto {
+                code: source.code.clone(),
+                message: source.message.clone(),
+                diagnostic_truncated: false,
+            }),
+        );
+        assert!(failed.rejection_reason.is_none());
+        assert!(failed.journal_failure.is_none());
+        assert!(failed.applied_tick.is_none());
+        assert_eq!(handle.status().unwrap().tick, 0);
+
+        owner.wait_applied(
+            &handle
+                .apply_patch(serde_json::json!({"food_growth_rate": 0.02}))
+                .expect("configuration admission"),
+        );
+        let applied = owner.wait_applied(&handle.step().expect("first step"));
+        let id = serde_json::from_value(Value::String(applied.command_id.clone()))
+            .expect("applied command identity");
+        let raw = port.command_status(id).unwrap().unwrap();
+        let ApplicationState::Applied(boundary) = raw.application() else {
+            panic!("step must have applied");
+        };
+        assert_eq!(applied.applied_tick, Some(1));
+        assert_eq!(applied.control_revision, boundary.revisions.control.get());
+        assert_eq!(applied.scientific_revision, boundary.revisions.scientific.get());
+        assert_eq!(applied.config_revision, boundary.revisions.config.get());
+        assert!(applied.config_revision > 0);
+        assert!(applied.application_failure.is_none());
+        assert!(applied.journal_failure.is_none());
+
+        owner.wait_applied(
+            &handle
+                .apply_patch(serde_json::json!({"food_growth_rate": 0.03}))
+                .expect("later configuration admission"),
+        );
+        owner.wait_applied(&handle.step().expect("later step"));
+        let now = handle.read_snapshot().unwrap();
+        assert!(now.world.tick > boundary.tick.0);
+        assert!(now.revisions.control > boundary.revisions.control);
+        assert!(now.revisions.scientific > boundary.revisions.scientific);
+        assert!(now.revisions.config > boundary.revisions.config);
+        assert_eq!(
+            handle.command_status(&applied.command_id).unwrap().unwrap(),
+            applied,
+            "lookup must retain the command's cut rather than substitute current world progress",
+        );
+    }
+
+    #[test]
+    fn command_receipt_projects_independent_failures_without_inventing_application() {
+        use scriptbots_runtime::{
+            AdmissionSequence, ApplicationFailure, AppliedCommand, CommandStatus, ConfigRevision,
+            ControlRevision, HostRevisions, JournalFailure, RejectionReason,
+        };
+
+        let (handle, _owner) = handle();
+        let boundary = AppliedCommand {
+            tick: Tick(41),
+            revisions: HostRevisions {
+                control: ControlRevision::new(7),
+                scientific: ScientificRevision::new(11),
+                config: ConfigRevision::new(3),
+            },
+        };
+        let application_failure = ApplicationFailure {
+            code: "science_refused".into(),
+            message: "the retained scientific transition did not complete".into(),
+        };
+        let journal_failure = JournalFailure {
+            code: "disk_full".into(),
+            message: "the command journal could not commit".into(),
+        };
+        for (application, journal) in [
+            (
+                ApplicationState::Failed(application_failure.clone()),
+                JournalState::CommittedVolatile,
+            ),
+            (
+                ApplicationState::Applied(boundary),
+                JournalState::Failed(journal_failure.clone()),
+            ),
+            (
+                ApplicationState::Failed(application_failure.clone()),
+                JournalState::Failed(journal_failure.clone()),
+            ),
+            (
+                ApplicationState::Rejected(RejectionReason::ConfigRevisionConflict {
+                    expected: ConfigRevision::new(2),
+                    actual: ConfigRevision::new(3),
+                }),
+                JournalState::Failed(journal_failure.clone()),
+            ),
+        ] {
+            let raw = CommandStatus::try_new(
+                CommandId::new(0x71),
+                Some(AdmissionSequence::new(5)),
+                application.clone(),
+                journal.clone(),
+            )
+            .expect("valid independent owner axes");
+            let projected = handle.status_dto(raw).expect("receipt projection");
+            let wire = serde_json::to_value(&projected).unwrap();
+            assert_eq!(
+                projected.application_failure.is_some(),
+                matches!(application, ApplicationState::Failed(_)),
+            );
+            assert_eq!(
+                projected.journal_failure.is_some(),
+                matches!(journal, JournalState::Failed(_)),
+            );
+            if let Some(failure) = &projected.application_failure {
+                assert_eq!(failure.code, application_failure.code);
+                assert_eq!(failure.message, application_failure.message);
+                assert!(!failure.diagnostic_truncated);
+            } else {
+                assert!(wire.get("application_failure").is_none());
+            }
+            if let Some(failure) = &projected.journal_failure {
+                assert_eq!(failure.code, journal_failure.code);
+                assert_eq!(failure.message, journal_failure.message);
+                assert!(!failure.diagnostic_truncated);
+            } else {
+                assert!(wire.get("journal_failure").is_none());
+            }
+            if matches!(application, ApplicationState::Applied(_)) {
+                assert_eq!(projected.applied_tick, Some(41));
+                assert_eq!(projected.control_revision, 7);
+                assert_eq!(projected.scientific_revision, 11);
+                assert_eq!(projected.config_revision, 3);
+            } else {
+                assert!(wire.get("applied_tick").is_none());
+            }
+            assert_eq!(
+                projected.rejection_reason.is_some(),
+                matches!(application, ApplicationState::Rejected(_)),
+            );
+            assert_eq!(
+                serde_json::from_value::<CommandStatusDto>(wire).unwrap(),
+                projected,
+            );
+        }
+    }
+
+    #[test]
+    fn command_failure_diagnostics_preserve_utf8_and_label_only_actual_truncation() {
+        let code = "é".repeat(64);
+        let message = "💡".repeat(128);
+        let exact = CommandFailureDto::from_diagnostic(&code, &message);
+        assert_eq!(exact.code, code);
+        assert_eq!(exact.message, message);
+        assert!(!exact.diagnostic_truncated);
+
+        let clipped = CommandFailureDto::from_diagnostic(
+            &format!("{}💡", "a".repeat(127)),
+            &format!("{}💡", "b".repeat(511)),
+        );
+        assert_eq!(clipped.code, "a".repeat(127));
+        assert_eq!(clipped.message, "b".repeat(511));
+        assert!(clipped.diagnostic_truncated);
     }
 
     /// A stale revision is rejected by the owner without advancing science.

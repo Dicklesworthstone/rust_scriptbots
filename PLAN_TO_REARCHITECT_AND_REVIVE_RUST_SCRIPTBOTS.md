@@ -2,6 +2,31 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Actionable command failures and retained application boundaries (2026-11-26):**
+[Source implemented and independently reviewed; native execution validation pending —
+Codex; corrective contribution to `bd-2z0.4.9`;
+original complete acceptance retained]
+
+REST, MCP and WebSocket command receipts preserve independent application and
+journal failure diagnoses. Applied commands retain their actual tick and all
+three owner revisions; later simulation or configuration progress cannot replace
+that boundary. Other application states omit the applied tick and identify their
+revisions as the latest published observation. UTF-8-safe diagnostic limits and
+explicit truncation flags keep both failure axes within the browser control
+frame budget. OpenAPI exposes the complete receipt.
+
+The control CLI checks both axes for submission, configuration, map, preset,
+shutdown and status responses. A command whose application succeeded but journal
+failed remains visibly applied and returns a failed process outcome with the
+journal diagnosis, rather than presenting an ordinary successful admission.
+
+Authored regressions cover a real owner failure, retained metadata after later
+progress, independent failure combinations, UTF-8 limits, CLI outcomes, the
+actual transport byte budget, OpenAPI and REST/MCP/WebSocket parity. Independent
+source review completed. Native formatting, compilation, Clippy and execution
+remain unverified after storage exhaustion and repeated executor disconnections.
+No original qualification gate is closed.
+
 **Bulk debug inspection at incomplete scientific boundaries (2026-11-25):**
 [Source implemented and independently reviewed; execution validation pending —
 Codex; corrective contribution to `bd-16g.15.2` and `bd-2z0.12.2`;

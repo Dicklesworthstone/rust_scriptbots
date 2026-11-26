@@ -39,8 +39,8 @@ use crate::command::CommandSubmit;
 use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
     CheckpointBranchRequest, CheckpointBranchStatusDto, CheckpointCreateRequest,
-    CheckpointMetadataDto, CheckpointRetentionDto, CommandStatusDto, ConfigSnapshot, ControlError,
-    ControlHandle, DietClassDto, EventEntry, EventKind, ExperimentBatchStatusDto,
+    CheckpointMetadataDto, CheckpointRetentionDto, CommandFailureDto, CommandStatusDto, ConfigSnapshot,
+    ControlError, ControlHandle, DietClassDto, EventEntry, EventKind, ExperimentBatchStatusDto,
     ExperimentComparisonDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
     ExperimentRetryFailedRequest, ExperimentRunArtifactsDto, ExperimentRunRecordDto,
     ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody,
@@ -1775,6 +1775,7 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
             AgentDebugEntryDto,
             PositionDto,
             SelectionUpdateRequestBody,
+            CommandFailureDto,
             CommandStatusDto,
             StepRequestBody,
             SpeedRequestBody,
@@ -12451,6 +12452,156 @@ mod tests {
         .await
         .expect_err("unknown command id must return 404 not found");
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn command_failure_fields_are_discoverable_in_openapi() {
+        let document = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI document");
+        let schemas = &document["components"]["schemas"];
+        let receipt = &schemas["CommandStatusDto"]["properties"];
+        for field in [
+            "application_failure",
+            "journal_failure",
+            "applied_tick",
+            "config_revision",
+        ] {
+            assert!(!receipt[field].is_null(), "missing receipt field {field}");
+        }
+        let failure = &schemas["CommandFailureDto"]["properties"];
+        assert_eq!(failure["code"]["type"], "string");
+        assert_eq!(failure["message"]["type"], "string");
+        assert_eq!(failure["diagnostic_truncated"]["type"], "boolean");
+    }
+
+    #[test]
+    fn two_maximum_command_failures_fit_the_browser_control_frame() {
+        // JSON escapes each of these one-byte controls to six bytes. Include
+        // both independent axes and the largest valid echoed request identity.
+        let failure = CommandFailureDto {
+            code: "\u{1}".repeat(128),
+            message: "\u{1}".repeat(512),
+            diagnostic_truncated: true,
+        };
+        let receipt = CommandStatusDto {
+            command_id: scriptbots_runtime::CommandId::new(u128::MAX).to_string(),
+            admission_sequence: Some(u64::MAX),
+            application_state: "failed".into(),
+            rejection_reason: None,
+            application_failure: Some(failure.clone()),
+            journal_state: "failed".into(),
+            journal_failure: Some(failure),
+            applied_tick: None,
+            control_revision: u64::MAX,
+            scientific_revision: u64::MAX,
+            config_revision: u64::MAX,
+        };
+        let reply = WsControlReply {
+            protocol_version: WS_CONTROL_PROTOCOL_VERSION,
+            request_id: Some("\u{1}".repeat(1024)),
+            outcome: WsControlOutcome::Receipt { receipt },
+        };
+        let bytes = serde_json::to_vec(&reply).expect("bounded receipt envelope");
+        assert!(
+            bytes.len() <= MAX_WS_CONTROL_MESSAGE_BYTES,
+            "{} bytes exceeds the browser control-frame bound",
+            bytes.len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn command_failures_and_applied_metadata_survive_rest_mcp_and_websocket() {
+        let host = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                rng_seed: Some(42),
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("small paused world"),
+        );
+        let handle = host.handle();
+        let failed = handle
+            .submit_command(
+                scriptbots_core::ControlCommand::SpawnCrossover {
+                    parent_a: scriptbots_core::AgentUid(900),
+                    parent_b: scriptbots_core::AgentUid(901),
+                },
+                None,
+            )
+            .expect("admit command with absent parents");
+        let failed = host.wait_finished(&failed.command_id);
+        assert_eq!(failed.application_state, "failed");
+        assert!(failed.application_failure.is_some());
+        assert!(failed.applied_tick.is_none());
+        let applied = host.wait_applied(&handle.step().expect("admit real step"));
+        assert_eq!(applied.applied_tick, Some(1));
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("receipt-fields", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "receipt-fields", "version": "0"},
+                },
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        for (index, command_id) in [failed.command_id, applied.command_id].into_iter().enumerate() {
+            // Non-applied revisions describe the current owner observation;
+            // sample after both commands so the three read surfaces agree.
+            let expected = handle
+                .command_status(&command_id)
+                .expect("owner lookup")
+                .expect("retained receipt");
+            let Json(rest) = get_control_status(
+                State(state.clone()),
+                axum::extract::Path(command_id.clone()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("REST owner status: {}", error.message));
+            assert_eq!(rest, expected);
+            let result = map_policy_mcp_request(
+                &mcp,
+                json!({
+                    "jsonrpc": "2.0", "id": index + 2, "method": "tools/call",
+                    "params": {
+                        "name": "get_command_status",
+                        "arguments": {"command_id": command_id},
+                    },
+                }),
+            )
+            .await;
+            assert!(result.get("error").is_none(), "{result}");
+            let via_mcp: CommandStatusDto = serde_json::from_str(
+                result["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("MCP receipt JSON"),
+            )
+            .expect("complete MCP receipt");
+            assert_eq!(via_mcp, expected);
+            let websocket = websocket_receipt(
+                apply_ws_control_message(
+                    handle.clone(),
+                    json!({
+                        "command": "status", "request_id": "receipt-fields",
+                        "command_id": command_id,
+                    })
+                    .to_string(),
+                )
+                .await,
+            );
+            assert_eq!(websocket, expected);
+        }
     }
 
     #[tokio::test]
