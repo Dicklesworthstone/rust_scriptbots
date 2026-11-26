@@ -3793,6 +3793,9 @@ struct CanvasReplayLimits {
 #[derive(Default)]
 struct CanvasReplayPendingInputs {
     arrivals: usize,
+    // Archive selection happens again at the due boundary, after any intervening
+    // configuration edits. Retain the bounded selectors, not a stale count.
+    archive_spawns: Vec<(scriptbots_core::CellSelector, Option<u32>)>,
     closed: Option<bool>,
 }
 
@@ -3854,14 +3857,24 @@ impl CanvasReplayLimits {
         command: &ControlCommand,
         pending: &mut CanvasReplayPendingInputs,
     ) -> Result<(), ControlError> {
+        let mut pending_arrivals = self.pending_arrivals(world, pending)?;
         let arrivals = match command {
             ControlCommand::SpawnAgent { .. } | ControlCommand::SpawnCrossover { .. } => 1,
             ControlCommand::Intervention(command) => {
                 match &command.intervention {
                     scriptbots_core::Intervention::InjectCohort { count, .. } => {
                         let count = usize::from(*count);
-                        self.validate_arrivals(world, pending.arrivals, count)?;
+                        self.validate_arrivals(world, pending_arrivals, count)?;
                         pending.arrivals += count;
+                        pending_arrivals += count;
+                    }
+                    scriptbots_core::Intervention::SpawnFromArchive {
+                        selector, headroom, ..
+                    } => {
+                        let count = Self::archive_spawn_count(world, selector, *headroom)?;
+                        self.validate_arrivals(world, pending_arrivals, count)?;
+                        pending.archive_spawns.push((selector.clone(), *headroom));
+                        pending_arrivals += count;
                     }
                     scriptbots_core::Intervention::SetClosedWorld { closed } => {
                         pending.closed = Some(*closed);
@@ -3872,7 +3885,78 @@ impl CanvasReplayLimits {
             }
             _ => 0,
         };
-        self.validate_arrivals(world, pending.arrivals, arrivals)
+        self.validate_arrivals(world, pending_arrivals, arrivals)
+    }
+
+    fn archive_spawn_count(
+        world: &WorldState,
+        selector: &scriptbots_core::CellSelector,
+        headroom: Option<u32>,
+    ) -> Result<usize, ControlError> {
+        let archive = world.archive().ok_or_else(|| {
+            ControlError::BadRequest(
+                "checkpoint replay requires a retained behavioral archive at resurrection".into(),
+            )
+        })?;
+        let headroom = usize::try_from(headroom.unwrap_or(scriptbots_core::MAX_COHORT_INJECTION))
+            .map_err(|error| ControlError::PayloadTooLarge(error.to_string()))?;
+        // Count without materializing or sorting selected cells before admission.
+        // Explicit selectors retain duplicates, matching core resurrection semantics.
+        let stop_after = headroom.saturating_add(1);
+        let count = match selector {
+            scriptbots_core::CellSelector::All => archive.cells.len(),
+            scriptbots_core::CellSelector::TopKByQuality(k) => {
+                archive.cells.len().min(usize::from(*k))
+            }
+            scriptbots_core::CellSelector::AxisRange(ranges) => archive
+                .cells
+                .values()
+                .filter(|entry| {
+                    ranges.iter().all(|&(axis, lo, hi)| {
+                        entry
+                            .descriptor
+                            .0
+                            .get(axis)
+                            .is_some_and(|&value| !(value < lo || value > hi))
+                    })
+                })
+                .take(stop_after)
+                .count(),
+            scriptbots_core::CellSelector::Explicit(ids) => ids
+                .iter()
+                .filter(|id| archive.cells.contains_key(*id))
+                .take(stop_after)
+                .count(),
+        };
+        if count > headroom {
+            return Err(ControlError::PayloadTooLarge(
+                "checkpoint replay exceeds archive resurrection headroom".into(),
+            ));
+        }
+        Ok(count)
+    }
+
+    fn pending_arrivals(
+        self,
+        world: &WorldState,
+        pending: &CanvasReplayPendingInputs,
+    ) -> Result<usize, ControlError> {
+        let mut arrivals = pending.arrivals;
+        // Config edits can disable and then recreate an archive at one boundary.
+        // Its absence is fatal at enqueue or the due step, not between those edits.
+        if world.archive().is_some() {
+            for (selector, headroom) in &pending.archive_spawns {
+                arrivals = arrivals
+                    .checked_add(Self::archive_spawn_count(world, selector, *headroom)?)
+                    .ok_or_else(|| {
+                        ControlError::PayloadTooLarge(
+                            "checkpoint replay population admission overflowed".into(),
+                        )
+                    })?;
+            }
+        }
+        self.validate_arrivals(world, arrivals, 0)?;
+        Ok(arrivals)
     }
 
     fn validate_step(
@@ -3881,12 +3965,17 @@ impl CanvasReplayLimits {
         pending: &CanvasReplayPendingInputs,
     ) -> Result<(), ControlError> {
         self.validate_world(world)?;
-        self.validate_arrivals(world, pending.arrivals, 0)?;
+        if world.archive().is_none()
+            && let Some((selector, headroom)) = pending.archive_spawns.first()
+        {
+            Self::archive_spawn_count(world, selector, *headroom)?;
+        }
+        let pending_arrivals = self.pending_arrivals(world, pending)?;
         let config = world.config();
         if !pending.closed.unwrap_or(config.closed) {
             let population = world
                 .agent_count()
-                .checked_add(pending.arrivals)
+                .checked_add(pending_arrivals)
                 .map(|population| population.max(config.population_minimum))
                 .ok_or_else(|| {
                     ControlError::PayloadTooLarge(
@@ -7797,8 +7886,8 @@ impl ControlHandle {
     /// Other scientific revisions refuse before stepping. The atomic current digest
     /// must also match before the reconstructed target is published.
     /// Complete sources retain their companion science during reconstruction.
-    /// Archive resurrection still requires its separate input-history admission
-    /// contract and remains explicitly refused.
+    /// Archive resurrection additionally requires a complete source checkpoint
+    /// whose retained behavioral archive is replayed with the scientific inputs.
     pub(crate) fn event_canvas(&self, target_tick: u64) -> Result<EventCanvasReview, ControlError> {
         let retained = self
             .data_services
@@ -8131,7 +8220,7 @@ impl ControlHandle {
             )?;
             if let Some(limits) = limits {
                 limits.validate_world(world)?;
-                limits.validate_arrivals(world, pending.arrivals, 0)?;
+                limits.pending_arrivals(world, &pending)?;
             }
             if world.config_revision() != expected {
                 return Err(ControlError::InvalidPatch(
@@ -8306,10 +8395,11 @@ impl ControlHandle {
                     command.intervention,
                     scriptbots_core::Intervention::SpawnFromArchive { .. }
                 )
+                && retained.metadata.schema != scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA
             {
                 return Err(ControlError::BadRequest(
-                    "event review requires a source-bound behavioral archive \
-                     for archive resurrection"
+                    "event review requires a complete source checkpoint with its \
+                     retained behavioral archive for archive resurrection"
                         .into(),
                 ));
             }
@@ -9957,11 +10047,9 @@ pub(crate) mod tests {
                     FixedDeadlineHost, ManualInstant,
                     channel::{ChannelHostDriver, ChannelRunOutcome},
                 };
-                let (mut driver, port) = ChannelHostDriver::new(
-                    FixedDeadlineHost::new(build_owner()),
-                    channel_options,
-                )
-                .expect("channel owner");
+                let (mut driver, port) =
+                    ChannelHostDriver::new(FixedDeadlineHost::new(build_owner()), channel_options)
+                        .expect("channel owner");
                 send.send(port).expect("publish test port");
                 let epoch = std::time::Instant::now();
                 let receipt = driver
@@ -13839,28 +13927,82 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &published));
     }
 
+    fn event_canvas_archive_world() -> WorldState {
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 120,
+            world_height: 120,
+            food_cell_size: 20,
+            rng_seed: Some(42),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            reproduction_energy_threshold: f32::MAX,
+            metabolism_drain: 0.0,
+            metabolism_ramp_rate: 0.0,
+            movement_drain: 0.0,
+            spike_damage: 0.0,
+            archive_enabled: true,
+            archive_interval: 1,
+            archive_min_lifetime_ticks: 1,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        let brains = crate::install_brains(&mut world, crate::BrainPreset::Mlp).unwrap();
+        for diet in [0.2, 0.8] {
+            let agent = world
+                .try_spawn_agent_with(scriptbots_core::AgentData::default(), |runtime| {
+                    runtime.herbivore_tendency = diet;
+                })
+                .unwrap();
+            assert!(
+                world
+                    .bind_agent_brain(agent, brains.population()[0])
+                    .unwrap()
+            );
+        }
+        world.step().unwrap();
+        world.step().unwrap();
+        assert!(world.archive().unwrap().coverage_count() >= 2);
+        // No replayed tick may rebuild a discarded archive from the live agents.
+        // The resurrection below must actually depend on the saved source history.
+        let mut config = world.config().clone();
+        config.archive_interval = 1_000;
+        world.apply_config_update(config).unwrap();
+        world
+    }
+
+    fn event_canvas_archive_command(
+        selector: scriptbots_core::CellSelector,
+        headroom: u32,
+    ) -> ControlCommand {
+        ControlCommand::Intervention(Box::new(scriptbots_core::InterventionCommand::new(
+            scriptbots_core::Intervention::SpawnFromArchive {
+                selector,
+                placement: scriptbots_core::Placement::Seeded {
+                    region: scriptbots_core::Region::All,
+                    seed: 0x51a7,
+                },
+                headroom: Some(headroom),
+                herbivore_tendency: Some(0.7),
+            },
+            scriptbots_core::InterventionSurface::Script,
+            "archive-replay",
+        )))
+    }
+
     #[test]
-    fn event_canvas_retains_archive_input_admission_refusal_for_full_sources() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real archived-genome resurrection proves complete-source replay, exact target oracles and source-loss refusals"
+    )]
+    fn event_canvas_replays_archive_resurrection_from_complete_sources() {
         let directory = tempfile::Builder::new()
             .prefix("event-archive-authority-")
             .tempdir()
             .unwrap()
             .keep();
-        let host = TestHost::spawn(
-            WorldState::new(ScriptBotsConfig {
-                world_width: 40,
-                world_height: 40,
-                food_cell_size: 10,
-                rng_seed: Some(42),
-                persistence_interval: 0,
-                population_minimum: 0,
-                population_spawn_interval: 0,
-                closed: true,
-                archive_enabled: true,
-                ..ScriptBotsConfig::default()
-            })
-            .unwrap(),
-        );
+        let host = TestHost::spawn(event_canvas_archive_world());
         let handle = host.handle().with_artifacts_dir(directory).unwrap();
         let checkpoint = handle
             .create_checkpoint(CheckpointCreateRequest::default())
@@ -13869,32 +14011,122 @@ pub(crate) mod tests {
             checkpoint.schema,
             scriptbots_runtime::HOST_CHECKPOINT_V1_SCHEMA
         );
+        let saved = handle
+            .verified_canvas_source(&checkpoint.checkpoint_id)
+            .unwrap();
+        assert!(saved.standalone_science().is_err());
+        let source = handle
+            .data_services
+            .checkpoint_retention
+            .lock()
+            .unwrap()
+            .requests
+            .values()
+            .next()
+            .unwrap()
+            .clone();
         host.wait_applied(&handle.step().unwrap());
-        let target = handle.read_snapshot().unwrap().world.tick;
+        let before = host.port.scientific_digest_v1().unwrap();
+        host.wait_applied(&handle.step().unwrap());
         let command = handle
-            .submit_control_command(ControlCommand::Intervention(Box::new(
-                scriptbots_core::InterventionCommand::new(
-                    scriptbots_core::Intervention::SpawnFromArchive {
-                        selector: scriptbots_core::CellSelector::All,
-                        placement: scriptbots_core::Placement::Seeded {
-                            region: scriptbots_core::Region::All,
-                            seed: 1,
-                        },
-                        headroom: None,
-                        herbivore_tendency: None,
-                    },
-                    scriptbots_core::InterventionSurface::Script,
-                    "archive-authority-guard",
-                ),
-            )))
+            .submit_control_command(event_canvas_archive_command(
+                scriptbots_core::CellSelector::TopKByQuality(1),
+                1,
+            ))
             .unwrap();
         host.wait_applied(&command);
+        let pending_tick = handle.read_snapshot().unwrap().world.tick;
+        assert!(host.port.scientific_digest_v1().is_err());
+        host.wait_applied(&handle.step().unwrap());
+        let after = host.port.scientific_digest_v1().unwrap();
+        assert_eq!(handle.read_snapshot().unwrap().world.agents.len(), 3);
         host.wait_applied(&handle.step().unwrap());
         let current = host.port.scientific_digest_cut().unwrap();
+        let published = handle.read_snapshot().unwrap();
         assert_eq!(current.scientific_commands.len(), 1);
+        let commands =
+            ControlHandle::event_review_scientific_commands(&source, &current, before.tick.0, &[])
+                .unwrap();
+        let replay = |world, tick, limits| {
+            ControlHandle::replay_event_canvas_world_restored(
+                world,
+                saved.science(),
+                &current.digest,
+                &[],
+                &commands,
+                tick,
+                source.source_persistence_interval,
+                source.source_config_revision,
+                limits,
+            )
+        };
+        for (expected, population) in [(&before, 2), (&after, 3)] {
+            let target = replay(
+                ControlHandle::restore_catalog_world(&saved).unwrap(),
+                expected.tick.0,
+                Some(CanvasReplayLimits::REMOTE),
+            )
+            .unwrap();
+            assert_eq!(&target.world_digest_v1().unwrap(), expected);
+            assert_eq!(target.agent_count(), population);
+            let native = handle.event_canvas(expected.tick.0).unwrap();
+            let (metadata, remote) = handle
+                .replay_canvas_from_checkpoint_bounded(
+                    handle.session_id(),
+                    &checkpoint.checkpoint_id,
+                    expected.tick.0,
+                )
+                .unwrap();
+            assert_eq!(metadata, checkpoint);
+            assert_eq!(native.snapshot.world.tick, expected.tick.0);
+            assert_eq!(native.snapshot.world.agents.len(), population);
+            assert_eq!(remote.verification, native.verification);
+            assert_eq!(
+                serde_json::to_value(&remote.snapshot.world).unwrap(),
+                serde_json::to_value(&native.snapshot.world).unwrap()
+            );
+        }
+
+        let mut pending = replay(
+            ControlHandle::restore_catalog_world(&saved).unwrap(),
+            pending_tick,
+            Some(CanvasReplayLimits::REMOTE),
+        )
+        .unwrap();
+        assert!(pending.world_digest_v1().is_err());
+        pending.step().unwrap();
+        assert_eq!(pending.agent_count(), 3);
+        assert_eq!(pending.world_digest_v1().unwrap(), after);
+
+        let mut raw_source = source.clone();
+        raw_source.metadata.schema = scriptbots_core::WORLD_CHECKPOINT_V1_SCHEMA.to_owned();
         assert!(matches!(
-            handle.event_canvas(target),
-            Err(ControlError::BadRequest(message)) if message.contains("source-bound behavioral archive")
+            ControlHandle::event_review_scientific_commands(
+                &raw_source,
+                &current,
+                before.tick.0,
+                &[],
+            ),
+            Err(ControlError::BadRequest(message)) if message.contains("complete source checkpoint")
+        ));
+        let mut missing_archive = ControlHandle::restore_catalog_world(&saved).unwrap();
+        let config = missing_archive.config();
+        let empty_archive = scriptbots_core::MapElitesArchive::new(
+            config.archive_space.clone(),
+            config.archive_quality_metric,
+            config.archive_min_lifetime_ticks,
+            config.archive_max_bytes,
+        )
+        .unwrap();
+        *missing_archive.archive_mut().unwrap() = empty_archive;
+        assert_eq!(
+            &missing_archive.world_digest_v1().unwrap(),
+            saved.science().source_digest(),
+            "the source science digest alone does not prove retained archive history"
+        );
+        assert!(matches!(
+            replay(missing_archive, before.tick.0, Some(CanvasReplayLimits::REMOTE)),
+            Err(ControlError::InvalidPatch(message)) if message.contains("captured current scientific digest")
         ));
         assert_eq!(
             handle
@@ -13907,6 +14139,137 @@ pub(crate) mod tests {
             "the independently verified source cut remains directly inspectable"
         );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), current.digest);
+        assert!(Arc::ptr_eq(&handle.read_snapshot().unwrap(), &published));
+    }
+
+    #[test]
+    fn bounded_event_replay_checks_archive_cohorts_before_enqueue_and_at_due_boundary() {
+        let mut world = event_canvas_archive_world();
+        let limits = CanvasReplayLimits {
+            max_agents: world.agent_count() + 1,
+        };
+        let mut pending = CanvasReplayPendingInputs::default();
+        let before = world.world_digest_v1().unwrap();
+        let oversized = event_canvas_archive_command(scriptbots_core::CellSelector::All, 1);
+        assert!(matches!(
+            limits.admit_command(&world, &oversized, &mut pending),
+            Err(ControlError::PayloadTooLarge(message)) if message.contains("resurrection headroom")
+        ));
+        assert!(pending.archive_spawns.is_empty());
+        assert_eq!(world.world_digest_v1().unwrap(), before);
+
+        let command =
+            event_canvas_archive_command(scriptbots_core::CellSelector::TopKByQuality(1), 1);
+        limits
+            .admit_command(&world, &command, &mut pending)
+            .unwrap();
+        scriptbots_core::apply_control_command(&mut world, command.clone()).unwrap();
+        assert!(matches!(
+            limits.admit_command(&world, &command, &mut pending),
+            Err(ControlError::PayloadTooLarge(message)) if message.contains("agent admission bound")
+        ));
+        assert_eq!(pending.archive_spawns.len(), 1);
+        limits.validate_step(&world, &pending).unwrap();
+        world.step().unwrap();
+        assert_eq!(world.agent_count(), limits.max_agents);
+
+        let mut world = event_canvas_archive_world();
+        let mut pending = CanvasReplayPendingInputs::default();
+        limits
+            .admit_command(&world, &command, &mut pending)
+            .unwrap();
+        scriptbots_core::apply_control_command(&mut world, command).unwrap();
+        let before_tick = world.tick();
+        let before_count = world.agent_count();
+        let mut config = world.config().clone();
+        config.archive_enabled = false;
+        world.apply_config_update(config).unwrap();
+        assert!(matches!(
+            limits.validate_step(&world, &pending),
+            Err(ControlError::BadRequest(message)) if message.contains("retained behavioral archive")
+        ));
+        assert_eq!(world.tick(), before_tick);
+        assert_eq!(world.agent_count(), before_count);
+
+        let closed =
+            ControlCommand::Intervention(Box::new(scriptbots_core::InterventionCommand::new(
+                scriptbots_core::Intervention::SetClosedWorld { closed: false },
+                scriptbots_core::InterventionSurface::Script,
+                "archive-replay",
+            )));
+        limits.admit_command(&world, &closed, &mut pending).unwrap();
+        scriptbots_core::apply_control_command(&mut world, closed).unwrap();
+        let mut config = world.config().clone();
+        config.archive_enabled = true;
+        world.apply_config_update(config).unwrap();
+        assert_eq!(world.archive().unwrap().coverage_count(), 0);
+        limits.validate_step(&world, &pending).unwrap();
+        world.step().unwrap();
+        assert_eq!(world.agent_count(), before_count);
+        assert!(!world.config().closed);
+    }
+
+    #[test]
+    fn bounded_event_replay_rechecks_growing_and_shrinking_archive_at_due_boundary() {
+        let mut world = event_canvas_archive_world();
+        let populated = world.archive().unwrap().clone();
+        let (&first_cell, first_entry) = populated.cells.first_key_value().unwrap();
+        let mut single = scriptbots_core::MapElitesArchive::new(
+            populated.space.clone(),
+            populated.quality_metric,
+            populated.min_lifetime_ticks,
+            populated.max_archive_bytes,
+        )
+        .unwrap();
+        single.insert(first_entry.clone()).unwrap();
+        *world.archive_mut().unwrap() = single.clone();
+        let limits = CanvasReplayLimits {
+            max_agents: world.agent_count() + 1,
+        };
+        let mut pending = CanvasReplayPendingInputs::default();
+
+        let repeated = event_canvas_archive_command(
+            scriptbots_core::CellSelector::Explicit(vec![first_cell, first_cell]),
+            2,
+        );
+        assert!(matches!(
+            limits.admit_command(&world, &repeated, &mut pending),
+            Err(ControlError::PayloadTooLarge(message)) if message.contains("agent admission bound")
+        ));
+        assert!(pending.archive_spawns.is_empty());
+        let diet = first_entry.descriptor.0[0];
+        assert_eq!(
+            CanvasReplayLimits::archive_spawn_count(
+                &world,
+                &scriptbots_core::CellSelector::AxisRange(vec![(0, diet, diet)]),
+                Some(1),
+            )
+            .unwrap(),
+            1
+        );
+
+        let command = event_canvas_archive_command(
+            scriptbots_core::CellSelector::All,
+            u32::try_from(populated.coverage_count()).unwrap(),
+        );
+        limits
+            .admit_command(&world, &command, &mut pending)
+            .unwrap();
+        scriptbots_core::apply_control_command(&mut world, command).unwrap();
+        let before_tick = world.tick();
+        let before_count = world.agent_count();
+        *world.archive_mut().unwrap() = populated;
+        assert!(matches!(
+            limits.validate_step(&world, &pending),
+            Err(ControlError::PayloadTooLarge(message)) if message.contains("agent admission bound")
+        ));
+        assert_eq!(world.tick(), before_tick);
+        assert_eq!(world.agent_count(), before_count);
+
+        *world.archive_mut().unwrap() = single;
+        limits.validate_step(&world, &pending).unwrap();
+        world.step().unwrap();
+        assert_eq!(world.agent_count(), before_count + 1);
     }
 
     #[test]
