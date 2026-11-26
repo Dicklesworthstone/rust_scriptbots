@@ -30,8 +30,10 @@ use scriptbots_app::control::{
     MAX_ARTIFACT_DOWNLOAD_BYTES, MAX_CHECKPOINT_BRANCH_REQUEST_BYTES,
     MAX_EXPERIMENT_RUN_ARTIFACT_BYTES, MAX_EXPERIMENT_RUN_ARTIFACTS,
     MAX_EXPERIMENT_RUN_ARTIFACTS_RESPONSE_BYTES, MAX_EXPERIMENT_RUN_TOTAL_ARTIFACT_BYTES,
+    MAX_STEP_BATCH, MAX_STEP_BATCH_ID_BYTES, MAX_STEP_BATCH_PAGE_BYTES, MAX_STEP_BATCH_PAGE_SIZE,
     MapApplyAgentPolicy, PaginatedArtifactsResponse, PaginatedCheckpointBranchesResponse,
-    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, compute_blake3, compute_sha256,
+    PaginatedCheckpointsResponse, PaginatedExperimentsResponse, StepBatchDto, StepBatchPhase,
+    compute_blake3, compute_sha256,
 };
 use scriptbots_app::experiment_runner::{EXPERIMENT_ENDPOINT_METRICS, verify_portable_run_bundle};
 use scriptbots_app::{
@@ -67,11 +69,12 @@ struct Cli {
     )]
     base_url: String,
 
-    /// Stable key making a retry of this command safe.
+    /// Retry identity for supported commands while the owner retains it.
     ///
-    /// Sent as the `Idempotency-Key` header. Re-running the same command with
-    /// the same key returns the ORIGINAL receipt and submits nothing, so a
-    /// retry after a timeout cannot double-apply (bd-k7nq).
+    /// Single commands send the `Idempotency-Key` header. For step batches the
+    /// key binds a count only for this control-service lifetime. After reservation,
+    /// resume execution with the printed batch ID; never recreate an unknown
+    /// batch as an execution retry after a service restart.
     #[arg(long, global = true)]
     idempotency_key: Option<String>,
 
@@ -146,11 +149,30 @@ enum Command {
     Pause,
     /// Resume the running simulation.
     Resume,
-    /// Advance the simulation by N ticks.
+    /// Request N single steps, retaining a resumable batch when N exceeds one.
     Step {
-        /// Number of ticks to advance (defaults to 1).
-        #[arg(default_value_t = 1)]
-        count: u64,
+        /// Number of steps; defaults to one. Also accepted as --count.
+        #[arg(value_name = "COUNT", conflicts_with = "count_option")]
+        count: Option<u64>,
+        #[arg(long = "count", value_name = "COUNT", conflicts_with = "count")]
+        count_option: Option<u64>,
+        /// Maximum seconds to wait for a multi-step batch; retain its ID on timeout.
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
+    /// Continue an existing step batch by its exact ID; never create a replacement.
+    ResumeStepBatch {
+        id: String,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
+    /// Read one bounded page of a step batch's retained command receipts.
+    LookupStepBatch {
+        id: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..=16))]
+        limit: u16,
     },
     /// Set target simulation speed multiplier.
     Speed {
@@ -542,7 +564,26 @@ async fn main() -> Result<()> {
                 Command::Hydrology => hydrology_command(&client, &cli.base_url).await?,
                 Command::Pause => pause_command(&client, &cli.base_url, key).await?,
                 Command::Resume => resume_command(&client, &cli.base_url, key).await?,
-                Command::Step { count } => step_command(&client, &cli.base_url, count, key).await?,
+                Command::Step {
+                    count,
+                    count_option,
+                    wait_seconds,
+                } => {
+                    step_command(
+                        &client,
+                        &cli.base_url,
+                        count_option.or(count).unwrap_or(1),
+                        key,
+                        wait_seconds,
+                    )
+                    .await?
+                }
+                Command::ResumeStepBatch { id, wait_seconds } => {
+                    resume_step_batch_command(&client, &cli.base_url, &id, wait_seconds).await?
+                }
+                Command::LookupStepBatch { id, offset, limit } => {
+                    lookup_step_batch_command(&client, &cli.base_url, &id, offset, limit).await?
+                }
                 Command::Speed { value } => {
                     speed_command(&client, &cli.base_url, value, key).await?
                 }
@@ -2533,16 +2574,366 @@ async fn step_command(
     base_url: &str,
     count: u64,
     idempotency_key: Option<&str>,
+    wait_seconds: u64,
 ) -> Result<()> {
-    issue_control_command(
+    if count == 0 || count > MAX_STEP_BATCH {
+        bail!("step count must be in 1..={MAX_STEP_BATCH}");
+    }
+    if count == 1 {
+        return issue_control_command(
+            client,
+            base_url,
+            "/api/step",
+            "step",
+            Some(serde_json::json!({ "count": count })),
+            idempotency_key,
+        )
+        .await;
+    }
+    let mut output = io::stdout();
+    create_and_drive_step_batch(
         client,
         base_url,
-        "/api/step",
-        "step",
-        Some(serde_json::json!({ "count": count })),
+        count,
         idempotency_key,
+        wait_seconds,
+        &mut output,
     )
     .await
+}
+
+fn step_batch_url(base_url: &str, batch_id: Option<&str>, advance: bool) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url).context("invalid control API base URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("control API base URL must be HTTP(S) without a query or fragment");
+    }
+    if let Some(id) = batch_id
+        && (id.is_empty()
+            || id.len() > MAX_STEP_BATCH_ID_BYTES
+            || matches!(id, "." | "..")
+            || id
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '/' | '\\')))
+    {
+        bail!("invalid step batch ID");
+    }
+    if advance && batch_id.is_none() {
+        bail!("advancing requires an existing step batch ID");
+    }
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("control API base URL cannot contain path segments"))?;
+        path.pop_if_empty()
+            .extend(["api", "control", "step-batches"]);
+        if let Some(id) = batch_id {
+            path.push(id);
+        }
+        if advance {
+            path.push("advance");
+        }
+    }
+    Ok(url)
+}
+
+fn step_batch_deadline(wait_seconds: u64) -> Result<Instant> {
+    if !(1..=300).contains(&wait_seconds) {
+        bail!("--wait-seconds must be in 1..=300");
+    }
+    Instant::now()
+        .checked_add(Duration::from_secs(wait_seconds))
+        .context("step batch wait deadline overflowed")
+}
+
+async fn step_batch_response(
+    request: reqwest::RequestBuilder,
+    deadline: Instant,
+) -> Result<StepBatchDto> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("step batch wait budget expired")?;
+    let response = request
+        .timeout(remaining)
+        .send()
+        .await
+        .context("step batch request outcome is unconfirmed")?;
+    let status = response.status();
+    let bytes = bounded_response_bytes(response, MAX_STEP_BATCH_PAGE_BYTES).await?;
+    if !status.is_success() {
+        bail!(
+            "step batch request failed ({status}): {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    serde_json::from_slice(&bytes).context("invalid step batch response")
+}
+
+fn step_batch_hints(base_url: &str, batch_id: &str, wait_seconds: u64) -> Result<(String, String)> {
+    let executable = std::env::current_exe()
+        .context("failed to locate this control CLI executable")?
+        .display()
+        .to_string()
+        .replace('\'', "'\\''");
+    let base = base_url.replace('\'', "'\\''");
+    let id = batch_id.replace('\'', "'\\''");
+    Ok((
+        format!(
+            "'{executable}' --base-url '{base}' resume-step-batch '{id}' --wait-seconds {wait_seconds}"
+        ),
+        format!(
+            "'{executable}' --base-url '{base}' lookup-step-batch '{id}' --offset 0 --limit 16"
+        ),
+    ))
+}
+
+fn write_step_batch_identity(
+    output: &mut impl Write,
+    batch_id: &str,
+    resume: &str,
+    lookup: &str,
+) -> Result<()> {
+    writeln!(output, "Step batch: {batch_id}")?;
+    writeln!(output, "  resume exactly: {resume}")?;
+    writeln!(output, "  inspect receipts: {lookup}")?;
+    writeln!(
+        output,
+        "Steps apply individually; a later failure keeps earlier applied steps."
+    )?;
+    output
+        .flush()
+        .context("could not flush the batch ID before advancing")
+}
+
+fn validate_step_batch_observation(batch: &StepBatchDto, batch_id: &str) -> Result<()> {
+    if batch.batch_id != batch_id {
+        bail!("step batch response changed the requested batch ID");
+    }
+    if batch.requested_count == 0
+        || batch.requested_count > MAX_STEP_BATCH
+        || batch.applied_count > batch.admitted_count
+        || batch.admitted_count > batch.attempted_count
+        || batch.settled_count > batch.attempted_count
+        || batch.attempted_count > batch.requested_count
+    {
+        bail!("step batch response has inconsistent observed counts");
+    }
+    if matches!(&batch.phase, StepBatchPhase::Complete)
+        && (batch.applied_count != batch.requested_count
+            || batch.settled_count != batch.requested_count)
+    {
+        bail!("step batch claims completion without every application and journal outcome");
+    }
+    Ok(())
+}
+
+fn check_step_batch_receipts(batch: &StepBatchDto) -> Result<()> {
+    for entry in &batch.entries {
+        if let Some(receipt) = &entry.receipt {
+            check_command_receipt(&format!("step batch index {}", entry.index), receipt)?;
+        }
+    }
+    Ok(())
+}
+
+async fn drive_step_batch(
+    client: &Client,
+    base_url: &str,
+    batch_id: &str,
+    deadline: Instant,
+    mut initial: Option<StepBatchDto>,
+    output: &mut impl Write,
+) -> Result<()> {
+    let url = step_batch_url(base_url, Some(batch_id), true)?;
+    let mut source = None;
+    let mut previous_counts = None;
+    let mut previous_json = None;
+    loop {
+        let batch = match initial.take() {
+            Some(batch) => batch,
+            None => step_batch_response(client.post(url.clone()), deadline).await?,
+        };
+        validate_step_batch_observation(&batch, batch_id)?;
+        let identity = (batch.session_id.clone(), batch.requested_count);
+        if source
+            .as_ref()
+            .is_some_and(|expected| expected != &identity)
+        {
+            bail!("step batch response changed its owner session or reserved count");
+        }
+        source = Some(identity);
+        let counts = (
+            batch.attempted_count,
+            batch.admitted_count,
+            batch.applied_count,
+            batch.settled_count,
+        );
+        if previous_counts.is_some_and(|(attempted, admitted, applied, settled)| {
+            counts.0 < attempted || counts.1 < admitted || counts.2 < applied || counts.3 < settled
+        }) {
+            bail!("step batch response regressed its retained observations");
+        }
+        previous_counts = Some(counts);
+        let json = serde_json::to_string_pretty(&batch)?;
+        if previous_json.as_ref() != Some(&json) {
+            writeln!(output, "{json}")?;
+            output.flush()?;
+            previous_json = Some(json);
+        }
+        check_step_batch_receipts(&batch)?;
+        match &batch.phase {
+            StepBatchPhase::Complete => return Ok(()),
+            StepBatchPhase::Stopped => bail!(
+                "step batch stopped after {}/{} confirmed applications; inspect its retained receipts",
+                batch.applied_count,
+                batch.requested_count,
+            ),
+            StepBatchPhase::Indeterminate => {
+                let diagnosis = batch
+                    .entries
+                    .iter()
+                    .find_map(|entry| entry.observation_error.as_ref());
+                let detail = diagnosis.map_or_else(
+                    || "owner outcome remains unconfirmed".to_owned(),
+                    |failure| {
+                        format!(
+                            "{}: {}{}",
+                            failure.code,
+                            failure.message,
+                            if failure.diagnostic_truncated {
+                                " [diagnostic truncated]"
+                            } else {
+                                ""
+                            }
+                        )
+                    },
+                );
+                bail!(
+                    "step batch outcome is indeterminate after {}/{} confirmed applications: {detail}",
+                    batch.applied_count,
+                    batch.requested_count,
+                );
+            }
+            StepBatchPhase::Reserved | StepBatchPhase::Ready | StepBatchPhase::Waiting => {}
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .context("step batch wait budget expired before completion")?;
+        if batch.advancing
+            || matches!(&batch.phase, StepBatchPhase::Waiting)
+            || batch
+                .entries
+                .iter()
+                .any(|entry| entry.observation_error.is_some())
+        {
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        }
+    }
+}
+
+async fn create_and_drive_step_batch(
+    client: &Client,
+    base_url: &str,
+    count: u64,
+    idempotency_key: Option<&str>,
+    wait_seconds: u64,
+    output: &mut impl Write,
+) -> Result<()> {
+    if count == 0 || count > MAX_STEP_BATCH {
+        bail!("step count must be in 1..={MAX_STEP_BATCH}");
+    }
+    if idempotency_key.is_some_and(|key| key.is_empty() || key.len() > 1024) {
+        bail!("step batch reservation key must contain 1..=1024 bytes");
+    }
+    let deadline = step_batch_deadline(wait_seconds)?;
+    let mut body = serde_json::json!({ "count": count });
+    if let Some(key) = idempotency_key {
+        body["idempotency_key"] = Value::String(key.to_owned());
+    }
+    let batch = step_batch_response(
+        client
+            .post(step_batch_url(base_url, None, false)?)
+            .json(&body),
+        deadline,
+    )
+    .await?;
+    if batch.requested_count != count {
+        bail!("step batch reservation returned a different count");
+    }
+    let id = batch.batch_id.clone();
+    step_batch_url(base_url, Some(&id), false)?;
+    validate_step_batch_observation(&batch, &id)?;
+    let (resume, lookup) = step_batch_hints(base_url, &id, wait_seconds)?;
+    write_step_batch_identity(output, &id, &resume, &lookup)?;
+    drive_step_batch(client, base_url, &id, deadline, Some(batch), output)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{error:#}\nRetained batch {id}. Resume exactly: {resume}\nInspect: {lookup}"
+            )
+        })
+}
+
+async fn resume_step_batch_command(
+    client: &Client,
+    base_url: &str,
+    batch_id: &str,
+    wait_seconds: u64,
+) -> Result<()> {
+    let deadline = step_batch_deadline(wait_seconds)?;
+    step_batch_url(base_url, Some(batch_id), true)?;
+    let (resume, lookup) = step_batch_hints(base_url, batch_id, wait_seconds)?;
+    let mut output = io::stdout();
+    write_step_batch_identity(&mut output, batch_id, &resume, &lookup)?;
+    drive_step_batch(client, base_url, batch_id, deadline, None, &mut output)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:#}\nBatch {batch_id} was not replaced. Resume exactly: {resume}\nInspect: {lookup}"))
+}
+
+async fn lookup_step_batch_command(
+    client: &Client,
+    base_url: &str,
+    batch_id: &str,
+    offset: u64,
+    limit: u16,
+) -> Result<()> {
+    if limit == 0 || usize::from(limit) > MAX_STEP_BATCH_PAGE_SIZE {
+        bail!("step batch --limit must be in 1..={MAX_STEP_BATCH_PAGE_SIZE}");
+    }
+    let batch = step_batch_response(
+        client
+            .get(step_batch_url(base_url, Some(batch_id), false)?)
+            .query(&[("offset", offset), ("limit", u64::from(limit))]),
+        step_batch_deadline(10)?,
+    )
+    .await?;
+    validate_step_batch_observation(&batch, batch_id)?;
+    if batch.offset != offset
+        || batch.entries.len() > usize::from(limit)
+        || batch
+            .next_offset
+            .is_some_and(|next| next <= offset || next > batch.attempted_count)
+    {
+        bail!("step batch response changed the requested receipt page");
+    }
+    println!("{}", serde_json::to_string_pretty(&batch)?);
+    if let Some(next_offset) = batch.next_offset {
+        println!("  next receipt page: --offset {next_offset} --limit {limit}");
+    }
+    check_step_batch_receipts(&batch)?;
+    if matches!(&batch.phase, StepBatchPhase::Stopped) {
+        bail!(
+            "step batch stopped after {}/{} confirmed applications; blocking index: {:?}",
+            batch.applied_count,
+            batch.requested_count,
+            batch.blocking_index,
+        );
+    }
+    Ok(())
 }
 
 async fn speed_command(
@@ -3306,7 +3697,10 @@ mod tests {
             assert!(read_checkpoint_branch_request(&path, Some("retry")).is_err());
         }
         let mut without_treatment = original;
-        without_treatment.as_object_mut().unwrap().remove("intervention");
+        without_treatment
+            .as_object_mut()
+            .unwrap()
+            .remove("intervention");
         fs::write(&path, serde_json::to_vec(&without_treatment)?)?;
         assert!(read_checkpoint_branch_request(&path, None).is_err());
         assert!(read_checkpoint_branch_request(directory.path(), None).is_err());
@@ -5058,6 +5452,371 @@ mod tests {
         }
     }
 
+    fn step_batch_fixture(phase: &str, completed: u64) -> Value {
+        serde_json::json!({
+            "batch_id": "sb1-0123456789abcdef-0000000000000001",
+            "session_id": "19",
+            "requested_count": 2,
+            "attempted_count": completed,
+            "admitted_count": completed,
+            "applied_count": completed,
+            "settled_count": completed,
+            "phase": phase,
+            "advancing": false,
+            "offset": 0,
+            "entries": [],
+        })
+    }
+
+    struct StepBatchOutput {
+        bytes: Vec<u8>,
+        identity_flushed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Write for StepBatchOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let text = String::from_utf8_lossy(&self.bytes);
+            if text.contains("sb1-0123456789abcdef-0000000000000001")
+                && text.contains("resume-step-batch")
+            {
+                self.identity_flushed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    fn step_batch_wire_peer(
+        replies: Vec<Value>,
+        identity_flushed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(String, std::thread::JoinHandle<Result<Vec<String>>>)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let worker = std::thread::spawn(move || -> Result<Vec<String>> {
+            use std::io::BufRead;
+            let mut requests = Vec::new();
+            for body in replies {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                let mut reader = io::BufReader::new(stream.try_clone()?);
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line)? == 0 || request.len() > MAX_DATA_ERROR_BYTES {
+                        bail!("incomplete or excessive step batch request headers");
+                    }
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("/advance "))
+                {
+                    assert!(
+                        identity_flushed.load(std::sync::atomic::Ordering::SeqCst),
+                        "the recovery ID must reach flushed output before the first execution request"
+                    );
+                }
+                let size = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<u64>())
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                if size > MAX_STEP_BATCH_PAGE_BYTES as u64 {
+                    bail!("excessive step batch request payload");
+                }
+                let mut payload = Vec::new();
+                reader.take(size).read_to_end(&mut payload)?;
+                request.push_str(std::str::from_utf8(&payload)?);
+                let encoded = serde_json::to_vec(&body)?;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    encoded.len(),
+                )?;
+                stream.write_all(&encoded)?;
+                stream.flush()?;
+                requests.push(request);
+            }
+            Ok(requests)
+        });
+        Ok((format!("http://{address}"), worker))
+    }
+
+    #[test]
+    fn step_batch_cli_preserves_positional_steps_and_exposes_exact_id_recovery() {
+        for arguments in [
+            vec!["control", "step", "2"],
+            vec!["control", "step", "--count", "2"],
+        ] {
+            let parsed = Cli::try_parse_from(arguments).unwrap();
+            let Command::Step {
+                count,
+                count_option,
+                wait_seconds,
+            } = parsed.command
+            else {
+                panic!("step command expected");
+            };
+            assert_eq!(count_option.or(count), Some(2));
+            assert_eq!(wait_seconds, 10);
+        }
+        assert!(Cli::try_parse_from(["control", "step", "2", "--count", "3"]).is_err());
+        for invalid in ["0", "301", "-1"] {
+            assert!(
+                Cli::try_parse_from([
+                    "control",
+                    "resume-step-batch",
+                    "saved-id",
+                    "--wait-seconds",
+                    invalid,
+                ])
+                .is_err()
+            );
+        }
+        let parsed = Cli::try_parse_from([
+            "control",
+            "lookup-step-batch",
+            "saved-id",
+            "--offset",
+            "31",
+            "--limit",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command,
+            Command::LookupStepBatch { id, offset: 31, limit: 1 } if id == "saved-id"));
+        assert!(
+            Cli::try_parse_from(["control", "lookup-step-batch", "saved-id", "--limit", "17",])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_execution_flushes_identity_before_any_advance_and_keeps_reservation_key()
+    -> Result<()> {
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut backpressure = step_batch_fixture("ready", 0);
+        backpressure["attempted_count"] = Value::from(1);
+        backpressure["entries"] = serde_json::json!([{
+            "index": 0, "command_id": "cmd-71", "submission_state": "not_admitted",
+            "observation_error": {
+                "code": "command_evidence_backpressure", "message": "no admission occurred",
+                "diagnostic_truncated": false,
+            },
+        }]);
+        let (base, peer) = step_batch_wire_peer(
+            vec![
+                step_batch_fixture("reserved", 0),
+                backpressure,
+                step_batch_fixture("ready", 1),
+                step_batch_fixture("complete", 2),
+            ],
+            Arc::clone(&flushed),
+        )?;
+        let mut output = StepBatchOutput {
+            bytes: Vec::new(),
+            identity_flushed: flushed,
+        };
+        create_and_drive_step_batch(
+            &Client::new(),
+            &base,
+            2,
+            Some("reserve-once"),
+            10,
+            &mut output,
+        )
+        .await?;
+        let requests = peer.join().expect("step batch peer joined")?;
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("POST /api/control/step-batches HTTP/1.1\r\n"));
+        let (_, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(body)?,
+            serde_json::json!({
+                "count": 2, "idempotency_key": "reserve-once",
+            })
+        );
+        for request in &requests[1..] {
+            assert!(request.starts_with(
+                "POST /api/control/step-batches/sb1-0123456789abcdef-0000000000000001/advance HTTP/1.1\r\n"
+            ));
+            assert!(request.ends_with("\r\n\r\n"));
+            assert!(!request.contains("reserve-once"));
+        }
+        let text = String::from_utf8(output.bytes)?;
+        assert!(text.contains("resume-step-batch"));
+        assert!(text.contains("lookup-step-batch"));
+        assert!(text.contains("\"applied_count\": 2"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_unknown_or_indeterminate_identity_never_creates_a_replacement() -> Result<()> {
+        let id = "sb1-0123456789abcdef-0000000000000001";
+        let mut uncertain = step_batch_fixture("indeterminate", 0);
+        uncertain["attempted_count"] = Value::from(1);
+        uncertain["entries"] = serde_json::json!([{
+            "index": 0, "command_id": "cmd-71", "submission_state": "indeterminate",
+            "observation_error": {
+                "code": "owner_timeout", "message": "admission response was lost",
+                "diagnostic_truncated": false,
+            },
+        }]);
+        for (status, body, expected) in [
+            (
+                "404 Not Found",
+                serde_json::json!({"message": "unknown batch scope"}),
+                "404",
+            ),
+            (
+                "200 OK",
+                uncertain,
+                "owner_timeout: admission response was lost",
+            ),
+        ] {
+            let bytes = serde_json::to_vec(&body)?;
+            let (base, peer) = data_wire_peer(status, bytes.clone(), Some(bytes.len()));
+            let mut output = Vec::new();
+            let error = drive_step_batch(
+                &Client::new(),
+                &base,
+                id,
+                step_batch_deadline(10)?,
+                None,
+                &mut output,
+            )
+            .await
+            .expect_err("the existing batch cannot be replaced");
+            assert!(format!("{error:#}").contains(expected));
+            let request = peer.join().expect("batch refusal peer joined")?;
+            assert!(request.starts_with(&format!(
+                "POST /api/control/step-batches/{id}/advance HTTP/1.1\r\n"
+            )));
+            assert!(request.ends_with("\r\n\r\n"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_completion_requires_observed_applications_and_both_failure_axes_survive() {
+        let mut value = step_batch_fixture("complete", 2);
+        value["applied_count"] = Value::from(1);
+        let incomplete: StepBatchDto = serde_json::from_value(value).unwrap();
+        assert!(validate_step_batch_observation(&incomplete, &incomplete.batch_id).is_err());
+
+        let mut value = step_batch_fixture("stopped", 0);
+        value["attempted_count"] = Value::from(1);
+        value["admitted_count"] = Value::from(1);
+        value["settled_count"] = Value::from(1);
+        value["entries"] = serde_json::json!([{
+            "index": 0, "command_id": "cmd-71", "submission_state": "observed",
+            "receipt": {
+                "command_id": "cmd-71", "admission_sequence": 5,
+                "application_state": "failed", "journal_state": "failed",
+                "application_failure": {"code":"world_step", "message":"sensing failed", "diagnostic_truncated":false},
+                "journal_failure": {"code":"disk_full", "message":"journal failed", "diagnostic_truncated":false},
+                "control_revision": 7, "scientific_revision": 11, "config_revision": 3,
+            },
+        }]);
+        let stopped: StepBatchDto = serde_json::from_value(value).unwrap();
+        let message = check_step_batch_receipts(&stopped).unwrap_err().to_string();
+        assert!(message.contains("application failed: world_step: sensing failed"));
+        assert!(message.contains("journal failed: disk_full: journal failed"));
+    }
+
+    #[tokio::test]
+    async fn batch_http_deadline_also_bounds_a_stalled_response_body() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let worker = std::thread::spawn(move || -> Result<()> {
+            use std::io::BufRead;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut reader = io::BufReader::new(stream.try_clone()?);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line)? == 0 {
+                    bail!("request headers missing");
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")?;
+            stream.flush()?;
+            std::thread::sleep(Duration::from_secs(1));
+            Ok(())
+        });
+        let error = step_batch_response(
+            Client::new().get(format!("http://{address}")),
+            Instant::now() + Duration::from_millis(200),
+        )
+        .await
+        .expect_err("body reading must share the overall deadline");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        }));
+        worker.join().expect("stalled peer joined")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_lookup_reads_only_the_requested_receipt_page() -> Result<()> {
+        let mut value = step_batch_fixture("complete", 2);
+        value["offset"] = Value::from(1);
+        let bytes = serde_json::to_vec(&value)?;
+        let (base, peer) = data_wire_peer("200 OK", bytes.clone(), Some(bytes.len()));
+        let id = value["batch_id"].as_str().unwrap();
+        lookup_step_batch_command(&Client::new(), &format!("{base}/prefix"), id, 1, 1).await?;
+        let request = peer.join().expect("lookup peer joined")?;
+        assert!(request.starts_with(&format!(
+            "GET /prefix/api/control/step-batches/{id}?offset=1&limit=1 HTTP/1.1\r\n"
+        )));
+        Ok(())
+    }
+
     fn owner_receipt_for_cli(application_state: &str, journal_state: &str) -> CommandStatusDto {
         serde_json::from_value(serde_json::json!({
             "command_id": "cmd-71",
@@ -5121,11 +5880,9 @@ mod tests {
         let message = check_command_receipt("step", &receipt)
             .expect_err("both failures must fail the CLI")
             .to_string();
-        assert!(
-            message.contains(
-                "application failed: science_refused: transition incomplete [diagnostic truncated]"
-            )
-        );
+        assert!(message.contains(
+            "application failed: science_refused: transition incomplete [diagnostic truncated]"
+        ));
         assert!(message.contains("journal failed: disk_full: journal unavailable"));
         assert!(!message.contains("applied at tick"));
 
