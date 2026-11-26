@@ -173,15 +173,19 @@ enum IngressMessage {
     },
     DebugAgents {
         query: AgentDebugQuery,
+        expires_at: Instant,
         reply: Sender<Result<Vec<AgentDebugInfo>, HostAccessError>>,
     },
     RequestReplayDigest {
+        expires_at: Instant,
         reply: Sender<Result<(), HostAccessError>>,
     },
     ScientificDigest {
+        expires_at: Instant,
         reply: Sender<Result<WorldDigestCut, HostAccessError>>,
     },
     WorldDigests {
+        expires_at: Instant,
         reply: Sender<Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError>>,
     },
     CaptureCheckpoint {
@@ -565,6 +569,18 @@ impl ChannelHostPort {
             })?
     }
 
+    /// Keep one original budget across admission, waiting and queued owner work.
+    /// Expiry cannot interrupt an observation that the owner has already started.
+    fn read_owner_with_expiry<R>(
+        &self,
+        message: impl FnOnce(Instant, Sender<Result<R, HostAccessError>>) -> IngressMessage,
+    ) -> Result<R, HostAccessError> {
+        let expires_at = self.inspection_deadline()?;
+        let bounded =
+            self.bounded_before_with_error(expires_at, HostAccessError::OwnerReadTimeout)?;
+        bounded.read_owner(|reply| message(expires_at, reply))
+    }
+
     /// Inspect selected brains with exact inspected and published source identities.
     pub fn project_brain(
         &self,
@@ -775,23 +791,32 @@ impl ChannelHostPort {
                 "debug query input limit exceeded before enqueue",
             ));
         }
-        self.read_owner(|reply| IngressMessage::DebugAgents { query, reply })
+        self.read_owner_with_expiry(|expires_at, reply| IngressMessage::DebugAgents {
+            query,
+            expires_at,
+            reply,
+        })
     }
 
     /// Ask the next completed replay tick to include its full scientific digest.
     pub fn request_replay_world_digest(&self) -> Result<(), HostAccessError> {
-        self.read_owner(|reply| IngressMessage::RequestReplayDigest { reply })
+        self.read_owner_with_expiry(|expires_at, reply| IngressMessage::RequestReplayDigest {
+            expires_at,
+            reply,
+        })
     }
 
     /// Compute the full scientific digest at an owner boundary.
     pub fn scientific_digest_v1(&self) -> Result<WorldDigestV1, HostAccessError> {
-        self.read_owner(|reply| IngressMessage::ScientificDigest { reply })
-            .map(|cut: WorldDigestCut| cut.digest)
+        self.scientific_digest_cut().map(|cut| cut.digest)
     }
 
     /// Read the full scientific digest and owner revision domains atomically, without flushing.
     pub fn scientific_digest_cut(&self) -> Result<WorldDigestCut, HostAccessError> {
-        self.read_owner(|reply| IngressMessage::ScientificDigest { reply })
+        self.read_owner_with_expiry(|expires_at, reply| IngressMessage::ScientificDigest {
+            expires_at,
+            reply,
+        })
     }
 
     /// Compute physical-layout and logical-science digests at the same owner boundary.
@@ -802,7 +827,10 @@ impl ChannelHostPort {
     pub fn world_digests(
         &self,
     ) -> Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError> {
-        self.read_owner(|reply| IngressMessage::WorldDigests { reply })
+        self.read_owner_with_expiry(|expires_at, reply| IngressMessage::WorldDigests {
+            expires_at,
+            reply,
+        })
     }
 
     /// Capture a full typed `WorldCheckpointV1` from the world owner thread.
@@ -1554,13 +1582,13 @@ impl ChannelHostDriver {
             IngressMessage::DebugAgents { reply, .. } => {
                 let _ = reply.send(Err(error()));
             }
-            IngressMessage::RequestReplayDigest { reply } => {
+            IngressMessage::RequestReplayDigest { reply, .. } => {
                 let _ = reply.send(Err(error()));
             }
-            IngressMessage::ScientificDigest { reply } => {
+            IngressMessage::ScientificDigest { reply, .. } => {
                 let _ = reply.send(Err(error()));
             }
-            IngressMessage::WorldDigests { reply } => {
+            IngressMessage::WorldDigests { reply, .. } => {
                 let _ = reply.send(Err(error()));
             }
             IngressMessage::CaptureCheckpoint { request } => {
@@ -1695,14 +1723,30 @@ impl ChannelHostDriver {
                     .map(|detail| (epoch, detail));
                 let _ = reply.send(result);
             }
-            IngressMessage::DebugAgents { query, reply } => {
+            IngressMessage::DebugAgents {
+                query,
+                expires_at,
+                reply,
+            } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
                 let _ = reply.send(self.host.core().debug_agents(query));
             }
-            IngressMessage::RequestReplayDigest { reply } => {
+            IngressMessage::RequestReplayDigest { expires_at, reply } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
                 self.host.request_replay_world_digest();
                 let _ = reply.send(Ok(()));
             }
-            IngressMessage::ScientificDigest { reply } => {
+            IngressMessage::ScientificDigest { expires_at, reply } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
                 let result = self
                     .host
                     .core()
@@ -1710,7 +1754,11 @@ impl ChannelHostDriver {
                     .map_err(|error| ChannelHostPort::protocol_violation(error.to_string()));
                 let _ = reply.send(result);
             }
-            IngressMessage::WorldDigests { reply } => {
+            IngressMessage::WorldDigests { expires_at, reply } => {
+                if Instant::now() >= expires_at {
+                    let _ = reply.send(Err(HostAccessError::OwnerReadTimeout));
+                    return;
+                }
                 self.process_world_digests(&reply);
             }
             IngressMessage::CaptureCheckpoint { request } => self.capture_or_park(request),
@@ -2174,6 +2222,40 @@ mod tests {
         }
     }
 
+    fn paused_query_driver_with_agent() -> (ChannelHostDriver, ChannelHostPort) {
+        let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            rng_seed: Some(0x614),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let core = HostCore::new(
+            HostSessionId::new(0x614),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    ..PlaybackSnapshot::default()
+                },
+                ..HostCoreOptions::default()
+            },
+        )
+        .unwrap();
+        let (mut driver, port) =
+            ChannelHostDriver::new(FixedDeadlineHost::new(core), fast_options()).unwrap();
+        driver.step(ManualInstant::from_nanos(0)).unwrap();
+        (driver, port)
+    }
+
     #[test]
     fn completed_fault_full_batches_finish_through_the_channel_run_loop() {
         use crate::host_core::fault_retry_fixture::{self, Outcome};
@@ -2546,7 +2628,11 @@ mod tests {
             let (reply, result) = std::sync::mpsc::channel();
             assert!(
                 port.sender
-                    .try_send(IngressMessage::DebugAgents { query, reply })
+                    .try_send(IngressMessage::DebugAgents {
+                        query,
+                        expires_at: Instant::now() + Duration::from_secs(1),
+                        reply,
+                    })
                     .is_ok()
             );
             driver.step(ManualInstant::from_nanos(2)).unwrap();
@@ -4530,6 +4616,201 @@ mod tests {
             reply,
         });
         assert!(receive.recv().expect("live brain reply").is_ok());
+    }
+
+    #[test]
+    fn remaining_owner_reads_keep_original_deadlines_and_skip_abandoned_ingress() {
+        let (mut driver, port) = paused_query_driver_with_agent();
+        let before = driver
+            .host()
+            .core()
+            .capture_host_checkpoint_v1()
+            .unwrap()
+            .encode()
+            .unwrap();
+        for query in 0..5 {
+            let started = Instant::now();
+            let deadline = started + Duration::from_millis(20);
+            let bounded = port.bounded_before(deadline).unwrap();
+            let result = match query {
+                0 => bounded.debug_agents(AgentDebugQuery::default()).map(|_| ()),
+                1 => bounded.request_replay_world_digest(),
+                2 => bounded.scientific_digest_v1().map(|_| ()),
+                3 => bounded.scientific_digest_cut().map(|_| ()),
+                4 => bounded.world_digests().map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(matches!(result, Err(HostAccessError::OwnerReadTimeout)));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let queued = driver
+                .receiver
+                .try_recv()
+                .expect("actual public API ingress");
+            let expires_at = match &queued {
+                IngressMessage::DebugAgents { expires_at, .. } if query == 0 => *expires_at,
+                IngressMessage::RequestReplayDigest { expires_at, .. } if query == 1 => *expires_at,
+                IngressMessage::ScientificDigest { expires_at, .. } if query == 2 || query == 3 => {
+                    *expires_at
+                }
+                IngressMessage::WorldDigests { expires_at, .. } if query == 4 => *expires_at,
+                _ => panic!("wrong owner read entered ingress"),
+            };
+            assert!(expires_at <= deadline && expires_at <= Instant::now());
+            driver.process_ingress(queued);
+            assert_eq!(
+                driver
+                    .host()
+                    .core()
+                    .capture_host_checkpoint_v1()
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+                before,
+                "an abandoned read must preserve the complete paused owner cut"
+            );
+            assert!(matches!(
+                driver.receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
+    fn queued_owner_observations_discard_expiry_and_preserve_live_results() {
+        let (mut driver, port) = paused_query_driver_with_agent();
+        let expected = driver.host().core().scientific_digest_cut().unwrap();
+        let expected_physical = driver
+            .host()
+            .core()
+            .world()
+            .characterization_digest_v0()
+            .unwrap();
+        let expected_agent = driver
+            .host()
+            .core()
+            .debug_agents(AgentDebugQuery::default())
+            .unwrap()[0]
+            .agent_uid;
+        for expired in [true, false] {
+            let expires_at = if expired {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(30)
+            };
+            let (reply, debug) = std::sync::mpsc::channel();
+            assert!(
+                port.sender
+                    .try_send(IngressMessage::DebugAgents {
+                        query: AgentDebugQuery {
+                            limit: Some(1),
+                            ..AgentDebugQuery::default()
+                        },
+                        expires_at,
+                        reply,
+                    })
+                    .is_ok()
+            );
+            let (reply, scientific) = std::sync::mpsc::channel();
+            assert!(
+                port.sender
+                    .try_send(IngressMessage::ScientificDigest { expires_at, reply })
+                    .is_ok()
+            );
+            let (reply, physical) = std::sync::mpsc::channel();
+            assert!(
+                port.sender
+                    .try_send(IngressMessage::WorldDigests { expires_at, reply })
+                    .is_ok()
+            );
+            driver.step(ManualInstant::from_nanos(0)).unwrap();
+            let debug = debug.try_recv().unwrap();
+            let scientific = scientific.try_recv().unwrap();
+            let physical = physical.try_recv().unwrap();
+            if expired {
+                assert!(matches!(debug, Err(HostAccessError::OwnerReadTimeout)));
+                assert!(matches!(scientific, Err(HostAccessError::OwnerReadTimeout)));
+                assert!(matches!(physical, Err(HostAccessError::OwnerReadTimeout)));
+            } else {
+                let debug = debug.unwrap();
+                assert_eq!(debug.len(), 1);
+                assert_eq!(debug[0].agent_uid, expected_agent);
+                let scientific = scientific.unwrap();
+                assert_eq!(scientific.digest, expected.digest);
+                assert_eq!(scientific.session_id, expected.session_id);
+                assert_eq!(scientific.scientific_revision, expected.scientific_revision);
+                assert_eq!(scientific.config_revision, expected.config_revision);
+                let physical = physical.unwrap();
+                assert_eq!(physical.0, expected_physical);
+                assert_eq!(physical.1, expected.digest);
+            }
+        }
+    }
+
+    #[test]
+    fn expired_replay_digest_request_preserves_full_checkpoint_availability() {
+        let (mut driver, port) = paused_query_driver_with_agent();
+        let before = driver.host().core().capture_host_checkpoint_v1().unwrap();
+        let bytes = before.encode().unwrap();
+        let (reply, expired) = std::sync::mpsc::channel();
+        assert!(
+            port.sender
+                .try_send(IngressMessage::RequestReplayDigest {
+                    expires_at: Instant::now(),
+                    reply,
+                })
+                .is_ok()
+        );
+        driver.step(ManualInstant::from_nanos(0)).unwrap();
+        assert!(matches!(
+            expired.try_recv().unwrap(),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert_eq!(
+            driver
+                .host()
+                .core()
+                .capture_host_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap(),
+            bytes
+        );
+
+        let (reply, live) = std::sync::mpsc::channel();
+        assert!(
+            port.sender
+                .try_send(IngressMessage::RequestReplayDigest {
+                    expires_at: Instant::now() + Duration::from_secs(30),
+                    reply,
+                })
+                .is_ok()
+        );
+        driver.step(ManualInstant::from_nanos(0)).unwrap();
+        live.try_recv().unwrap().unwrap();
+        assert!(matches!(
+            driver.host().core().capture_host_checkpoint_v1(),
+            Err(HostCheckpointError::World(
+                scriptbots_core::WorldCheckpointError::DeferredHostOutput {
+                    field: "host.persistence_tail"
+                }
+            ))
+        ));
+        assert_eq!(
+            &driver.host().core().scientific_digest_v1().unwrap(),
+            before.world_checkpoint().source_digest(),
+            "live instrumentation changes deferred work without advancing science"
+        );
+        let admitted = queue_command(&port, 617, HostCommand::Step);
+        for _ in 0..4 {
+            driver.step(ManualInstant::from_nanos(1)).unwrap();
+        }
+        admitted.try_recv().unwrap().unwrap();
+        let after = driver.host().core().capture_host_checkpoint_v1().unwrap();
+        assert_eq!(after.tick(), scriptbots_core::Tick(1));
+        assert_ne!(
+            after.world_checkpoint().source_digest(),
+            before.world_checkpoint().source_digest()
+        );
     }
 
     #[test]

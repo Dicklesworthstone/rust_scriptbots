@@ -2,6 +2,30 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Expired owner reads preserve checkpoint availability (2026-11-26):**
+[Source implemented and independently reviewed; native execution pending —
+Codex; corrective contribution to `bd-2z0.4.11` and `bd-2z0.5.13`;
+original complete acceptance retained]
+
+Bulk debug, scientific digest, physical/scientific digest and replay-digest
+requests retain one original deadline through admission, waiting and queued
+owner work. Expired ingress is refused before inspecting the world or enabling
+deferred replay instrumentation. A timed-out request therefore cannot later
+make a paused owner's exact checkpoint unavailable. Work already executing on
+the owner remains cooperative; this does not introduce a hard interruption.
+
+Three authored regressions use actual public ingress and owner execution:
+original budgets and unchanged complete checkpoint bytes, expired/live read
+results, and the real replay-request checkpoint refusal followed by completed
+science restoring checkpoint availability. Native tests and compilation remain
+unverified: DSR's locked offline workspace check stopped before compilation at
+the missing pinned `rust-xcb` source. No original qualification gate is closed.
+
+The earlier follow-up's formatter pass applied to the recorded `405a87e`-based
+file. Its later rebase exposed one additional formatting difference in a
+concurrent control-receipt test; this change corrects that difference along with
+the new runtime test formatting. Native execution claims remain unchanged.
+
 **Browser command diagnoses and fault/publication separation (2026-11-26):**
 [Source implemented and independently reviewed; browser execution validation pending —
 Codex; corrective contribution to `bd-2z0.12.2`;

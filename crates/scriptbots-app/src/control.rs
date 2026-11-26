@@ -1050,9 +1050,11 @@ fn compare_verified_variant_endpoints(
         let variant = variants[arm];
         for state in states {
             let metrics = state.summary.available_metrics();
-            if let Some(metric) = requested_metrics.iter().copied().find(|metric| {
-                !metrics.get(*metric).is_some_and(|value| value.is_finite())
-            }) {
+            if let Some(metric) = requested_metrics
+                .iter()
+                .copied()
+                .find(|metric| !metrics.get(*metric).is_some_and(|value| value.is_finite()))
+            {
                 return Err(ControlError::Conflict(format!(
                     "endpoint '{metric}' is unavailable for run '{}' at tick {}; missing values are not replaced with zero",
                     state.run_id, state.tick
@@ -10867,7 +10869,11 @@ pub(crate) mod tests {
             &["total_energy", "average_energy"],
         )
         .unwrap_err();
-        assert!(unavailable.to_string().contains("endpoint 'average_energy' is unavailable"));
+        assert!(
+            unavailable
+                .to_string()
+                .contains("endpoint 'average_energy' is unavailable")
+        );
         let error = handle
             .compare_experiment_variants("extinct-pair", "baseline", "challenger", "average_energy")
             .unwrap_err();
@@ -21439,7 +21445,10 @@ pub(crate) mod tests {
         };
         assert_eq!(applied.applied_tick, Some(1));
         assert_eq!(applied.control_revision, boundary.revisions.control.get());
-        assert_eq!(applied.scientific_revision, boundary.revisions.scientific.get());
+        assert_eq!(
+            applied.scientific_revision,
+            boundary.revisions.scientific.get()
+        );
         assert_eq!(applied.config_revision, boundary.revisions.config.get());
         assert!(applied.config_revision > 0);
         assert!(applied.application_failure.is_none());
