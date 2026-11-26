@@ -27499,9 +27499,26 @@ impl WorldState {
             0.0
         };
 
+        // Sensing already captured the source boundary's sound_multiplier values before
+        // actuation, births and deaths changed the cohort. Lagging that buffer again, or
+        // sampling the current sound_output values, pairs hearing with the wrong emission.
+        // An empty sensing pass retains old work buffers, so it has no source cohort to sample.
+        let source_emitted_sound = if self.latest_realized_hearing_observations.is_empty() {
+            0.0
+        } else {
+            let sum: f64 = self
+                .work_sound_emitters
+                .iter()
+                .map(|&value| f64::from(value))
+                .sum();
+            sum / (self.work_sound_emitters.len() as f64)
+        };
+
         self.communication_emitted_history
-            .push_back(self.last_tick_emitted_sound);
+            .push_back(source_emitted_sound);
         self.communication_realized_history.push_back(mean_hearing);
+        // Preserve this full-host checkpoint field's post-actuation meaning, even though
+        // current observation must use the exact source buffer instead of this cached mean.
         self.last_tick_emitted_sound = current_emitted_sound;
 
         let window = self.config.communication_mi_window as usize;
@@ -42282,8 +42299,38 @@ mod tests {
         let mut seen_mi_metric = false;
         let mut seen_replay_mi = false;
 
-        for _ in 1..=20 {
+        for tick in 1_u64..=20 {
             let completion = session.step_outcome(&mut world).expect("step outcome");
+            let expected_emission = if tick == 1 {
+                1.0
+            } else if (tick - 1).is_multiple_of(2) {
+                f64::from(0.8_f32)
+            } else {
+                f64::from(0.1_f32)
+            };
+            assert_eq!(
+                world.communication_emitted_history.back().copied(),
+                Some(expected_emission),
+                "hearing at tick {tick} must pair with the emission it actually consumed"
+            );
+            assert_eq!(
+                world.last_tick_emitted_sound,
+                if tick.is_multiple_of(2) {
+                    f64::from(0.8_f32)
+                } else {
+                    f64::from(0.1_f32)
+                },
+                "the retained checkpoint cache keeps its post-actuation meaning"
+            );
+            assert!(
+                world
+                    .latest_realized_hearing_observations()
+                    .iter()
+                    .all(|observation| {
+                        observation.source_tick == Tick(tick - 1)
+                            && observation.observation_tick == Tick(tick)
+                    })
+            );
             if let Some(batch) = completion.outcome.persistence.batch() {
                 for sample in &batch.metrics {
                     if sample.name == "comms.mi.bits" {
@@ -42314,6 +42361,114 @@ mod tests {
         assert_eq!(report.window.pair, "sound_to_hearing");
         assert!(report.estimate.n >= 10);
         assert!(report.estimate.bits_corrected >= 0.0);
+    }
+
+    #[test]
+    fn communication_mi_activation_samples_the_current_sensing_boundary() {
+        let mut world =
+            WorldState::new(quiet_trace_config(0x004d_495f_4c41_5445, 0)).expect("world");
+        let ids = [40.0, 50.0].map(|x| {
+            world.spawn_agent(AgentData {
+                position: Position::new(x, 50.0),
+                ..AgentData::default()
+            })
+        });
+        for _ in 0..3 {
+            world.step().expect("uninstrumented tick");
+        }
+        assert!(world.communication_emitted_history.is_empty());
+        for (id, emission) in ids.into_iter().zip([0.25, 0.75]) {
+            assert!(
+                world
+                    .try_update_agent_runtime(id, |runtime| {
+                        runtime.sound_multiplier = emission;
+                        runtime.sound_output = 0.0;
+                    })
+                    .expect("finite emission update")
+            );
+        }
+        let mut enabled = world.config().clone();
+        enabled.communication_mi_interval = 1;
+        enabled.communication_mi_window = 4;
+        world.apply_config_update(enabled).expect("enable MI");
+
+        world.step().expect("first observed tick");
+
+        assert_eq!(
+            world
+                .communication_emitted_history
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.5],
+            "enabling observation must not inject an unobserved zero-emission sample"
+        );
+        assert_eq!(world.latest_realized_hearing_observations().len(), 2);
+        assert!(
+            world
+                .latest_realized_hearing_observations()
+                .iter()
+                .all(|observation| {
+                    observation.source_tick == Tick(3)
+                        && observation.observation_tick == Tick(4)
+                        && observation.hearing > 0.0
+                })
+        );
+    }
+
+    #[test]
+    fn communication_mi_samples_arrivals_and_does_not_reuse_empty_world_buffers() {
+        let config = ScriptBotsConfig {
+            communication_mi_interval: 1,
+            communication_mi_window: 4,
+            ..quiet_trace_config(0x004d_495f_494e_4a45, 0)
+        };
+        let mut world = WorldState::new(config).expect("world");
+        let brain = world
+            .brain_registry_mut()
+            .expect("registry")
+            .register("stub", |_rng| Ok(Box::new(StubBrain)));
+        let founder = world
+            .try_spawn_agent(AgentData {
+                position: Position::new(40.0, 50.0),
+                ..AgentData::default()
+            })
+            .expect("founder");
+        assert!(world.bind_agent_brain(founder, brain).expect("founder brain"));
+        world.step().expect("founder first tick");
+        world.step().expect("silent source boundary");
+        assert_eq!(world.communication_emitted_history.back().copied(), Some(0.0));
+
+        let arrival = world
+            .try_inject_agent(AgentData {
+                position: Position::new(50.0, 50.0),
+                ..AgentData::default()
+            })
+            .expect("post-bootstrap arrival");
+        assert!(world.bind_agent_brain(arrival, brain).expect("arrival brain"));
+        let founder_uid = world.agent_uid(founder).expect("founder identity");
+        world.step().expect("arrival heard before its first actuation");
+
+        assert_eq!(
+            world.communication_emitted_history.back().copied(),
+            Some(0.5),
+            "the silent founder and newly emitting arrival are the actual source cohort"
+        );
+        let heard = world
+            .latest_realized_hearing_observations()
+            .iter()
+            .find(|observation| observation.receiver_uid == founder_uid)
+            .expect("founder hearing");
+        assert_eq!((heard.source_tick, heard.observation_tick), (Tick(2), Tick(3)));
+        assert!(heard.hearing > 0.0);
+
+        assert!(world.remove_agent(founder).is_some());
+        assert!(world.remove_agent(arrival).is_some());
+        world.step().expect("empty observed tick");
+        assert!(world.latest_realized_hearing_observations().is_empty());
+        assert!(world.work_sound_emitters.iter().any(|value| *value > 0.0));
+        assert_eq!(world.communication_emitted_history.back().copied(), Some(0.0));
+        assert_eq!(world.communication_realized_history.back().copied(), Some(0.0));
     }
 
     #[test]

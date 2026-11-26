@@ -2,6 +2,25 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Communication MI samples the hearing source boundary (2026-11-26):**
+[Source implemented and independently reviewed — Codex; corrective contribution
+to `bd-16g.7.2`; native execution and the `bd-16g.7.3` study remain unqualified]
+
+Live communication MI now pairs realized hearing with the exact emitter cohort
+captured during sensing, before actuation, births and deaths change the world.
+This also handles enabling instrumentation mid-run, injected arrivals and an
+empty world without reusing stale emission buffers. The persisted
+`last_tick_emitted_sound` field retains its existing post-actuation meaning;
+checkpoint representation, physics and RNG consumption are unchanged.
+
+Regression source exercises the real persistence pipeline, alternating emissions,
+late activation, arrivals and empty-world cleanup. Independent review passed.
+The full core file exceeded the bounded DSR formatting attempt; native tests
+have not run. Offline native checks missed the uncached pinned `rust-xcb`
+checkout; that revision is reachable online, but the execution volume then
+filled and lacked DSR's required native-build disk headroom. No native pass or
+communication-emergence qualification is claimed.
+
 **Checkpoint handoff delivery at caller timeout (2026-11-26):**
 [Source implemented and independently reviewed — Codex; corrective contribution
 to `bd-2z0.5.13` and `bd-2z0.4.11`; native execution remains unqualified]
@@ -14,7 +33,8 @@ Two deterministic real-owner regressions cover both race orderings, exact bytes,
 later command admission and a poisoned payload-free fence. Scoped runtime
 formatting passed through DSR before integration with concurrent status-board
 changes. Locked offline check and Clippy stopped before compilation at an
-uncached `rust-xcb` checkout; an online native check is pending. The regressions
+uncached `rust-xcb` checkout. The revision is reachable online, but the execution
+volume subsequently filled and could not admit a native build. The regressions
 have not run and no qualification gate is closed.
 
 **Scenario execution, live checkpoints and browser recovery (2026-11-26)**
