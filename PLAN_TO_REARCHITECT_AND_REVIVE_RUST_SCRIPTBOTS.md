@@ -2,6 +2,23 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Scenario execution, live checkpoints and browser recovery (2026-11-26)**
+[Currently In Progress — `bd-2z0.5.13`, `bd-2z0.10` and `bd-2z0.12.2`]
+
+Characterization applies scheduled configuration changes at their declared
+boundaries before the next scientific step. An explicit zero-tick bootstrap
+overrides scenario warmup. A full checkpoint or handoff can request the ordered
+flush of a running world's partial persistence interval while holding the current
+scientific tick. Native regression coverage is present; execution is pending.
+
+A browser tab retains the endpoint, owner session and exact reservation request
+before creating a step batch. It records the returned ID before advancing.
+Reloading restores a reference for explicit inspection or continuation. Receipt
+pages come from the server. Restricted storage and endpoints with query strings
+fall back to in-memory operation with a visible notice. Focused V8 controller
+probes exercised recovery with simulated storage and transport. The packaged
+browser, native service and DSR qualification remain open.
+
 **Remote browser step plans and retained receipt inspection (2026-11-26):**
 [Source implemented and independently reviewed; browser module validation passed —
 Codex; functional contribution to `bd-2z0.12.2`;

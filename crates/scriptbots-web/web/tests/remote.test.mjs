@@ -836,6 +836,81 @@ test("clearing a batch reference makes no native calls and cannot discard a pend
   assert.deepEqual([creates, reads, advances], [1, 2, 0]);
 });
 
+test("reloading a tab retains the reservation before POST and the batch ID before any steps", async (t) => {
+  stepBatchCrypto(t);
+  const records = new Map();
+  const storage = { getItem: (key) => records.get(key) ?? null,
+    setItem: (key, value) => records.set(key, value), removeItem: (key) => records.delete(key) };
+  const reservations = [], submissions = [], lookups = [];
+  const client = stepBatchClient({
+    async createStepBatch(request) {
+      reservations.push({ request, saved: JSON.parse([...records.values()][0]) });
+      if (reservations.length === 1) throw new Error("reservation reply lost");
+      return stepBatchFixture();
+    },
+    async advanceStepBatch(id) {
+      submissions.push({ id, saved: JSON.parse([...records.values()][0]) });
+      throw new Error("advance reply lost");
+    },
+    async stepBatchStatus(id) {
+      lookups.push(id);
+      return stepBatchFixture({ attempted_count: 3, applied_count: 3, admitted_count: 3,
+        settled_count: 3, phase: "complete", entries: [0, 1, 2].map((index) => stepBatchEntry(index)) });
+    },
+  });
+  let live = true;
+  const reload = () => new RemoteStepBatchController({ getClient: () => client, canAdvance: () => live,
+    tabStorage: () => storage });
+  assert.equal(await reload().start(3), false);
+  const reserved = reload();
+  assert.equal(reserved.canStart, false);
+  assert.equal(reservations.length, 1);
+  assert.deepEqual(reservations[0].saved.creation, reservations[0].request);
+  assert.equal(reservations[0].saved.batchId, null);
+  assert.deepEqual(submissions, []);
+  assert.deepEqual(lookups, []);
+  live = false;
+  assert.equal(await reserved.resume(), false);
+  live = true;
+  assert.equal(await reserved.resume(), false);
+  const afterAdvance = reload();
+  assert.equal(afterAdvance.page, null);
+  assert.equal(afterAdvance.batchId, "retained-batch-a");
+  assert.deepEqual(reservations[1].request, reservations[0].request);
+  assert.equal(submissions[0].id, "retained-batch-a");
+  assert.equal(submissions[0].saved.batchId, submissions[0].id);
+  assert.deepEqual(lookups, []);
+  client.tracker.sessionId = "42";
+  assert.equal(await afterAdvance.resume(), false);
+  client.tracker.sessionId = OWNER_SESSION;
+  assert.equal(await afterAdvance.refresh(), true);
+  assert.equal(afterAdvance.terminal, true);
+  afterAdvance.clearReference();
+  assert.equal(reload().source, null);
+  assert.equal(reservations.length, 2);
+  assert.equal(submissions.length, 1);
+  assert.deepEqual(lookups, ["retained-batch-a"]);
+});
+
+test("unavailable tab storage and private endpoint parameters keep batch inspection usable", async () => {
+  let writes = 0;
+  const client = stepBatchClient({ async stepBatchStatus() { return stepBatchFixture(); } });
+  const inspect = async (tabStorage) => {
+    const controller = new RemoteStepBatchController({ getClient: () => client, tabStorage });
+    assert.equal(await controller.open("retained-batch-a"), true);
+    assert.equal(controller.page.batch_id, "retained-batch-a");
+    assert.match(controller.recoveryWarning, /in memory only/);
+    return controller;
+  };
+  await inspect(() => { throw new Error("storage denied"); });
+  client.url += "?token=private";
+  const storage = { getItem: () => "{", setItem: () => { writes++; }, removeItem() {} };
+  const controller = await inspect(() => storage);
+  assert.equal(writes, 0);
+  controller.clearReference();
+  assert.equal(controller.recoveryWarning, "");
+});
+
 function ownerStatusFixture(sessionId = OWNER_SESSION, revision = "9007199254740993") {
   return { schema: "scriptbots.remote-owner-status.v1",
     identity: { sessionId, publicationRevision: revision, scientificRevision: "9007199254740993",

@@ -195,6 +195,7 @@ const remoteStepBatch = new RemoteStepBatchController({
   getClient: () => remoteMode ? remoteClient : null,
   canAdvance: () => remoteOwnerAllowsMutation() && !reviewedCheckpoint,
   onChange: renderRemoteStepBatch,
+  tabStorage: () => window.sessionStorage,
 });
 
 const experimentPanel = document.getElementById("experiment-lab");
@@ -1199,7 +1200,7 @@ function renderRemoteStepBatch() {
   }
   remoteBatchOpen.disabled = !remoteMode || !remoteConnected || pending || !remoteBatchId.value;
   remoteBatchClear.disabled = pending || !batch.source;
-  remoteBatchStatus.textContent = batch.notice;
+  remoteBatchStatus.textContent = [batch.notice, batch.recoveryWarning].filter(Boolean).join(" ");
   remoteBatchStatus.dataset.state = batch.missing ? "missing" : batch.page?.phase ?? (batch.source ? "unconfirmed" : "idle");
   const page = batch.page;
   remoteBatchProgress.textContent = page

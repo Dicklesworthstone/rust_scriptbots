@@ -267,14 +267,26 @@ function waitForStepBatch(milliseconds, signal) {
   });
 }
 
+const STEP_BATCH_REFERENCE = "scriptbots.remote-step-batch.v1";
+
+function batchReferenceUrl(value) {
+  if (typeof value !== "string" || value.length > 2048) throw new Error("Invalid batch endpoint");
+  const url = new URL(value);
+  if (!["ws:", "wss:"].includes(url.protocol) || value !== url.href || url.username || url.password
+      || url.search || url.hash) throw new Error("Batch endpoint cannot be saved in this tab");
+  return value;
+}
+
 /** Explicit continuation retains creation identity and never guesses a missing admission. */
 export class RemoteStepBatchController {
-  constructor({ getClient, canAdvance = () => true, onChange = () => {}, now = () => performance.now(), wait = waitForStepBatch }) {
+  constructor({ getClient, canAdvance = () => true, onChange = () => {}, now = () => performance.now(), wait = waitForStepBatch, tabStorage }) {
     this.getClient = getClient;
     this.canAdvance = canAdvance;
     this.onChange = onChange;
     this.now = now;
     this.wait = wait;
+    this.tabStorage = tabStorage;
+    this.recoveryWarning = "";
     this.source = null;
     this.creation = null;
     this.batchId = null;
@@ -282,6 +294,53 @@ export class RemoteStepBatchController {
     this.pending = null;
     this.missing = false;
     this.notice = "Run a bounded number of steps on the connected server, or open a retained batch ID.";
+    this.#restoreReference();
+  }
+
+  // Restore only identity. A reload neither contacts the server nor restores
+  // a terminal outcome, a receipt, or permission to continue running steps.
+  #restoreReference() {
+    if (!this.tabStorage) return;
+    try {
+      const raw = this.tabStorage().getItem(STEP_BATCH_REFERENCE);
+      if (raw === null) return;
+      if (raw.length > 4096) throw new Error("Oversized batch reference");
+      const { url, sessionId, creation, batchId } = JSON.parse(raw);
+      batchReferenceUrl(url);
+      decimal(sessionId);
+      if (batchId !== null) stepBatchIdentifier(batchId);
+      if (creation !== null) {
+        stepBatchCount(creation.count);
+        if (typeof creation.idempotency_key !== "string" || !/^web-step-batch-[0-9a-f]{32}$/.test(creation.idempotency_key)) {
+          throw new Error("Invalid saved reservation key");
+        }
+      } else if (batchId === null) throw new Error("Missing saved batch identity");
+      this.source = Object.freeze({ url, sessionId });
+      this.creation = creation && Object.freeze({ count: creation.count, idempotency_key: creation.idempotency_key });
+      this.batchId = batchId;
+      this.notice = `Recovered this tab's batch reference. Reconnect to ${url} (session ${sessionId}) to inspect or explicitly resume it.`;
+    } catch {
+      this.recoveryWarning = "This tab could not read its saved batch reference.";
+    }
+  }
+
+  #saveReference() {
+    if (!this.tabStorage) return;
+    try {
+      const storage = this.tabStorage();
+      if (this.source) {
+        // Never put endpoint query strings or fragments into browser storage.
+        try { batchReferenceUrl(this.source.url); }
+        catch (error) { storage.removeItem(STEP_BATCH_REFERENCE); throw error; }
+        storage.setItem(STEP_BATCH_REFERENCE, JSON.stringify({ ...this.source,
+          creation: this.creation, batchId: this.batchId }));
+      } else storage.removeItem(STEP_BATCH_REFERENCE);
+      this.recoveryWarning = "";
+    } catch {
+      this.recoveryWarning = this.source
+        ? "This reference is held in memory only. Copy the batch ID before reloading."
+        : "This tab could not erase its saved reference. It may reappear after reload.";
+    }
   }
 
   get terminal() { return ["complete", "stopped"].includes(this.page?.phase); }
@@ -306,7 +365,9 @@ export class RemoteStepBatchController {
   accept(value) {
     const page = validateRemoteStepBatch(value, { sessionId: this.source.sessionId,
       batchId: this.batchId ?? undefined, count: this.creation?.count });
+    const learnedId = this.batchId === null;
     this.batchId = page.batch_id;
+    if (learnedId) this.#saveReference();
     this.page = page;
     this.missing = false;
     this.onChange(this); // Expose the retained ID before the first advance request.
@@ -341,6 +402,7 @@ export class RemoteStepBatchController {
     this.attach();
     this.creation = creation;
     this.batchId = null;
+    this.#saveReference();
     this.page = null;
     this.missing = false;
     return this.execute(async (signal) => {
@@ -356,6 +418,7 @@ export class RemoteStepBatchController {
     this.attach();
     this.creation = null;
     this.batchId = batchId;
+    this.#saveReference();
     this.page = null;
     this.missing = false;
     return this.refresh(0);
@@ -369,6 +432,7 @@ export class RemoteStepBatchController {
     this.batchId = null;
     this.page = null;
     this.missing = false;
+    this.#saveReference();
     this.notice = `Cleared the local batch reference${previousId ? ` to ${previousId}` : ""}. Earlier server work is unchanged; no step was cancelled, submitted or retried.`;
     this.onChange(this);
   }
@@ -386,6 +450,7 @@ export class RemoteStepBatchController {
     return this.execute(async (signal) => {
       const client = this.client();
       const options = { sessionId: this.source.sessionId, signal };
+      if (!this.batchId && !this.canAdvance()) throw new Error("Return to the live owner before recovering a reservation");
       this.accept(this.batchId ? await client.stepBatchStatus(this.batchId, options)
         : await client.createStepBatch(this.creation, options));
       await this.advance(signal);
