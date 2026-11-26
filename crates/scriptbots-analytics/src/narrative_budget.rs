@@ -22,6 +22,9 @@ use crate::{
     require_single_world_narrative, verify_narrative_inputs,
 };
 
+/// Qualification of one scientific budget across independent recorded root seeds.
+pub mod cohort;
+
 const QUIET_TICKS: u64 = 10_000;
 const MAX_EXPECTATIONS: usize = 64;
 

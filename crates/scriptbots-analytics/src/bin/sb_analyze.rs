@@ -94,6 +94,15 @@ enum Command {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Check a common scenario budget across 3–32 distinct pinned root seeds.
+    VerifyNarrativeCohort {
+        /// JSON cohort specification (member database paths are relative to this file).
+        #[arg(long)]
+        spec: PathBuf,
+        /// Save the full member reports and aggregate verdict (also printed to stdout).
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
     /// Export run tables to Parquet, Arrow, or CSV (bd-2z0.11.8).
     Export {
         /// Destination directory for exported files (default: current dir).
@@ -201,6 +210,33 @@ fn main() -> ExitCode {
     handler.join().unwrap_or(ExitCode::FAILURE)
 }
 
+fn read_narrative_spec<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, AnalyticsError> {
+    // Check the bytes actually read even when the file grows after opening.
+    const SPEC_LIMIT: usize = 65_536;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?.take(65_537).read_to_end(&mut bytes)?;
+    if bytes.len() > SPEC_LIMIT {
+        return Err(AnalyticsError::BadParam {
+            name: "spec".to_owned(),
+            reason: "specification exceeds 65,536 bytes".to_owned(),
+        });
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn emit_narrative_verdict(
+    report: &impl serde::Serialize,
+    passed: bool,
+    path: Option<&Path>,
+) -> Result<(), AnalyticsError> {
+    let payload = serde_json::to_string_pretty(report)?;
+    if let Some(path) = path {
+        std::fs::write(path, &payload)?;
+    }
+    println!("{payload}");
+    if passed { Ok(()) } else { Err(AnalyticsError::NarrativeBudgetFailed) }
+}
+
 fn run(cli: &Cli) -> Result<(), AnalyticsError> {
     let registry = Registry::builtin();
     let db = cli.db.display().to_string();
@@ -293,30 +329,24 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             Ok(())
         }
         Command::VerifyNarrativeBudget { spec, json } => {
-            // Check the actual bytes read even if the file grows after opening.
-            const SPEC_LIMIT: usize = 65_536;
-            let mut bytes = Vec::new();
-            std::fs::File::open(spec)?.take(65_537).read_to_end(&mut bytes)?;
-            if bytes.len() > SPEC_LIMIT {
-                return Err(AnalyticsError::BadParam {
-                    name: "spec".to_owned(),
-                    reason: "budget exceeds 65,536 bytes".to_owned(),
-                });
-            }
-            let budget = serde_json::from_slice(&bytes)?;
+            let budget = read_narrative_spec(spec)?;
             let report = scriptbots_analytics::narrative_budget::verify_narrative_budget(
                 &open_reader()?, &budget,
             )?;
-            let payload = serde_json::to_string_pretty(&report)?;
-            if let Some(path) = json {
-                std::fs::write(path, &payload)?;
+            emit_narrative_verdict(&report, report.passed, json.as_deref())
+        }
+        Command::VerifyNarrativeCohort { spec, json } => {
+            if cli.run_id.is_some() {
+                return Err(AnalyticsError::BadParam {
+                    name: "run-id".to_owned(),
+                    reason: "cohort members each specify their run ID".to_owned(),
+                });
             }
-            println!("{payload}");
-            if report.passed {
-                Ok(())
-            } else {
-                Err(AnalyticsError::NarrativeBudgetFailed)
-            }
+            let cohort = read_narrative_spec(spec)?;
+            let report = scriptbots_analytics::narrative_budget::cohort::verify_cohort(
+                &cohort, &cli.db, spec.parent().unwrap_or(Path::new(".")),
+            )?;
+            emit_narrative_verdict(&report, report.passed, json.as_deref())
         }
         Command::Export {
             out_dir,

@@ -11611,6 +11611,18 @@ impl StorageReader {
         })
     }
 
+    /// Move this finished reader to another retained run while holding the
+    /// same immutable connection and file lease. Validation precedes mutation,
+    /// so an unavailable run leaves the previous selection and cache intact.
+    pub fn switch_finished_run(&mut self, run_id: RunId) -> Result<(), StorageError> {
+        let selected = Self::resolve_run_id(self.finished_connection()?, Some(run_id))?;
+        if selected != self.run_id {
+            self.run_id = selected;
+            let _ = self.narrative_input_binding_v1.take();
+        }
+        Ok(())
+    }
+
     pub(crate) fn connection(&self) -> Result<&Connection, StorageError> {
         self.conn.as_ref().ok_or(StorageError::Closed)
     }

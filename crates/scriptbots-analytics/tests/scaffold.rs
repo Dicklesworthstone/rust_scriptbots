@@ -1868,12 +1868,21 @@ fn narrative_verification_isolates_explicitly_selected_runs() {
             ..
         }))
     ));
-    let first = ReaderCtx::open_for_run(&path, first_id).expect("select first run");
+    let mut first = ReaderCtx::open_for_run(&path, first_id).expect("select first run");
     let first_report = verify_narrative(&first.reader).expect("first selected comparison");
     first_report
         .require_equivalent()
         .expect("second run output cannot contaminate first");
     assert_eq!(first_report.inputs_replayed, 4);
+    let missing = scriptbots_runtime::RunId::new(0x16_020_ABC);
+    assert!(first.reader.switch_finished_run(missing).is_err());
+    assert_eq!(verify_narrative(&first.reader).unwrap(), first_report);
+    first.reader.switch_finished_run(second_id).unwrap();
+    let switched = verify_narrative(&first.reader).unwrap();
+    assert_eq!(switched.input_binding.run_id, second_id);
+    assert_eq!(switched.inputs_replayed, 1);
+    first.reader.switch_finished_run(first_id).unwrap();
+    assert_eq!(verify_narrative(&first.reader).unwrap(), first_report);
     drop(first);
     let second = ReaderCtx::open_for_run(&path, second_id).expect("select second run");
     let second_report = verify_narrative(&second.reader).expect("second selected comparison");
@@ -1893,6 +1902,37 @@ fn narrative_verification_isolates_explicitly_selected_runs() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(String::from_utf8_lossy(&run.stdout).contains(&first_id.to_string()));
+
+    // Two runs share the positional file. A third is selected relative to the
+    // specification. Unattributed input is retained as three failed results.
+    let third_id = scriptbots_runtime::RunId::new(0x16_020_98A);
+    let other = dir.path().join("second-file.sqlite");
+    let mut storage = Storage::create_new_file_for_run(
+        other.to_str().unwrap(), RunManifestRecord::unattributed(third_id),
+    ).unwrap();
+    storage.persist(&second_batch).unwrap();
+    storage.close().unwrap();
+    let spec = dir.path().join("cohort.json");
+    std::fs::write(&spec, serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,
+        "budget":{"schema_version":1,"scenario_id":"meadow","expected_ticks":10000,"rule":{"type":"quiet"}},
+        "members":[{"run_id":first_id,"root_seed":1},{"run_id":second_id,"root_seed":2},
+                   {"run_id":third_id,"root_seed":3,"database":"second-file.sqlite"}]
+    })).unwrap()).unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_sb-analyze"))
+        .args([&path,"verify-narrative-cohort","--spec"]).arg(spec).output().unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    let payload: serde_json::Value = serde_json::from_slice(&run.stdout)
+        .unwrap_or_else(|_| panic!("no cohort verdict: {}", String::from_utf8_lossy(&run.stderr)));
+    assert_eq!(payload["passed"], false);
+    assert_eq!(payload["distinct_observed_seeds"], 0);
+    let members = payload["members"].as_array().unwrap();
+    assert_eq!(members.len(), 3);
+    for ((member, id), ticks) in members.iter().zip([first_id,second_id,third_id]).zip([4,1,1]) {
+        assert_eq!(member["result"]["verification"]["input_binding"]["run_id"], id.to_string());
+        assert_eq!(member["result"]["verification"]["inputs_replayed"], ticks);
+        assert!(member["violations"].as_array().unwrap().contains(&"unverified_launch_design".into()));
+    }
 }
 
 #[test]
