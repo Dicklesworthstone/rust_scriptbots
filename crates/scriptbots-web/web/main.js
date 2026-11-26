@@ -2,7 +2,7 @@ import initWasm, * as wasm from "./pkg/scriptbots_web.js";
 import { CanvasRenderer } from "./renderers/canvas.js";
 import { WebGpuRenderer } from "./renderers/webgpu.js";
 import { environmentDescription } from "./renderers/environment.js";
-import { RemoteStreamClient } from "./remote.js";
+import { RemoteStreamClient, describeRemoteOwnerFault, describeRemoteCommandReceipt } from "./remote.js";
 import { BrowserContinuationStore, BrowserRecoveryController } from "./continuation-store.js";
 import { InspectionController, pickAgent, renderInspector, renderInspectorSource,
   validateBrainInspection, renderBrainInspector, renderBrainSource } from "./inspector.js";
@@ -1103,19 +1103,25 @@ function renderRemoteOwnerStatus() {
   remoteOwnerState.dataset.tick = status?.identity.tick ?? "";
   remoteOwnerState.dataset.publicationRevision = status?.identity.publicationRevision ?? "";
   remoteOwnerState.dataset.faultCode = status?.fault?.code ?? "";
+  remoteOwnerState.dataset.faultTick = status?.fault?.kind === "scientific" ? status.fault.tick : "";
+  const displayed = paintedWorld()?.frame.identity;
+  remoteOwnerState.dataset.displayedTick = displayed?.tick ?? "";
+  remoteOwnerState.dataset.displayedSessionId = displayed?.sessionId ?? "";
+  remoteOwnerState.dataset.displayedView = displayed ? reviewedCheckpoint ? "checkpoint" : "live" : "unavailable";
   let description = "Waiting for a current owner observation. Live-world commands are disabled.";
   if (status) {
     const fault = status.fault;
-    const boundary = fault?.kind === "scientific" ? `tick ${fault.tick}`
-      : fault?.kind === "journal" ? `journal batch ${fault.session_id}/${fault.batch_sequence}` : `tick ${status.identity.tick}`;
-    description = fault ? `${fault.kind} fault at ${boundary} (${fault.code}): ${fault.message}${fault.diagnostic_truncated ? " [diagnostic truncated]" : ""}`
+    description = fault ? describeRemoteOwnerFault(status)
       : `Owner ${status.lifecycle}, ${status.health}${status.blocker ? ` (${status.blocker})` : ""}; ${status.playback.paused ? "paused" : "running"} at tick ${status.identity.tick}.`;
     description = `${current ? "Observed" : "Last observed"} ${description}`;
+    if (fault) description += displayed
+      ? ` Displayed ${reviewedCheckpoint ? "historical" : "live"} world: tick ${displayed.tick}, session ${displayed.sessionId}.`
+      : " No current canvas frame is available.";
     if (!current) description += " Current owner health is unavailable; live-world commands are disabled.";
     else if (!remoteOwnerAllowsMutation()) description += " Live-world commands are disabled. Inspection and saved checkpoint transfer remain available.";
   }
   if (remoteClient?.ownerStatusError) description += ` Status read failed: ${remoteClient.ownerStatusError}`;
-  remoteOwnerState.textContent = description;
+  if (remoteOwnerState.textContent !== description) remoteOwnerState.textContent = description;
 }
 
 function updateRemoteControls() {
@@ -1256,15 +1262,14 @@ function receiveRemoteReceipt(reply) {
   if (!remoteMode) return;
   if (reply.request_id !== lastRemoteRequestId && reply.request_id !== lastRemoteStatusRequestId) {
     appendLog(`Earlier remote request ${reply.request_id}: ${reply.type === "receipt"
-      ? `${reply.receipt.application_state}; journal ${reply.receipt.journal_state}`
+      ? describeRemoteCommandReceipt(reply.receipt)
       : `${reply.status}: ${reply.message}`}`);
     return;
   }
   if (reply.type === "receipt") {
     const receipt = reply.receipt;
     lastRemoteCommandId = receipt.command_id;
-    remoteReceipt.textContent = `Command ${receipt.command_id}: application ${receipt.application_state}; journal ${receipt.journal_state}.`;
-    if (receipt.rejection_reason) remoteReceipt.textContent += ` ${JSON.stringify(receipt.rejection_reason)}`;
+    remoteReceipt.textContent = describeRemoteCommandReceipt(receipt);
   } else {
     remoteReceipt.textContent = `Command response ${reply.status}: ${reply.message}`;
   }
@@ -1778,6 +1783,7 @@ function presentSimulation(now) {
     const frame = reviewedCheckpoint?.frame ?? liveFrame;
     const presented = drawSnapshot(frame, !!reviewedCheckpoint);
     updateStats(frame.snapshot, now, !!reviewedCheckpoint);
+    if (presented && remoteMode && remoteClient?.ownerStatus?.fault) renderRemoteOwnerStatus();
     if (presented && presentationFailure) {
       if (rendererStatus.textContent === presentationFailure.message) {
         rendererStatus.textContent = presentationFailure.previousStatus;

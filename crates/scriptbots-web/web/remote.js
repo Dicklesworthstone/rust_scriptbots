@@ -73,7 +73,37 @@ export function validateRemoteOwnerStatus(value, sessionId, previous = null) {
       throw new Error("Remote owner status contradicts its retained publication");
     }
   }
-  return status;
+  Object.freeze(status.identity);
+  Object.freeze(status.playback);
+  if (status.fault) Object.freeze(status.fault);
+  return Object.freeze(status);
+}
+
+/** Keep a terminal owner diagnosis distinct from its retained world publication. */
+export function describeRemoteOwnerFault(status) {
+  const fault = status.fault;
+  if (!fault) return "";
+  const boundary = fault.kind === "scientific" ? `owner boundary tick ${fault.tick}`
+    : fault.kind === "journal" ? `journal batch ${fault.session_id}/${fault.batch_sequence}`
+      : `published world tick ${status.identity.tick}`;
+  return `${fault.kind} fault at ${boundary} (${fault.code}): ${fault.message}${fault.diagnostic_truncated ? " [diagnostic truncated]" : ""}. Published world tick ${status.identity.tick}.`;
+}
+
+/** Describe the owner's independent application and journal outcomes verbatim. */
+export function describeRemoteCommandReceipt(receipt) {
+  let text = `Command ${receipt.command_id}: application ${receipt.application_state}; journal ${receipt.journal_state}.`;
+  if (receipt.application_state === "applied") {
+    // These legacy DTO fields are JSON numbers. Never present a rounded u64 as
+    // an exact applied boundary, or borrow the currently displayed frame's tick.
+    const exact = (value) => Number.isSafeInteger(value) && value >= 0
+      ? String(value) : "unavailable (not an exact browser integer)";
+    text += ` Applied at tick ${exact(receipt.applied_tick)}; control revision ${exact(receipt.control_revision)}, scientific revision ${exact(receipt.scientific_revision)}, config revision ${exact(receipt.config_revision)}.`;
+  }
+  if (receipt.rejection_reason) text += ` Rejection: ${JSON.stringify(receipt.rejection_reason)}.`;
+  for (const [label, failure] of [["Application", receipt.application_failure], ["Journal", receipt.journal_failure]]) {
+    if (failure) text += ` ${label} failure (${failure.code}): ${failure.message}${failure.diagnostic_truncated ? " [diagnostic truncated]" : ""}.`;
+  }
+  return text;
 }
 
 /** Preserve actual HTTP refusal separately from transport failures and lost receipts. */

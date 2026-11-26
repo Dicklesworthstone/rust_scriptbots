@@ -3,12 +3,76 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import test from "node:test";
-import { RemoteFrameTracker, RemoteStreamClient, consumeRemoteFrame, validateRemoteOwnerStatus } from "../remote.js";
+import { RemoteFrameTracker, RemoteStreamClient, consumeRemoteFrame, validateRemoteOwnerStatus, describeRemoteCommandReceipt, describeRemoteOwnerFault } from "../remote.js";
 import { EXPERIMENT_LIMITS, prepareExperimentRequest } from "../experiment-protocol.js";
 import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
 
 const SESSION = "340282366920938463463374607431768211455";
 const COMMAND = "1234567890abcdef1234567890abcdef";
+
+test("command receipt text preserves applied boundaries and independent failure axes", () => {
+  const applied = {
+    command_id: COMMAND,
+    application_state: "applied",
+    journal_state: "failed",
+    applied_tick: 12,
+    control_revision: 7,
+    scientific_revision: 5,
+    config_revision: 3,
+    journal_failure: { code: "disk_full", message: "retained write failed", diagnostic_truncated: false },
+  };
+  const original = structuredClone(applied);
+  const text = describeRemoteCommandReceipt(applied);
+  assert.match(text, /application applied; journal failed/);
+  assert.match(text, /Applied at tick 12; control revision 7, scientific revision 5, config revision 3/);
+  assert.match(text, /Journal failure \(disk_full\): retained write failed/);
+  assert.doesNotMatch(text, /Application failure|diagnostic truncated/);
+  assert.deepEqual(applied, original);
+
+  const failed = {
+    ...applied,
+    application_state: "failed",
+    application_failure: { code: "world_step", message: "<img src=x> failed sensing", diagnostic_truncated: true },
+  };
+  const failedText = describeRemoteCommandReceipt(failed);
+  assert.match(failedText, /application failed; journal failed/);
+  assert.match(failedText, /Application failure \(world_step\): <img src=x> failed sensing \[diagnostic truncated\]/);
+  assert.match(failedText, /Journal failure \(disk_full\): retained write failed/);
+  assert.doesNotMatch(failedText, /Applied at tick|control revision/,
+    "latest published revisions on a failed command do not become an applied boundary");
+
+  const rejected = {
+    command_id: COMMAND,
+    application_state: "rejected",
+    journal_state: "pending",
+    rejection_reason: { stale_revision: { expected: 9, actual: 10 } },
+  };
+  assert.match(describeRemoteCommandReceipt(rejected), /Rejection: .*stale_revision/);
+  assert.doesNotMatch(describeRemoteCommandReceipt(rejected), /Applied at tick|failure/);
+  assert.doesNotMatch(describeRemoteCommandReceipt({ ...applied, application_state: "queued" }), /Applied at tick/);
+});
+
+test("command receipt text never reports rounded numeric fields as an exact applied boundary", () => {
+  const receipt = {
+    command_id: COMMAND,
+    application_state: "applied",
+    journal_state: "durable",
+    applied_tick: 0,
+    control_revision: 0,
+    scientific_revision: 0,
+    config_revision: 0,
+  };
+  assert.match(describeRemoteCommandReceipt(receipt), /Applied at tick 0; control revision 0, scientific revision 0, config revision 0/);
+  for (const [field, label] of [["applied_tick", "tick"], ["control_revision", "control revision"],
+    ["scientific_revision", "scientific revision"], ["config_revision", "config revision"]]) {
+    for (const value of [undefined, null, -1, 1.5, NaN, Infinity, "7", Number.MAX_SAFE_INTEGER + 1]) {
+      assert.ok(describeRemoteCommandReceipt({ ...receipt, [field]: value })
+        .includes(`${label} unavailable (not an exact browser integer)`));
+    }
+    assert.ok(describeRemoteCommandReceipt({ ...receipt, [field]: Number.MAX_SAFE_INTEGER })
+      .includes(`${label} ${Number.MAX_SAFE_INTEGER}`));
+  }
+});
 
 function environment() {
   return { width: 2, height: 2, sourceWidth: 2, sourceHeight: 2, cellSize: 40,
@@ -469,6 +533,47 @@ function ownerStatusFixture(sessionId = OWNER_SESSION, revision = "9007199254740
     playback: { paused: true, speedMultiplier: 1 } };
 }
 const settleOwnerStatus = () => new Promise((resolve) => setImmediate(resolve));
+
+test("owner fault descriptions retain immutable diagnoses separately from published science", () => {
+  const response = ownerStatusFixture();
+  response.identity.tick = "3";
+  response.health = "faulted";
+  response.fault = {
+    kind: "scientific",
+    tick: "5",
+    code: "world_step",
+    message: "original sensing failure",
+    diagnostic_truncated: false,
+  };
+  const observed = validateRemoteOwnerStatus(response, OWNER_SESSION);
+  assert.match(describeRemoteOwnerFault(observed), /scientific fault at owner boundary tick 5 \(world_step\): original sensing failure/);
+  assert.match(describeRemoteOwnerFault(observed), /Published world tick 3\./);
+  for (const value of [observed, observed.identity, observed.playback, observed.fault]) {
+    assert.equal(Object.isFrozen(value), true);
+  }
+  assert.throws(() => { observed.fault.tick = "3"; }, TypeError);
+  response.identity.tick = "99";
+  response.fault.message = "replaced input";
+  assert.equal(observed.identity.tick, "3");
+  assert.equal(observed.fault.message, "original sensing failure");
+
+  const journal = ownerStatusFixture();
+  journal.identity.tick = "3";
+  journal.health = "faulted";
+  journal.fault = {
+    kind: "journal",
+    session_id: OWNER_SESSION,
+    batch_sequence: "18446744073709551615",
+    code: "disk_full",
+    message: "bounded diagnostic",
+    diagnostic_truncated: true,
+  };
+  const journalText = describeRemoteOwnerFault(validateRemoteOwnerStatus(journal, OWNER_SESSION));
+  assert.ok(journalText.includes(`journal batch ${OWNER_SESSION}/18446744073709551615`));
+  assert.match(journalText, /bounded diagnostic \[diagnostic truncated\]/);
+  assert.match(journalText, /Published world tick 3\./);
+  assert.equal(describeRemoteOwnerFault(validateRemoteOwnerStatus(ownerStatusFixture(), OWNER_SESSION)), "");
+});
 
 test("remote owner status preserves exact fault identities and refuses contradictory publications", () => {
   const source = ownerStatusFixture();

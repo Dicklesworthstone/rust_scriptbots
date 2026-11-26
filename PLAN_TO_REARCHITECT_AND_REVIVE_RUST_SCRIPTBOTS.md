@@ -2,6 +2,29 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Browser command diagnoses and fault/publication separation (2026-11-26):**
+[Source implemented and independently reviewed; browser execution validation pending —
+Codex; corrective contribution to `bd-2z0.12.2`;
+original complete acceptance retained]
+
+Current and earlier browser command receipts show independent application and
+journal failure details, truncation markers and retained application boundaries.
+Unsafe or absent numeric receipt fields are explicitly unavailable instead of
+being presented as exact JavaScript integers. Rejected, failed and admitted
+commands do not borrow a completed boundary from their latest publication.
+
+Normalized owner observations are immutable. A scientific fault's owner boundary,
+the retained published world and the currently displayed live or historical
+world remain distinct in the fault panel, including after a new frame is painted.
+Three authored module regressions cover both failure axes, exact numeric bounds,
+detached immutable observations and scientific/journal fault descriptions.
+
+DSR and an isolated current-source browser checkout were restored, but the
+executor disconnected before the candidate suite and syntax checks could start.
+Independent source review completed; no candidate execution result or packaged
+browser qualification is claimed. Existing sparse-publication validation and
+cooperation-study additions are preserved.
+
 **Actionable command failures and retained application boundaries (2026-11-26):**
 [Source implemented and independently reviewed; native execution validation pending —
 Codex; corrective contribution to `bd-2z0.4.9`;
