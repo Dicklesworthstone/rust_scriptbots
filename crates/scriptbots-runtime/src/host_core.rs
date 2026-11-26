@@ -4160,6 +4160,11 @@ impl HostCore {
             .map(|pending| pending.envelope.command_id)
     }
 
+    /// Stable receipt threshold for observers of this owner's journal.
+    pub(crate) fn journal_commit_requirement(&self) -> ShutdownCommitRequirement {
+        self.journal.shutdown_commit_requirement()
+    }
+
     /// Next admission sequence, exposed as a monotonic accounting cursor.
     #[must_use]
     pub(crate) fn admission_cursor(&self) -> AdmissionSequence {

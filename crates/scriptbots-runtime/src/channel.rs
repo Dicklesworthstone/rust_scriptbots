@@ -45,7 +45,7 @@ use scriptbots_core::{
     INPUT_SIZE, IndicatorState, MutationRates, NUM_EYES, OUTPUT_SIZE, SelectionState,
     SensorAttribution, TraitModifiers, WorldDigestV1,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock, TryLockError};
 use std::time::{Duration, Instant};
@@ -359,15 +359,31 @@ pub struct AgentInspectorData {
 /// a finished command (application resolved and journal axis settled) is
 /// evicted before any still-admitted command, and only when every retained
 /// status is unfinished does the oldest unfinished status yield.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StatusBoard {
     order: VecDeque<CommandId>,
     statuses: HashMap<CommandId, CommandStatus>,
+    unsettled: BTreeSet<CommandId>,
+    commitment: crate::ShutdownCommitRequirement,
 }
 
 impl StatusBoard {
+    fn new(commitment: crate::ShutdownCommitRequirement) -> Self {
+        Self {
+            order: VecDeque::new(),
+            statuses: HashMap::new(),
+            unsettled: BTreeSet::new(),
+            commitment,
+        }
+    }
+
     fn insert(&mut self, status: CommandStatus, capacity: usize) {
         let command_id = status.command_id();
+        if status_is_finished(&status, self.commitment) {
+            self.unsettled.remove(&command_id);
+        } else {
+            self.unsettled.insert(command_id);
+        }
         if self.statuses.insert(command_id, status).is_none() {
             self.order.push_back(command_id);
         }
@@ -375,12 +391,13 @@ impl StatusBoard {
             let evict = self
                 .order
                 .iter()
-                .position(|id| self.statuses.get(id).is_some_and(status_is_finished))
+                .position(|id| !self.unsettled.contains(id))
                 .unwrap_or(0);
             let Some(removed) = self.order.remove(evict) else {
                 break;
             };
             self.statuses.remove(&removed);
+            self.unsettled.remove(&removed);
         }
     }
 
@@ -390,10 +407,23 @@ impl StatusBoard {
 }
 
 /// Whether both axes of a command status reached a terminal state.
-const fn status_is_finished(status: &CommandStatus) -> bool {
-    let application_finished = !matches!(status.application(), crate::ApplicationState::Admitted);
-    let journal_finished = !matches!(status.journal(), crate::JournalState::Pending);
-    application_finished && journal_finished
+const fn status_is_finished(
+    status: &CommandStatus,
+    commitment: crate::ShutdownCommitRequirement,
+) -> bool {
+    let journal_finished = match status.journal() {
+        crate::JournalState::Pending => false,
+        crate::JournalState::CommittedVolatile => {
+            matches!(
+                commitment,
+                crate::ShutdownCommitRequirement::CommittedVolatile
+            )
+        }
+        crate::JournalState::NotRequired
+        | crate::JournalState::Durable
+        | crate::JournalState::Failed(_) => true,
+    };
+    journal_finished && !matches!(status.application(), crate::ApplicationState::Admitted)
 }
 
 /// Bounded mirror of the ordered protocol-event ring.
@@ -1267,7 +1297,9 @@ impl ChannelHostDriver {
         let options = options.validate()?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(options.ingress_capacity);
         let ingress_open = Arc::new(Mutex::new(true));
-        let statuses = Arc::new(RwLock::new(StatusBoard::default()));
+        let statuses = Arc::new(RwLock::new(StatusBoard::new(
+            host.core().journal_commit_requirement(),
+        )));
         let protocol_events = Arc::new(RwLock::new(ProtocolEventBoard::default()));
         let local = host.local_port();
         let port = ChannelHostPort {
@@ -1618,7 +1650,9 @@ impl ChannelHostDriver {
         let Ok(board) = self.statuses.read() else {
             return;
         };
-        self.mirror_poll_ids.extend(board.order.iter().copied());
+        // Looking up an evicted owner status can consult durable storage and repopulate
+        // the owner's retry cache. Only track IDs whose next transition is still due.
+        self.mirror_poll_ids.extend(board.unsettled.iter().copied());
         drop(board);
 
         for index in 0..self.mirror_poll_ids.len() {
@@ -3736,7 +3770,10 @@ mod tests {
         }
     }
 
-    fn authority_test_host(authority: Arc<dyn CommandAuthorityReader>) -> FixedDeadlineHost {
+    fn authority_test_host(
+        authority: Arc<dyn CommandAuthorityReader>,
+        archived_command_capacity: usize,
+    ) -> FixedDeadlineHost {
         let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
             rng_seed: Some(0x5eed_cafe),
             persistence_interval: 0,
@@ -3744,6 +3781,7 @@ mod tests {
         })
         .expect("deterministic authority world");
         let options = HostCoreOptions {
+            archived_command_capacity,
             initial_playback: PlaybackSnapshot {
                 paused: true,
                 ..PlaybackSnapshot::default()
@@ -4309,9 +4347,23 @@ mod tests {
         );
         assert_eq!(driver.host.drive_interest(), HostDriveInterest::Draining);
 
+        let batch_id = journal_state.borrow().attempts[0];
+        journal_state
+            .borrow_mut()
+            .receipts
+            .push_back(crate::JournalReceipt::new(
+                batch_id,
+                crate::JournalReceiptState::CommittedVolatile,
+            ));
+        driver.step(ManualInstant::from_nanos(11)).unwrap();
+        let intermediate = port.command_status(CommandId::new(82)).unwrap().unwrap();
+        assert_eq!(
+            intermediate.journal(),
+            &crate::JournalState::CommittedVolatile
+        );
+
         {
             let mut state = journal_state.borrow_mut();
-            let batch_id = *state.attempts.first().expect("accepted journal batch");
             state.receipts.push_back(crate::JournalReceipt::new(
                 batch_id,
                 crate::JournalReceiptState::Durable,
@@ -5161,9 +5213,11 @@ mod tests {
                 ]),
             )])),
         });
-        let (mut driver, port) =
-            ChannelHostDriver::new(authority_test_host(authority), fast_options())
-                .expect("channel authority driver");
+        let (mut driver, port) = ChannelHostDriver::new(
+            authority_test_host(authority, HostCoreOptions::default().archived_command_capacity),
+            fast_options(),
+        )
+        .expect("channel authority driver");
 
         let (first_reply, first_receipt) = std::sync::mpsc::channel();
         port.sender
@@ -5364,8 +5418,48 @@ mod tests {
     }
 
     #[test]
+    fn settled_channel_receipts_do_not_reload_evicted_command_authority() {
+        let first_id = CommandId::new(71);
+        let authority = Arc::new(ScriptedChannelAuthority {
+            outcomes: Mutex::new(HashMap::from([
+                (
+                    first_id,
+                    VecDeque::from([
+                        CommandAuthorityLookup::Claimed,
+                        CommandAuthorityLookup::Failed(crate::CommandAuthorityLookupFailure::Busy),
+                    ]),
+                ),
+                (
+                    CommandId::new(72),
+                    VecDeque::from([CommandAuthorityLookup::Claimed]),
+                ),
+            ])),
+        });
+        let (mut driver, mut port) =
+            ChannelHostDriver::new(authority_test_host(authority, 1), fast_options()).unwrap();
+        for (id, now) in [(71, 0), (72, 2)] {
+            let receipt = queue_command(&port, id, HostCommand::Pause);
+            driver.step(ManualInstant::from_nanos(now)).unwrap();
+            receipt.try_recv().unwrap().unwrap();
+            driver.step(ManualInstant::from_nanos(now + 1)).unwrap();
+        }
+        driver.step(ManualInstant::from_nanos(4)).unwrap();
+        let mirrored = port.command_status(first_id).unwrap().unwrap();
+        assert_eq!(mirrored.journal(), &crate::JournalState::CommittedVolatile);
+        // The second ID evicted the first from the real host archive. Its first
+        // external lookup must still be available to an explicit owner read.
+        assert!(matches!(
+            driver.port.command_status(first_id),
+            Err(HostAccessError::CommandAuthorityLookup {
+                failure: crate::CommandAuthorityLookupFailure::Busy,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn status_board_evicts_finished_first() {
-        let mut board = StatusBoard::default();
+        let mut board = StatusBoard::new(ShutdownCommitRequirement::CommittedVolatile);
         let finished = CommandStatus::rejected(
             CommandId::new(71),
             RejectionReason::Validation {
@@ -5434,7 +5528,10 @@ mod tests {
             archived.application(),
             ApplicationState::Applied(_)
         ));
-        assert!(status_is_finished(&archived));
+        assert!(status_is_finished(
+            &archived,
+            ShutdownCommitRequirement::CommittedVolatile
+        ));
 
         // Fresh A displaces terminal B from both retention structures. An
         // archived retry of B then made the old FIFO drop A while the board
