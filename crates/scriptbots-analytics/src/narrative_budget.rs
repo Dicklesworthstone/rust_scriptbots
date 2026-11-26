@@ -120,6 +120,12 @@ impl NarrativeBudget {
 pub struct BudgetMeasurements {
     /// Exact number of input ticks included in at least one eligible detector pass.
     pub covered_ticks: u64,
+    /// Adjacent recorded tick pairs seen together in at least one eligible pass.
+    /// A run starting at tick one has one fewer observable transition than inputs.
+    /// This measures available comparisons, independently of detector sensitivity.
+    pub covered_transitions: u64,
+    /// Earliest adjacent pair never seen together, including an uncovered tail.
+    pub first_uncovered_transition: Option<[u64; 2]>,
     /// Number of inputs containing a nonempty population.
     pub occupied_ticks: u64,
     /// Number of eligible detector passes, including zero-event passes.
@@ -171,7 +177,22 @@ impl<'a> BudgetTally<'a> {
         {
             self.measurements.detector_passes += 1;
             self.measurements.covered_ticks += tick - self.last_covered.max(oldest - 1);
+            // An inclusive history [oldest, tick] exposes transition endpoints
+            // (oldest, tick]. Consecutive passes must share a sample to cover
+            // their boundary transition. Retention never recovers evicted inputs.
+            let previous = self.last_covered.max(1);
+            if oldest > previous && self.measurements.first_uncovered_transition.is_none() {
+                self.measurements.first_uncovered_transition = Some([previous, previous + 1]);
+            }
+            self.measurements.covered_transitions += tick - previous.max(oldest);
             self.last_covered = tick;
+        }
+    }
+
+    fn finish_input_coverage(&mut self, terminal_tick: u64) {
+        let previous = self.last_covered.max(1);
+        if previous < terminal_tick && self.measurements.first_uncovered_transition.is_none() {
+            self.measurements.first_uncovered_transition = Some([previous, previous + 1]);
         }
     }
 
@@ -205,6 +226,11 @@ impl<'a> BudgetTally<'a> {
         if m.covered_ticks != self.budget.expected_ticks {
             failures.push("incomplete_detector_coverage");
         }
+        // Both rules bound the complete temporal narrative, including threshold
+        // crossings. An otherwise quiet seam can conceal an unexamined change.
+        if m.first_uncovered_transition.is_some() {
+            failures.push("incomplete_detector_transition_coverage");
+        }
         match &self.budget.rule {
             NarrativeBudgetRule::Quiet => {
                 if m.occupied_ticks != self.budget.expected_ticks {
@@ -233,7 +259,7 @@ impl<'a> BudgetTally<'a> {
 /// Full parity evidence and a separate budget verdict for this recorded detector.
 #[derive(Debug, Serialize)]
 pub struct NarrativeBudgetReport<'a> {
-    /// Version of the report.
+    /// Report V2 distinguishes point and adjacent-transition coverage.
     pub schema_version: u32,
     /// Exact user-supplied budget.
     pub budget: &'a NarrativeBudget,
@@ -268,6 +294,7 @@ pub fn verify_narrative_budget<'a>(
     let manifest = reader.run_manifest()?;
     let mut tally = BudgetTally::new(budget);
     let (verification, island_binding) = verify_narrative_inputs(reader, scope, Some(&mut tally))?;
+    tally.finish_input_coverage(verification.input_binding.terminal_tick);
     let mut violations = tally.violations();
     if !verification.equivalent {
         violations.push("saved_events_diverged");
@@ -282,7 +309,7 @@ pub fn verify_narrative_budget<'a>(
         violations.push("root_seed_mismatch");
     }
     Ok(NarrativeBudgetReport {
-        schema_version: 1,
+        schema_version: 2,
         budget,
         observed_scenario_id: (manifest.manifest_schema_version != 0).then_some(manifest.scenario_id),
         observed_root_seed: (manifest.manifest_schema_version != 0).then_some(manifest.root_seed),
@@ -338,6 +365,67 @@ mod tests {
             }
             assert_eq!(incomplete.measurements.covered_ticks, expected);
             assert!(incomplete.violations().contains(&"incomplete_detector_coverage"));
+        }
+    }
+
+    #[test]
+    fn full_point_coverage_can_hide_every_change_at_disjoint_pass_boundaries() {
+        use scriptbots_core::narrative::{NarrativeReplay, NarrativeReplayPolicyV1};
+
+        let spec = budget(NarrativeBudgetRule::Quiet);
+        for retained in [8_usize, 9] {
+            let mut tally = BudgetTally::new(&spec);
+            let policy = NarrativeReplayPolicyV1::new(8, retained, 8).unwrap();
+            let mut replay = NarrativeReplay::new(policy).unwrap();
+            for tick in 1..=QUIET_TICKS {
+                let mut record = input(tick, 8, 8);
+                record.history_capacity = u64::try_from(retained).unwrap();
+                let population = if ((tick - 1) / 8).is_multiple_of(2) { 20 } else { 200 };
+                record.input = NarrativeInputV1::new(Tick(tick), population, 1.0, 0).unwrap();
+                replay.push(record.input).unwrap();
+                tally.input(record, replay.history().front().unwrap().tick.0);
+                let events = replay.drain_pending_persistence();
+                if retained == 8 {
+                    // Each eligible live-kernel window is constant. Only the
+                    // missing pairs connect the alternating populations.
+                    assert!(events.is_empty());
+                }
+            }
+            tally.finish_input_coverage(QUIET_TICKS);
+            let m = &tally.measurements;
+            assert_eq!(m.covered_ticks, QUIET_TICKS);
+            assert_eq!(m.detector_passes, 1_250);
+            if retained == 8 {
+                assert_eq!(m.covered_transitions, 8_750);
+                assert_eq!(m.first_uncovered_transition, Some([8, 9]));
+                assert_eq!(tally.violations(), ["incomplete_detector_transition_coverage"]);
+            } else {
+                // One shared sample suffices for pair exposure. Longer-window
+                // change detection has its own warmup and materiality criteria.
+                assert_eq!(m.covered_transitions, QUIET_TICKS - 1);
+                assert_eq!(m.first_uncovered_transition, None);
+            }
+        }
+    }
+
+    #[test]
+    fn reports_the_first_unobserved_transition_at_start_interior_or_tail() {
+        let spec = budget(NarrativeBudgetRule::Quiet);
+        for (passes, terminal, expected_count, expected_gap) in [
+            (vec![(8, 1), (16, 8)], 16, 15, None),
+            (vec![(16, 9)], 16, 7, Some([1, 2])),
+            (vec![(8, 1), (24, 17)], 24, 14, Some([8, 9])),
+            (vec![(8, 1)], 9, 7, Some([8, 9])),
+            (vec![], 8, 0, Some([1, 2])),
+            (vec![], 1, 0, None),
+        ] {
+            let mut tally = BudgetTally::new(&spec);
+            for (tick, oldest) in passes {
+                tally.input(input(tick, 8, 8), oldest);
+            }
+            tally.finish_input_coverage(terminal);
+            assert_eq!(tally.measurements.covered_transitions, expected_count);
+            assert_eq!(tally.measurements.first_uncovered_transition, expected_gap);
         }
     }
 
