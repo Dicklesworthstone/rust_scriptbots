@@ -1018,6 +1018,8 @@
                     <p>Pause the local world and choose an intervention above. Both copies start from that checkpoint. Only the treatment receives the chosen intervention.</p>
                     <label for="local-study-ticks">Scientific ticks per arm</label>
                     <input id="local-study-ticks" type="number" min="1" max="512" step="1" value="64" />
+                    <label for="local-study-delay">Ticks to run before queuing the intervention</label>
+                    <input id="local-study-delay" type="number" min="0" max="63" step="1" value="0" required />
                     <button id="local-study-run" type="button" disabled>Run local comparison</button>
                     <button id="local-study-cancel" type="button" disabled>Cancel comparison</button>
                     <p id="local-study-status" role="status" aria-live="polite"></p>

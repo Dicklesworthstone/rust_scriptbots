@@ -7,18 +7,19 @@ if (!globalThis.crypto) Object.defineProperty(globalThis, "crypto", { value: web
 
 const action = { kind: "drought", region: { shape: "all" }, ticks: 5, growth_scale: 0.1 };
 
-function fixture() {
+function fixture(maxBatch = 16) {
   const bytes = Uint8Array.of(9, 2);
   let checkpointCalls = 0;
   const released = [];
   function owner() {
     let tick = 71, control = 3, staged = false, committed = false, energy = 1;
+    let appliedAt = null;
     const identity = () => ({ sessionId: "340282366920938463463374607431768211455", tick: String(tick),
       scientificRevision: String(tick), controlRevision: String(control), configRevision: "0",
       publicationRevision: String(tick + control) });
     const receipt = () => ({ schema: "scriptbots.browser-intervention-receipt.v1", commandId: "d".repeat(32),
       applicationState: "applied", journalState: committed ? "committed_volatile" : "pending",
-      admissionSequence: "4", applicationBoundary: { tick: "71", scientificRevision: "71", controlRevision: "4", configRevision: "0" },
+      admissionSequence: "4", applicationBoundary: appliedAt,
       source: { ...identity(), epoch: "2", paused: true }, ownerError: null, message: null, messageTruncated: false });
     return {
       frame: () => ({ identity: identity(), playback: { paused: true }, snapshot: { epoch: "2", tick,
@@ -27,16 +28,19 @@ function fixture() {
       checkpoint() { checkpointCalls++; return bytes; },
       intervene(request) {
         assert.deepEqual(request.intervention, action);
-        assert.equal(request.expectedControlRevision, "3");
+        assert.equal(request.expectedControlRevision, String(control));
         assert.equal(request.sessionId, identity().sessionId);
-        control++; staged = true; return receipt();
+        control++; staged = true;
+        appliedAt = { tick: String(tick), scientificRevision: String(tick), controlRevision: String(control), configRevision: "0" };
+        return receipt();
       },
       drive(elapsed) { assert.equal(elapsed, 0); committed = true; },
       interventionStatus(commandId) { assert.equal(commandId, receipt().commandId); return receipt(); },
       tick(count) {
-        assert.ok(count > 0 && count <= 16);
+        assert.ok(count > 0 && count <= maxBatch);
         assert.ok(!staged || committed);
         tick += count;
+        control += count;
         energy += (staged ? -1 : 1) * count;
       },
       free() { released.push(tick); },
@@ -122,5 +126,61 @@ test("long horizons include their endpoint and stay within thirty-three observat
     assert.equal(rows.at(-1).tick, String(71 + horizon));
     assert.deepEqual(rows.map(row => row.tick), result.treatment.samples.map(row => row.tick));
     assert.ok(rows.slice(1).every((row, i) => BigInt(row.tick) > BigInt(rows[i].tick)));
+  }
+});
+
+test("delayed treatments split both arms at the same exact boundary, including the last possible tick", () => {
+  for (const [ticks, delay] of [[35, 7], [512, 1], [512, 511]]) {
+    const f = fixture(17);
+    const job = captureLocalStudy(f.live, action, ticks, 1024, delay);
+    const result = runLocalStudy(job, f.owner);
+    const boundary = String(71 + delay);
+    assert.equal(result.delayTicks, delay);
+    assert.equal(result.treatment.receipt.applicationBoundary.tick, boundary);
+    assert.equal(result.treatment.receipt.applicationBoundary.controlRevision, String(4 + delay));
+    const { control, treatment } = result;
+    assert.deepEqual(control.samples.map(row => row.tick), treatment.samples.map(row => row.tick));
+    const at = control.samples.findIndex(row => row.tick === boundary);
+    assert.ok(at > 0 && at < control.samples.length - 1 && control.samples.length <= 33);
+    assert.deepEqual(control.samples.slice(0, at + 1), treatment.samples.slice(0, at + 1));
+    assert.equal(result.difference.averageEnergy, -2 * (ticks - delay));
+    assert.equal(job.source.tick, f.live.frame().identity.tick);
+    assert.deepEqual(f.released, [71 + ticks, 71 + ticks]);
+  }
+});
+
+test("impossible delays are refused by both capture and worker before allocating an owner", () => {
+  const f = fixture(), job = captureLocalStudy(f.live, action, 4, 1024);
+  for (const delay of [-1, 0.5, 4, 5, NaN, "1", null]) {
+    assert.throws(() => captureLocalStudy(f.live, action, 4, 1024, delay), /delay/);
+    assert.throws(() => runLocalStudy({ ...job, delayTicks: delay }, () => assert.fail("unexpected restore")), /delay/);
+  }
+  assert.equal(f.captures(), 1);
+});
+
+test("wrong queue timing and divergent pretreatment samples cannot produce a paired result", () => {
+  for (const fault of ["early receipt", "divergent baseline"]) {
+    const f = fixture();
+    const job = captureLocalStudy(f.live, action, 8, 1024, 4);
+    assert.throws(() => runLocalStudy(job, () => {
+      const copy = f.owner();
+      if (f.released.length && fault === "early receipt") {
+        const observe = copy.interventionStatus;
+        const earlier = r => ({ ...r, applicationBoundary: { ...r.applicationBoundary, tick: "71" } });
+        const submit = copy.intervene;
+        copy.intervene = request => earlier(submit(request));
+        copy.interventionStatus = (...args) => earlier(observe(...args));
+      }
+      if (f.released.length && fault === "divergent baseline") {
+        const read = copy.frame;
+        copy.frame = () => {
+          const frame = read();
+          if (frame.identity.tick === "73") frame.snapshot.summary.averageEnergy++;
+          return frame;
+        };
+      }
+      return copy;
+    }), fault === "early receipt" ? /requested scientific tick/ : /unchanged trajectories/);
+    assert.equal(f.released.length, 2);
   }
 });
