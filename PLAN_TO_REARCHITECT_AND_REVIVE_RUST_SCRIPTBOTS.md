@@ -71,7 +71,7 @@ then the executor disconnected. Candidate formatting, compilation, Clippy and
 test execution remain unverified. No original qualification gate is closed.
 
 **Final experiment-service owner teardown (2026-11-25):**
-[Source implemented and independently reviewed; execution validation pending —
+[Source implemented and independently reviewed; native execution pending —
 Codex; corrective contribution to `bd-2z0.5.11`;
 original complete acceptance retained]
 
@@ -96,13 +96,17 @@ completed but undisplayed tick. It requires the older scientific publication and
 config revisions to remain intact while health reports the later fault tick,
 complementing the browser regressions below.
 
-The executor exhausted its disk and became unavailable. Regression execution,
-native compilation, Clippy and rustfmt remain unverified. Independent source
-reviews completed; no native, persistence, browser or experiment qualification
-gate is closed.
+After the executor recovered, the pinned nightly rustfmt check executed through
+DSR and passed on the prepared follow-up. The formatting changes were reapplied
+over concurrent additions and checked again on 2026-11-26: `control.rs` blob
+`08ebf4f2d524d1ad2b44f03bf697cd7677b26136` passed. The locked offline application
+check stopped before compilation because the pinned `rust-xcb` Git source
+`ae3b2cd080e78173223038ccbebdc644eaf4a9ad` was unavailable. Native regression
+execution, compilation and Clippy remain unverified. Independent source reviews
+completed; no native, persistence or experiment qualification gate is closed.
 
 **Remote scientific faults with sparse publications (2026-11-25):**
-[Source implemented and independently reviewed; execution validation pending —
+[Browser unit regressions verified; native and packaged-browser validation pending —
 Codex; corrective contribution to `bd-2z0.12.2` and `bd-ac4l`;
 original complete acceptance retained]
 
@@ -112,11 +116,21 @@ completed tick that snapshot cadence has not yet published; that observation no
 longer becomes an unavailable-status error. Exact integer validation, publication
 consistency, terminal lifecycle checks and mutation refusal remain in place.
 
-Two authored browser regressions cover full-width and malformed tick identities,
+Two browser regressions cover full-width and malformed tick identities,
 contradictory publications, terminal health and polling after actual canvas,
-telemetry and nonempty event consumption. The executor exhausted its disk and
-disconnected before DSR execution; tests, syntax checks and packaged-browser
-acceptance remain unverified. No original qualification gate is closed.
+telemetry and nonempty event consumption. After executor recovery, DSR 0.2.3
+executed the focused suite (32 passed), all browser `.test.mjs` units (368 passed,
+including that focused suite) and the `remote.js` syntax check against exact
+commit `84e646125d30e9f297b22c5671a6a437f33ab011`. There were no skipped or
+failed candidate tests, and source fingerprints matched before and after.
+
+A separate negative control restored only the original `e946a46` validator
+while retaining the new tests: 30 passed and exactly the two new sparse-fault
+regressions failed. Their failures reproduce rejection of the genuine later
+fault and the incorrect unavailable connection status. This expected failure
+is separate from the passing candidate evidence. Native DTO regression and
+packaged-browser/DOM acceptance remain unverified; no original qualification
+gate is closed.
 
 **Effective communication-scrambling seeds (2026-11-25):**
 [Source implemented and independently reviewed; execution validation pending —

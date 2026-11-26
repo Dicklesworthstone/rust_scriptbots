@@ -3009,7 +3009,8 @@ fn stage_checkpoint_branch_artifacts(
         usize::try_from(*byte_size)
             .map_err(|error| ControlError::PayloadTooLarge(error.to_string()))?,
     )?;
-    if source_bytes.len() as u64 != *byte_size || compute_blake3(&source_bytes) != *checksum_blake3 {
+    if source_bytes.len() as u64 != *byte_size || compute_blake3(&source_bytes) != *checksum_blake3
+    {
         return Err(ControlError::InvalidPatch(
             "checkpoint branch source differs from its immutable admission".to_owned(),
         ));
@@ -11036,7 +11037,10 @@ pub(crate) mod tests {
                     matches!(status.status.as_str(), "pending" | "running"),
                     "unexpected experiment result: {status:?}"
                 );
-                assert!(Instant::now() < deadline, "real experiment did not complete");
+                assert!(
+                    Instant::now() < deadline,
+                    "real experiment did not complete"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
         };
@@ -11058,9 +11062,9 @@ pub(crate) mod tests {
             assert_eq!(actual.total_ticks, 64);
             assert_eq!(actual.final_digest, expected.final_digest);
             assert!(actual.final_digest.is_some());
-            crate::experiment_runner::verify_portable_run_bundle(
-                Path::new(actual.bundle_path.as_ref().unwrap()),
-            )
+            crate::experiment_runner::verify_portable_run_bundle(Path::new(
+                actual.bundle_path.as_ref().unwrap(),
+            ))
             .unwrap();
         }
     }
@@ -11102,7 +11106,10 @@ pub(crate) mod tests {
                         std::thread::yield_now();
                     }
                     observed.fetch_add(1, Ordering::AcqRel);
-                    assert_ne!(index, 0, "injected experiment worker panic during owner drop");
+                    assert_ne!(
+                        index, 0,
+                        "injected experiment worker panic during owner drop"
+                    );
                     finished.store(true, Ordering::Release);
                 }));
             }
@@ -11131,7 +11138,10 @@ pub(crate) mod tests {
                 std::thread::yield_now();
             }
         }
-        assert!(joined_all, "owner drop did not cancel and join every sibling");
+        assert!(
+            joined_all,
+            "owner drop did not cancel and join every sibling"
+        );
         let released = *capacity.lock().unwrap();
         assert_eq!(released.reserved_batches, 0);
         assert_eq!(released.reserved_run_slots, 0);
@@ -16714,9 +16724,11 @@ pub(crate) mod tests {
         assert_eq!(request.bounded_payload().unwrap().as_slice(), original);
         let mut explicit_zero = serde_json::to_value(&request).unwrap();
         explicit_zero["intervention_delay_ticks"] = serde_json::json!(0);
-        let explicit_zero: CheckpointBranchRequest =
-            serde_json::from_value(explicit_zero).unwrap();
-        assert_eq!(explicit_zero.bounded_payload().unwrap().as_slice(), original);
+        let explicit_zero: CheckpointBranchRequest = serde_json::from_value(explicit_zero).unwrap();
+        assert_eq!(
+            explicit_zero.bounded_payload().unwrap().as_slice(),
+            original
+        );
 
         let mut delayed = request.clone();
         delayed.intervention =
@@ -17504,7 +17516,9 @@ pub(crate) mod tests {
         let report = serde_json::from_slice(&report_bytes).unwrap();
         let original: scriptbots_storage::RunBundleV1 =
             serde_json::from_slice(&manifest_bytes).unwrap();
-        assert!(stage_checkpoint_branch_artifacts(&directory, &output, &report, &definition).is_ok());
+        assert!(
+            stage_checkpoint_branch_artifacts(&directory, &output, &report, &definition).is_ok()
+        );
         drop(handle);
 
         for case in [
@@ -17543,7 +17557,9 @@ pub(crate) mod tests {
                     changed.manifest.source_revision = Some("another-source".to_owned());
                     changed.digests.source_revision = changed.manifest.source_revision.clone();
                 }
-                "root_seed" => changed.manifest.root_seed = changed.manifest.root_seed.wrapping_add(1),
+                "root_seed" => {
+                    changed.manifest.root_seed = changed.manifest.root_seed.wrapping_add(1)
+                }
                 "missing_trajectory" => changed
                     .artifacts
                     .retain(|artifact| artifact.relative_path != "exports/summary.csv"),
@@ -17602,7 +17618,9 @@ pub(crate) mod tests {
             fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
             let cold = host.handle().with_artifacts_dir(directory.clone()).unwrap();
             assert_eq!(
-                cold.get_checkpoint_branch(&admitted.branch_id).unwrap().status,
+                cold.get_checkpoint_branch(&admitted.branch_id)
+                    .unwrap()
+                    .status,
                 "completed",
                 "{case}: history remains a terminal observation"
             );
@@ -17620,7 +17638,9 @@ pub(crate) mod tests {
             cold.read_artifact_bytes(&artifact_id).unwrap().1,
             report_bytes
         );
-        assert!(stage_checkpoint_branch_artifacts(&directory, &output, &report, &definition).is_ok());
+        assert!(
+            stage_checkpoint_branch_artifacts(&directory, &output, &report, &definition).is_ok()
+        );
         assert_eq!(host.port.scientific_digest_v1().unwrap(), before);
     }
 
