@@ -77,18 +77,21 @@ export function runLocalStudy({ bytes, source, ticks, action }, restore, onProgr
           throw new Error("The treatment was not confirmed at the saved tick");
         }
       }
+      const samples = [{ tick: start.identity.tick, ...metrics(start) }];
+      const stride = Math.ceil(ticks / 32);
       let end;
       for (let done = 0; done < ticks;) {
-        const batch = Math.min(16, ticks - done);
+        const batch = Math.min(stride, ticks - done);
         owner.tick(batch);
         done += batch;
         end = observation(owner);
         if (end.identity.sessionId !== source.sessionId || end.snapshot.tick !== start.snapshot.tick + done) {
           throw new Error(`The ${name} arm did not reach its requested scientific tick`);
         }
+        samples.push({ tick: end.identity.tick, ...metrics(end) });
         onProgress(name, done, ticks);
       }
-      return { start: metrics(start), end: metrics(end), finalTick: end.identity.tick, receipt };
+      return { start: metrics(start), end: metrics(end), finalTick: end.identity.tick, receipt, samples };
     } finally {
       owner.free();
     }

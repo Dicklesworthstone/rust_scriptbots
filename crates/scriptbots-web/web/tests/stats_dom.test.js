@@ -292,7 +292,8 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
       if (link.hidden) throw new Error(document.querySelector("#local-study-status").textContent);
       return (await fetch(link.href)).json();
     });
-    if (paired.source.sessionId !== saved.identity.sessionId || paired.source.tick !== saved.identity.tick
+    if (!/^[0-9a-f]{64}$/.test(paired.checkpoint.sha256) || paired.checkpoint.bytes <= 0
+        || paired.source.sessionId !== saved.identity.sessionId || paired.source.tick !== saved.identity.tick
         || paired.control.end.population !== expectedControl.agentCount
         || paired.control.end.averageEnergy !== (expectedControl.agentCount ? expectedControl.averageEnergy : null)
         || paired.control.end.averageHealth !== (expectedControl.agentCount ? expectedControl.averageHealth : null)
@@ -301,6 +302,17 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
         || await snapshot() !== saved.snapshot) {
       throw new Error("Local paired study disagreed with the reference control or changed its live source");
     }
+    const inspected = await page.evaluate(() => {
+      const picker = document.querySelector("#local-study-sample");
+      picker.value = "0";
+      picker.dispatchEvent(new Event("input", { bubbles: true }));
+      return { label: document.querySelector("#local-study-sample-label").textContent,
+        rows: [...document.querySelectorAll("#local-study-metrics tr")].slice(1)
+          .map(row => [...row.cells].map(cell => cell.textContent)) };
+    });
+    if (!inspected.label.startsWith(`Scientific tick ${saved.identity.tick} · observation 1 of 3`)
+        || inspected.rows.length !== 3 || inspected.rows.some(([, control, treatment]) => control !== treatment)
+        || await snapshot() !== saved.snapshot) throw new Error("Changing the sampled tick lost the common source");
     await page.evaluate(() => { document.querySelector("#intervention-toolbox").open = false; });
     const [download] = await Promise.all([page.waitForEvent("download"), page.click("#checkpoint-save")]);
     const artifact = path.join(proof, download.suggestedFilename());

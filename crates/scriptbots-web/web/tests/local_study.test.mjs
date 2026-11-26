@@ -59,6 +59,10 @@ test("the same paused cut feeds independent arms and only the treatment receives
   assert.deepEqual(f.released, [106, 106]);
   assert.equal(f.live.frame().identity.tick, "71");
   assert.equal(f.live.frame().identity.controlRevision, "3");
+  const ticks = result.control.samples.map(row => row.tick);
+  assert.deepEqual(ticks, result.treatment.samples.map(row => row.tick));
+  assert.deepEqual(ticks, ["71", ...Array.from({ length: 17 }, (_, i) => String(73 + 2 * i)), "106"]);
+  assert.equal(result.treatment.samples[1].averageEnergy - result.control.samples[1].averageEnergy, -4);
   assert.equal(result.control.receipt, null);
   assert.equal(result.treatment.receipt.journalState, "committed_volatile");
   assert.deepEqual(result.difference, { population: 0, averageEnergy: -70, averageHealth: 0 });
@@ -107,4 +111,16 @@ test("extinction retains a population endpoint and leaves means and their differ
   });
   assert.deepEqual(result.treatment.end, { population: 0, averageEnergy: null, averageHealth: null });
   assert.deepEqual(result.difference, { population: -12, averageEnergy: null, averageHealth: null });
+});
+
+test("long horizons include their endpoint and stay within thirty-three observations per arm", () => {
+  for (const horizon of [1, 31, 32, 33, 511, 512]) {
+    const f = fixture();
+    const result = runLocalStudy(captureLocalStudy(f.live, action, horizon, 1024), f.owner);
+    const rows = result.control.samples;
+    assert.ok(rows.length >= 2 && rows.length <= 33);
+    assert.equal(rows.at(-1).tick, String(71 + horizon));
+    assert.deepEqual(rows.map(row => row.tick), result.treatment.samples.map(row => row.tick));
+    assert.ok(rows.slice(1).every((row, i) => BigInt(row.tick) > BigInt(rows[i].tick)));
+  }
 });

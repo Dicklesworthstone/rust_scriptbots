@@ -1534,8 +1534,9 @@ function validateFrameIdentity(frame) {
 }
 
 function observePresentedLiveFrame(frame) {
-  if (!remoteMode && localStudyPaused !== frame.playback.paused) {
-    localStudyPaused = frame.playback.paused;
+  const paused = frame.playback?.paused === true;
+  if (!remoteMode && localStudyPaused !== paused) {
+    localStudyPaused = paused;
     updateCheckpointControls();
   }
   lastPaintedLiveFrame = { simulationGeneration, sessionId: frame.identity.sessionId };
@@ -1937,7 +1938,7 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   const previous = simHandle;
   localStudy?.reset();
   simHandle = next;
-  localStudyPaused = frame.playback.paused;
+  localStudyPaused = frame.playback?.paused === true;
   localOwnerStatus = ownerStatus;
   localClockFailure = null;
   recoveryReadStatus = "";

@@ -158,7 +158,7 @@ history/credit handling; nonempty narrative delivery requires observed records.
   scientific intervention toolbox. **Run local comparison** restores two copies
   of the same complete continuation, stages the action on the treatment, and
   advances both copies by the chosen 1–512 scientific ticks. The table shows
-  endpoint population, mean energy and mean health. An extinct arm has no\n  population mean, and its mean differences are shown as unavailable. The JSON includes the
+  population, mean energy and mean health at the endpoint. Move the tick slider\n  to compare earlier observations from the two arms. Studies of up to 32 ticks\n  record every tick. Longer studies record at equal tick intervals and always\n  include the exact endpoint, with up to 33 observations per arm including the\n  source. The JSON retains both sampled series. An extinct arm has no\n  population mean, and its mean differences are shown as unavailable. The JSON includes the
   source identity, intervention receipt and both arms' starting and final
   measurements, plus the checkpoint byte count and SHA-256 when Web Crypto is\n  available. A worker runs one arm at a time and can be cancelled. The live
   world receives no study commands. The comparison describes one saved world.

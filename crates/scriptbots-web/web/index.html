@@ -996,7 +996,12 @@
                     <button id="local-study-run" type="button" disabled>Run local comparison</button>
                     <button id="local-study-cancel" type="button" disabled>Cancel comparison</button>
                     <p id="local-study-status" role="status" aria-live="polite"></p>
-                    <table id="local-study-metrics" aria-label="Local study endpoints"></table>
+                    <div id="local-study-samples" hidden>
+                      <label for="local-study-sample">Compare at a recorded tick</label>
+                      <input id="local-study-sample" type="range" min="0" step="1" value="0" />
+                      <output id="local-study-sample-label" for="local-study-sample"></output>
+                    </div>
+                    <table id="local-study-metrics" aria-label="Local study measurements at the selected tick"></table>
                     <a id="local-study-export" hidden>Download study result (JSON)</a>
                 </fieldset>
                 <p id="intervention-request">No intervention request in this owner session.</p>
