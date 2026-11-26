@@ -39,19 +39,21 @@ use crate::command::CommandSubmit;
 use crate::control::{
     AgentScoreEntry, ApiSchemaDto, ApiVersionDto, AppliedInterventionDto, ArtifactMetadataDto,
     CheckpointBranchRequest, CheckpointBranchStatusDto, CheckpointCreateRequest,
-    CheckpointMetadataDto, CheckpointRetentionDto, CommandFailureDto, CommandStatusDto, ConfigSnapshot,
-    ControlError, ControlHandle, DietClassDto, EventEntry, EventKind, ExperimentBatchStatusDto,
-    ExperimentComparisonDto, ExperimentCreateRequest, ExperimentExecutionCapacityDto,
-    ExperimentRetryFailedRequest, ExperimentRunArtifactsDto, ExperimentRunRecordDto,
-    ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody,
-    InterventionsPollDto, KnobEntry, KnobUpdate, MAX_CHECKPOINT_BRANCH_ID_BYTES,
-    MAX_CHECKPOINT_BRANCH_KEY_BYTES, MAX_CHECKPOINT_BRANCH_NAME_BYTES,
-    MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MAX_CHECKPOINT_BRANCH_TICKS,
+    CheckpointMetadataDto, CheckpointRetentionDto, CommandFailureDto, CommandStatusDto,
+    ConfigSnapshot, ControlError, ControlHandle, DietClassDto, EventEntry, EventKind,
+    ExperimentBatchStatusDto, ExperimentComparisonDto, ExperimentCreateRequest,
+    ExperimentExecutionCapacityDto, ExperimentRetryFailedRequest, ExperimentRunArtifactsDto,
+    ExperimentRunRecordDto, ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot,
+    InterveneRequestBody, InterventionsPollDto, KnobEntry, KnobUpdate,
+    MAX_CHECKPOINT_BRANCH_ID_BYTES, MAX_CHECKPOINT_BRANCH_KEY_BYTES,
+    MAX_CHECKPOINT_BRANCH_NAME_BYTES, MAX_CHECKPOINT_BRANCH_REQUEST_BYTES,
+    MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH, MAX_STEP_BATCH_ID_BYTES, MAX_STEP_BATCH_PAGE_SIZE,
     MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
     PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse,
     PaginatedExperimentsResponse, RemoteOwnerStatusDto, Scoreboard, SelectionModeDto,
-    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest,
-    parse_intervention_command, parse_map_artifact,
+    SelectionSnapshotDto, SelectionStateDto, SimulationStatusDto, SpeedRequest, StepBatchDto,
+    StepBatchEntryDto, StepBatchPhase, StepBatchSubmissionState, parse_intervention_command,
+    parse_map_artifact,
 };
 use crate::narrative_search::{NarrativeAroundQuery, NarrativeSearchHitDto, NarrativeSearchQuery};
 use crate::{ScenarioIdentityV0, ScenarioInterventionV1};
@@ -1611,6 +1613,28 @@ fn parse_step_count(bytes: &[u8]) -> Result<u64, AppError> {
     Ok(body.count)
 }
 
+/// Reserve a bounded, process-scoped batch before admitting any scientific step.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateStepBatchRequestBody {
+    pub count: u64,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StepBatchPageQuery {
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default = "default_step_batch_page_limit")]
+    pub limit: usize,
+}
+
+const fn default_step_batch_page_limit() -> usize {
+    MAX_STEP_BATCH_PAGE_SIZE
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SpeedRequestBody {
     pub speed: f32,
@@ -1716,6 +1740,9 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
         post_control_speed,
         post_control_shutdown,
         get_control_status,
+        post_step_batch,
+        post_step_batch_advance,
+        get_step_batch,
         get_status,
         get_v1_owner_status,
         get_selection,
@@ -1783,6 +1810,12 @@ impl utoipa::Modify for FillEmptyResponseDescriptions {
             SelectionUpdateRequestBody,
             CommandFailureDto,
             CommandStatusDto,
+            StepBatchDto,
+            StepBatchEntryDto,
+            StepBatchPhase,
+            StepBatchSubmissionState,
+            CreateStepBatchRequestBody,
+            StepBatchPageQuery,
             StepRequestBody,
             SpeedRequestBody,
             SimulationStatusDto,
@@ -1920,7 +1953,8 @@ impl From<ControlError> for AppError {
                 Self::service_unavailable(ControlError::ExperimentShuttingDown.to_string())
             }
             ControlError::ExperimentWorkerFailed(message) => Self::internal(message),
-            capacity @ ControlError::ExperimentCapacity(_) => {
+            capacity @ (ControlError::ExperimentCapacity(_)
+            | ControlError::StepBatchCapacity(_)) => {
                 Self::service_unavailable(capacity.to_string())
             }
             busy @ ControlError::ExperimentComparisonBusy => {
@@ -1941,6 +1975,8 @@ impl From<ControlError> for AppError {
                 Self::bad_request(format!("unknown knob path: {path}"))
             }
             ControlError::InvalidPatch(msg) => Self::bad_request(msg),
+            ControlError::Serialization(msg) => Self::internal(msg),
+            ControlError::Lock => Self::service_unavailable("world state is currently unavailable"),
             ControlError::Host(
                 error @ scriptbots_runtime::HostAccessError::CommandIdCollision { .. },
             ) => Self::conflict(error.to_string()),
@@ -1960,18 +1996,7 @@ impl From<ControlError> for AppError {
                 }
                 other => Self::bad_request(other.to_string()),
             },
-            other => remaining_rest_control_error(other),
         }
-    }
-}
-
-// Preserve existing failures while separately updated control adapters may
-// introduce a new error before its transport-specific classification arrives.
-fn remaining_rest_control_error(error: ControlError) -> AppError {
-    match error {
-        ControlError::Lock => AppError::service_unavailable("world state is currently unavailable"),
-        ControlError::Serialization(message) => AppError::internal(message),
-        other => AppError::internal(other.to_string()),
     }
 }
 
@@ -2554,7 +2579,8 @@ async fn stream_ticks_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) ->
 struct WsControlRequest {
     #[serde(default = "ws_control_protocol_version")]
     protocol_version: u16,
-    /// Also the canonical host idempotency key for a mutating command.
+    /// Also the canonical host idempotency key for a single mutating command.
+    /// Batch requests use this only for correlation and carry their own retry identity.
     #[serde(default)]
     request_id: Option<String>,
     command: String,
@@ -2562,6 +2588,16 @@ struct WsControlRequest {
     speed: Option<f32>,
     #[serde(default)]
     command_id: Option<String>,
+    #[serde(default)]
+    count: Option<u64>,
+    #[serde(default)]
+    batch_id: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 const fn ws_control_protocol_version() -> u16 {
@@ -2580,6 +2616,7 @@ struct WsControlReply {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WsControlOutcome {
     Receipt { receipt: CommandStatusDto },
+    StepBatch { batch: StepBatchDto },
     Error { status: u16, message: String },
 }
 
@@ -2613,8 +2650,18 @@ fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
             command: text.to_ascii_lowercase(),
             speed: None,
             command_id: None,
+            count: None,
+            batch_id: None,
+            offset: None,
+            limit: None,
+            idempotency_key: None,
         }
     } else {
+        if !text.starts_with('{') {
+            return Err(AppError::bad_request(
+                "WebSocket control requests must be JSON objects or a plain pause, resume or step",
+            ));
+        }
         serde_json::from_str::<WsControlRequest>(text).map_err(|error| {
             AppError::bad_request(format!("invalid WebSocket control request: {error}"))
         })?
@@ -2633,26 +2680,68 @@ fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
             ));
         }
     }
+    let no_batch_fields = request.count.is_none()
+        && request.batch_id.is_none()
+        && request.offset.is_none()
+        && request.limit.is_none()
+        && request.idempotency_key.is_none();
+    let no_single_fields = request.speed.is_none() && request.command_id.is_none();
+    let valid_batch_id = request
+        .batch_id
+        .as_ref()
+        .is_some_and(|id| !id.is_empty() && id.len() <= MAX_STEP_BATCH_ID_BYTES);
     let valid_shape = match request.command.as_str() {
-        "pause" | "resume" | "step" => request.speed.is_none() && request.command_id.is_none(),
+        "pause" | "resume" | "step" => no_single_fields && no_batch_fields,
         "speed" => {
-            request
-                .speed
-                .is_some_and(|speed| speed.is_finite() && speed >= 0.0)
+            no_batch_fields
+                && request
+                    .speed
+                    .is_some_and(|speed| speed.is_finite() && speed >= 0.0)
                 && request.command_id.is_none()
         }
         "status" => {
-            request.speed.is_none()
+            no_batch_fields
+                && request.speed.is_none()
                 && request
                     .command_id
                     .as_ref()
                     .is_some_and(|id| !id.is_empty() && id.len() <= 128)
         }
+        "step_batch_create" => {
+            no_single_fields
+                && request
+                    .count
+                    .is_some_and(|count| (1..=MAX_STEP_BATCH).contains(&count))
+                && request.batch_id.is_none()
+                && request.offset.is_none()
+                && request.limit.is_none()
+                && request
+                    .idempotency_key
+                    .as_ref()
+                    .is_none_or(|key| !key.is_empty() && key.len() <= 1024)
+        }
+        "step_batch_advance" => {
+            no_single_fields
+                && valid_batch_id
+                && request.count.is_none()
+                && request.offset.is_none()
+                && request.limit.is_none()
+                && request.idempotency_key.is_none()
+        }
+        "step_batch_status" => {
+            no_single_fields
+                && valid_batch_id
+                && request.count.is_none()
+                && request.idempotency_key.is_none()
+                && request
+                    .limit
+                    .is_none_or(|limit| (1..=MAX_STEP_BATCH_PAGE_SIZE).contains(&limit))
+        }
         _ => false,
     };
     if !valid_shape {
         return Err(AppError::bad_request(
-            "expected pause, resume, step, speed with a finite nonnegative speed, or status with command_id; unrelated command fields are refused",
+            "invalid control command fields; step batches use step_batch_create with count, or step_batch_advance/step_batch_status with only the retained batch_id and optional status pagination",
         ));
     }
     Ok(request)
@@ -2673,22 +2762,49 @@ async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsCont
             "speed" => ControlCommand::SetSpeed(request.speed.expect("validated speed")),
             "status" => {
                 let command_id = request.command_id.as_deref().expect("validated command id");
-                return handle.command_status(command_id)?.ok_or_else(|| {
-                    ControlError::NotFound(format!("command '{command_id}' is not retained"))
-                });
+                return handle
+                    .command_status(command_id)?
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("command '{command_id}' is not retained"))
+                    })
+                    .map(|receipt| WsControlOutcome::Receipt { receipt });
+            }
+            "step_batch_create" => {
+                return handle
+                    .create_step_batch(
+                        request.count.expect("validated batch count"),
+                        request.idempotency_key.as_deref(),
+                    )
+                    .map(|batch| WsControlOutcome::StepBatch { batch });
+            }
+            "step_batch_advance" => {
+                return handle
+                    .advance_step_batch(request.batch_id.as_deref().expect("validated batch id"))
+                    .map(|batch| WsControlOutcome::StepBatch { batch });
+            }
+            "step_batch_status" => {
+                return handle
+                    .step_batch_status(
+                        request.batch_id.as_deref().expect("validated batch id"),
+                        request.offset.unwrap_or(0),
+                        request.limit.unwrap_or(MAX_STEP_BATCH_PAGE_SIZE),
+                    )
+                    .map(|batch| WsControlOutcome::StepBatch { batch });
             }
             _ => unreachable!("validated WebSocket command"),
         };
         // The host owns retry identity and conflicting-payload refusal. A reconnect
         // must not create a second Step after the first receipt was lost.
-        handle.submit_command(command, request.request_id.as_deref())
+        handle
+            .submit_command(command, request.request_id.as_deref())
+            .map(|receipt| WsControlOutcome::Receipt { receipt })
     })
     .await;
     match outcome {
-        Ok(receipt) => WsControlReply {
+        Ok(outcome) => WsControlReply {
             protocol_version: WS_CONTROL_PROTOCOL_VERSION,
             request_id,
-            outcome: WsControlOutcome::Receipt { receipt },
+            outcome,
         },
         Err(error) => WsControlReply::error(request_id, error),
     }
@@ -4067,6 +4183,110 @@ async fn get_control_status(
 
 #[utoipa::path(
     post,
+    path = "/api/control/step-batches",
+    tag = "control",
+    request_body = CreateStepBatchRequestBody,
+    responses(
+        (status = 200, description = "Retained reservation; no scientific step is submitted", body = StepBatchDto),
+        (status = 400, body = ErrorResponse),
+        (status = 409, body = ErrorResponse),
+        (status = 503, body = ErrorResponse)
+    )
+)]
+async fn post_step_batch(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Result<Json<StepBatchDto>, AppError> {
+    require_lab_session(&headers, state.handle.session_id())?;
+    require_json_content_type(&headers, &bytes)?;
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(AppError::bad_request(
+            "step batch reservation requires a JSON object",
+        ));
+    }
+    let request: CreateStepBatchRequestBody = serde_json::from_slice(&bytes).map_err(|error| {
+        AppError::bad_request(format!("invalid step batch reservation: {error}"))
+    })?;
+    let batch = run_control(ControlWorkLane::Command, move || {
+        state
+            .handle
+            .create_step_batch(request.count, request.idempotency_key.as_deref())
+    })
+    .await?;
+    Ok(Json(batch))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/control/step-batches/{batch_id}/advance",
+    tag = "control",
+    params(("batch_id" = String, Path, description = "Exact retained batch identity")),
+    responses(
+        (status = 200, description = "Bounded progress and the last attempted constituent; resume only this identity", body = StepBatchDto),
+        (status = 400, body = ErrorResponse),
+        (status = 404, body = ErrorResponse),
+        (status = 503, body = ErrorResponse)
+    )
+)]
+async fn post_step_batch_advance(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    axum::extract::Path(batch_id): axum::extract::Path<String>,
+    bytes: axum::body::Bytes,
+) -> Result<Json<StepBatchDto>, AppError> {
+    require_lab_session(&headers, state.handle.session_id())?;
+    if !bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(AppError::bad_request(
+            "batch advance accepts an empty body and only the retained batch identity",
+        ));
+    }
+    let batch = run_control(ControlWorkLane::Command, move || {
+        state.handle.advance_step_batch(&batch_id)
+    })
+    .await?;
+    Ok(Json(batch))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/control/step-batches/{batch_id}",
+    tag = "control",
+    params(
+        ("batch_id" = String, Path, description = "Exact retained batch identity"),
+        StepBatchPageQuery
+    ),
+    responses(
+        (status = 200, description = "Bounded retained receipts; reading never submits a step", body = StepBatchDto),
+        (status = 400, body = ErrorResponse),
+        (status = 404, body = ErrorResponse),
+        (status = 503, body = ErrorResponse)
+    )
+)]
+async fn get_step_batch(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    axum::extract::Path(batch_id): axum::extract::Path<String>,
+    page: Result<
+        axum::extract::Query<StepBatchPageQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Result<Json<StepBatchDto>, AppError> {
+    require_lab_session(&headers, state.handle.session_id())?;
+    let axum::extract::Query(page) = page.map_err(|error| {
+        AppError::bad_request(format!("invalid step batch pagination: {error}"))
+    })?;
+    let batch = run_control(ControlWorkLane::Command, move || {
+        state
+            .handle
+            .step_batch_status(&batch_id, page.offset, page.limit)
+    })
+    .await?;
+    Ok(Json(batch))
+}
+
+#[utoipa::path(
+    post,
     path = "/api/pause",
     tag = "control",
     responses((status = 200, body = CommandStatusDto))
@@ -4343,8 +4563,8 @@ async fn post_step(
 ) -> Result<Json<CommandStatusDto>, AppError> {
     require_json_content_type(&headers, &bytes)?;
     let count = parse_step_count(&bytes)?;
-    // Only one step can be represented by this command receipt. Refuse an
-    // untracked multi-step request before it reaches the owner.
+    // A single step keeps its command receipt. Multi-step callers must reserve
+    // a batch and advance its exact identity so partial progress remains visible.
     let key = idempotency_key(&headers);
     let status = run_control(ControlWorkLane::Command, move || {
         state.handle.step_count(count, key.as_deref())
@@ -5318,6 +5538,16 @@ fn prepare_rest_server(
     // Every browser Lab operation shares the owner-session fence before its
     // handler can admit work, cancel a worker, read artifacts or run analysis.
     let lab_router = Router::new()
+        .route(
+            "/api/control/step-batches",
+            post(post_step_batch).layer(DefaultBodyLimit::max(MAX_WS_CONTROL_MESSAGE_BYTES)),
+        )
+        .route("/api/control/step-batches/{batch_id}", get(get_step_batch))
+        .route(
+            "/api/control/step-batches/{batch_id}/advance",
+            post(post_step_batch_advance)
+                .layer(DefaultBodyLimit::max(MAX_WS_CONTROL_MESSAGE_BYTES)),
+        )
         // Experiments lifecycle
         .route(
             "/api/v1/experiments",
@@ -5690,7 +5920,7 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "step",
-        "Submit one scientific step; multi-step execution requires a retained batch identity",
+        "Submit one scientific step; use create_step_batch and advance_step_batch for retained multi-step progress",
         json!({
             "type": "object",
             "properties": {
@@ -5700,6 +5930,56 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
             "additionalProperties": false
         }),
         ControlToolKind::Step,
+        handle.clone(),
+    );
+
+    builder = register_tool(
+        builder,
+        "create_step_batch",
+        "Reserve a process-scoped step batch without advancing science; resume execution only by its returned batch_id",
+        json!({
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer", "minimum": 1, "maximum": MAX_STEP_BATCH},
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}
+            },
+            "required": ["count"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::CreateStepBatch,
+        handle.clone(),
+    );
+    builder = register_tool(
+        builder,
+        "advance_step_batch",
+        "Advance the exact retained batch within a bounded work budget; unknown identities are never recreated",
+        json!({
+            "type": "object",
+            "properties": {
+                "batch_id": {"type": "string", "minLength": 1, "maxLength": MAX_STEP_BATCH_ID_BYTES}
+            },
+            "required": ["batch_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::AdvanceStepBatch,
+        handle.clone(),
+    );
+    builder = register_tool(
+        builder,
+        "get_step_batch",
+        "Read bounded retained step receipts and partial progress without submitting any step",
+        json!({
+            "type": "object",
+            "properties": {
+                "batch_id": {"type": "string", "minLength": 1, "maxLength": MAX_STEP_BATCH_ID_BYTES},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_STEP_BATCH_PAGE_SIZE,
+                    "default": MAX_STEP_BATCH_PAGE_SIZE}
+            },
+            "required": ["batch_id"],
+            "additionalProperties": false
+        }),
+        ControlToolKind::GetStepBatch,
         handle.clone(),
     );
 
@@ -6565,6 +6845,22 @@ struct McpExperimentRunArtifactsRequest {
     run_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpStepBatchIdentity {
+    batch_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpStepBatchPage {
+    batch_id: String,
+    #[serde(default)]
+    offset: u64,
+    #[serde(default = "default_step_batch_page_limit")]
+    limit: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlToolKind {
     ListPresets,
@@ -6576,6 +6872,9 @@ enum ControlToolKind {
     Pause,
     Resume,
     Step,
+    CreateStepBatch,
+    AdvanceStepBatch,
+    GetStepBatch,
     SetSpeed,
     GetStatus,
     Shutdown,
@@ -6618,6 +6917,9 @@ impl ControlToolKind {
             "pause" => Self::Pause,
             "resume" => Self::Resume,
             "step" => Self::Step,
+            "create_step_batch" => Self::CreateStepBatch,
+            "advance_step_batch" => Self::AdvanceStepBatch,
+            "get_step_batch" => Self::GetStepBatch,
             "set_speed" => Self::SetSpeed,
             "get_status" => Self::GetStatus,
             "shutdown" => Self::Shutdown,
@@ -6658,6 +6960,9 @@ impl ControlToolKind {
             | Self::Pause
             | Self::Resume
             | Self::Step
+            | Self::CreateStepBatch
+            | Self::AdvanceStepBatch
+            | Self::GetStepBatch
             | Self::SetSpeed
             | Self::GetStatus
             | Self::Shutdown
@@ -6733,6 +7038,9 @@ impl ToolHandler for ControlTool {
         if matches!(
             self.kind,
             ControlToolKind::Step
+                | ControlToolKind::CreateStepBatch
+                | ControlToolKind::AdvanceStepBatch
+                | ControlToolKind::GetStepBatch
                 | ControlToolKind::ExperimentRunArtifacts
                 | ControlToolKind::ExperimentCompare
                 | ControlToolKind::ExperimentRetryFailed
@@ -6878,6 +7186,38 @@ impl ToolHandler for ControlTool {
                 let status =
                     run_control_mcp_sync(move || handle.step_count(count, key.as_deref()))?;
                 make_tool_result(status)
+            }
+            ControlToolKind::CreateStepBatch => {
+                let request: CreateStepBatchRequestBody =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(McpErrorCode::InvalidParams, error.to_string())
+                    })?;
+                let handle = self.handle.clone();
+                let batch = run_control_mcp_sync(move || {
+                    handle.create_step_batch(request.count, request.idempotency_key.as_deref())
+                })?;
+                make_tool_result(batch)
+            }
+            ControlToolKind::AdvanceStepBatch => {
+                let request: McpStepBatchIdentity =
+                    serde_json::from_value(Value::Object(arguments)).map_err(|error| {
+                        McpError::new(McpErrorCode::InvalidParams, error.to_string())
+                    })?;
+                let handle = self.handle.clone();
+                let batch =
+                    run_control_mcp_sync(move || handle.advance_step_batch(&request.batch_id))?;
+                make_tool_result(batch)
+            }
+            ControlToolKind::GetStepBatch => {
+                let request: McpStepBatchPage = serde_json::from_value(Value::Object(arguments))
+                    .map_err(|error| {
+                        McpError::new(McpErrorCode::InvalidParams, error.to_string())
+                    })?;
+                let handle = self.handle.clone();
+                let batch = run_control_mcp_sync(move || {
+                    handle.step_batch_status(&request.batch_id, request.offset, request.limit)
+                })?;
+                make_tool_result(batch)
             }
             ControlToolKind::SetSpeed => {
                 let speed = arguments
@@ -7352,7 +7692,7 @@ fn map_control_error(err: ControlError) -> McpError {
         ControlError::ExperimentWorkerFailed(message) => {
             McpError::new(McpErrorCode::ToolExecutionError, message)
         }
-        capacity @ ControlError::ExperimentCapacity(_) => {
+        capacity @ (ControlError::ExperimentCapacity(_) | ControlError::StepBatchCapacity(_)) => {
             // Capacity is a retryable tool execution failure. FastMCP returns
             // its actionable text with isError=true, while InternalError would
             // become a masked protocol failure.
@@ -7378,10 +7718,14 @@ fn map_control_error(err: ControlError) -> McpError {
             format!("unknown knob path: {path}"),
         ),
         ControlError::InvalidPatch(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
+        ControlError::Serialization(msg) => McpError::new(McpErrorCode::InternalError, msg),
         ControlError::Host(
             error @ scriptbots_runtime::HostAccessError::CommandIdCollision { .. },
         ) => McpError::new(McpErrorCode::InvalidParams, error.to_string()),
         ControlError::Host(error) => McpError::new(McpErrorCode::InternalError, error.to_string()),
+        ControlError::Lock => {
+            McpError::new(McpErrorCode::InternalError, "world state is unavailable")
+        }
         ControlError::CommandQueueFull => McpError::new(
             McpErrorCode::InternalError,
             "command queue is full; retry shortly",
@@ -7398,17 +7742,7 @@ fn map_control_error(err: ControlError) -> McpError {
             }
             other => McpError::new(McpErrorCode::InvalidParams, other.to_string()),
         },
-        other => remaining_mcp_control_error(other),
     }
-}
-
-fn remaining_mcp_control_error(error: ControlError) -> McpError {
-    let message = match error {
-        ControlError::Lock => "world state is unavailable".to_owned(),
-        ControlError::Serialization(message) => message,
-        other => other.to_string(),
-    };
-    McpError::new(McpErrorCode::InternalError, message)
 }
 
 #[cfg(test)]
@@ -10268,7 +10602,10 @@ mod tests {
             schema["properties"]["intervention_delay_ticks"]["maximum"],
             MAX_CHECKPOINT_BRANCH_TICKS - 1
         );
-        assert_eq!(schema["properties"]["intervention_delay_ticks"]["default"], 0);
+        assert_eq!(
+            schema["properties"]["intervention_delay_ticks"]["default"],
+            0
+        );
         assert_eq!(
             schema["required"],
             json!(["checkpoint_id", "branch_name", "ticks", "idempotency_key"])
@@ -12503,8 +12840,8 @@ mod tests {
         // JSON escapes each of these one-byte controls to six bytes. Include
         // both independent axes and the largest valid echoed request identity.
         let failure = CommandFailureDto {
-            code: "\u{1}".repeat(128),
-            message: "\u{1}".repeat(512),
+            code: "\u{1}".repeat(CommandFailureDto::MAX_CODE_BYTES),
+            message: "\u{1}".repeat(CommandFailureDto::MAX_MESSAGE_BYTES),
             diagnostic_truncated: true,
         };
         let receipt = CommandStatusDto {
@@ -12523,7 +12860,9 @@ mod tests {
         let reply = WsControlReply {
             protocol_version: WS_CONTROL_PROTOCOL_VERSION,
             request_id: Some("\u{1}".repeat(1024)),
-            outcome: WsControlOutcome::Receipt { receipt },
+            outcome: WsControlOutcome::Receipt {
+                receipt: receipt.clone(),
+            },
         };
         let bytes = serde_json::to_vec(&reply).expect("bounded receipt envelope");
         assert!(
@@ -12531,6 +12870,36 @@ mod tests {
             "{} bytes exceeds the browser control-frame bound",
             bytes.len(),
         );
+        let batch = StepBatchDto {
+            batch_id: "b".repeat(MAX_STEP_BATCH_ID_BYTES),
+            session_id: u64::MAX.to_string(),
+            requested_count: MAX_STEP_BATCH,
+            attempted_count: MAX_STEP_BATCH,
+            admitted_count: MAX_STEP_BATCH,
+            applied_count: MAX_STEP_BATCH - 1,
+            settled_count: MAX_STEP_BATCH,
+            phase: StepBatchPhase::Stopped,
+            advancing: false,
+            blocking_index: Some(MAX_STEP_BATCH - 1),
+            offset: MAX_STEP_BATCH - 1,
+            next_offset: None,
+            entries: vec![StepBatchEntryDto {
+                index: MAX_STEP_BATCH - 1,
+                command_id: receipt.command_id.clone(),
+                submission_state: StepBatchSubmissionState::Observed,
+                receipt: Some(receipt),
+                observation_error: None,
+            }],
+        };
+        let bytes = serde_json::to_vec(&batch).expect("bounded batch body");
+        assert!(bytes.len() <= crate::control::MAX_STEP_BATCH_PAGE_BYTES);
+        let reply = WsControlReply {
+            protocol_version: WS_CONTROL_PROTOCOL_VERSION,
+            request_id: Some("\u{1}".repeat(1024)),
+            outcome: WsControlOutcome::StepBatch { batch },
+        };
+        let bytes = serde_json::to_vec(&reply).expect("bounded batch envelope");
+        assert!(bytes.len() <= MAX_WS_CONTROL_MESSAGE_BYTES);
     }
 
     #[tokio::test]
@@ -12581,7 +12950,10 @@ mod tests {
         )
         .await;
         assert!(initialized.get("error").is_none(), "{initialized}");
-        for (index, command_id) in [failed.command_id, applied.command_id].into_iter().enumerate() {
+        for (index, command_id) in [failed.command_id, applied.command_id]
+            .into_iter()
+            .enumerate()
+        {
             // Non-applied revisions describe the current owner observation;
             // sample after both commands so the three read surfaces agree.
             let expected = handle
@@ -12626,6 +12998,437 @@ mod tests {
                 .await,
             );
             assert_eq!(websocket, expected);
+        }
+    }
+
+    fn websocket_step_batch(reply: WsControlReply) -> StepBatchDto {
+        assert_eq!(reply.protocol_version, WS_CONTROL_PROTOCOL_VERSION);
+        match reply.outcome {
+            WsControlOutcome::StepBatch { batch } => batch,
+            outcome => panic!("expected retained step batch, got {outcome:?}"),
+        }
+    }
+
+    fn mcp_step_batch(reply: &Value) -> StepBatchDto {
+        assert!(reply.get("error").is_none(), "{reply}");
+        serde_json::from_str(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .expect("MCP batch JSON"),
+        )
+        .expect("complete retained batch")
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real owner proves reservation, cross-transport continuation and retained paging"
+    )]
+    async fn step_batches_preserve_all_receipts_across_rest_mcp_and_websocket() {
+        let owner = crate::control::tests::TestHost::spawn(
+            WorldState::new(ScriptBotsConfig {
+                world_width: 64,
+                world_height: 64,
+                food_cell_size: 16,
+                rng_seed: Some(42),
+                persistence_interval: 0,
+                closed: true,
+                ..ScriptBotsConfig::default()
+            })
+            .expect("small paused batch world"),
+        );
+        let handle = owner.handle();
+        let state = ApiState {
+            handle: handle.clone(),
+            scenario: None,
+            presented_frame: empty_presented_frame(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert(
+            LAB_SESSION_HEADER,
+            handle.session_id().get().to_string().parse().unwrap(),
+        );
+        let body = json!({"count": 3, "idempotency_key": "all-batch-transports"});
+        let Json(reserved) = post_step_batch(
+            State(state.clone()),
+            headers.clone(),
+            axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("batch reservation: {}", error.message));
+        assert_eq!(reserved.phase, StepBatchPhase::Reserved);
+        assert_eq!(reserved.attempted_count, 0);
+        assert_eq!(reserved.admitted_count, 0);
+        assert_eq!(handle.status().unwrap().tick, 0);
+        let batch_id = reserved.batch_id.clone();
+
+        let mcp = mcp_http_test_state(handle.clone(), ServerBuilder::new("step-batches", "0"));
+        let initialized = map_policy_mcp_request(
+            &mcp,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "step-batches", "version": "0"}}
+            }),
+        )
+        .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let listed = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":3, "method":"tools/list", "params":{}}),
+        )
+        .await;
+        let tools = listed["result"]["tools"]
+            .as_array()
+            .expect("tool discovery");
+        for name in ["create_step_batch", "advance_step_batch", "get_step_batch"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).expect(name);
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        }
+        let unknown = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":4, "method":"tools/call",
+                "params":{"name":"advance_step_batch", "arguments":{"batch_id":"prior-process-batch"}}}),
+        )
+        .await;
+        assert_mcp_handler_refusal(
+            &unknown,
+            "step batch 'prior-process-batch' is not retained by this control service; do not recreate it as an execution retry",
+        );
+        let repeated = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
+                "params":{"name":"create_step_batch", "arguments":body}}),
+        )
+        .await;
+        assert_eq!(mcp_step_batch(&repeated), reserved);
+        let repeated = websocket_step_batch(
+            apply_ws_control_message(
+                handle.clone(),
+                json!({"command":"step_batch_create", "request_id":"reserve-reply",
+                    "count":3, "idempotency_key":"all-batch-transports"})
+                .to_string(),
+            )
+            .await,
+        );
+        assert_eq!(repeated, reserved);
+        assert_eq!(
+            handle.status().unwrap().tick,
+            0,
+            "reservation retries submit no science"
+        );
+
+        let Json(read_only) = get_step_batch(
+            State(state.clone()),
+            headers.clone(),
+            axum::extract::Path(batch_id.clone()),
+            Ok(axum::extract::Query(StepBatchPageQuery {
+                offset: 0,
+                limit: 2,
+            })),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("reserved batch read: {}", error.message));
+        assert_eq!(read_only.attempted_count, 0);
+        assert_eq!(handle.status().unwrap().tick, 0);
+
+        let mut progress = reserved;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut turn = 0_u64;
+        while progress.phase != StepBatchPhase::Complete {
+            assert!(std::time::Instant::now() < deadline, "{progress:?}");
+            progress = match turn % 3 {
+                0 => {
+                    let Json(batch) = post_step_batch_advance(
+                        State(state.clone()),
+                        headers.clone(),
+                        axum::extract::Path(batch_id.clone()),
+                        axum::body::Bytes::new(),
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("REST batch advance: {}", error.message));
+                    batch
+                }
+                1 => {
+                    let reply = map_policy_mcp_request(
+                        &mcp,
+                        json!({"jsonrpc":"2.0", "id":turn + 10, "method":"tools/call",
+                            "params":{"name":"advance_step_batch",
+                                "arguments":{"batch_id":batch_id}}}),
+                    )
+                    .await;
+                    mcp_step_batch(&reply)
+                }
+                _ => websocket_step_batch(
+                    apply_ws_control_message(
+                        handle.clone(),
+                        json!({"command":"step_batch_advance", "batch_id":batch_id,
+                            "request_id":"advance-reply"})
+                        .to_string(),
+                    )
+                    .await,
+                ),
+            };
+            assert_eq!(progress.batch_id, batch_id);
+            assert!(progress.applied_count <= progress.requested_count);
+            assert!(!matches!(
+                progress.phase,
+                StepBatchPhase::Stopped | StepBatchPhase::Indeterminate
+            ));
+            turn += 1;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(progress.applied_count, 3);
+        assert_eq!(progress.settled_count, 3);
+        assert_eq!(handle.status().unwrap().tick, 3);
+
+        let Json(first) = get_step_batch(
+            State(state.clone()),
+            headers.clone(),
+            axum::extract::Path(batch_id.clone()),
+            Ok(axum::extract::Query(StepBatchPageQuery {
+                offset: 0,
+                limit: 2,
+            })),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("first receipt page: {}", error.message));
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(first.next_offset, Some(2));
+        let tail = websocket_step_batch(
+            apply_ws_control_message(
+                handle.clone(),
+                json!({"command":"step_batch_status", "batch_id":batch_id,
+                    "offset":2, "limit":2, "request_id":"page-reply"})
+                .to_string(),
+            )
+            .await,
+        );
+        assert_eq!(tail.entries.len(), 1);
+        assert_eq!(tail.next_offset, None);
+        let mut ids = std::collections::BTreeSet::new();
+        for (index, entry) in first.entries.iter().chain(&tail.entries).enumerate() {
+            assert_eq!(entry.index, index as u64);
+            assert!(ids.insert(entry.command_id.clone()));
+            let receipt = entry.receipt.as_ref().expect("retained applied receipt");
+            assert_eq!(receipt.application_state, "applied");
+            assert_eq!(receipt.applied_tick, Some(index as u64 + 1));
+        }
+
+        // Retrying an already completed batch through either mutation transport
+        // preserves its original constituents and cannot add another tick.
+        let reply = map_policy_mcp_request(
+            &mcp,
+            json!({"jsonrpc":"2.0", "id":100, "method":"tools/call",
+                "params":{"name":"advance_step_batch", "arguments":{"batch_id":batch_id}}}),
+        )
+        .await;
+        assert_eq!(mcp_step_batch(&reply).phase, StepBatchPhase::Complete);
+        let repeated = websocket_step_batch(
+            apply_ws_control_message(
+                handle.clone(),
+                json!({"command":"step_batch_advance", "batch_id":batch_id,
+                    "request_id":"completed-retry"})
+                .to_string(),
+            )
+            .await,
+        );
+        assert_eq!(repeated.applied_count, 3);
+        assert_eq!(handle.status().unwrap().tick, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "real HTTP routing proves owner fencing and invalid requests cannot advance a reserved batch"
+    )]
+    async fn step_batch_routes_fence_owners_and_refuse_invalid_execution_retries() {
+        let owner = test_host();
+        let reservation = ControlServerReservation::prepare(ControlServerConfig {
+            rest_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            mcp_transport: McpTransportConfig::Disabled,
+            ..ControlServerConfig::default()
+        })
+        .unwrap();
+        let address = reservation.rest_address().unwrap();
+        let (server, _) = reservation.launch(owner.port.clone(), false).unwrap();
+        let handle = server.control_handle().unwrap();
+        let client = reqwest::Client::new();
+        let root = format!("http://{address}/api/control/step-batches");
+        let session = handle.session_id().get();
+        let wrong_session = session.wrapping_add(1).to_string();
+        let body = json!({"count":2, "idempotency_key":"validated-batch"});
+        let refused = client
+            .post(&root)
+            .header(LAB_SESSION_HEADER, &wrong_session)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status().as_u16(), 409);
+        let reserved: StepBatchDto = client
+            .post(&root)
+            .header(LAB_SESSION_HEADER, session.to_string())
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reserved.phase, StepBatchPhase::Reserved);
+        let batch_url = format!("{root}/{}", reserved.batch_id);
+        let advance_url = format!("{batch_url}/advance");
+        for request in [client.get(&batch_url), client.post(&advance_url)] {
+            let response = request
+                .header(LAB_SESSION_HEADER, &wrong_session)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 409);
+        }
+        for body in [
+            r#"{"count":0}"#,
+            r#"{"count":100001}"#,
+            r#"{"count":2,"count":3}"#,
+            r#"{"count":2,"unexpected":true}"#,
+            r#"{"count":2,"idempotency_key":""}"#,
+            r#"[]"#,
+        ] {
+            let response = client
+                .post(&root)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 400, "{body}");
+        }
+        let conflict = client
+            .post(&root)
+            .json(&json!({"count":3, "idempotency_key":"validated-batch"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflict.status().as_u16(), 409);
+        for query in [
+            "offset=1",
+            "limit=0",
+            "limit=17",
+            "limit=invalid",
+            "offset=0&offset=0",
+            "unexpected=true",
+        ] {
+            let response = client
+                .get(format!("{batch_url}?{query}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 400, "{query}");
+            let error: Value = response.json().await.unwrap();
+            assert!(error["message"].is_string(), "{error}");
+        }
+        for request in [
+            client.get(format!("{root}/prior-process-batch")),
+            client.post(format!("{root}/prior-process-batch/advance")),
+        ] {
+            assert_eq!(request.send().await.unwrap().status().as_u16(), 404);
+        }
+        let invalid_advance = client
+            .post(&advance_url)
+            .json(&json!({"count":2}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid_advance.status().as_u16(), 400);
+        let oversized = client
+            .post(&root)
+            .json(&json!({
+                "count":2, "idempotency_key":"x".repeat(MAX_WS_CONTROL_MESSAGE_BYTES),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(oversized.status().as_u16(), 413);
+        for request in [
+            json!({"command":"step_batch_advance", "batch_id":reserved.batch_id, "count":2}),
+            json!({"command":"step_batch_status", "batch_id":reserved.batch_id, "limit":0}),
+            json!({"command":"step_batch_create", "count":2, "batch_id":reserved.batch_id}),
+        ] {
+            let reply = apply_ws_control_message(handle.clone(), request.to_string()).await;
+            assert!(matches!(
+                reply.outcome,
+                WsControlOutcome::Error { status: 400, .. }
+            ));
+        }
+        let unknown = apply_ws_control_message(
+            handle.clone(),
+            json!({"command":"step_batch_advance", "batch_id":"prior-process-batch"}).to_string(),
+        )
+        .await;
+        assert!(matches!(
+            unknown.outcome,
+            WsControlOutcome::Error { status: 404, .. }
+        ));
+        let observed: StepBatchDto = client
+            .get(&batch_url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(observed, reserved);
+        assert_eq!(
+            handle.status().unwrap().tick,
+            0,
+            "no rejected request advances science"
+        );
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn step_batch_paths_and_progress_are_discoverable() {
+        let document = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI document");
+        for (path, method) in [
+            ("/api/control/step-batches", "post"),
+            ("/api/control/step-batches/{batch_id}/advance", "post"),
+            ("/api/control/step-batches/{batch_id}", "get"),
+        ] {
+            assert!(!document["paths"][path][method].is_null(), "{path}");
+        }
+        let schemas = &document["components"]["schemas"];
+        for field in [
+            "batch_id",
+            "session_id",
+            "requested_count",
+            "attempted_count",
+            "admitted_count",
+            "applied_count",
+            "settled_count",
+            "phase",
+            "entries",
+        ] {
+            assert!(
+                !schemas["StepBatchDto"]["properties"][field].is_null(),
+                "{field}"
+            );
+        }
+        for field in [
+            "command_id",
+            "submission_state",
+            "receipt",
+            "observation_error",
+        ] {
+            assert!(
+                !schemas["StepBatchEntryDto"]["properties"][field].is_null(),
+                "{field}"
+            );
         }
     }
 
@@ -12911,11 +13714,7 @@ mod tests {
             (json!({"count":null}), None),
             (json!({"count":true}), None),
             (json!({"count":u64::MAX}), None),
-            (json!({"count":2}), None),
-            (
-                json!({"count":2, "idempotency_key":"refused-step"}),
-                None,
-            ),
+            (json!({"count":2, "idempotency_key":"refused-step"}), None),
             (json!({"cout":2}), None),
             (json!({"idempotency_key":7}), None),
             (
@@ -12934,6 +13733,12 @@ mod tests {
             let direct = tool
                 .call(&ctx, arguments.clone())
                 .expect_err("invalid step must be refused directly");
+            if arguments["count"] == 2 {
+                assert_eq!(
+                    direct.message,
+                    "count > 1 requires a retained step batch: reserve with /api/control/step-batches, retain its batch_id, then advance that exact identity",
+                );
+            }
             let response = map_policy_mcp_request(
                 &mcp,
                 json!({
@@ -12942,9 +13747,6 @@ mod tests {
                 }),
             )
             .await;
-            if arguments.get("count") == Some(&json!(2)) {
-                assert_eq!(direct.message, SINGLE_STEP_REQUIRED_MESSAGE);
-            }
             if let Some(diagnostic) = handler_diagnostic {
                 assert_eq!(direct.message, diagnostic, "{arguments}");
                 assert_mcp_handler_refusal(&response, diagnostic);
@@ -13884,6 +14686,9 @@ mod tests {
         assert_eq!(reply.protocol_version, WS_CONTROL_PROTOCOL_VERSION);
         match reply.outcome {
             WsControlOutcome::Receipt { receipt } => receipt,
+            WsControlOutcome::StepBatch { batch } => {
+                panic!("expected one command receipt, got batch {}", batch.batch_id)
+            }
             WsControlOutcome::Error { status, message } => {
                 panic!("expected owner receipt, got {status}: {message}")
             }
