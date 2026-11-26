@@ -96,7 +96,7 @@ function artifactPage(items = [artifact()], changes = {}) {
   return { items, total: items.length, limit: CHECKPOINT_LAB_PAGE_SIZE, offset: 0, has_more: false, ...changes };
 }
 
-async function harness({ listStudies, parseReport, parseTrajectories } = {}) {
+async function harness({ listStudies, parseReport, parseTrajectories, sessionId = SESSION } = {}) {
   let time = 0, nextId = 0;
   const queues = Object.fromEntries(["save", "review", "replay", "launch", "status", "cancel", "artifacts", "download"].map((kind) => [kind, []]));
   const services = Object.fromEntries(Object.keys(queues).map((kind) => [kind, (request, signal) => new Promise((resolve, reject) => {
@@ -106,7 +106,7 @@ async function harness({ listStudies, parseReport, parseTrajectories } = {}) {
   const controller = new CheckpointLabController({ ...services, listStudies, parseReport, parseTrajectories,
     list: async (request) => { reads.push(request); return page(); },
     id: () => `browser-lab-${++nextId}`, now: () => time });
-  controller.observe(frame(), SOURCE);
+  controller.observe(frame(sessionId), SOURCE);
   controller.setEnabled(true);
   await flush();
   controller.select(checkpoint().checkpoint_id);
@@ -460,6 +460,122 @@ test("study treatments match real PascalCase server enums and reject silent subs
     { type: "Core", params: { kind: "spawn_from_archive" } },
     { type: "ConfigPatch", params: { uncontrolled: true } },
   ]) assert.throws(() => validateLabIntervention(value));
+});
+
+test("cooperation treatments preserve native bounds and optional partner semantics", () => {
+  const required = { food_sharing_rate: 0, food_transfer_rate: 0, food_sharing_distance: 1 };
+  const treatments = [
+    { type: "Cooperation", params: { ...required } },
+    { type: "Cooperation", params: { ...required, reproduction_partner_chance: null } },
+    { type: "Cooperation", params: { ...required, food_sharing_rate: 1, reproduction_partner_chance: 0 } },
+    { type: "Cooperation", params: { ...required, food_sharing_rate: 0.9, food_transfer_rate: 0.5,
+      food_sharing_distance: 40, reproduction_partner_chance: 1 } },
+    { type: "Cooperation", params: { ...required, food_transfer_rate: 3.4028234663852886e38,
+      food_sharing_distance: 3.4028234663852886e38 } },
+    { type: "Cooperation", params: { ...required, food_sharing_distance: 1e-45 } },
+  ];
+  for (const value of treatments) {
+    const wire = JSON.stringify(value);
+    assert.equal(validateLabIntervention(value), value);
+    assert.equal(JSON.stringify(value), wire, "validation must not normalize a retained study request");
+  }
+  assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(treatments[0])).params, "reproduction_partner_chance"), false);
+  assert.equal(JSON.parse(JSON.stringify(treatments[1])).params.reproduction_partner_chance, null);
+  assert.equal(JSON.parse(JSON.stringify(treatments[2])).params.reproduction_partner_chance, 0);
+});
+
+test("cooperation refuses unknown fields, invalid f32 distances and invalid probabilities", () => {
+  const params = { food_sharing_rate: 0.9, food_transfer_rate: 0.5,
+    food_sharing_distance: 40, reproduction_partner_chance: null };
+  const treatment = (changes = {}) => ({ type: "Cooperation", params: { ...params, ...changes } });
+  for (const field of Object.keys(params)) {
+    for (const invalid of [NaN, Infinity, -Infinity, 1e39, -0.1, "0.5", true, undefined]) {
+      assert.throws(() => validateLabIntervention(treatment({ [field]: invalid })), field);
+    }
+  }
+  for (const field of ["food_sharing_rate", "food_transfer_rate", "food_sharing_distance"]) {
+    assert.throws(() => validateLabIntervention(treatment({ [field]: null })), field);
+    const value = treatment();
+    delete value.params[field];
+    assert.throws(() => validateLabIntervention(value), field);
+  }
+  for (const field of ["food_sharing_rate", "reproduction_partner_chance"]) {
+    assert.throws(() => validateLabIntervention(treatment({ [field]: 1.01 })), field);
+  }
+  for (const food_sharing_distance of [0, -0, 1e-50]) {
+    assert.throws(() => validateLabIntervention(treatment({ food_sharing_distance })), /Sharing distance/);
+  }
+  for (const value of [
+    { ...treatment(), type: "cooperation" }, { ...treatment(), ignored: true },
+    treatment({ ignored: true }), treatment({ region: null }),
+  ]) assert.throws(() => validateLabIntervention(value));
+});
+
+test("invalid cooperation inputs cannot allocate a study identity or reach admission", async () => {
+  const h = await harness();
+  for (const params of [
+    { food_sharing_rate: 0.9, food_transfer_rate: 0.5, food_sharing_distance: 40, reproduction_partner_chance: 1.01 },
+    { food_sharing_rate: 0.9, food_transfer_rate: 1e39, food_sharing_distance: 40 },
+    { food_sharing_rate: 0.9, food_transfer_rate: 0.5, food_sharing_distance: 0 },
+    { food_sharing_rate: 0.9, food_transfer_rate: 0.5, food_sharing_distance: 1e-50 },
+  ]) {
+    assert.equal(await h.controller.launch({ branchName: "sharing", ticks: 25,
+      intervention: { type: "Cooperation", params } }), null);
+  }
+  assert.equal(h.identities(), 0);
+  assert.equal(h.queues.launch.length, 0);
+  assert.equal(h.controller.branch, null);
+});
+
+test("cooperation reaches only saved-world admission and retries the exact source and treatment", async () => {
+  const sessionId = "18446744073709551615";
+  const previous = globalThis.fetch, requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url), ...options });
+    if (requests.length === 1) throw new Error("admission response lost");
+    return new Response(JSON.stringify(status(JSON.parse(options.body))),
+      { headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    const h = await harness({ sessionId }), remote = client(sessionId);
+    h.controller.services.launch = (request, signal) => remote.launchCheckpointBranch(request, { signal });
+    const draft = { branchName: "sharing", ticks: 25, interventionDelayTicks: 5,
+      intervention: { type: "Cooperation", params: { food_sharing_rate: 0.9, food_transfer_rate: 0.5,
+        food_sharing_distance: 40, reproduction_partner_chance: 0 } } };
+    await h.controller.launch(draft);
+    assert.equal(h.controller.branchState, "unconfirmed");
+    const retained = h.controller.branch.request;
+    assert.equal(Object.isFrozen(retained.intervention.params), true);
+    assert.deepEqual(JSON.parse(requests[0].body), {
+      checkpoint_id: checkpoint().checkpoint_id, branch_name: "sharing", ticks: 25,
+      intervention: { type: "Cooperation", params: { food_sharing_rate: 0.9, food_transfer_rate: 0.5,
+        food_sharing_distance: 40, reproduction_partner_chance: 0 } },
+      intervention_delay_ticks: 5, idempotency_key: "browser-lab-1",
+    }, "the saved-world body must contain only the native request fields");
+
+    draft.intervention.params.food_transfer_rate = 2;
+    draft.intervention.params.reproduction_partner_chance = 1;
+    draft.interventionDelayTicks = 0;
+    h.controller.page = page([checkpoint({ checkpoint_id: "later-source", tick: 200 })]);
+    h.controller.select("later-source");
+    assert.equal(await h.controller.launch(draft), null);
+    assert.equal(requests.length, 1, "uncertain admission requires an explicit retry");
+    await h.controller.retryLaunch();
+    assert.equal(h.controller.branch.request, retained);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].body, requests[0].body);
+    assert.equal(h.identities(), 1);
+    assert.equal(h.controller.branch.status.source_tick, 100);
+    assert.equal(h.controller.branch.status.target_tick, 125);
+    assert.equal(h.controller.branch.status.status, "running");
+    for (const request of requests) {
+      assert.equal(request.url.pathname, "/nested/api/v1/checkpoints/branches");
+      assert.equal(request.method, "POST");
+      assert.equal(request.headers["X-ScriptBots-Session"], sessionId);
+    }
+    assert.equal(h.queues.save.length, 0, "a cooperation study does not save or replace the live world");
+    assert.equal(h.queues.cancel.length, 0);
+  } finally { globalThis.fetch = previous; }
 });
 
 test("archive study treatments preserve the native wire format and bounded population request", () => {
@@ -1601,10 +1717,10 @@ test("selecting another retained study clears the previous study's trajectories 
   assert.equal(h.queues.launch.length, 1);
 });
 
-function client() {
+function client(sessionId = SESSION) {
   const value = new RemoteStreamClient({ url: `${SOURCE}?old=query#fragment`, decodeFrame() {} });
   value.state = "connected";
-  value.tracker.acknowledge(SESSION);
+  value.tracker.acknowledge(sessionId);
   return value;
 }
 

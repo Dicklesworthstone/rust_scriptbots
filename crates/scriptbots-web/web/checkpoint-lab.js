@@ -190,6 +190,22 @@ export function validateLabIntervention(value) {
     if (![p.discomfort_rate, p.comfort_band].every((n) => scalar(n) && n >= 0)) {
       throw new Error("Temperature discomfort and comfort band must be finite and nonnegative");
     }
+  } else if (value.type === "Cooperation" && keys(p,
+    ["food_sharing_rate", "food_transfer_rate", "food_sharing_distance"], ["reproduction_partner_chance"])) {
+    if (!scalar(p.food_sharing_rate) || p.food_sharing_rate < 0 || p.food_sharing_rate > 1) {
+      throw new Error("Legacy sharing fraction must be finite and between zero and one");
+    }
+    if (!scalar(p.food_transfer_rate) || p.food_transfer_rate < 0) {
+      throw new Error("Sharing transfer amount must be finite and nonnegative");
+    }
+    if (!scalar(p.food_sharing_distance) || Math.fround(p.food_sharing_distance) <= 0) {
+      throw new Error("Sharing distance must be positive and within the simulation's numeric range");
+    }
+    if (Object.hasOwn(p, "reproduction_partner_chance") && p.reproduction_partner_chance !== null
+        && (!scalar(p.reproduction_partner_chance) || p.reproduction_partner_chance < 0
+          || p.reproduction_partner_chance > 1)) {
+      throw new Error("Reproduction partner chance must be blank or a finite number between zero and one");
+    }
   } else if (value.type === "ClosedWorld" && keys(p, ["closed"]) && typeof p.closed === "boolean") {
     return value;
   } else if (value.type === "Core" && p?.kind === "spawn_from_archive") {

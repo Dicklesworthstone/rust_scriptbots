@@ -196,8 +196,8 @@ history/credit handling; nonempty narrative delivery requires observed records.
 - **Saved-world experiments (remote)**: connect to a server and open the
   **Saved-world experiments** panel. Save a server checkpoint or select an
   existing one, then run an unchanged future or a paired treatment/control
-  study. Drought, food shock, temperature stress and population injection
-  policy are available as explicit treatments. The source is the selected
+  study. Treatments include drought, food shock, temperature stress,
+  population injection policy and cooperation. The source is the selected
   saved scientific state, rather than a new tick-zero recipe. The live owner
   is not replaced or advanced by the study. The panel shows observed job
   status, supports cooperative cancellation, and exposes the completed report
@@ -205,6 +205,27 @@ history/credit handling; nonempty narrative delivery requires observed records.
 - Runtime brain presets can be rebuilt programmatically via
   `registerBrain("mlp" | "dwraon" | "assembly" | "wander" | "none")` on the
   `SimHandle`. Invalid choices preserve the current world.
+
+### Cooperation studies from a saved checkpoint
+
+In the connected browser's **Saved-world experiments**, select a checkpoint and choose
+**Cooperation versus unchanged control**. Set the future horizon, optional
+treatment delay and sharing controls, then run the study. The treatment and
+unchanged control start from the same saved cut and run independently of the
+live world. After an uncertain submission, **Retry same study request** retains
+the original source, settings, timing and retry identity even if the form changes.
+
+The transfer amount requests energy for each eligible giver/recipient pair,
+capped by the giver's energy and the recipient's remaining capacity. Agents'
+giving behavior still determines whether they share. Sharing distance must be
+positive; set the transfer amount to zero to disable transfers. The **Legacy
+sharing fraction** is retained in the study configuration for compatibility but
+does not affect the current sharing calculation.
+
+Leave the optional crossover partner chance blank to keep the saved value.
+Entering zero explicitly overrides it to zero; entered values must be between
+zero and one. Completed reports describe one saved trajectory pair, without
+claiming independent replication from its recorded ticks.
 
 ### Remote matched-seed experiments
 

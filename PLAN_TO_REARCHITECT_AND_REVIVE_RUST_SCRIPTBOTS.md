@@ -5700,6 +5700,18 @@ synchronous ports, and null frontend. It does not own `WorldState` or drive scie
 
 ### 5.2 `SimulationHost`
 
+**Checkpoint request lifetime (2026-11-25):** [Currently In Progress — Codex;
+scoped contribution to `bd-2z0.5.13`, original acceptance retained].
+`d8b0800ebe9a` bounds pending science-only checkpoint captures and carries each
+caller's original deadline through ingress and parking. Expired readers release
+capacity before new ingress and cannot initiate new capture or flush work;
+already initiated owner persistence obligations remain intact. Four regressions
+cover expired public reads, bounded overflow, capacity reclamation and the
+eventual cut's exact provenance. Independent source review and the pinned DSR
+formatter passed. Native compilation, tests and Clippy remain unverified because
+the available environment cannot satisfy DSR's storage admission requirement.
+This does not close `bd-2z0.4.11` or the full-owner continuation qualification gate.
+
 The target below spans multiple beads. The first `scriptbots-runtime` slice defines and exercises
 the protocol without implementing the production simulation host. Sole world ownership and
 tick-boundary application begin in `bd-2z0.4.5`.
@@ -8919,6 +8931,22 @@ resume, replay, and first-divergence verification remain separate open work in t
 **Exit:** UI and exported report explain one observed evolutionary change.
 
 #### 4.5 intervention studies
+
+**Browser cooperation studies (2026-11-25):** [Currently In Progress — Codex;
+scoped contribution to `bd-2z0.12.2`, original acceptance retained]. The browser
+can now launch saved-world `Cooperation` studies with transfer amount, positive
+sharing distance, optional reproduction partner chance and explicit treatment
+delay. Blank partner chance preserves the saved value; zero is an explicit
+override. The selected saved source, timing, payload and retry identity remain
+immutable after uncertain admission. Native preflight now rejects nonpositive
+sharing distance before source loading, warmup or output reservation; the
+browser also rejects values that underflow to zero when converted to `f32`.
+The legacy sharing fraction is honestly labelled as recorded configuration:
+current transfers still use the established constant-transfer semantics.
+DSR executed three JavaScript syntax checks and all 372 browser module tests
+with no failures, skips or cancellations; the pinned formatter passed for both
+changed Rust files. Native tests and actual Canvas/WebGPU/browser acceptance
+remain unverified, and no new ecological or inferential result is claimed.
 
 **Source functionality extension — Codex, 2026-11-08:** `branch-study --example`
 and `branch-study --plan ... --out ...` expose paired checkpoint studies through

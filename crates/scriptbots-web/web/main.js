@@ -432,6 +432,14 @@ function readLabTreatment() {
     case "temperature": return { type: "TemperatureShift", params: {
       discomfort_rate: number("lab-discomfort"), comfort_band: number("lab-comfort-band"),
     } };
+    case "cooperation": {
+      const partnerChance = document.getElementById("lab-partner-chance").value.trim();
+      return { type: "Cooperation", params: {
+        food_sharing_rate: number("lab-sharing-rate"), food_transfer_rate: number("lab-transfer-rate"),
+        food_sharing_distance: number("lab-sharing-distance"),
+        reproduction_partner_chance: partnerChance === "" ? null : Number(partnerChance),
+      } };
+    }
     case "closed_world": return { type: "ClosedWorld", params: {
       closed: document.getElementById("lab-closed").value === "true",
     } };

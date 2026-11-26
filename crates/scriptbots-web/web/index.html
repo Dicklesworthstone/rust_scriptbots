@@ -820,11 +820,12 @@
                             <option value="drought">Drought versus unchanged control</option>
                             <option value="resource_shock">Food shock versus unchanged control</option>
                             <option value="temperature">Temperature stress versus unchanged control</option>
+                            <option value="cooperation">Cooperation versus unchanged control</option>
                             <option value="closed_world">Population injection policy versus control</option>
                             <option value="archive">Archived genomes versus unchanged control</option>
                         </select>
                     </label>
-                    <fieldset data-lab-kinds="drought resource_shock temperature closed_world archive" hidden disabled>
+                    <fieldset data-lab-kinds="drought resource_shock temperature cooperation closed_world archive" hidden disabled>
                         <legend>Treatment timing</legend>
                         <label for="lab-treatment-delay">Wait before treatment (ticks)
                             <input id="lab-treatment-delay" type="number" min="0" max="9999" step="1" value="0" aria-describedby="lab-treatment-delay-help" required />
@@ -857,6 +858,25 @@
                         <label for="lab-comfort-band">Comfort band around preferred temperature
                             <input id="lab-comfort-band" type="number" min="0" step="any" value="0.1" required />
                         </label>
+                    </fieldset>
+                    <fieldset data-lab-kinds="cooperation" hidden disabled>
+                        <legend>Sharing and reproduction</legend>
+                        <p>These settings change the treatment only. The control retains the saved configuration.</p>
+                        <label for="lab-sharing-rate">Legacy sharing fraction (recorded only, 0–1)
+                            <input id="lab-sharing-rate" type="number" min="0" max="1" step="any" value="0.9" aria-describedby="lab-sharing-rate-help" required />
+                        </label>
+                        <p id="lab-sharing-rate-help">Current sharing behavior uses the transfer amount and distance below. The legacy fraction is retained in the study but does not change transfers.</p>
+                        <label for="lab-transfer-rate">Energy transferred during sharing
+                            <input id="lab-transfer-rate" type="number" min="0" step="any" value="0.5" required />
+                        </label>
+                        <label for="lab-sharing-distance">Sharing distance (positive world units)
+                            <input id="lab-sharing-distance" type="number" min="1e-45" step="any" value="40" aria-describedby="lab-sharing-distance-help" required />
+                        </label>
+                        <p id="lab-sharing-distance-help">Use a positive distance. Set the transfer amount to zero to disable sharing.</p>
+                        <label for="lab-partner-chance">Crossover partner chance (optional, 0–1)
+                            <input id="lab-partner-chance" type="number" min="0" max="1" step="any" placeholder="Keep saved value" aria-describedby="lab-partner-chance-help" />
+                        </label>
+                        <p id="lab-partner-chance-help">Leave blank to keep the saved partner chance. Zero is an explicit override for the treatment.</p>
                     </fieldset>
                     <fieldset data-lab-kinds="closed_world" hidden disabled>
                         <legend>Population injection policy</legend>
