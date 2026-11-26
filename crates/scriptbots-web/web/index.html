@@ -1030,6 +1030,12 @@
                     </div>
                     <table id="local-study-metrics" aria-label="Local study measurements at the selected tick"></table>
                     <a id="local-study-export" hidden>Download study result (JSON)</a>
+                    <p><a id="local-study-file-export" hidden>Download repeatable study with its saved world</a></p>
+                    <label for="local-study-import">Open a saved comparison (.sbstudy)</label>
+                    <input id="local-study-import" type="file" accept=".sbstudy,application/octet-stream" disabled />
+                    <p id="local-study-file-status" role="status">Choose a saved study to inspect its source and repeat it on independent copies.</p>
+                    <button id="local-study-replay" type="button" disabled>Repeat saved comparison</button>
+                    <p>The study file includes the original continuation, intervention and tick count. Opening it checks integrity; repeating it runs two separate worlds without changing the canvas. A compatible browser build is required. Results describe one saved world; cross-build equality is not certified.</p>
                 </fieldset>
                 <p id="intervention-request">No intervention request in this owner session.</p>
                 <p id="intervention-receipt" role="status" aria-live="polite"></p>

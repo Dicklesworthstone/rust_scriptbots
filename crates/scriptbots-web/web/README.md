@@ -187,12 +187,37 @@ from another owner cannot settle or recover the retained request.
   durable event journal. Reading the timeline never ticks the simulation.
 - **Local paired study**: Pause a local world and choose an action in the
   scientific intervention toolbox. **Run local comparison** restores two copies
-  of the same complete continuation, stages the action on the treatment, and
-  advances both copies by the chosen 1–512 scientific ticks. The table shows
-  population, mean energy and mean health at the endpoint. Move the tick slider\n  to compare earlier observations from the two arms. Studies of up to 32 ticks\n  record every tick. Longer studies record at equal tick intervals and always\n  include the exact endpoint, with up to 33 observations per arm including the\n  source. The JSON retains both sampled series. An extinct arm has no\n  population mean, and its mean differences are shown as unavailable. The JSON includes the
+  of the same complete continuation and advances both copies by the chosen
+  1–512 scientific ticks. The treatment is queued after the selected delay;
+  zero queues it at the saved boundary, and the delay must leave at least one
+  transition after treatment. The table shows
+  population, mean energy and mean health at the endpoint. Move the tick slider
+  to compare earlier observations from the two arms. Both trajectories use the
+  same bounded sample schedule, including the source, the treatment boundary
+  and the exact endpoint, with up to 33 observations per arm. Before-treatment
+  observations must agree. The JSON retains both sampled series. An extinct arm has no
+  population mean, and its mean differences are shown as unavailable. The JSON includes the
   source identity, intervention receipt and both arms' starting and final
-  measurements, plus the checkpoint byte count and SHA-256 when Web Crypto is\n  available. A worker runs one arm at a time and can be cancelled. The live
+  measurements, plus the checkpoint byte count and SHA-256 when Web Crypto is
+  available. A worker runs one arm at a time and can be cancelled. The live
   world receives no study commands. The comparison describes one saved world.
+  **Download repeatable study with its saved world** exports a `.sbstudy` file
+  containing the original owner continuation, exact source identities,
+  intervention, delay and horizon. **Open a saved comparison** validates the bounded
+  file and shows its saved source without restoring or advancing a world.
+  **Repeat saved comparison** explicitly reruns its two independent arms; the
+  current canvas, intervention form, delay and tick-count controls are not its inputs.
+  Repetition is available even when the current world cannot be captured.
+  Cancellation and source replacement discard outstanding file/worker results.
+  Portable files require Web Crypto on a secure connection; ordinary comparisons
+  remain available without it. The 44-byte `SBSTUDY1` header stores a little-endian
+  metadata length and SHA-256 of at most 4 KiB of canonical UTF-8 JSON. That
+  metadata binds the plan and the length/SHA-256 of up to 64 MiB of unchanged
+  checkpoint bytes. Import checks both hashes and exact lengths before owner
+  restoration. The owner codec still enforces compatibility; checksums do not
+  certify cross-build scientific equality or durable-journal semantics. Repeated
+  commands receive fresh identities, so receipts need not be byte-identical even
+  when the scientific measurements match.
 - **Saved continuations**: MLP, DWRAON, Assembly and Unbound worlds can be saved.
   Both save controls are visibly disabled for the legacy Wander demo.
   **Save Continuation File** downloads a portable full-owner checkpoint; **Load

@@ -1225,7 +1225,9 @@ function updateCheckpointControls() {
   const runningOwner = localOwnerAllowsCommands();
   localStudy?.setAvailable(!remoteMode && localStudyPaused && runningOwner && localOwnerStatus.health === "healthy"
     && supportsContinuation && !checkpointLoadPending && !browserStorePending && !recoveryBusy
-    && typeof wasm.checkpoint_byte_limit === "function" && typeof Worker === "function");
+    && typeof wasm.checkpoint_byte_limit === "function" && typeof Worker === "function",
+    wasmInitialized && typeof wasm.checkpoint_byte_limit === "function" && typeof Worker === "function"
+      && !!globalThis.crypto?.subtle);
   stepsSlider.disabled = remoteMode || !runningOwner;
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
   resetButton.disabled = remoteMode || brainPresetSelect?.value === "mixed_continuation";
