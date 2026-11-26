@@ -55,6 +55,19 @@ fn bad(reason: &str) -> AnalyticsError {
 }
 
 impl NarrativeCohort {
+    /// Resolve the input database of each replicate using the same paths as verification.
+    pub fn database_paths(&self, default_database: &Path, spec_directory: &Path) -> Vec<PathBuf> {
+        self.members
+            .iter()
+            .map(|member| {
+                member.database.as_ref().map_or_else(
+                    || default_database.to_owned(),
+                    |path| spec_directory.join(path),
+                )
+            })
+            .collect()
+    }
+
     fn validate(&self) -> Result<(), AnalyticsError> {
         self.budget.validate()?;
         if self.schema_version != 1 || !(3..=MAX_RUNS).contains(&self.members.len()) {
@@ -155,12 +168,7 @@ pub fn verify_cohort<'a>(
     spec_directory: &Path,
 ) -> Result<NarrativeCohortReport<'a>, AnalyticsError> {
     spec.validate()?;
-    let paths: Vec<_> = spec.members.iter().map(|member| {
-        member.database.as_ref().map_or_else(
-            || default_database.to_owned(),
-            |path| spec_directory.join(path),
-        )
-    }).collect();
+    let paths = spec.database_paths(default_database, spec_directory);
     let mut sources = BTreeMap::new();
     for (member, path) in spec.members.iter().zip(&paths) {
         sources.entry(path.as_path()).or_insert(member.run_id);

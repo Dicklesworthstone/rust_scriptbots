@@ -1520,6 +1520,23 @@ fn curated_extinction_budget_replays_durable_history_and_retains_failed_verdicts
     assert_eq!(report["measurements"]["covered_ticks"], 320);
     assert_eq!(report["observed_root_seed"], serde_json::Value::Null);
 
+    let saved_spec = std::fs::read(&spec_path).unwrap();
+    for destination in [std::path::Path::new(&path), spec_path.as_path()] {
+        let refused = Command::new(env!("CARGO_BIN_EXE_sb-analyze"))
+            .args([&path, "verify-narrative-budget", "--spec"])
+            .arg(&spec_path)
+            .arg("--json")
+            .arg(destination)
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(refused.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("conflicts with input evidence"));
+    }
+    assert_eq!(std::fs::read(&spec_path).unwrap(), saved_spec);
+    // Reopening and replaying this same database below also checks the refusal
+    // preserved a usable scientific input.
+
     spec["rule"]["expected"][0]["last_tick"] = 96.into();
     spec["rule"]["expected"][0]["first_tick"] = 96.into();
     let (success, report) = evaluate(&spec);

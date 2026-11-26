@@ -14,6 +14,9 @@
 //!   sb-analyze runs/archipelago.sqlite verify-narrative --all-islands --json archipelago.json
 //!   sb-analyze runs/meadow.sqlite verify-narrative-budget --spec quiet.json --json verdict.json
 
+#[path = "sb_analyze/report_output.rs"]
+mod report_output;
+
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -228,10 +231,12 @@ fn emit_narrative_verdict(
     report: &impl serde::Serialize,
     passed: bool,
     path: Option<&Path>,
+    databases: &[PathBuf],
+    spec: &Path,
 ) -> Result<(), AnalyticsError> {
     let payload = serde_json::to_string_pretty(report)?;
     if let Some(path) = path {
-        std::fs::write(path, &payload)?;
+        report_output::publish(&[(path, payload.as_bytes())], databases, Some(spec))?;
     }
     println!("{payload}");
     if passed { Ok(()) } else { Err(AnalyticsError::NarrativeBudgetFailed) }
@@ -311,12 +316,14 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
                     verdict,
                 )
             };
+            let mut outputs = Vec::new();
             if let Some(path) = json {
-                std::fs::write(path, payload)?;
+                outputs.push((path.as_path(), payload.as_slice()));
             }
             if let Some(path) = md {
-                std::fs::write(path, &markdown)?;
+                outputs.push((path.as_path(), markdown.as_bytes()));
             }
+            report_output::publish(&outputs, &[PathBuf::from(&db)], None)?;
             println!("{markdown}");
             tracing::info!(
                 run_id = %reader.run_id(),
@@ -333,7 +340,13 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             let report = scriptbots_analytics::narrative_budget::verify_narrative_budget(
                 &open_reader()?, &budget,
             )?;
-            emit_narrative_verdict(&report, report.passed, json.as_deref())
+            emit_narrative_verdict(
+                &report,
+                report.passed,
+                json.as_deref(),
+                &[PathBuf::from(&db)],
+                spec,
+            )
         }
         Command::VerifyNarrativeCohort { spec, json } => {
             if cli.run_id.is_some() {
@@ -343,10 +356,15 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
                 });
             }
             let cohort = read_narrative_spec(spec)?;
+            let directory = spec.parent().unwrap_or(Path::new("."));
             let report = scriptbots_analytics::narrative_budget::cohort::verify_cohort(
-                &cohort, &cli.db, spec.parent().unwrap_or(Path::new(".")),
+                &cohort, &cli.db, directory,
             )?;
-            emit_narrative_verdict(&report, report.passed, json.as_deref())
+            let mut databases = cohort.database_paths(&cli.db, directory);
+            if !databases.contains(&cli.db) {
+                databases.push(cli.db.clone());
+            }
+            emit_narrative_verdict(&report, report.passed, json.as_deref(), &databases, spec)
         }
         Command::Export {
             out_dir,
