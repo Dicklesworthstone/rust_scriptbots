@@ -917,26 +917,57 @@ impl ChannelHostPort {
             .checked_add(self.remaining_budget(started))
             .ok_or_else(|| Self::protocol_violation("host checkpoint deadline overflow"))?;
         let (reply, receiver) = std::sync::mpsc::channel();
+        let delivery_fence = Arc::new(Mutex::new(()));
         self.enqueue(
             IngressMessage::CaptureHostCheckpoint {
                 request: HostCaptureRequest {
                     reply,
                     deadline,
                     handoff,
+                    delivery_fence: Arc::clone(&delivery_fence),
                 },
             },
             started,
         )?;
-        receiver
-            .recv_timeout(self.remaining_budget(started))
-            .map_err(|error| match error {
-                RecvTimeoutError::Timeout => Self::protocol_violation(if handoff {
-                    "host checkpoint reply timed out; owner handoff is unconfirmed"
-                } else {
-                    "host checkpoint reply timed out"
-                }),
-                RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
-            })?
+        let received = receiver.recv_timeout(self.remaining_budget(started));
+        Self::finalize_host_checkpoint_reply(receiver, received, handoff, &delivery_fence)
+    }
+
+    fn finalize_host_checkpoint_reply(
+        receiver: Receiver<HostCaptureResult>,
+        received: Result<HostCaptureResult, RecvTimeoutError>,
+        handoff: bool,
+        delivery_fence: &Mutex<()>,
+    ) -> HostCaptureResult {
+        let error = match received {
+            Ok(result) => return result,
+            Err(error) => error,
+        };
+        if handoff {
+            // A timeout can race a successful send before this receiver is dropped.
+            // Either consume that already-delivered cut or close the receiver before
+            // the owner can commit retirement. No new wait or capture starts here.
+            // This unit mutex protects only that ordering, so poison contains no
+            // partially mutated payload and must not bypass receiver cleanup.
+            let delivery = delivery_fence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let delivered = receiver.try_recv();
+            drop(receiver);
+            drop(delivery);
+            if let Ok(result) = delivered {
+                return result;
+            }
+        }
+        let error = match error {
+            RecvTimeoutError::Timeout => Self::protocol_violation(if handoff {
+                "host checkpoint reply timed out; owner handoff is unconfirmed"
+            } else {
+                "host checkpoint reply timed out"
+            }),
+            RecvTimeoutError::Disconnected => HostAccessError::Disconnected,
+        };
+        Err(error.into())
     }
 
     fn protocol_violation(message: impl Into<String>) -> HostAccessError {
@@ -1266,10 +1297,14 @@ enum HandoffState {
     Retired,
 }
 
+type HostCaptureResult = Result<HostCheckpointV1, HostCheckpointError>;
+
 struct HostCaptureRequest {
-    reply: Sender<Result<HostCheckpointV1, HostCheckpointError>>,
+    reply: Sender<HostCaptureResult>,
     deadline: Instant,
     handoff: bool,
+    /// Orders retirement delivery against the caller's final receiver cleanup.
+    delivery_fence: Arc<Mutex<()>>,
 }
 
 /// Progress of the persistence flush a paused host needs before it can be captured.
@@ -1475,6 +1510,12 @@ impl ChannelHostDriver {
         result: Result<HostCheckpointV1, HostCheckpointError>,
     ) {
         if request.handoff {
+            // The caller takes this same short fence before abandoning a timed-out
+            // receiver. Capture and encoding have already completed outside it.
+            let _delivery = request
+                .delivery_fence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let retiring = result.is_ok();
             // Fence the owner before a successful reply can become visible to the caller.
             self.handoff = if retiring {
@@ -2806,6 +2847,7 @@ mod tests {
                         reply,
                         deadline,
                         handoff,
+                        delivery_fence: Arc::new(Mutex::new(())),
                     },
                 })
                 .is_ok(),
@@ -3466,6 +3508,119 @@ mod tests {
             .expect("original cut eventually settles");
         assert_eq!(checkpoint.tick(), scriptbots_core::Tick(1));
         assert!(driver.parked_host_captures.is_empty());
+    }
+
+    #[test]
+    fn handoff_reply_sent_after_wait_timeout_is_recovered_before_abandonment() {
+        for poison_fence in [false, true] {
+            let (mut driver, mut port) =
+                ChannelHostDriver::new(test_host(true), fast_options()).expect("handoff owner");
+            let before = driver
+                .host()
+                .core()
+                .capture_host_checkpoint_v1()
+                .unwrap()
+                .encode()
+                .unwrap();
+            let delivery_fence = Arc::new(Mutex::new(()));
+            if poison_fence {
+                let fence = Arc::clone(&delivery_fence);
+                assert!(
+                    std::thread::spawn(move || {
+                        let _delivery = fence.lock().unwrap();
+                        panic!("poison the payload-free delivery fence");
+                    })
+                    .join()
+                    .is_err()
+                );
+            }
+            let (reply, receiver) = std::sync::mpsc::channel();
+            // Exercise the exact race window: waiting has timed out, but its
+            // receiver still exists while the real owner completes the capture.
+            let received = receiver.recv_timeout(Duration::ZERO);
+            assert!(matches!(received, Err(RecvTimeoutError::Timeout)));
+            driver.process_ingress(IngressMessage::CaptureHostCheckpoint {
+                request: HostCaptureRequest {
+                    reply,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    handoff: true,
+                    delivery_fence: Arc::clone(&delivery_fence),
+                },
+            });
+            assert_eq!(driver.handoff, HandoffState::Retired);
+            assert!(!*port.ingress_open.lock().unwrap());
+            let checkpoint = ChannelHostPort::finalize_host_checkpoint_reply(
+                receiver,
+                received,
+                true,
+                &delivery_fence,
+            )
+            .expect("consume the delivered cut instead of losing it behind the earlier timeout");
+            assert_eq!(checkpoint.encode().unwrap(), before);
+            let retired = driver.run(|| ManualInstant::from_nanos(0)).unwrap();
+            assert_eq!(retired.outcome, ChannelRunOutcome::HandedOff);
+            assert_eq!(retired.drives, 0);
+            assert_eq!(retired.commands_admitted, 0);
+            assert!(matches!(
+                port.submit(CommandEnvelope::new(CommandId::new(198), HostCommand::Step)),
+                Err(HostAccessError::ProtocolViolation { .. })
+            ));
+            assert!(driver.host().core().shutdown_command_status().is_none());
+        }
+    }
+
+    #[test]
+    fn handoff_reply_timeout_closes_receiver_before_owner_can_retire() {
+        for poison_fence in [false, true] {
+            let (mut driver, port) =
+                ChannelHostDriver::new(test_host(true), fast_options()).expect("handoff owner");
+            let before = driver.host().core().admission_cursor();
+            let delivery_fence = Arc::new(Mutex::new(()));
+            if poison_fence {
+                let fence = Arc::clone(&delivery_fence);
+                assert!(
+                    std::thread::spawn(move || {
+                        let _delivery = fence.lock().unwrap();
+                        panic!("poison the payload-free delivery fence");
+                    })
+                    .join()
+                    .is_err()
+                );
+            }
+            let (reply, receiver) = std::sync::mpsc::channel();
+            let received = receiver.recv_timeout(Duration::ZERO);
+            assert!(matches!(received, Err(RecvTimeoutError::Timeout)));
+            assert!(matches!(
+                ChannelHostPort::finalize_host_checkpoint_reply(
+                    receiver,
+                    received,
+                    true,
+                    &delivery_fence,
+                ),
+                Err(HostCheckpointError::Host(HostAccessError::ProtocolViolation { message }))
+                    if message == "host checkpoint reply timed out; owner handoff is unconfirmed"
+            ));
+            // The caller won the race and returned without an artifact. Even a
+            // valid capture must leave this owner available for later commands.
+            driver.process_ingress(IngressMessage::CaptureHostCheckpoint {
+                request: HostCaptureRequest {
+                    reply,
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    handoff: true,
+                    delivery_fence: Arc::clone(&delivery_fence),
+                },
+            });
+            assert_eq!(driver.handoff, HandoffState::Open);
+            assert!(*port.ingress_open.lock().unwrap());
+            assert_eq!(driver.host().core().admission_cursor(), before);
+            assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(0));
+            let step = queue_command(&port, 199, HostCommand::Step);
+            let advanced = driver.step(ManualInstant::from_nanos(0)).unwrap();
+            assert_eq!(advanced.admitted, 1);
+            assert!(step.try_recv().unwrap().is_ok());
+            assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(1));
+            assert!(driver.host().core().shutdown_command_status().is_none());
+        }
     }
 
     #[test]

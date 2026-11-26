@@ -2,6 +2,21 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Checkpoint handoff delivery at caller timeout (2026-11-26):**
+[Source implemented and independently reviewed — Codex; corrective contribution
+to `bd-2z0.5.13` and `bd-2z0.4.11`; native execution remains unqualified]
+
+A deliberate handoff now orders retirement and reply delivery against the
+caller's final timeout cleanup. The caller receives an already-delivered exact
+checkpoint, or closes its receiver before the owner can retire; failed delivery
+reopens the original owner. Capture and encoding stay outside the short fence.
+Two deterministic real-owner regressions cover both race orderings, exact bytes,
+later command admission and a poisoned payload-free fence. Scoped runtime
+formatting passed through DSR before integration with concurrent status-board
+changes. Locked offline check and Clippy stopped before compilation at an
+uncached `rust-xcb` checkout; an online native check is pending. The regressions
+have not run and no qualification gate is closed.
+
 **Scenario execution, live checkpoints and browser recovery (2026-11-26)**
 [Currently In Progress — `bd-2z0.5.13`, `bd-2z0.10` and `bd-2z0.12.2`]
 
