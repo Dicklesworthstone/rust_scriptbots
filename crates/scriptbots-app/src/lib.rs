@@ -1822,6 +1822,8 @@ pub enum CharacterizationTraceErrorV2 {
     #[error(transparent)]
     Characterization(#[from] CharacterizationError),
     #[error(transparent)]
+    Intervention(#[from] ScenarioRunError),
+    #[error(transparent)]
     Step(#[from] scriptbots_core::WorldStepError),
     #[error("failed to encode characterization artifact: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -1916,7 +1918,15 @@ impl CharacterizationTraceV2 {
             digest: initial,
             tick_events: None,
         });
+        let mut current_config = manifest.normalized_config.clone();
         for _ in 0..ticks {
+            let boundary = world.tick().0;
+            apply_scenario_interventions(
+                world,
+                &mut current_config,
+                &manifest.scenario.interventions,
+                boundary,
+            )?;
             let events = step(world)?;
             let digest = world.characterization_digest_v0()?;
             points.push(TracePointV0 {
@@ -3295,6 +3305,77 @@ mod characterization_tests {
                 derived: true,
             }
         ));
+    }
+
+    #[test]
+    fn characterization_executes_the_recorded_schedule_at_each_boundary() {
+        let mut scenario = ScenarioIdentityV0::caller_seeded("scheduled-trace");
+        let patch = |tick, drain: f32| ScenarioInterventionV1 {
+            tick,
+            set: serde_json::json!({ "metabolism_drain": drain }),
+        };
+        scenario.interventions = vec![
+            patch(1, 0.03),
+            patch(0, 0.01),
+            patch(1, 0.02),
+            patch(2, 0.04),
+        ];
+
+        let mut world = test_world(Some(42));
+        let mut reference = test_world(Some(42));
+        let initial = reference.characterization_digest_v0().unwrap();
+        let trace = CharacterizationTraceV2::capture_with_scenario(
+            test_run_identity(42),
+            scenario.clone(),
+            &mut world,
+            2,
+        )
+        .unwrap();
+        assert_eq!(trace.manifest.scenario, scenario);
+        assert_eq!(trace.points[0].digest, initial);
+        for (index, drains) in [&[0.01][..], &[0.03, 0.02][..]].into_iter().enumerate() {
+            for &drain in drains {
+                let mut config = reference.config().clone();
+                config.metabolism_drain = drain;
+                reference.apply_config_update(config).unwrap();
+            }
+            let events = reference.step().unwrap();
+            assert_eq!(trace.points[index + 1].tick_events, Some(events));
+            assert_eq!(
+                trace.points[index + 1].digest,
+                reference.characterization_digest_v0().unwrap()
+            );
+        }
+        // A patch at the last sampled boundary belongs to the next transition.
+        assert_eq!(
+            world.config().metabolism_drain.to_bits(),
+            0.02_f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn invalid_characterization_intervention_stops_before_its_science_step() {
+        let mut scenario = ScenarioIdentityV0::caller_seeded("invalid-scheduled-trace");
+        scenario.interventions.push(ScenarioInterventionV1 {
+            tick: 1,
+            set: serde_json::json!({ "food_cell_size": 0 }),
+        });
+        let mut world = test_world(Some(42));
+        let error = CharacterizationTraceV2::capture_with_scenario(
+            test_run_identity(42),
+            scenario,
+            &mut world,
+            2,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CharacterizationTraceErrorV2::Intervention(ScenarioRunError::Intervention {
+                tick: 1,
+                ..
+            })
+        ));
+        assert_eq!(world.tick().0, 1);
     }
 
     #[test]
