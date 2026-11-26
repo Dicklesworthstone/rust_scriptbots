@@ -103,6 +103,10 @@ impl SimulationView {
         self.synchronize_lab_source();
     }
 
+    pub(super) fn open_first_run_guide(&mut self, cx: &mut Context<Self>) {
+        self.guide_action(LabGuideAction::Open, cx);
+    }
+
     fn guide_action(&mut self, action: LabGuideAction, cx: &mut Context<Self>) {
         match action {
             LabGuideAction::Open | LabGuideAction::Hide | LabGuideAction::Restart => {

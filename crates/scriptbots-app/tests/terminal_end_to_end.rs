@@ -866,7 +866,8 @@ for profile in profiles:
         port = reservation.getsockname()[1]
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith(('SCRIPTBOTS_', 'SB_'))}
-    environment.update(SCRIPTBOTS_MODE='terminal', SCRIPTBOTS_TERMINAL_HEADLESS='0',
+    environment.update(XDG_CONFIG_HOME=str(directory / 'config'),
+                       SCRIPTBOTS_MODE='terminal', SCRIPTBOTS_TERMINAL_HEADLESS='0',
                        SCRIPTBOTS_TERMINAL_EMOJI='0',
                        SCRIPTBOTS_ARTIFACTS_DIR=str(directory / 'artifacts'),
                        SCRIPTBOTS_CONTROL_REST_ENABLED='1', SCRIPTBOTS_CONTROL_MCP='disabled',
@@ -977,6 +978,11 @@ for profile in profiles:
             pump_until(lambda: screen.alternate_entered, 'alternate-screen startup')
             pump_until(lambda: not (termios.tcgetattr(slave)[3] & termios.ICANON), 'raw-mode startup')
             raw_mode = not (termios.tcgetattr(slave)[3] & termios.ICANON)
+            pump_until(lambda: 'FIRST-RUN LAB GUIDE 1/8' in screen.text() and not screen.synchronized,
+                       'fresh-profile guide')
+            send_terminal_input(b'\x1b')
+            pump_until(lambda: 'FIRST-RUN LAB GUIDE' not in screen.text() and not screen.synchronized,
+                       'dismiss first-run guide')
             for key, title in routes:
                 send_terminal_input(key.encode())
                 pump_until(lambda: screen.alternate and not screen.synchronized

@@ -333,6 +333,13 @@ impl TerminalRenderer {
         };
         let mut program = Program::with_config(model, config)
             .context("failed to start FrankenTUI terminal runtime")?;
+        if scriptbots_runtime::native_preferences::claim_first_lab_guide_launch() {
+            program
+                .model()
+                .app
+                .borrow_mut()
+                .execute_palette_action(CommandPaletteAction::ShowLabGuide);
+        }
         let result = program.run();
         let failure = program.model().failure.borrow_mut().take();
         drop(program);

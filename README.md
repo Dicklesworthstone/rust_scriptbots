@@ -6,7 +6,9 @@ The authoritative roadmap is `PLAN_TO_REARCHITECT_AND_REVIVE_RUST_SCRIPTBOTS.md`
 
 ### First-run Lab guide
 
-The opt-in terminal and GPUI walkthrough connects the live world, organism
+The terminal and GPUI open the Lab guide on the first interactive launch with a
+writable user profile. Both frontends share that preference. Later launches
+open directly into the lab. The walkthrough connects the live world, organism
 inspector, Pause, one scientific tick, a food-growth change, a fresh checkpoint,
 and a control/intervention study. In the terminal, open it with **F1** or
 **First-run Lab Guide** in the command palette; **Esc** hides it while retaining
@@ -23,10 +25,8 @@ Progress follows the actual owner, command identity, applied publication and
 journal receipt. A memory-only commitment is labelled `CommittedVolatile`.
 Saving requires a fresh request/result pair; the study must match that saved
 cut and its verified two-arm report. Its outcome describes one seed and does
-not establish a general effect. This is an optional guided path; automatic
-first-install onboarding and full native acceptance under `bd-2z0.10.4` remain
-open. The guide's newly authored tests and native builds have not been executed
-in the current implementation session.
+not establish a general effect. Full native journey acceptance under
+`bd-2z0.10.4` remains open.
 
 ### Philosophy & purpose
 - **Why this exists**: ScriptBots is a minimalist artificial life laboratory. By rebuilding the original simulator with rigorously deterministic Rust systems, we can observe, measure, and reproduce emergent behavior at scale—without undefined behavior or global state muddying results.

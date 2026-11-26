@@ -5416,6 +5416,15 @@ The application is interesting when the default launch already tells a story. A 
 
 ### 2.2 Default first-run experience
 
+[Currently In Progress — `bd-2z0.10.4`] The native interactive terminal and
+GPUI now claim a shared per-profile marker after frontend initialization to open
+the existing receipt-driven guide once. A headless terminal run leaves the
+preference available for a later interactive launch. The live terminal PTY
+fixture now starts with a fresh profile and exercises guide dismissal before
+its route checks. The standalone preference test and a cross-process profile
+check passed on the pinned toolchain. The interactive PTY and GPUI journey
+remain unverified.
+
 The default `meadow` scenario should:
 
 - seed agents across the full world rather than in a 4x4 corner grid;

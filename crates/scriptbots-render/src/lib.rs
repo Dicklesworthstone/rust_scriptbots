@@ -2940,7 +2940,13 @@ pub fn run_demo(
                     return;
                 }
             };
-            let _ = (hud, canvas);
+            if scriptbots_runtime::native_preferences::claim_first_lab_guide_launch() {
+                let _ = hud.update(app, |view, window, cx| {
+                    view.open_first_run_guide(cx);
+                    window.activate_window();
+                });
+            }
+            let _ = canvas;
 
             start_gui_health_monitor(
                 app,
@@ -17478,32 +17484,8 @@ mod hud_layout_store {
         perf_open: bool,
     }
 
-    /// Platform config directory, resolved with `std` alone.
-    ///
-    /// Deliberately not a `dirs`/`directories` dependency: neither is a
-    /// workspace dependency today (`dirs` appears in `Cargo.lock` only
-    /// transitively), so taking one would be a new direct third-party
-    /// dependency decision for a three-boolean preference file. If a second
-    /// crate ever needs the same path, promote this helper then.
-    fn config_dir() -> Option<PathBuf> {
-        #[cfg(windows)]
-        {
-            std::env::var_os("APPDATA").map(PathBuf::from)
-        }
-        #[cfg(not(windows))]
-        {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
-                })
-        }
-    }
-
-    /// Full path to the preference file, or `None` when no config dir exists.
     fn layout_path() -> Option<PathBuf> {
-        Some(config_dir()?.join("scriptbots").join("hud_layout.json"))
+        Some(scriptbots_runtime::native_preferences::config_dir()?.join("hud_layout.json"))
     }
 
     /// Load the saved layout, or the default when anything at all is wrong.

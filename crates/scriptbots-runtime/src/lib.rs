@@ -93,6 +93,8 @@ pub mod lab_guide;
 pub mod lab_workflows;
 pub mod migrator;
 pub mod native;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod native_preferences;
 pub mod remote;
 pub mod remote_subscription;
 
