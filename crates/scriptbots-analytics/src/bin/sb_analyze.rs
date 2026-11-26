@@ -12,7 +12,9 @@
 //!   sb-analyze runs/scriptbots-123.sqlite verify-narrative --json verification.json
 //!   sb-analyze runs/archipelago.sqlite verify-narrative --island-id 2 --json island-2.json
 //!   sb-analyze runs/archipelago.sqlite verify-narrative --all-islands --json archipelago.json
+//!   sb-analyze runs/meadow.sqlite verify-narrative-budget --spec quiet.json --json verdict.json
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -81,6 +83,16 @@ enum Command {
         /// Write the human-readable comparison to this path (also printed to stdout).
         #[arg(long)]
         md: Option<PathBuf>,
+    },
+    /// Replay complete detector inputs and check a quiet-world or curated-event budget.
+    VerifyNarrativeBudget {
+        /// Versioned JSON expectations. For example a 10,000-tick quiet world:
+        /// {"schema_version":1,"expected_ticks":10000,"rule":{"type":"quiet"}}.
+        #[arg(long)]
+        spec: PathBuf,
+        /// Save the full JSON evidence and verdict (also printed to stdout).
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
     /// Export run tables to Parquet, Arrow, or CSV (bd-2z0.11.8).
     Export {
@@ -279,6 +291,32 @@ fn run(cli: &Cli) -> Result<(), AnalyticsError> {
             );
             verdict?;
             Ok(())
+        }
+        Command::VerifyNarrativeBudget { spec, json } => {
+            // Check the actual bytes read even if the file grows after opening.
+            const SPEC_LIMIT: usize = 65_536;
+            let mut bytes = Vec::new();
+            std::fs::File::open(spec)?.take(65_537).read_to_end(&mut bytes)?;
+            if bytes.len() > SPEC_LIMIT {
+                return Err(AnalyticsError::BadParam {
+                    name: "spec".to_owned(),
+                    reason: "budget exceeds 65,536 bytes".to_owned(),
+                });
+            }
+            let budget = serde_json::from_slice(&bytes)?;
+            let report = scriptbots_analytics::narrative_budget::verify_narrative_budget(
+                &open_reader()?, &budget,
+            )?;
+            let payload = serde_json::to_string_pretty(&report)?;
+            if let Some(path) = json {
+                std::fs::write(path, &payload)?;
+            }
+            println!("{payload}");
+            if report.passed {
+                Ok(())
+            } else {
+                Err(AnalyticsError::NarrativeBudgetFailed)
+            }
         }
         Command::Export {
             out_dir,

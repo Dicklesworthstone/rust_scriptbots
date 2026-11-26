@@ -96,6 +96,9 @@ pub use graphs::*;
 
 /// Statistical certification of narrative events (bd-2z0.11.6).
 pub mod narrative_validate;
+
+/// Quiet and curated scenario budgets evaluated alongside complete saved-event replay.
+pub mod narrative_budget;
 pub use narrative_validate::*;
 
 pub use lineage::{
@@ -611,6 +614,9 @@ pub enum AnalyticsError {
     /// Graph construction, algorithm, or export error (bd-2z0.11.7).
     #[error("graph error: {0}")]
     Graph(String),
+    /// The completed narrative budget report recorded at least one failed condition.
+    #[error("saved narrative failed the requested budget")]
+    NarrativeBudgetFailed,
     /// The canonical narrative detector refused a recorded input or policy.
     #[error("narrative reconstruction error: {0}")]
     NarrativeInput(#[from] scriptbots_core::narrative::NarrativeInputError),
@@ -3914,6 +3920,7 @@ impl NarrativeComparison<'_> {
         &mut self,
         identity: RunEventIdentity,
         record: EventRecord,
+        budget: Option<&mut narrative_budget::BudgetTally<'_>>,
     ) -> Result<(), AnalyticsError> {
         if self
             .last_reconstructed
@@ -3923,6 +3930,9 @@ impl NarrativeComparison<'_> {
             return Err(NarrativeVerificationError::EventOrder { identity }.into());
         }
         self.last_reconstructed = Some(identity.clone());
+        if let Some(tally) = budget {
+            tally.event(record.kind, record.tick.0);
+        }
         increment_narrative_counter(
             &mut self.result.events_reconstructed,
             "reconstructed events",
@@ -4047,6 +4057,12 @@ fn verify_narrative_policy(record: NarrativeInputRecordV1) -> Result<(), Analyti
 /// non-default islands, and recorded capacities above [`NARRATIVE_VERIFICATION_CAPACITY`].
 /// Observed record differences return a complete result with `equivalent = false`.
 pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV1, AnalyticsError> {
+    require_single_world_narrative(reader)?;
+    verify_narrative_inputs(reader, NarrativeComparisonScope::SingleWorld, None)
+        .map(|(verification, _)| verification)
+}
+
+fn require_single_world_narrative(reader: &StorageReader) -> Result<(), AnalyticsError> {
     for island in reader.archipelago_islands()? {
         if island.island_id != 0 {
             return Err(NarrativeVerificationError::UnsupportedIsland {
@@ -4055,8 +4071,7 @@ pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV
             .into());
         }
     }
-    verify_narrative_inputs(reader, NarrativeComparisonScope::SingleWorld)
-        .map(|(verification, _)| verification)
+    Ok(())
 }
 
 /// Independently reconstruct and compare every narrative event from one configured island.
@@ -4076,7 +4091,7 @@ fn compare_island_narrative(
     reader: &StorageReader,
     scope: NarrativeComparisonScope,
 ) -> Result<IslandNarrativeVerificationV1, AnalyticsError> {
-    let (verification, binding) = verify_narrative_inputs(reader, scope)?;
+    let (verification, binding) = verify_narrative_inputs(reader, scope, None)?;
     let input_binding = binding.ok_or(NarrativeVerificationError::SourceBinding)?;
     Ok(IslandNarrativeVerificationV1 {
         schema_version: 1,
@@ -4173,6 +4188,7 @@ pub fn verify_archipelago_narrative(
 fn verify_narrative_inputs(
     reader: &StorageReader,
     scope: NarrativeComparisonScope,
+    mut budget: Option<&mut narrative_budget::BudgetTally<'_>>,
 ) -> Result<(NarrativeVerificationV1, Option<IslandNarrativeInputBindingV1>), AnalyticsError> {
     let island = scope.island();
     let mut inputs = NarrativeInputPages::new(reader, island)?;
@@ -4240,6 +4256,9 @@ fn verify_narrative_inputs(
                 .history()
                 .front()
                 .map_or(record.input.tick.0, |input| input.tick.0);
+            if let Some(tally) = budget.as_deref_mut() {
+                tally.input(record, oldest);
+            }
             for event in replay.drain_pending_persistence() {
                 if event.tick.0 < oldest || event.tick > record.input.tick {
                     return Err(NarrativeVerificationError::EventOutsideHistory {
@@ -4275,7 +4294,7 @@ fn verify_narrative_inputs(
                 .is_some_and(|(identity, _)| identity.tick().0 < oldest)
             {
                 if let Some((identity, event)) = pending.pop_first() {
-                    comparison.reconstructed(identity, event)?;
+                    comparison.reconstructed(identity, event, budget.as_deref_mut())?;
                 }
             }
         }
@@ -4295,7 +4314,7 @@ fn verify_narrative_inputs(
         .into());
     }
     for (identity, event) in pending {
-        comparison.reconstructed(identity, event)?;
+        comparison.reconstructed(identity, event, budget.as_deref_mut())?;
     }
     while let Some(event) = comparison.take_stored()? {
         comparison.unexpected(event)?;

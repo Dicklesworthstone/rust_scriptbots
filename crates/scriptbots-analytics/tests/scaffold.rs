@@ -1491,6 +1491,52 @@ fn island_narrative_reconstruction_and_verification_follow_independent_real_worl
 }
 
 #[test]
+fn curated_extinction_budget_replays_durable_history_and_retains_failed_verdicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = real_narrative_db(&dir);
+    let spec_path = dir.path().join("budget.json");
+    let verdict_path = dir.path().join("verdict.json");
+    let mut spec = serde_json::json!({
+        "schema_version": 1, "expected_ticks": 320,
+        "rule": {"type": "curated", "max_unexpected": 16,
+                 "expected": [{"kind": "extinction", "first_tick": 97, "last_tick": 97,
+                               "min_count": 1, "max_count": 1}]}
+    });
+    let evaluate = |spec: &serde_json::Value| {
+        std::fs::write(&spec_path, serde_json::to_vec(spec).unwrap()).unwrap();
+        let command = Command::new(env!("CARGO_BIN_EXE_sb-analyze"))
+            .args([&path, "verify-narrative-budget", "--spec"]).arg(&spec_path)
+            .arg("--json").arg(&verdict_path).output().unwrap();
+        let from_stdout: serde_json::Value = serde_json::from_slice(&command.stdout)
+            .unwrap_or_else(|_| panic!("no verdict: {}", String::from_utf8_lossy(&command.stderr)));
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&verdict_path).unwrap()).unwrap();
+        assert_eq!(from_stdout, saved);
+        (command.status.success(), saved)
+    };
+    let (success, report) = evaluate(&spec);
+    assert!(success, "{report}");
+    assert_eq!(report["verification"]["equivalent"], true);
+    assert_eq!(report["measurements"]["counts"], serde_json::json!([1]));
+    assert_eq!(report["measurements"]["covered_ticks"], 320);
+    assert_eq!(report["observed_root_seed"], serde_json::Value::Null);
+
+    spec["rule"]["expected"][0]["last_tick"] = 96.into();
+    spec["rule"]["expected"][0]["first_tick"] = 96.into();
+    let (success, report) = evaluate(&spec);
+    assert!(!success);
+    assert_eq!(report["measurements"]["counts"], serde_json::json!([0]));
+    assert!(report["violations"].as_array().unwrap().contains(&"expected_event_count_out_of_range".into()));
+
+    spec["root_seed"] = 1234.into();
+    spec["expected_ticks"] = 321.into();
+    let (success, report) = evaluate(&spec);
+    assert!(!success);
+    let failures = report["violations"].as_array().unwrap();
+    assert!(failures.contains(&"root_seed_mismatch".into()));
+    assert!(failures.contains(&"unexpected_run_length".into()));
+}
+
+#[test]
 fn narrative_verification_distinguishes_active_quiet_history_from_missing_inputs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = synth_narrative_input_db_ticks(&dir, 1, 320);
