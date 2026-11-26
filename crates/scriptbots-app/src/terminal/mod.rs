@@ -13,6 +13,7 @@ use std::{
 
 pub mod subcell;
 
+use manual_focus::ManualFocus;
 use subcell::{ColorDepth, Layer, SubCellBuffer, SubCellMode, quantize};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -88,6 +89,7 @@ pub use command_palette::{
 };
 pub mod export;
 pub mod frankentui_shell;
+mod manual_focus;
 pub mod pointer;
 pub mod science_screens;
 pub mod science_widgets;
@@ -3569,8 +3571,7 @@ struct TerminalApp<'a> {
     // instead of auto-expanding on wide terminals.
     expanded_user_override: bool,
     // Brain view controls
-    focused_agent_cursor: usize,
-    manual_focus_cleared: bool,
+    manual_focus: ManualFocus,
     activation_layer_index: usize,
     activation_row_offset: usize,
     focus_lock: FocusLockMode,
@@ -3775,8 +3776,7 @@ impl<'a> TerminalApp<'a> {
             simulation_fault: None,
             expanded: false,
             expanded_user_override: false,
-            focused_agent_cursor: 0,
-            manual_focus_cleared: false,
+            manual_focus: ManualFocus::default(),
             activation_layer_index: 0,
             activation_row_offset: 0,
             focus_lock: FocusLockMode::Manual,
@@ -4611,18 +4611,17 @@ impl<'a> TerminalApp<'a> {
             .find(|(_, (agent, state))| {
                 pending.update.agent_ids.contains(&agent.id) && **state == SelectionState::Selected
             })
-            .map(|(index, _)| index);
+            .map(|(index, (agent, _))| (index, agent.uid.get()));
         let cleared = pending.update.mode == SelectionMode::Clear
             && pending.update.agent_ids.is_empty()
             && world
                 .agent_selection
                 .iter()
                 .all(|state| *state == SelectionState::None);
-        if let Some(index) = selected {
-            self.focused_agent_cursor = index;
-            self.manual_focus_cleared = false;
+        if let Some((row, uid)) = selected {
+            self.manual_focus = ManualFocus::Agent { row, uid };
         } else if cleared {
-            self.manual_focus_cleared = true;
+            self.manual_focus.clear();
         }
         if selected.is_some() || cleared {
             self.focus_lock = FocusLockMode::Manual;
@@ -6452,8 +6451,10 @@ impl<'a> TerminalApp<'a> {
                         .map_or((norm_pos.0 * world_w, norm_pos.1 * world_h), |a| {
                             (a.position[0], a.position[1])
                         });
-                    self.focused_agent_cursor = best_idx;
-                    self.manual_focus_cleared = false;
+                    self.manual_focus = ManualFocus::Agent {
+                        row: best_idx,
+                        uid: uid.get(),
+                    };
                     self.pending_selections.clear();
                     self.focus_lock = FocusLockMode::Manual;
                     self.snapshot.focused_agent_uid = Some(uid.0);
@@ -7752,8 +7753,7 @@ impl<'a> TerminalApp<'a> {
         }
 
         // Legend for brain paging
-        if self.snapshot.agent_count > 0 {
-            let ai = self.focused_agent_cursor % self.snapshot.agent_count;
+        if let Some(uid) = self.snapshot.focused_agent_uid {
             let total_layers = self.snapshot.brain_layers.len();
             let li = if total_layers == 0 {
                 0
@@ -7764,7 +7764,7 @@ impl<'a> TerminalApp<'a> {
                 Span::styled("Focus ", self.palette.header_style()),
                 Span::raw(format!(
                     "agent #{:>3}  layer {:>2}/{}  row {:>3}",
-                    ai, li, total_layers, self.activation_row_offset
+                    uid, li, total_layers, self.activation_row_offset
                 )),
             ]));
         }
@@ -9817,20 +9817,14 @@ impl<'a> TerminalApp<'a> {
                 if self.rail_visible && !self.snapshot.narrative.is_empty() {
                     self.move_rail_selection(-1);
                 } else {
-                    self.manual_focus_cleared = false;
-                    self.pending_selections.clear();
-                    self.focused_agent_cursor = self.focused_agent_cursor.saturating_sub(1);
-                    self.refresh_snapshot();
+                    self.browse_manual_focus(-1);
                 }
             }
             (KeyCode::Right, _) => {
                 if self.rail_visible && !self.snapshot.narrative.is_empty() {
                     self.move_rail_selection(1);
                 } else {
-                    self.manual_focus_cleared = false;
-                    self.pending_selections.clear();
-                    self.focused_agent_cursor = self.focused_agent_cursor.saturating_add(1);
-                    self.refresh_snapshot();
+                    self.browse_manual_focus(1);
                 }
             }
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
@@ -9877,10 +9871,7 @@ impl<'a> TerminalApp<'a> {
                 self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Oldest agents");
             }
             (KeyCode::Char('m') | KeyCode::Char('M'), _) => {
-                self.manual_focus_cleared = false;
-                self.pending_selections.clear();
-                self.focus_lock = FocusLockMode::Manual;
-                self.refresh_snapshot();
+                self.browse_manual_focus(0);
                 self.push_event(self.snapshot.tick, EventKind::Info, "Focus: Manual");
             }
             _ => {}
@@ -9994,6 +9985,18 @@ impl<'a> TerminalApp<'a> {
         &self.snapshot
     }
 
+    fn browse_manual_focus(&mut self, offset: isize) {
+        self.manual_focus.browse(
+            &self.snapshot.agents,
+            self.snapshot.focused_agent_uid,
+            offset,
+            |agent| agent.uid,
+        );
+        self.pending_selections.clear();
+        self.focus_lock = FocusLockMode::Manual;
+        self.refresh_snapshot();
+    }
+
     fn refresh_snapshot(&mut self) {
         let next_request_revision = BrainInspectionRevision::new(
             self.brain_inspection_revision
@@ -10027,16 +10030,9 @@ impl<'a> TerminalApp<'a> {
 
         // Determine focused agent id
         let agent_id_opt = match self.focus_lock {
-            FocusLockMode::Manual => {
-                if !self.manual_focus_cleared && snap.agent_count > 0 {
-                    world
-                        .world
-                        .agents
-                        .get(self.focused_agent_cursor % snap.agent_count)
-                } else {
-                    None
-                }
-            }
+            FocusLockMode::Manual => self
+                .manual_focus
+                .resolve(&world.world.agents, |agent| agent.uid.get()),
             FocusLockMode::TopPredator => snap
                 .leaderboard
                 .first()
@@ -23164,7 +23160,7 @@ for case in ('panic', 'subscription', 'renderer'):
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
-        app.manual_focus_cleared = true;
+        app.manual_focus.clear();
         let paint = |app: &mut TerminalApp<'_>| {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
             terminal
@@ -26968,8 +26964,7 @@ for case in ('panic', 'subscription', 'renderer'):
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 
-        app.focused_agent_cursor = 1;
-        app.refresh_snapshot();
+        app.browse_manual_focus(1);
         let second = app
             .snapshot
             .brain_inspection
@@ -31088,7 +31083,7 @@ for case in ('panic', 'subscription', 'renderer'):
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
-        app.manual_focus_cleared = true;
+        app.manual_focus.clear();
         let checkpoint = handle
             .create_checkpoint(crate::control::CheckpointCreateRequest::default())
             .unwrap();
@@ -31401,7 +31396,7 @@ for case in ('panic', 'subscription', 'renderer'):
         let renderer = TerminalRenderer::default();
         let mut app = TerminalApp::new(&renderer, host.context(&runtime));
         app.palette = Palette::test_backend_evidence();
-        app.manual_focus_cleared = true;
+        app.manual_focus.clear();
         for _ in 0..3 {
             apply_terminal_owner_command_without_refresh(&mut app, ControlCommand::Step);
         }
@@ -31606,7 +31601,7 @@ for case in ('panic', 'subscription', 'renderer'):
     fn narrative_canvas_review_uses_real_frames_and_keeps_owner_and_status_live() {
         let world = narrative_e2e_world(1);
         rail_test_app!(world, app, _backend);
-        app.manual_focus_cleared = true;
+        app.manual_focus.clear();
         app.refresh_snapshot();
         let initial_events = app.snapshot.narrative.len();
         let step = |app: &mut TerminalApp<'_>| {
@@ -32078,7 +32073,6 @@ for case in ('panic', 'subscription', 'renderer'):
         rail_test_app!(world, app, _backend);
 
         app.probe_enabled = true;
-        app.focused_agent_cursor = 0;
         app.refresh_snapshot();
 
         let artifact_dir = std::env::var("SCRIPTBOTS_INSPECTOR_ARTIFACT_DIR")
