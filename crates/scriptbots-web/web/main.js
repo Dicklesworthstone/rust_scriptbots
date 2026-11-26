@@ -2,7 +2,7 @@ import initWasm, * as wasm from "./pkg/scriptbots_web.js";
 import { CanvasRenderer } from "./renderers/canvas.js";
 import { WebGpuRenderer } from "./renderers/webgpu.js";
 import { environmentDescription } from "./renderers/environment.js";
-import { RemoteStreamClient, describeRemoteOwnerFault, describeRemoteCommandReceipt } from "./remote.js";
+import { RemoteStreamClient, RemoteStepBatchController, describeRemoteOwnerFault, describeRemoteCommandReceipt } from "./remote.js";
 import { BrowserContinuationStore, BrowserRecoveryController } from "./continuation-store.js";
 import { InspectionController, pickAgent, renderInspector, renderInspectorSource,
   validateBrainInspection, renderBrainInspector, renderBrainSource } from "./inspector.js";
@@ -108,6 +108,20 @@ const remoteResume = document.getElementById("remote-resume");
 const remoteStep = document.getElementById("remote-step");
 const remoteRefresh = document.getElementById("remote-refresh");
 const remoteRetry = document.getElementById("remote-retry");
+const remoteBatchCount = document.getElementById("remote-batch-count");
+const remoteBatchRun = document.getElementById("remote-batch-run");
+const remoteBatchResume = document.getElementById("remote-batch-resume");
+const remoteBatchPause = document.getElementById("remote-batch-pause");
+const remoteBatchId = document.getElementById("remote-batch-id");
+const remoteBatchOpen = document.getElementById("remote-batch-open");
+const remoteBatchClear = document.getElementById("remote-batch-clear");
+const remoteBatchRefresh = document.getElementById("remote-batch-refresh");
+const remoteBatchFirst = document.getElementById("remote-batch-first");
+const remoteBatchLatest = document.getElementById("remote-batch-latest");
+const remoteBatchNext = document.getElementById("remote-batch-next");
+const remoteBatchStatus = document.getElementById("remote-batch-status");
+const remoteBatchProgress = document.getElementById("remote-batch-progress");
+const remoteBatchReceipts = document.getElementById("remote-batch-receipts");
 
 const mismatchBannerEl = document.getElementById("mismatch-banner");
 const permalinkInput = document.getElementById("permalink-input");
@@ -177,6 +191,11 @@ const remoteOwnerState = document.getElementById("remote-owner-state");
 let lastRemoteRequestId = null;
 let lastRemoteCommandId = null;
 let lastRemoteStatusRequestId = null;
+const remoteStepBatch = new RemoteStepBatchController({
+  getClient: () => remoteMode ? remoteClient : null,
+  canAdvance: () => remoteOwnerAllowsMutation() && !reviewedCheckpoint,
+  onChange: renderRemoteStepBatch,
+});
 
 const experimentPanel = document.getElementById("experiment-lab");
 const experimentForm = document.getElementById("experiment-form");
@@ -1149,6 +1168,8 @@ function updateRemoteControls() {
   for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteOwnerAllowsMutation() || !!reviewedCheckpoint;
   remoteRefresh.disabled = !remoteConnected || !lastRemoteCommandId;
   remoteRetry.disabled = !remoteOwnerAllowsMutation() || !!reviewedCheckpoint || !lastRemoteRequestId;
+  remoteStepBatch.syncAuthority();
+  renderRemoteStepBatch();
   captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
   remoteOverlay.hidden = !remoteMode || !!remoteFrame || !!reviewedCheckpoint;
   renderCheckpointView();
@@ -1156,6 +1177,44 @@ function updateRemoteControls() {
   renderRemoteOwnerStatus();
   updateCheckpointControls();
   updateWorldNavigation();
+}
+
+function renderRemoteStepBatch() {
+  const batch = remoteStepBatch;
+  const pending = !!batch.pending;
+  const live = remoteOwnerAllowsMutation() && !reviewedCheckpoint;
+  const readable = batch.connected && !!batch.batchId && !pending;
+  remoteBatchCount.disabled = !batch.canStart;
+  remoteBatchRun.disabled = !live || !batch.canStart;
+  remoteBatchResume.disabled = !live || !batch.connected || pending || batch.terminal || batch.missing;
+  remoteBatchPause.disabled = !batch.pending?.continuation;
+  remoteBatchRefresh.disabled = !readable;
+  remoteBatchFirst.disabled = !readable || !batch.page?.offset;
+  remoteBatchLatest.disabled = !readable || !batch.page?.attempted_count;
+  remoteBatchNext.disabled = !readable || batch.page?.next_offset == null;
+  remoteBatchId.disabled = pending;
+  if (remoteBatchId.dataset.boundId !== (batch.batchId ?? "")) {
+    remoteBatchId.value = batch.batchId ?? "";
+    remoteBatchId.dataset.boundId = batch.batchId ?? "";
+  }
+  remoteBatchOpen.disabled = !remoteMode || !remoteConnected || pending || !remoteBatchId.value;
+  remoteBatchClear.disabled = pending || !batch.source;
+  remoteBatchStatus.textContent = batch.notice;
+  remoteBatchStatus.dataset.state = batch.missing ? "missing" : batch.page?.phase ?? (batch.source ? "unconfirmed" : "idle");
+  const page = batch.page;
+  remoteBatchProgress.textContent = page
+    ? `Batch ${batch.batchId}; session ${batch.source.sessionId}. ${page.applied_count}/${page.requested_count} applied; ${page.attempted_count} attempted; ${page.admitted_count} admitted; ${page.settled_count} settled. State: ${page.phase}${page.advancing ? " (advance in progress)" : ""}.${page.blocking_index == null ? "" : ` Waiting at step ${page.blocking_index + 1}.`}`
+    : batch.creation ? `Requested ${batch.creation.count} steps. The creation request is retained unchanged until its outcome is known.`
+      : batch.batchId ? `Retained batch ID: ${batch.batchId}; no current receipt page.` : "";
+  remoteBatchReceipts.replaceChildren();
+  for (const entry of page?.entries ?? []) {
+    const item = document.createElement("li");
+    const error = entry.observation_error;
+    item.textContent = `Step ${entry.index + 1}: ${entry.receipt ? describeRemoteCommandReceipt(entry.receipt)
+      : `submission ${entry.submission_state}; command ${entry.command_id}; no authoritative receipt available.`}${error
+      ? ` Receipt observation (${error.code}): ${error.message}${error.diagnostic_truncated ? " [diagnostic truncated]" : ""}.` : ""}`;
+    remoteBatchReceipts.appendChild(item);
+  }
 }
 
 function updateCheckpointControls() {
@@ -1436,6 +1495,21 @@ function sendRemoteControl(command) {
 remotePause.addEventListener("click", () => sendRemoteControl("pause"));
 remoteResume.addEventListener("click", () => sendRemoteControl("resume"));
 remoteStep.addEventListener("click", () => sendRemoteControl("step"));
+async function performRemoteBatch(operation) {
+  try { await operation(); }
+  catch (error) { remoteStepBatch.notice = String(error.message || error); }
+  renderRemoteStepBatch();
+}
+remoteBatchRun.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.start(Number(remoteBatchCount.value))));
+remoteBatchResume.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.resume()));
+remoteBatchPause.addEventListener("click", () => remoteStepBatch.pause());
+remoteBatchOpen.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.open(remoteBatchId.value)));
+remoteBatchClear.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.clearReference()));
+remoteBatchRefresh.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.refresh()));
+remoteBatchFirst.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.refresh(0)));
+remoteBatchLatest.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.refresh(Math.max(0, remoteStepBatch.page.attempted_count - 1))));
+remoteBatchNext.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.refresh(remoteStepBatch.page.next_offset)));
+remoteBatchId.addEventListener("input", renderRemoteStepBatch);
 remoteRefresh.addEventListener("click", () => {
   try { lastRemoteStatusRequestId = remoteClient.sendControl("status", { commandId: lastRemoteCommandId }); }
   catch (error) { remoteReceipt.textContent = `Outcome lookup failed: ${error.message}`; }
