@@ -35,10 +35,10 @@
 use crate::{
     BrainProjection, BrainProjectionRequest, BrainProjectionSource, CommandEnvelope, CommandId,
     CommandStatus, EventCatchUp, EventCatchUpLocator, EventCursor, EventHub, EventPoll,
-    FixedDeadlineHost, HostAccessError, HostCheckpointError, HostCheckpointV1,
-    HostDriveInterest, HostEvent, HostPort, HostSessionId, LocalHostPort, ManualInstant,
-    NativeDriveTrigger, NativeScheduleError, ProtocolEventSequence, RenderSnapshot, SnapshotHub,
-    SnapshotRevision, WorldCheckpointCut, WorldDigestCut,
+    FixedDeadlineHost, HostAccessError, HostCheckpointError, HostCheckpointV1, HostDriveInterest,
+    HostEvent, HostPort, HostSessionId, LocalHostPort, ManualInstant, NativeDriveTrigger,
+    NativeScheduleError, ProtocolEventSequence, RenderSnapshot, SnapshotHub, SnapshotRevision,
+    WorldCheckpointCut, WorldDigestCut,
 };
 use scriptbots_core::{
     AgentDebugInfo, AgentDebugQuery, AgentUid, CharacterizationDigestV0, CombatEventFlags,
@@ -69,7 +69,8 @@ pub const INSPECTOR_GENOME_PAGE_SIZE: usize = 20;
 /// Bounds and deadlines for one channel host driver and its ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelHostOptions {
-    /// Bounded pre-admission ingress channel capacity.
+    /// Bounded pre-admission ingress channel capacity and the maximum pending
+    /// requests in each of the science and full-owner checkpoint capture lanes.
     pub ingress_capacity: usize,
     /// Maximum ingress messages processed before one host drive boundary.
     pub ingress_drain_budget: usize,
@@ -184,7 +185,7 @@ enum IngressMessage {
         reply: Sender<Result<(CharacterizationDigestV0, WorldDigestV1), HostAccessError>>,
     },
     CaptureCheckpoint {
-        reply: CaptureReply,
+        request: ScienceCaptureRequest,
     },
     CaptureHostCheckpoint {
         request: HostCaptureRequest,
@@ -808,14 +809,17 @@ impl ChannelHostPort {
     pub fn capture_checkpoint_v1(
         &self,
     ) -> Result<scriptbots_core::WorldCheckpointV1, HostAccessError> {
-        self.read_owner(|reply| IngressMessage::CaptureCheckpoint { reply })
-            .map(|cut: WorldCheckpointCut| cut.checkpoint)
+        self.capture_checkpoint_cut().map(|cut| cut.checkpoint)
     }
 
     /// Capture the checkpoint and its scientific owner revision in one owner read.
-    /// Parked requests capture every field when the eventual boundary is quiescent.
+    /// Parked requests retain the caller's original budget and capture every field
+    /// only when the eventual boundary is quiescent.
     pub fn capture_checkpoint_cut(&self) -> Result<WorldCheckpointCut, HostAccessError> {
-        self.read_owner(|reply| IngressMessage::CaptureCheckpoint { reply })
+        let deadline = self.inspection_deadline()?;
+        self.read_owner(|reply| IngressMessage::CaptureCheckpoint {
+            request: ScienceCaptureRequest { reply, deadline },
+        })
     }
 
     /// Capture a settled owner/session checkpoint without retiring the owner.
@@ -1179,18 +1183,23 @@ pub struct ChannelHostDriver {
     journal_retry_at: Option<ManualInstant>,
     controller_disconnected: bool,
     shutdown_requested: bool,
-    /// Checkpoint requests that arrived while the world still held deferred
-    /// persistence output; each is answered at the next quiescent boundary.
-    parked_captures: Vec<CaptureReply>,
+    /// Bounded, expiring science captures waiting for deferred persistence output
+    /// to settle; each successful reply names the eventual quiescent boundary.
+    parked_captures: Vec<ScienceCaptureRequest>,
     /// Persistence flush requested on behalf of parked captures (bd-2mpi).
     capture_flush: CaptureFlush,
     /// Full owner captures retain their original caller budgets and a fixed capacity.
     parked_host_captures: Vec<HostCaptureRequest>,
-    host_capture_capacity: usize,
+    capture_request_capacity: usize,
     handoff: HandoffState,
 }
 
 type CaptureReply = Sender<Result<WorldCheckpointCut, HostAccessError>>;
+
+struct ScienceCaptureRequest {
+    reply: CaptureReply,
+    deadline: Instant,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandoffState {
@@ -1262,10 +1271,10 @@ impl ChannelHostDriver {
             journal_retry_at: None,
             controller_disconnected: false,
             shutdown_requested: false,
-            parked_captures: Vec::new(),
+            parked_captures: Vec::with_capacity(options.ingress_capacity),
             capture_flush: CaptureFlush::Idle,
             parked_host_captures: Vec::with_capacity(options.ingress_capacity),
-            host_capture_capacity: options.ingress_capacity,
+            capture_request_capacity: options.ingress_capacity,
             handoff: HandoffState::Open,
         };
         Ok((driver, port))
@@ -1281,11 +1290,21 @@ impl ChannelHostDriver {
     /// flush the partial persistence tail ([`HostCommand::FlushPersistence`]) and parks
     /// the request until that flush is journaled (bd-2mpi). Only when the flush cannot be
     /// admitted, or did not leave the world quiescent (a stopped or faulted host), is the
-    /// refusal returned. Every other refusal is returned unchanged.
-    fn capture_or_park(&mut self, reply: CaptureReply) {
-        let error = match self.host.core().capture_checkpoint_cut() {
+    /// refusal returned. Every other refusal is returned unchanged. Expired readers
+    /// cannot request a new flush or retain a slot after their caller stopped waiting.
+    fn capture_or_park(&mut self, request: ScienceCaptureRequest) {
+        if Instant::now() >= request.deadline {
+            let _ = request.reply.send(Err(HostAccessError::OwnerReadTimeout));
+            return;
+        }
+        let captured = self.host.core().capture_checkpoint_cut();
+        if Instant::now() >= request.deadline {
+            let _ = request.reply.send(Err(HostAccessError::OwnerReadTimeout));
+            return;
+        }
+        let error = match captured {
             Ok(cut) => {
-                let _ = reply.send(Ok(cut));
+                let _ = request.reply.send(Ok(cut));
                 return;
             }
             Err(error) => error,
@@ -1295,6 +1314,13 @@ impl ChannelHostDriver {
             scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
                 | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. }
         );
+        if not_yet && self.parked_captures.len() >= self.capture_request_capacity {
+            let error = ChannelHostPort::protocol_violation(
+                "bounded science checkpoint request capacity exhausted",
+            );
+            let _ = request.reply.send(Err(error));
+            return;
+        }
         // A journal batch retained under backpressure reads as `WakeOnly` to the host, but
         // this driver retries it on its maintenance cadence, so the boundary will still come.
         let advancing = self.journal_retry_needed()
@@ -1305,7 +1331,7 @@ impl ChannelHostDriver {
                     | HostDriveInterest::Draining
             );
         if not_yet && advancing {
-            self.parked_captures.push(reply);
+            self.parked_captures.push(request);
             return;
         }
         let flush_refusal = if not_yet && self.capture_flush != CaptureFlush::Admitted {
@@ -1313,7 +1339,7 @@ impl ChannelHostDriver {
             match self.host.request_persistence_flush() {
                 Ok(_) => {
                     self.capture_flush = CaptureFlush::Admitted;
-                    self.parked_captures.push(reply);
+                    self.parked_captures.push(request);
                     return;
                 }
                 Err(HostAccessError::CommandAuthorityLookup {
@@ -1324,7 +1350,7 @@ impl ChannelHostDriver {
                     ..
                 }) => {
                     self.capture_flush = CaptureFlush::Submitting;
-                    self.parked_captures.push(reply);
+                    self.parked_captures.push(request);
                     return;
                 }
                 Err(flush_error) => Some(flush_error),
@@ -1343,7 +1369,21 @@ impl ChannelHostDriver {
             ),
             (false, _) => error.to_string(),
         };
-        let _ = reply.send(Err(ChannelHostPort::protocol_violation(message)));
+        let _ = request
+            .reply
+            .send(Err(ChannelHostPort::protocol_violation(message)));
+    }
+
+    fn expire_parked_captures(&mut self) {
+        let now = Instant::now();
+        self.parked_captures.retain(|request| {
+            if request.deadline > now {
+                true
+            } else {
+                let _ = request.reply.send(Err(HostAccessError::OwnerReadTimeout));
+                false
+            }
+        });
     }
 
     /// Answer parked checkpoint requests once the world is quiescent.
@@ -1352,8 +1392,8 @@ impl ChannelHostDriver {
             return;
         }
         let parked = std::mem::take(&mut self.parked_captures);
-        for reply in parked {
-            self.capture_or_park(reply);
+        for request in parked {
+            self.capture_or_park(request);
         }
         if self.parked_captures.is_empty() && self.parked_host_captures.is_empty() {
             self.capture_flush = CaptureFlush::Idle;
@@ -1468,7 +1508,7 @@ impl ChannelHostDriver {
     }
 
     fn accept_host_capture(&mut self, request: HostCaptureRequest) {
-        if self.parked_host_captures.len() >= self.host_capture_capacity {
+        if self.parked_host_captures.len() >= self.capture_request_capacity {
             let error = ChannelHostPort::protocol_violation(
                 "bounded host checkpoint request capacity exhausted",
             );
@@ -1523,8 +1563,8 @@ impl ChannelHostDriver {
             IngressMessage::WorldDigests { reply } => {
                 let _ = reply.send(Err(error()));
             }
-            IngressMessage::CaptureCheckpoint { reply } => {
-                let _ = reply.send(Err(error()));
+            IngressMessage::CaptureCheckpoint { request } => {
+                let _ = request.reply.send(Err(error()));
             }
             IngressMessage::CaptureHostCheckpoint { request } => {
                 let _ = request.reply.send(Err(error().into()));
@@ -1673,7 +1713,7 @@ impl ChannelHostDriver {
             IngressMessage::WorldDigests { reply } => {
                 self.process_world_digests(&reply);
             }
-            IngressMessage::CaptureCheckpoint { reply } => self.capture_or_park(reply),
+            IngressMessage::CaptureCheckpoint { request } => self.capture_or_park(request),
             IngressMessage::CaptureHostCheckpoint { request } => {
                 self.accept_host_capture(request);
             }
@@ -1751,14 +1791,14 @@ impl ChannelHostDriver {
             Self::refuse_handoff_ingress(message);
         }
         // The shared fence prevents every public producer from refilling this bounded queue.
-        for _ in 0..self.host_capture_capacity {
+        for _ in 0..self.capture_request_capacity {
             let Ok(message) = self.receiver.try_recv() else {
                 break;
             };
             Self::refuse_handoff_ingress(message);
         }
-        for reply in std::mem::take(&mut self.parked_captures) {
-            let _ = reply.send(Err(HostAccessError::Disconnected));
+        for request in std::mem::take(&mut self.parked_captures) {
+            let _ = request.reply.send(Err(HostAccessError::Disconnected));
         }
         for request in std::mem::take(&mut self.parked_host_captures) {
             let _ = request
@@ -1941,6 +1981,8 @@ impl ChannelHostDriver {
             .into());
         }
         let admission_before = self.host.core().admission_cursor();
+        // Release elapsed readers before new ingress competes for the same bounded lane.
+        self.expire_parked_captures();
         self.drain_ingress();
         self.update_journal_retry_deadline(now)?;
         let drove = self.handoff != HandoffState::Retired && self.drive_due_boundary(now)?;
@@ -1981,6 +2023,7 @@ impl ChannelHostDriver {
         };
         let retrying_submission = (self.controller_disconnected && !self.shutdown_requested)
             || self.capture_flush == CaptureFlush::Submitting
+            || !self.parked_captures.is_empty()
             || !self.parked_host_captures.is_empty();
         if retrying_submission && interest == HostDriveInterest::WakeOnly {
             interest = HostDriveInterest::Draining;
@@ -2512,7 +2555,10 @@ mod tests {
                 Err(HostAccessError::ScientificState(error)) if error == fault
             ));
         }
-        assert_eq!(driver.host().core().latest_snapshot().world, completed.world);
+        assert_eq!(
+            driver.host().core().latest_snapshot().world,
+            completed.world
+        );
     }
 
     #[test]
@@ -2642,6 +2688,236 @@ mod tests {
             "checkpoint intent must enter the actual bounded ingress"
         );
         receipt
+    }
+
+    fn queue_science_capture(
+        port: &ChannelHostPort,
+        deadline: Instant,
+    ) -> Receiver<Result<WorldCheckpointCut, HostAccessError>> {
+        let (reply, receipt) = std::sync::mpsc::channel();
+        assert!(
+            port.sender
+                .try_send(IngressMessage::CaptureCheckpoint {
+                    request: ScienceCaptureRequest { reply, deadline },
+                })
+                .is_ok(),
+            "science capture must enter the actual bounded ingress"
+        );
+        receipt
+    }
+
+    fn partial_cadence_capture_driver() -> (ChannelHostDriver, ChannelHostPort) {
+        let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0x5eed_cafe),
+            persistence_interval: 3,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("partial-cadence world");
+        let core = HostCore::with_journal(
+            HostSessionId::new(94),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    ..PlaybackSnapshot::default()
+                },
+                tick_period_nanos: 10,
+                snapshot_interval_ticks: 1,
+                ..HostCoreOptions::default()
+            },
+            Box::new(VolatileJournal::with_capacity(1)),
+        )
+        .expect("actual capacity-one journal");
+        let mut host = FixedDeadlineHost::new(core);
+        for (id, command) in [(98, HostCommand::Pause), (99, HostCommand::Step)] {
+            host.submit(CommandEnvelope::new(CommandId::new(id), command))
+                .expect("prepare journal pressure");
+        }
+        let (mut driver, port) = ChannelHostDriver::new(
+            host,
+            ChannelHostOptions {
+                ingress_capacity: 1,
+                maintenance_period: Duration::from_nanos(100),
+                ..fast_options()
+            },
+        )
+        .expect("capacity-one science capture lane");
+        driver
+            .step(ManualInstant::from_nanos(0))
+            .expect("real partial persistence and journal pressure");
+        assert!(matches!(
+            driver.host().core().health().blocker(),
+            Some(HostBlocker::JournalFull { .. })
+        ));
+        assert!(matches!(
+            driver.host().core().capture_checkpoint_cut(),
+            Err(
+                scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
+                    | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. }
+            )
+        ));
+        (driver, port)
+    }
+
+    #[test]
+    fn expired_science_capture_refuses_even_when_the_world_is_quiescent() {
+        let (mut driver, port) =
+            ChannelHostDriver::new(test_host(true), fast_options()).expect("quiescent owner");
+        let before = driver
+            .host()
+            .core()
+            .capture_checkpoint_cut()
+            .expect("the actual world is already capturable");
+        let expired = queue_science_capture(&port, Instant::now());
+        driver
+            .step(ManualInstant::from_nanos(0))
+            .expect("consume expired ingress");
+        assert!(matches!(
+            expired.try_recv().expect("expired read disposition"),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(driver.parked_captures.is_empty());
+        let after = driver.host().core().capture_checkpoint_cut().unwrap();
+        assert_eq!(
+            after.checkpoint.source_digest(),
+            before.checkpoint.source_digest()
+        );
+        assert_eq!(after.scientific_revision, before.scientific_revision);
+        assert_eq!(after.config_revision, before.config_revision);
+    }
+
+    #[test]
+    fn science_capture_overflow_preserves_the_original_eventual_cut() {
+        let (mut driver, port) = partial_cadence_capture_driver();
+        let before = driver
+            .host()
+            .core()
+            .scientific_digest_v1()
+            .expect("science before waiting readers");
+        let snapshot = driver.host().core().latest_snapshot();
+        let pending = queue_science_capture(&port, Instant::now() + Duration::from_secs(30));
+        driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("park the first science capture");
+        assert_eq!(driver.parked_captures.len(), 1);
+        for now in 2..10 {
+            let overflow = queue_science_capture(&port, Instant::now() + Duration::from_secs(30));
+            driver
+                .step(ManualInstant::from_nanos(now))
+                .expect("bounded refusal while the actual journal remains full");
+            assert!(matches!(
+                overflow.try_recv().expect("explicit capacity refusal"),
+                Err(HostAccessError::ProtocolViolation { message })
+                    if message == "bounded science checkpoint request capacity exhausted"
+            ));
+            assert_eq!(driver.parked_captures.len(), 1);
+            assert!(matches!(
+                pending.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+        }
+        for now in 100..104 {
+            driver
+                .step(ManualInstant::from_nanos(now))
+                .expect("settle the real journal and partial persistence tail");
+        }
+        let cut = pending
+            .try_recv()
+            .expect("original reply survived the overflow")
+            .expect("eventual science boundary");
+        assert_eq!(cut.checkpoint.tick(), scriptbots_core::Tick(1));
+        assert_eq!(cut.checkpoint.source_digest(), &before);
+        assert_eq!(cut.session_id, port.session_id());
+        assert_eq!(cut.scientific_revision, snapshot.revisions.scientific);
+        assert_eq!(cut.config_revision, snapshot.revisions.config);
+        assert_eq!(cut.persistence_interval, 3);
+        assert!(driver.parked_captures.is_empty());
+        assert_eq!(driver.host().core().scientific_digest_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn expired_parked_science_capture_releases_capacity_before_new_ingress() {
+        let (mut driver, port) = partial_cadence_capture_driver();
+        let expired = queue_science_capture(&port, Instant::now() + Duration::from_secs(30));
+        driver
+            .step(ManualInstant::from_nanos(1))
+            .expect("park the first reader");
+        assert_eq!(driver.parked_captures.len(), 1);
+        // Advance only the retained wall-clock budget, without sleeping or driving science.
+        driver.parked_captures[0].deadline = Instant::now();
+        let admission = driver.host().core().admission_cursor();
+        let replacement = queue_science_capture(&port, Instant::now() + Duration::from_secs(30));
+        driver
+            .step(ManualInstant::from_nanos(2))
+            .expect("expire the old reader before admitting the replacement");
+        assert!(matches!(
+            expired
+                .try_recv()
+                .expect("expired reader receives its disposition"),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            replacement.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(driver.parked_captures.len(), 1);
+        assert_eq!(driver.host().core().admission_cursor(), admission);
+        assert_eq!(driver.host().core().world_tick(), scriptbots_core::Tick(1));
+        for now in 100..104 {
+            driver
+                .step(ManualInstant::from_nanos(now))
+                .expect("settle the remaining live capture");
+        }
+        let cut = replacement
+            .try_recv()
+            .expect("replacement reply retained")
+            .expect("replacement observes the settled cut");
+        assert_eq!(cut.checkpoint.tick(), scriptbots_core::Tick(1));
+        assert!(driver.parked_captures.is_empty());
+    }
+
+    #[test]
+    fn timed_out_public_science_reads_cannot_later_request_a_persistence_flush() {
+        let (mut driver, port) = partial_cadence_capture_driver();
+        for now in [100, 101] {
+            driver
+                .step(ManualInstant::from_nanos(now))
+                .expect("settle only the preceding journal work");
+        }
+        assert_eq!(driver.host().drive_interest(), HostDriveInterest::WakeOnly);
+        assert!(matches!(
+            driver.host().core().capture_checkpoint_cut(),
+            Err(scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. })
+        ));
+        let before_admission = driver.host().core().admission_cursor();
+        let before = driver.host().core().scientific_digest_v1().unwrap();
+        let mut waiting = port.clone();
+        waiting.submit_deadline = Duration::from_millis(10);
+        for (now, with_provenance) in [(102, false), (103, true)] {
+            let result = if with_provenance {
+                waiting.capture_checkpoint_cut().map(|_| ())
+            } else {
+                waiting.capture_checkpoint_v1().map(|_| ())
+            };
+            assert!(matches!(result, Err(HostAccessError::OwnerReadTimeout)));
+            driver
+                .step(ManualInstant::from_nanos(now))
+                .expect("discard the expired actual ingress request");
+            assert!(driver.parked_captures.is_empty());
+            assert_eq!(driver.capture_flush, CaptureFlush::Idle);
+            assert_eq!(driver.host().core().admission_cursor(), before_admission);
+            assert_eq!(driver.host().drive_interest(), HostDriveInterest::WakeOnly);
+            assert_eq!(driver.host().core().scientific_digest_v1().unwrap(), before);
+        }
+        waiting.caller_deadline = Some(Instant::now());
+        assert!(matches!(
+            waiting.capture_checkpoint_cut(),
+            Err(HostAccessError::OwnerReadTimeout)
+        ));
+        assert!(matches!(
+            driver.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
