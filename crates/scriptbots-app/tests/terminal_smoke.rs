@@ -163,6 +163,7 @@ enum SchedulePerturbation {
 // scenario resolver, and its sort. Each perturbation must change the result.
 fn schedule_reference(
     perturbation: SchedulePerturbation,
+    seed: u64,
 ) -> (Vec<serde_json::Value>, Vec<scriptbots_core::WorldDigestV1>) {
     use scriptbots_app::{
         brains::{BrainPreset, install_brains},
@@ -170,7 +171,7 @@ fn schedule_reference(
     };
     use scriptbots_core::{ScriptBotsConfig, WorldState};
     let config = ScriptBotsConfig {
-        rng_seed: Some(4242),
+        rng_seed: Some(seed),
         world_width: 600,
         world_height: 600,
         food_cell_size: 50,
@@ -451,7 +452,7 @@ fn headless_scenario_schedule_matches_manual_science_across_bootstrap() {
     let scenario = directory.join("scheduled.scenario.toml");
     write_unsorted_schedule(&scenario);
     let (report, manifest, stderr) = launch_scheduled_terminal(&directory, &scenario);
-    let (expected_frames, expected_digests) = schedule_reference(SchedulePerturbation::None);
+    let (expected_frames, expected_digests) = schedule_reference(SchedulePerturbation::None, 4242);
     assert_scheduled_terminal_trace(&report, &manifest, &expected_frames, &expected_digests);
     assert_scheduled_determinism_trace(&directory, &scenario, &expected_frames, &expected_digests);
     for (label, perturbation) in [
@@ -462,13 +463,60 @@ fn headless_scenario_schedule_matches_manual_science_across_bootstrap() {
         ),
         ("late recovery", SchedulePerturbation::DelayRecovery),
     ] {
-        let (_, wrong) = schedule_reference(perturbation);
+        let (_, wrong) = schedule_reference(perturbation, 4242);
         assert_ne!(
             wrong[5].overall, expected_digests[5].overall,
             "the digest oracle must detect {label}"
         );
     }
     assert_scheduled_patch_logs(&stderr);
+}
+
+#[test]
+fn determinism_self_check_uses_the_resolved_world_in_both_processes() {
+    let directory = tempdir().unwrap();
+    let scenario = directory.path().join("scheduled.scenario.toml");
+    write_unsorted_schedule(&scenario);
+    for (seed, cli_threads, env_threads, workers) in [
+        (4242, Some("2"), Some("1"), 2),
+        (u64::MAX, None, Some("2"), 2),
+        (4242, None, None, 1),
+    ] {
+        let (_, expected) = schedule_reference(SchedulePerturbation::None, seed);
+        let mut command = headless_command();
+        if let Some(threads) = cli_threads {
+            command.args(["--threads", threads]);
+        }
+        if let Some(threads) = env_threads {
+            command.env("SCRIPTBOTS_MAX_THREADS", threads);
+        }
+        let output = command
+            .env("RAYON_NUM_THREADS", "1")
+            .env("SCRIPTBOTS_CONFIG_OVERRIDES", "world_width=800")
+            .arg("--scenario")
+            .arg(&scenario)
+            .args([
+                "--set", "world_width=600", "--brain", "mlp", "--det-check", "5", "--rng-seed",
+            ])
+            .arg(seed.to_string())
+            .output()
+            .expect("launch determinism check");
+        assert!(
+            output.status.success(),
+            "seed {seed}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&format!("workers 1 vs {workers},")), "{stdout}");
+        if workers == 1 {
+            assert!(stdout.contains("Single-worker repeatability check passed"), "{stdout}");
+            assert!(!stdout.contains("Determinism self-check passed"), "{stdout}");
+        }
+        assert!(
+            stdout.contains(&format!("digest {})", expected[5].overall)),
+            "{stdout}"
+        );
+    }
 }
 
 #[test]

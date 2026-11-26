@@ -423,6 +423,23 @@ fn main() -> Result<()> {
     // environment so build provenance records what the user exported, not what
     // startup's thread-policy set_var smeared over it (bd-3p7i).
     let _launch_environment = scriptbots_app::LaunchEnvironmentV0::pin();
+    // A self-check child consumes the parent's already-resolved launch, including
+    // its schedule. Re-reading files or applying ambient configuration here could
+    // make both children agree on a different experiment.
+    if env::var("SCRIPTBOTS_DET_RUN").as_deref() == Ok("resolved-v1") {
+        init_tracing();
+        let (threads, input): (Option<usize>, DeterminismCheckInput) =
+            serde_json::from_reader(io::stdin().lock())
+                .context("read resolved determinism-check launch from stdin")?;
+        configure_simulation_parallelism(threads)?;
+        return run_det_child(
+            &input.config,
+            input.ticks,
+            input.brain,
+            founder_recipe_of(&input.scenario)?,
+            &input.scenario.interventions,
+        );
+    }
     let cli = AppCli::parse();
     init_tracing();
 
@@ -679,7 +696,13 @@ fn main() -> Result<()> {
     }
 
     if let Some(ticks) = cli.det_check {
-        run_det_check(&cli, ticks)?;
+        run_det_check(
+            config,
+            launch_scenario,
+            cli.brain,
+            ticks,
+            launch_thread_policy(&cli, None).threads,
+        )?;
         return Ok(());
     }
     if let Some(ticks) = cli.det_check_archipelago {
@@ -1723,6 +1746,7 @@ fn run_det_child(
     )?;
     #[derive(serde::Serialize)]
     struct DetOut {
+        workers: usize,
         events: usize,
         ticks: u64,
         last_tick: u64,
@@ -1731,6 +1755,7 @@ fn run_det_child(
     }
     let last_tick = run.summaries.last().map(|s| s.tick.0).unwrap_or(0);
     let out = DetOut {
+        workers: scriptbots_core::CoreBuildIdentityV0::current().rayon_threads,
         events: run.events.len(),
         ticks: run.simulated_ticks,
         last_tick,
@@ -1842,13 +1867,22 @@ fn run_lab_cli(cli: &AppCli, goal: &str) -> Result<()> {
     run_lab_subcommand(&args)
 }
 
-fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
-    let exe = std::env::current_exe().context("failed to get current exe path")?;
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DeterminismCheckInput {
+    config: ScriptBotsConfig,
+    scenario: ScenarioIdentityV0,
+    brain: BrainPreset,
+    ticks: u64,
+}
 
-    // Both children must replay the identical scenario: compose the parent's
-    // effective config, pin a shared seed, and hand the whole thing over as a
-    // config layer (env-only forwarding loses `--config`/`--rng-seed` flags).
-    let mut config = compose_config(cli)?;
+fn run_det_check(
+    mut config: ScriptBotsConfig,
+    scenario: ScenarioIdentityV0,
+    brain: BrainPreset,
+    ticks: u64,
+    comparison_threads: Option<usize>,
+) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to get current exe path")?;
     if let Ok(seed) = std::env::var("SCRIPTBOTS_DET_SEED") {
         let parsed = seed
             .trim()
@@ -1856,64 +1890,45 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
             .context("SCRIPTBOTS_DET_SEED must be a u64")?;
         config.rng_seed = Some(parsed);
     }
-    let seed = match config.rng_seed {
-        Some(seed) => seed,
-        None => {
-            let generated = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x0D57_C0FF_EE00);
-            config.rng_seed = Some(generated);
-            generated
-        }
-    };
-    let layer = toml::to_string_pretty(&config).context("failed to serialize det-check config")?;
-    let layer_path = std::env::temp_dir().join(format!(
-        "scriptbots-det-check-{}-{seed}.toml",
-        std::process::id()
-    ));
-    fs::write(&layer_path, layer).with_context(|| {
-        format!(
-            "failed to write det-check config layer {}",
-            layer_path.display()
-        )
-    })?;
-
-    let spawn_child = |threads: Option<&str>| -> Result<std::process::Child> {
-        let mut child = Command::new(&exe); // ubs:ignore -- exe comes from std::env::current_exe(), never caller input.
-        child.arg("--config-only"); // avoid launching UI
-        child.arg("--config");
-        child.arg(&layer_path);
-        if let Some(scenario) = &cli.scenario {
-            // The pinned full config layer controls launch values; the scenario
-            // still supplies the timed interventions that neither child may drop.
-            child.arg("--scenario").arg(scenario);
-        }
-        child.arg("--brain");
-        child.arg(cli.brain.as_str());
-        child.env("SCRIPTBOTS_DET_RUN", "1");
-        child.env("SCRIPTBOTS_DET_TICKS", ticks.to_string());
-        child.env("SCRIPTBOTS_RNG_SEED", seed.to_string());
-        child.env("RUST_LOG", "error");
-        if let Some(threads) = threads {
-            child.env("RAYON_NUM_THREADS", threads);
-        }
-        child.stdout(Stdio::piped());
-        child.stderr(Stdio::inherit());
-        child.spawn().context("failed to spawn det child")
+    let (seed, _) = materialize_run_seed(&mut config);
+    let launch = DeterminismCheckInput {
+        config,
+        scenario,
+        brain,
+        ticks,
     };
 
-    // Child 1: single-thread; child N: default thread budget.
-    let handle1 = spawn_child(Some("1"))?;
-    let handlen = spawn_child(None)?;
+    let run_child = |threads: Option<usize>| -> Result<std::process::Output> {
+        let input = serde_json::to_vec(&(threads, &launch))
+            .context("encode resolved determinism-check launch")?;
+        let mut command = Command::new(&exe);
+        command
+            .env("SCRIPTBOTS_DET_RUN", "resolved-v1")
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let mut child = command.spawn().context("spawn determinism-check child")?;
+        let written = child
+            .stdin
+            .take()
+            .expect("configured piped child stdin")
+            .write_all(&input);
+        let output = child
+            .wait_with_output()
+            .context("wait for determinism-check child")?;
+        written.context("write resolved determinism-check launch to child")?;
+        Ok(output)
+    };
 
-    // Wait for both to complete (they run concurrently)
-    let out1 = handle1
-        .wait_with_output()
-        .context("failed to wait for det child 1")?;
-    let outn = handlen
-        .wait_with_output()
-        .context("failed to wait for det child N")?;
+    // Reap both children even if the other fails to start or read its input.
+    let (single, multiple) = std::thread::scope(|scope| {
+        let single = scope.spawn(|| run_child(Some(1)));
+        let multiple = run_child(comparison_threads);
+        (single.join(), multiple)
+    });
+    let out1 = single.map_err(|_| anyhow!("single-thread determinism driver panicked"))??;
+    let outn = multiple?;
     if !out1.status.success() {
         bail!("det child 1 failed: status {:?}", out1.status);
     }
@@ -1923,6 +1938,7 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
 
     #[derive(serde::Deserialize)]
     struct DetOutIn {
+        workers: usize,
         events: usize,
         ticks: u64,
         last_tick: u64,
@@ -1934,6 +1950,13 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
     let right: DetOutIn =
         serde_json::from_slice(&outn.stdout).context("failed to parse child N JSON output")?;
 
+    if left.workers != 1 || comparison_threads.is_some_and(|expected| expected != right.workers) {
+        bail!(
+            "determinism-check worker mismatch: requested 1 vs {comparison_threads:?}, observed {} vs {}",
+            left.workers,
+            right.workers
+        );
+    }
     if left.ticks != right.ticks || left.last_tick != right.last_tick {
         bail!(
             "tick count/last tick mismatch: 1t {:?} vs Nt {:?}",
@@ -1979,14 +2002,19 @@ fn run_det_check(cli: &AppCli, ticks: u64) -> Result<()> {
             right.world_digest.overall
         );
     }
-    let _ = fs::remove_file(&layer_path);
+    let result = if right.workers == 1 {
+        "Single-worker repeatability check passed"
+    } else {
+        "Determinism self-check passed"
+    };
     println!(
-        "{} Determinism self-check passed for {} ticks (seed {}, events: 1t={}, Nt={})",
+        "{} {result} for {ticks} ticks (workers {} vs {}, seed {seed}, events {} vs {}, digest {})",
         "✔".green().bold(),
-        ticks,
-        seed,
+        left.workers,
+        right.workers,
         left.events,
-        right.events
+        right.events,
+        left.world_digest.overall
     );
     Ok(())
 }
