@@ -728,27 +728,92 @@ function uniqueRequestId(kind) {
 }
 
 function controlText(command, options) {
-  const { speed, commandId } = options;
+  const { speed, commandId, idempotencyKey, sessionId } = options;
   const requestId = options.requestId ?? uniqueRequestId("control");
   if (typeof requestId !== "string" || requestId.trim() !== requestId || !requestId
       || encoder.encode(requestId).length > 1024) throw new Error("Invalid remote request identity");
   const request = { protocol_version: VERSION, request_id: requestId, command };
+  if (command !== "status_by_key" && (idempotencyKey !== undefined || sessionId !== undefined)) {
+    throw new Error("Unrelated remote recovery fields");
+  }
   if (["pause", "resume", "step"].includes(command)) {
     if (speed !== undefined || commandId !== undefined) throw new Error("Unrelated remote command fields");
   } else if (command === "speed") {
     if (!Number.isFinite(speed) || speed < 0 || commandId !== undefined) throw new Error("Invalid remote speed request");
     request.speed = speed;
   } else if (command === "status") {
-    if (speed !== undefined || typeof commandId !== "string" || !commandId
-        || encoder.encode(commandId).length > 128) throw new Error("Invalid remote status request");
+    if (speed !== undefined || typeof commandId !== "string"
+        || !/^[0-9a-f]{32}$/.test(commandId)) throw new Error("Invalid remote status request");
     request.command_id = commandId;
+  } else if (command === "status_by_key") {
+    if (speed !== undefined || commandId !== undefined || typeof idempotencyKey !== "string"
+        || !idempotencyKey || idempotencyKey.trim() !== idempotencyKey || idempotencyKey === requestId
+        || encoder.encode(idempotencyKey).length > 1024) throw new Error("Invalid remote recovery key");
+    decimal(sessionId);
+    request.idempotency_key = idempotencyKey;
+    request.session_id = sessionId;
   } else {
     throw new Error("Unknown remote control command");
   }
-  return { requestId, text: JSON.stringify(request), commandId: command === "status" ? commandId : null };
+  return { requestId, text: JSON.stringify(request), command,
+    commandId: command === "status" ? commandId : null,
+    idempotencyKey: command === "status_by_key" ? idempotencyKey : null };
 }
 
-/** Bounded browser WebSocket client. Reconnect and command retries are explicit. */
+function freezeControlEvidence(value) {
+  const copy = structuredClone(value), pending = [copy];
+  while (pending.length) {
+    const item = pending.pop();
+    if (!item || typeof item !== "object" || Object.isFrozen(item)) continue;
+    pending.push(...Object.values(item));
+    Object.freeze(item);
+  }
+  return copy;
+}
+
+/** A reply is not a settled outcome until both independent owner axes settle. */
+function controlReceipt(receipt) {
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+      || typeof receipt.command_id !== "string" || !/^[0-9a-f]{32}$/.test(receipt.command_id)
+      || !["admitted", "applied", "rejected", "failed"].includes(receipt.application_state)
+      || !["not_required", "pending", "committed_volatile", "durable", "failed"].includes(receipt.journal_state)
+      || (receipt.application_state === "admitted" && !["not_required", "pending"].includes(receipt.journal_state))) {
+    throw new Error("Invalid remote command receipt outcome");
+  }
+  for (const [axis, state] of [["application", receipt.application_state], ["journal", receipt.journal_state]]) {
+    const failure = receipt[`${axis}_failure`];
+    if (state === "failed" ? !failure || typeof failure.code !== "string"
+        || encoder.encode(failure.code).length > 128 || typeof failure.message !== "string"
+        || encoder.encode(failure.message).length > 512 || typeof failure.diagnostic_truncated !== "boolean"
+      : failure != null) throw new Error("Invalid remote command failure diagnosis");
+  }
+  return freezeControlEvidence(receipt);
+}
+
+/** Delayed replies cannot undo a previously observed application or commitment. */
+function retainControlReceipt(previous, next) {
+  if (!previous) return next;
+  if (previous.application_state !== next.application_state) {
+    if (previous.application_state === "admitted") return next;
+    if (next.application_state === "admitted") return previous;
+    throw new Error("Remote receipt contradicts its retained terminal application state");
+  }
+  if (previous.application_state === "applied") {
+    for (const field of ["applied_tick", "control_revision", "scientific_revision", "config_revision"]) {
+      if (previous[field] != null && next[field] != null && previous[field] !== next[field]) {
+        throw new Error("Remote receipt changed its retained application boundary");
+      }
+    }
+  }
+  if (previous.journal_state === next.journal_state) return previous;
+  if (previous.journal_state === "pending") return next;
+  if (next.journal_state === "pending") return previous;
+  if (previous.journal_state === "committed_volatile" && next.journal_state === "durable") return next;
+  if (previous.journal_state === "durable" && next.journal_state === "committed_volatile") return previous;
+  throw new Error("Remote receipt contradicts its retained journal outcome");
+}
+
+/** Bounded browser WebSocket client. Reconnect and outcome recovery are explicit. */
 export class RemoteStreamClient {
   constructor({ url, decodeFrame, channels = CHANNELS, maxFps = 60,
     onFrame = () => {}, onState = () => {}, onReceipt = () => {}, onOwnerStatus = () => {} }) {
@@ -774,6 +839,9 @@ export class RemoteStreamClient {
     this.ownerStatusAttemptAt = -Infinity;
     this.tracker = new RemoteFrameTracker(this.channels);
     this.requests = new Map();
+    // Read-only outcome lookup remains possible when all 32 mutation envelopes
+    // are unresolved. It has one independent, bounded request slot.
+    this.statusRequest = null;
     this.socket = null;
     this.generation = 0;
     this.subscription = null;
@@ -781,6 +849,14 @@ export class RemoteStreamClient {
   }
 
   get resume() { return this.tracker.resume(this.channels); }
+
+  /** Immutable mutation history, independent of the single read-only lookup. */
+  controlRequests() {
+    return Object.freeze([...this.requests.values()].map((request) => Object.freeze({
+      requestId: request.requestId, command: request.command, sessionId: request.sessionId,
+      commandId: request.commandId, receipt: request.receipt, error: request.error, settled: request.settled,
+    })));
+  }
 
   get ownerAllowsMutation() {
     return this.state === "connected" && this.ownerStatusEnabled && this.ownerStatusAvailable
@@ -1232,32 +1308,66 @@ export class RemoteStreamClient {
 
   sendControl(command, options = {}) {
     if (this.state !== "connected") throw new Error("Wait for the remote subscription before sending controls");
-    const request = controlText(command, options);
-    const existing = this.requests.get(request.requestId);
-    if (existing && existing.text !== request.text) throw new Error("A request identity cannot be reused for a different command");
-    if (!existing && this.requests.size === MAX_REQUESTS) {
-      const settled = [...this.requests].find(([, item]) => item.received);
-      if (!settled) throw new Error("32 control acknowledgements are pending; inspect or retry an existing request");
-      this.requests.delete(settled[0]);
+    const sessionId = this.tracker.sessionId;
+    if (sessionId === null) throw new Error("Wait for the negotiated owner before sending controls");
+    if (command === "status_by_key" && options.sessionId !== sessionId) {
+      throw new Error("The recovery request belongs to another owner session");
     }
-    // Retain the exact key and payload even when browser send throws: an
-    // explicit retry must never allocate another Step identity.
-    this.requests.set(request.requestId, existing ?? { ...request, received: false });
+    const lookup = this.statusRequest;
+    const isLookup = command === "status" || command === "status_by_key";
+    const reuseLookup = isLookup && lookup?.command === command && !lookup.received
+      && lookup.generation === this.generation && lookup.sessionId === sessionId
+      && lookup.commandId === (options.commandId ?? null)
+      && lookup.idempotencyKey === (options.idempotencyKey ?? null) && options.requestId === undefined;
+    const request = controlText(command, reuseLookup ? { ...options, requestId: lookup.requestId } : options);
+    const existing = this.requests.get(request.requestId);
+    if ((existing && (existing.text !== request.text || existing.sessionId !== sessionId))
+        || (lookup?.requestId === request.requestId && (lookup.text !== request.text || lookup.sessionId !== sessionId))) {
+      throw new Error("A request identity cannot be reused for a different command or owner");
+    }
+    // Native idempotency history is bounded. Even the exact old envelope can
+    // execute again after eviction; an attempted mutation is only read back.
+    if (existing) return this.retryControl(existing.requestId);
+    let retained;
+    if (isLookup) {
+      if (lookup && !lookup.received && lookup.generation === this.generation) {
+        if (lookup.requestId === request.requestId) return lookup.requestId;
+        throw new Error("A command outcome lookup is pending; wait for its reply or reconnect before choosing another");
+      }
+      retained = { ...request, sessionId, generation: this.generation, received: false };
+      this.statusRequest = retained;
+    } else {
+      if (this.requests.size === MAX_REQUESTS) {
+        const settled = [...this.requests].find(([, item]) => item.settled);
+        if (!settled) throw new Error("32 control outcomes remain unresolved; recover an existing outcome before sending another command");
+        this.requests.delete(settled[0]);
+      }
+      retained = { ...request, sessionId, received: false, receipt: null, error: null, settled: false };
+      this.requests.set(request.requestId, retained);
+    }
+    // Preserve the original key even when send throws. Recovery only queries
+    // that key or its observed command ID; it never resubmits a mutation.
     try {
-      this.sendText(request.text);
+      this.sendText(retained.text);
     } catch (error) {
+      // A failed read may be repeated safely; it must not occupy the only
+      // lookup slot until a reconnect. The mutation envelope stays retained.
+      if (isLookup) retained.generation = -1;
       error.requestId = request.requestId;
       throw error;
     }
     return request.requestId;
   }
 
+  /** Recover an attempted command through reads, including a lost first receipt. */
   retryControl(requestId) {
-    if (this.state !== "connected") throw new Error("Reconnect and subscribe before retrying a control request");
+    if (this.state !== "connected") throw new Error("Reconnect and subscribe before recovering a control outcome");
     const request = this.requests.get(requestId);
-    if (!request) throw new Error("The exact request is no longer retained; it cannot be retried safely");
-    this.sendText(request.text);
-    return requestId;
+    if (!request) throw new Error("The exact request is no longer retained; its outcome cannot be recovered here");
+    if (request.sessionId !== this.tracker.sessionId) throw new Error("The retained command belongs to another owner session; it cannot be recovered here");
+    return request.commandId
+      ? this.sendControl("status", { commandId: request.commandId })
+      : this.sendControl("status_by_key", { idempotencyKey: request.requestId, sessionId: request.sessionId });
   }
 
   receive(data) {
@@ -1311,18 +1421,45 @@ export class RemoteStreamClient {
     if (reply.type === "error" && reply.request_id === this.subscription?.request_id) {
       throw new Error(`Remote subscription refused: ${reply.message}`);
     }
-    const request = this.requests.get(reply.request_id);
+    const request = this.requests.get(reply.request_id)
+      ?? (this.statusRequest?.requestId === reply.request_id ? this.statusRequest : null);
     if (!request) throw new Error(`Uncorrelated remote reply: ${reply.message ?? reply.type}`);
+    if (request.sessionId !== this.tracker.sessionId) throw new Error("Remote reply belongs to another retained owner session");
+    const target = request.command === "status_by_key" ? this.requests.get(request.idempotencyKey)
+      : request.command === "status" ? [...this.requests.values()].find((item) =>
+        item.sessionId === request.sessionId && item.commandId === request.commandId) : request;
+    if (target && target.sessionId !== request.sessionId) throw new Error("Remote lookup belongs to another retained owner session");
+    let observedReply = reply;
     if (reply.type === "receipt") {
-      const commandId = reply.receipt?.command_id;
-      if (typeof commandId !== "string" || !/^[0-9a-f]{32}$/.test(commandId)
-          || (request.commandId && request.commandId !== commandId)) {
+      const receipt = controlReceipt(reply.receipt), commandId = receipt.command_id;
+      if ((request.commandId && request.commandId !== commandId)
+          || (target?.commandId && target.commandId !== commandId)) {
         throw new Error("Remote receipt changed its canonical command identity");
       }
+      if (target && [...this.requests.values()].some((item) => item !== target
+          && item.sessionId === request.sessionId && item.commandId === commandId)) {
+        throw new Error("Remote receipt assigned one command identity to different requests");
+      }
+      const retained = retainControlReceipt(target?.receipt, receipt);
       request.commandId = commandId;
+      if (target) {
+        target.commandId = commandId;
+        target.receipt = retained;
+        target.error = null;
+        target.settled = retained.application_state !== "admitted" && retained.journal_state !== "pending";
+      }
+      // The UI sees the strongest retained observation, not a delayed pending
+      // response that would hide an already observed terminal outcome.
+      observedReply = { ...reply, receipt: retained };
+    } else {
+      if (!Number.isSafeInteger(reply.status) || reply.status < 400 || reply.status > 599
+          || typeof reply.message !== "string") throw new Error("Invalid remote command error");
+      // An error is not an owner receipt. A 404 after lost admission cannot
+      // prove non-admission or authorize replaying the original mutation.
+      if (target) target.error = Object.freeze({ status: reply.status, message: reply.message, operation: request.command });
     }
     request.received = true;
-    this.onReceipt(reply);
+    this.onReceipt(observedReply);
   }
 
   fail(error) {

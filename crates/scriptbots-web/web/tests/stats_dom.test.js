@@ -1668,9 +1668,23 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     const revisions = ["canvas", "telemetry"].map((kind) => BigInt(consumed.findLast((ack) => ack.channel === kind).publication_revision));
     if (cursor?.session_id !== expectedPng.sessionId || BigInt(cursor.after_revision) !== (revisions[0] < revisions[1] ? revisions[0] : revisions[1])
         || cursor.after_event !== consumed.findLast((ack) => ack.channel === "events").after_event) throw new Error("Reconnect did not use independently consumed channel cursors");
-    observations.retry = await control("#remote-retry", "step");
-    if (observations.retry.command_id !== observations.step.command_id || (await request("/api/status")).tick !== observations.afterStep.tick) {
-      throw new Error("Same-ID browser retry after a lost receipt/reconnect duplicated a native Step");
+    const beforeRecovery = await page.evaluate(() => ({
+      steps: window.__remoteWire.sent.filter((message) => message.command === "step").length,
+      request: window.__remoteWire.sent.findLast((message) => message.command === "step"),
+    }));
+    observations.retry = await control("#remote-retry", "status_by_key");
+    observations.recoveryWire = await page.evaluate(() => ({
+      steps: window.__remoteWire.sent.filter((message) => message.command === "step").length,
+      lookup: window.__remoteWire.sent.findLast((message) => message.command === "status_by_key"),
+    }));
+    if (observations.retry.command_id !== observations.step.command_id
+        || observations.retry.admission_sequence !== observations.step.admission_sequence
+        || (await request("/api/status")).tick !== observations.afterStep.tick
+        || observations.recoveryWire.steps !== beforeRecovery.steps
+        || observations.recoveryWire.lookup.idempotency_key !== beforeRecovery.request.request_id
+        || observations.recoveryWire.lookup.session_id !== expectedPng.sessionId
+        || observations.recoveryWire.lookup.request_id === beforeRecovery.request.request_id) {
+      throw new Error("Lost-receipt recovery must query the original owner's key without submitting another native Step");
     }
     await control("#remote-refresh", "status");
     // A saved scientific view must remain frozen while the real subscription
@@ -1731,12 +1745,13 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
       births: document.getElementById("metric-births").textContent,
       deaths: document.getElementById("metric-deaths").textContent,
       tps: document.getElementById("metric-tps").textContent,
-      blocked: ["remote-pause", "remote-step", "remote-resume", "remote-retry", "inspector-uid",
+      blocked: ["remote-pause", "remote-step", "remote-resume", "inspector-uid",
         "lab-checkpoint-save", "lab-branch-launch"].every((id) => document.getElementById(id).disabled),
+      recoveryAvailable: ["remote-retry", "remote-refresh"].every((id) => !document.getElementById(id).disabled),
     }));
-    if (!reviewUi.blocked || reviewUi.tick !== saved.tick.toLocaleString()
+    if (!reviewUi.blocked || !reviewUi.recoveryAvailable || reviewUi.tick !== saved.tick.toLocaleString()
         || [reviewUi.births, reviewUi.deaths, reviewUi.tps].some((value) => value !== "—")) {
-      throw new Error("Saved-world review exposed live controls or invented original per-tick activity");
+      throw new Error("Saved-world review must block mutations, retain read-only command recovery, and preserve original activity evidence");
     }
     for (const backend of ["canvas", "webgpu"]) {
       await page.selectOption("#renderer", backend);

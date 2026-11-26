@@ -9129,6 +9129,37 @@ impl ControlHandle {
             .transpose()
     }
 
+    /// Recover a keyed command's retained receipt without submitting an envelope.
+    ///
+    /// The exact owner session fences a reconnect from looking up a different
+    /// owner's command. Absence is missing evidence, never permission to replay
+    /// a mutation whose acknowledgement may have been lost.
+    pub fn command_status_by_key(
+        &self,
+        idempotency_key: &str,
+        session_id: &str,
+    ) -> Result<Option<CommandStatusDto>, ControlError> {
+        let session = session_id.parse::<u64>().map_err(|_| {
+            ControlError::InvalidPatch("session_id must be a canonical decimal u64".into())
+        })?;
+        if session.to_string() != session_id {
+            return Err(ControlError::InvalidPatch(
+                "session_id must be a canonical decimal u64".into(),
+            ));
+        }
+        if session != self.host.session_id().get() {
+            return Err(ControlError::Conflict(
+                "command lookup belongs to a different owner session".into(),
+            ));
+        }
+        let id = self.keyed_control_command_id(idempotency_key)?;
+        self.host
+            .clone()
+            .command_status(id)?
+            .map(|status| self.status_dto(status))
+            .transpose()
+    }
+
     /// Submit a map command with an optional owner-side scientific revision guard.
     pub fn apply_map(
         &self,
@@ -9290,17 +9321,7 @@ impl ControlHandle {
         let command = HostCommand::try_from(cmd)
             .map_err(|error| ControlError::InvalidPatch(error.to_string()))?;
         let id = if let Some(key) = idempotency_key {
-            if key.is_empty() || key.len() > 1024 {
-                return Err(ControlError::InvalidPatch(
-                    "idempotency key must contain 1..=1024 bytes".into(),
-                ));
-            }
-            let mut hasher = blake3::Hasher::new_derive_key("scriptbots.control.idempotency.v1");
-            hasher.update(&self.host.session_id().get().to_le_bytes());
-            hasher.update(key.as_bytes());
-            let mut bytes = [0_u8; 16];
-            bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-            u128::from_le_bytes(bytes) | (1_u128 << 127)
+            self.keyed_control_command_id(key)?
         } else {
             let sequence = self
                 .command_counter
@@ -9312,9 +9333,24 @@ impl ControlHandle {
                 .map_err(|_| {
                     ControlError::InvalidPatch("command identity sequence exhausted".into())
                 })?;
-            (u128::from(self.command_namespace) << 64) | u128::from(sequence)
+            CommandId::new((u128::from(self.command_namespace) << 64) | u128::from(sequence))
         };
-        Ok(CommandEnvelope::new(CommandId::new(id), command))
+        Ok(CommandEnvelope::new(id, command))
+    }
+
+    /// Shared identity derivation for mutation admission and read-only recovery.
+    fn keyed_control_command_id(&self, key: &str) -> Result<CommandId, ControlError> {
+        if key.is_empty() || key.len() > 1024 {
+            return Err(ControlError::InvalidPatch(
+                "idempotency key must contain 1..=1024 bytes".into(),
+            ));
+        }
+        let mut hasher = blake3::Hasher::new_derive_key("scriptbots.control.idempotency.v1");
+        hasher.update(&self.host.session_id().get().to_le_bytes());
+        hasher.update(key.as_bytes());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Ok(CommandId::new(u128::from_le_bytes(bytes) | (1_u128 << 127)))
     }
 
     fn status_dto(
@@ -9872,8 +9908,45 @@ pub(crate) mod tests {
             })
         }
 
+        pub(crate) fn spawn_with_command_history(world: WorldState, capacity: usize) -> Self {
+            Self::spawn_with_owner_options(
+                move || {
+                    use scriptbots_runtime::{
+                        HostCore, HostCoreOptions, HostSessionId, PlaybackSnapshot,
+                    };
+                    HostCore::new(
+                        HostSessionId::new(0xc017),
+                        world,
+                        HostCoreOptions {
+                            initial_playback: PlaybackSnapshot {
+                                paused: true,
+                                speed_multiplier: 1.0,
+                            },
+                            archived_command_capacity: capacity,
+                            ..HostCoreOptions::default()
+                        },
+                    )
+                    .expect("test host with bounded command history")
+                },
+                scriptbots_runtime::channel::ChannelHostOptions {
+                    status_board_capacity: capacity,
+                    ..scriptbots_runtime::channel::ChannelHostOptions::default()
+                },
+            )
+        }
+
         fn spawn_with_owner(
             build_owner: impl FnOnce() -> scriptbots_runtime::HostCore + Send + 'static,
+        ) -> Self {
+            Self::spawn_with_owner_options(
+                build_owner,
+                scriptbots_runtime::channel::ChannelHostOptions::default(),
+            )
+        }
+
+        fn spawn_with_owner_options(
+            build_owner: impl FnOnce() -> scriptbots_runtime::HostCore + Send + 'static,
+            channel_options: scriptbots_runtime::channel::ChannelHostOptions,
         ) -> Self {
             let (send, receive) = std::sync::mpsc::sync_channel(1);
             let clock_gate = Arc::new(Mutex::new(()));
@@ -9882,11 +9955,11 @@ pub(crate) mod tests {
             let worker = std::thread::spawn(move || {
                 use scriptbots_runtime::{
                     FixedDeadlineHost, ManualInstant,
-                    channel::{ChannelHostDriver, ChannelHostOptions, ChannelRunOutcome},
+                    channel::{ChannelHostDriver, ChannelRunOutcome},
                 };
                 let (mut driver, port) = ChannelHostDriver::new(
                     FixedDeadlineHost::new(build_owner()),
-                    ChannelHostOptions::default(),
+                    channel_options,
                 )
                 .expect("channel owner");
                 send.send(port).expect("publish test port");
@@ -21747,6 +21820,117 @@ pub(crate) mod tests {
             1,
             "a retried Step must advance once"
         );
+    }
+
+    #[test]
+    fn command_status_by_key_recovers_without_allocating_or_admitting_a_command() {
+        let (handle, owner) = handle();
+        let key = "lost-keyed-receipt";
+        let original = handle
+            .submit_command(ControlCommand::Step, Some(key))
+            .expect("actual owner admission");
+        let applied = owner.wait_applied(&original);
+        let before = handle.read_snapshot().expect("completed original step");
+        let session = handle.session_id().get().to_string();
+
+        // A reconnect has no local receipt cache or command allocator in common.
+        let reconnected = owner.handle();
+        let counter = reconnected
+            .command_counter
+            .load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..3 {
+            let recovered = reconnected
+                .command_status_by_key(key, &session)
+                .expect("read original key")
+                .expect("retained original command");
+            assert_eq!(recovered, applied);
+        }
+        assert_eq!(
+            reconnected
+                .command_counter
+                .load(std::sync::atomic::Ordering::Relaxed),
+            counter,
+            "read-only recovery must not allocate an envelope"
+        );
+        let after = handle.read_snapshot().expect("after status recovery");
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+        assert_eq!(after.command_queue_depth, 0);
+
+        let next = handle.pause(None).expect("next independent admission");
+        assert_eq!(
+            next.admission_sequence,
+            applied.admission_sequence.map(|sequence| sequence + 1),
+            "recovery must not consume another admission order"
+        );
+        owner.wait_applied(&next);
+        assert_eq!(handle.status().unwrap().tick, 1);
+    }
+
+    #[test]
+    fn command_status_by_key_requires_exact_session_and_bounded_key() {
+        let world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(42),
+            persistence_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("session-fenced lookup world");
+        let owner = TestHost::spawn_with_identity(
+            world,
+            None,
+            scriptbots_runtime::HostSessionId::new(u64::MAX),
+        );
+        let handle = owner.handle();
+        let session = u64::MAX.to_string();
+        let key = "maximum-session-key";
+        let original = handle
+            .submit_command(ControlCommand::Pause, Some(key))
+            .expect("maximum-width session command");
+        let applied = owner.wait_applied(&original);
+        assert_eq!(
+            handle.command_status_by_key(key, &session).unwrap(),
+            Some(applied)
+        );
+        let before = handle.read_snapshot().unwrap();
+        for invalid in [
+            "",
+            "+18446744073709551615",
+            "018446744073709551615",
+            "18446744073709551615 ",
+            "18446744073709551616",
+            "1.0",
+        ] {
+            assert!(matches!(
+                handle.command_status_by_key(key, invalid),
+                Err(ControlError::InvalidPatch(_))
+            ));
+        }
+        assert!(matches!(
+            handle.command_status_by_key(key, "1"),
+            Err(ControlError::Conflict(_))
+        ));
+        for invalid in ["".to_owned(), "k".repeat(1025)] {
+            assert!(matches!(
+                handle.command_status_by_key(&invalid, &session),
+                Err(ControlError::InvalidPatch(_))
+            ));
+        }
+        assert!(
+            handle
+                .command_status_by_key("never-submitted", &session)
+                .unwrap()
+                .is_none()
+        );
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+        assert_eq!(after.command_queue_depth, 0);
     }
 
     #[test]

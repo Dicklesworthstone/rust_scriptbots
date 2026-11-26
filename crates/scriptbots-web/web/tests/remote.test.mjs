@@ -9,7 +9,9 @@ import { EXPERIMENT_LIMITS, prepareExperimentRequest } from "../experiment-proto
 import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
 
 const SESSION = "340282366920938463463374607431768211455";
+const CONTROL_SESSION = "71";
 const COMMAND = "1234567890abcdef1234567890abcdef";
+if (!globalThis.crypto) Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true });
 
 test("command receipt text preserves applied boundaries and independent failure axes", () => {
   const applied = {
@@ -343,29 +345,50 @@ function client(options = {}) {
 }
 
 function retainUnconfirmed(value, requestId) {
-  // Exercise the actual failed-send admission path: a previously connected
-  // browser may lose its socket before its close callback is delivered.
+  // A previously connected browser may lose its socket before its close
+  // callback is delivered. Neither the send error nor a missing receipt proves
+  // whether the owner admitted the attempted mutation.
   value.state = "connected";
+  if (value.tracker.sessionId === null) value.tracker.acknowledge(CONTROL_SESSION);
   assert.throws(() => value.sendControl("step", { requestId }), (error) =>
     /socket is not open/.test(error.message) && error.requestId === requestId);
 }
 
-test("failed send retains exactly one retry identity, refuses conflicting reuse, and bounds history", () => {
+function connectedControlClient(options = {}) {
+  const value = client(options), sent = [];
+  value.state = "connected";
+  value.tracker.acknowledge(CONTROL_SESSION);
+  value.generation = 1;
+  value.socket = { readyState: 1, bufferedAmount: 0, send: (text) => sent.push(JSON.parse(text)), close() {} };
+  return { value, sent };
+}
+
+function commandReceipt(requestId, commandId = COMMAND, fields = {}) {
+  return { protocol_version: 1, request_id: requestId, type: "receipt",
+    receipt: { command_id: commandId, application_state: "admitted", journal_state: "pending", ...fields } };
+}
+
+function receiveControl(value, reply) { value.receive(JSON.stringify(reply)); }
+
+test("failed send retains one recovery identity, refuses conflicting reuse, and bounds history", () => {
   const value = client();
   retainUnconfirmed(value, "step-1");
   const retained = value.requests.get("step-1").text;
   assert.deepEqual(JSON.parse(retained), { protocol_version: 1, request_id: "step-1", command: "step" });
-  retainUnconfirmed(value, "step-1");
+  assert.throws(() => value.sendControl("step", { requestId: "step-1" }), (error) =>
+    /socket is not open/.test(error.message) && error.requestId !== "step-1");
+  assert.equal(value.statusRequest.command, "status_by_key", "repeating an attempted mutation only reads its outcome");
+  assert.equal(value.statusRequest.idempotencyKey, "step-1");
   assert.equal(value.requests.size, 1);
   assert.equal(value.requests.get("step-1").text, retained);
   assert.throws(() => value.sendControl("resume", { requestId: "step-1" }), /different command/);
-  assert.throws(() => value.retryControl("step-1"), /socket is not open/);
+  assert.throws(() => value.retryControl("step-1"), /socket is not open/,
+    "a failed read must release its lookup slot for another safe read");
   assert.equal(value.requests.get("step-1").text, retained);
   for (let index = 2; index <= 32; index += 1) retainUnconfirmed(value, `step-${index}`);
   assert.equal(value.requests.size, 32);
-  assert.throws(() => value.sendControl("step", { requestId: "step-33" }), /32 control acknowledgements/);
-  value.receive(JSON.stringify({ protocol_version: 1, request_id: "step-1", type: "receipt",
-    receipt: { command_id: COMMAND, application_state: "applied", journal_state: "disabled" } }));
+  assert.throws(() => value.sendControl("step", { requestId: "step-33" }), /32 control outcomes/);
+  receiveControl(value, commandReceipt("step-1", COMMAND, { application_state: "applied", journal_state: "not_required" }));
   retainUnconfirmed(value, "step-33");
   assert.equal(value.requests.size, 32);
   assert.equal(value.requests.has("step-1"), false);
@@ -376,18 +399,184 @@ test("receipt correlation preserves command identity and exposes server errors t
   const receipts = [];
   const value = client({ onReceipt: (reply) => receipts.push(reply) });
   retainUnconfirmed(value, "step-1");
-  const receipt = { protocol_version: 1, request_id: "step-1", type: "receipt",
-    receipt: { command_id: COMMAND, application_state: "queued", journal_state: "pending" } };
-  value.receive(JSON.stringify(receipt));
+  const receipt = commandReceipt("step-1");
+  receiveControl(value, receipt);
   assert.deepEqual(receipts[0], receipt);
   const changed = structuredClone(receipt);
   changed.receipt.command_id = "ffffffffffffffffffffffffffffffff";
-  assert.throws(() => value.receive(JSON.stringify(changed)), /changed its canonical command identity/);
+  assert.throws(() => receiveControl(value, changed), /changed its canonical command identity/);
   assert.equal(receipts.length, 1);
   const error = { protocol_version: 1, request_id: "step-1", type: "error", status: 409, message: "Request cannot be re-admitted" };
-  value.receive(JSON.stringify(error));
+  receiveControl(value, error);
   assert.deepEqual(receipts[1], error);
-  assert.throws(() => value.receive(JSON.stringify({ ...receipt, request_id: "unknown" })), /Uncorrelated/);
+  assert.equal(value.controlRequests()[0].settled, false, "an error is not an owner outcome");
+  assert.throws(() => receiveControl(value, { ...receipt, request_id: "unknown" }), /Uncorrelated/);
+});
+
+test("a full mutation history preserves both pending axes while a separate status lookup can settle an original", () => {
+  const { value, sent } = connectedControlClient();
+  for (let index = 0; index < 32; index += 1) {
+    const key = `step-${index}`, id = BigInt(index + 1).toString(16).padStart(32, "0");
+    value.sendControl("step", { requestId: key });
+    receiveControl(value, commandReceipt(key, id,
+      { application_state: index % 2 ? "applied" : "admitted", journal_state: "pending" }));
+  }
+  assert.ok(value.controlRequests().every((request) => !request.settled));
+  assert.throws(() => value.sendControl("step", { requestId: "step-32" }), /32 control outcomes/);
+  assert.equal(sent.length, 32, "a refused mutation must not reach the socket");
+  const lookup = value.retryControl("step-0");
+  assert.equal(sent.at(-1).command, "status");
+  assert.equal(value.requests.size, 32);
+  assert.equal(value.retryControl("step-0"), lookup, "repeated pending reads share the single lookup slot");
+  assert.equal(sent.length, 33);
+  assert.throws(() => value.retryControl("step-1"), /lookup is pending/);
+  receiveControl(value, commandReceipt(lookup, "00000000000000000000000000000001",
+    { application_state: "applied", journal_state: "committed_volatile" }));
+  assert.equal(value.controlRequests()[0].settled, true);
+  value.sendControl("step", { requestId: "step-32" });
+  assert.equal(value.requests.size, 32);
+  assert.equal(value.requests.has("step-0"), false);
+  assert.ok(Array.from({ length: 31 }, (_, index) => value.requests.has(`step-${index + 1}`)).every(Boolean),
+    "only the original whose two axes settled may be evicted");
+});
+
+test("lost admission recovery is read-only even after errors, full retention, and missing native history", () => {
+  const { value, sent } = connectedControlClient();
+  for (let index = 0; index < 32; index += 1) {
+    const key = `unknown-${index}`;
+    value.sendControl("step", { requestId: key });
+    receiveControl(value, { protocol_version: 1, request_id: key, type: "error",
+      status: 503, message: "Owner reply unavailable" });
+  }
+  assert.throws(() => value.sendControl("step", { requestId: "overflow" }), /32 control outcomes/);
+  const lookup = value.retryControl("unknown-0");
+  assert.deepEqual(sent.at(-1), { protocol_version: 1, request_id: lookup, command: "status_by_key",
+    idempotency_key: "unknown-0", session_id: CONTROL_SESSION });
+  assert.notEqual(lookup, "unknown-0");
+  receiveControl(value, { protocol_version: 1, request_id: lookup, type: "error",
+    status: 404, message: "No retained command receipt" });
+  assert.equal(value.controlRequests()[0].settled, false);
+  assert.deepEqual(value.controlRequests()[0].error,
+    { status: 404, message: "No retained command receipt", operation: "status_by_key" });
+  assert.throws(() => value.sendControl("step", { requestId: "overflow" }), /32 control outcomes/);
+  const secondLookup = value.sendControl("step", { requestId: "unknown-0" });
+  assert.notEqual(secondLookup, lookup, "a completed read gets a fresh correlation identity");
+  assert.equal(sent.at(-1).command, "status_by_key");
+  receiveControl(value, commandReceipt(secondLookup, COMMAND,
+    { application_state: "applied", journal_state: "durable" }));
+  assert.equal(value.controlRequests()[0].commandId, COMMAND);
+  assert.equal(value.controlRequests()[0].error, null);
+  assert.equal(value.controlRequests()[0].settled, true);
+  const knownLookup = value.retryControl("unknown-0");
+  assert.deepEqual(sent.at(-1), { protocol_version: 1, request_id: knownLookup, command: "status", command_id: COMMAND });
+  receiveControl(value, { protocol_version: 1, request_id: knownLookup, type: "error",
+    status: 404, message: "Volatile receipt history was evicted" });
+  assert.equal(value.controlRequests()[0].receipt.journal_state, "durable", "missing later history cannot erase observed evidence");
+  assert.equal(value.controlRequests()[0].settled, true);
+  assert.equal(sent.filter((message) => message.command === "step").length, 32,
+    "neither unknown admission nor known admission may be resubmitted after native history eviction");
+  value.sendControl("step", { requestId: "next" });
+  assert.equal(value.requests.has("unknown-0"), false);
+  assert.equal(value.requests.size, 32);
+});
+
+test("terminal application and journal failures settle independently without becoming successful or mutable", () => {
+  const { value } = connectedControlClient();
+  const failure = { code: "disk_full", message: "Journal could not commit", diagnostic_truncated: false };
+  value.sendControl("step", { requestId: "failed-step" });
+  receiveControl(value, commandReceipt("failed-step", COMMAND,
+    { application_state: "failed", application_failure: { ...failure, code: "step_failed" } }));
+  assert.equal(value.controlRequests()[0].settled, false, "a terminal application does not settle a pending journal");
+  const lookup = value.retryControl("failed-step");
+  const reply = commandReceipt(lookup, COMMAND, { application_state: "failed",
+    application_failure: { ...failure, code: "step_failed" }, journal_state: "failed", journal_failure: failure });
+  receiveControl(value, reply);
+  const history = value.controlRequests(), saved = history[0];
+  assert.equal(saved.settled, true);
+  assert.equal(saved.receipt.application_state, "failed");
+  assert.equal(saved.receipt.journal_state, "failed");
+  assert.ok(Object.isFrozen(history) && Object.isFrozen(saved) && Object.isFrozen(saved.receipt)
+    && Object.isFrozen(saved.receipt.application_failure) && Object.isFrozen(saved.receipt.journal_failure));
+  assert.throws(() => { saved.receipt.journal_failure.message = "success"; }, TypeError);
+  reply.receipt.journal_failure.message = "changed outside the client";
+  assert.equal(value.controlRequests()[0].receipt.journal_failure.message, "Journal could not commit");
+  assert.deepEqual(Object.keys(saved).sort(),
+    ["requestId", "command", "sessionId", "commandId", "receipt", "error", "settled"].sort());
+});
+
+test("delayed admission cannot regress settled receipt evidence or callbacks and contradictory outcomes are rejected atomically", () => {
+  const callbacks = [], { value } = connectedControlClient({ onReceipt: (reply) => callbacks.push(reply) });
+  const boundary = { application_state: "applied", journal_state: "pending",
+    applied_tick: 12, control_revision: 7, scientific_revision: 5, config_revision: 3 };
+  value.sendControl("step", { requestId: "observed" });
+  receiveControl(value, commandReceipt("observed", COMMAND, boundary));
+  const lookup = value.retryControl("observed");
+  receiveControl(value, commandReceipt(lookup, COMMAND, { ...boundary, journal_state: "durable" }));
+  const terminal = value.controlRequests()[0].receipt;
+  receiveControl(value, commandReceipt("observed"));
+  assert.equal(value.controlRequests()[0].receipt, terminal);
+  assert.equal(callbacks.at(-1).receipt, terminal);
+  assert.equal(value.controlRequests()[0].settled, true);
+  receiveControl(value, commandReceipt("observed", COMMAND, { ...boundary, journal_state: "committed_volatile" }));
+  assert.equal(value.controlRequests()[0].receipt, terminal, "a weaker journal observation cannot hide durability");
+  const count = callbacks.length;
+  for (const fields of [
+    { application_state: "rejected", journal_state: "not_required" },
+    { ...boundary, journal_state: "not_required" },
+    { ...boundary, applied_tick: 13, journal_state: "durable" },
+  ]) assert.throws(() => receiveControl(value, commandReceipt("observed", COMMAND, fields)), /retained/);
+  assert.equal(callbacks.length, count);
+  assert.equal(value.controlRequests()[0].receipt, terminal);
+});
+
+test("outcome lookup slots recover across reconnects and refuse changed owner sessions without replay", () => {
+  const { value, sent } = connectedControlClient();
+  value.sendControl("step", { requestId: "first" });
+  value.sendControl("step", { requestId: "second" });
+  const lookup = value.retryControl("first");
+  assert.equal(value.retryControl("first"), lookup);
+  assert.throws(() => value.retryControl("second"), /lookup is pending/);
+  const beforeReconnect = sent.length;
+  value.disconnect();
+  value.state = "connected";
+  value.socket = { readyState: 1, bufferedAmount: 0, send: (text) => sent.push(JSON.parse(text)), close() {} };
+  const resumedLookup = value.retryControl("second");
+  assert.notEqual(resumedLookup, lookup);
+  assert.equal(sent.length, beforeReconnect + 1, "reconnect preserves envelopes without sending mutations");
+  assert.equal(sent.at(-1).command, "status_by_key");
+  assert.equal(value.requests.size, 2);
+  value.tracker.sessionId = "72";
+  const sourceChanged = sent.length;
+  assert.throws(() => value.retryControl("first"), /another owner session/);
+  assert.throws(() => receiveControl(value, commandReceipt("first")), /another retained owner session/);
+  assert.throws(() => value.sendControl("status_by_key",
+    { idempotencyKey: "first", sessionId: CONTROL_SESSION }), /another owner session/);
+  assert.equal(sent.length, sourceChanged);
+  assert.ok(value.controlRequests().every((request) => !request.settled && request.receipt === null));
+});
+
+test("malformed or miscorrelated receipts cannot resolve or evict a retained mutation", () => {
+  const { value } = connectedControlClient();
+  value.sendControl("step", { requestId: "checked" });
+  for (const fields of [
+    { application_state: "queued" },
+    { journal_state: "disabled" },
+    { journal_state: "durable" },
+    { application_state: "failed", application_failure: { code: "failure", message: "missing truncation marker" } },
+  ]) assert.throws(() => receiveControl(value, commandReceipt("checked", COMMAND, fields)), /Invalid remote command/);
+  assert.equal(value.requests.get("checked").received, false);
+  assert.equal(value.controlRequests()[0].commandId, null);
+  receiveControl(value, commandReceipt("checked"));
+  const lookup = value.retryControl("checked");
+  assert.throws(() => receiveControl(value, commandReceipt(lookup, "ffffffffffffffffffffffffffffffff")),
+    /changed its canonical command identity/);
+  value.sendControl("step", { requestId: "distinct" });
+  assert.throws(() => receiveControl(value, commandReceipt("distinct")), /different requests/);
+  assert.ok(value.controlRequests().every((request) => !request.settled));
+  assert.equal(value.controlRequests()[1].commandId, null);
+  assert.throws(() => value.sendControl("status_by_key", {
+    requestId: "same-key", idempotencyKey: "same-key", sessionId: CONTROL_SESSION,
+  }), /Invalid remote recovery key/);
 });
 
 test("subscription acknowledgement gates all binary decoding and refuses unrelated acknowledgements", () => {

@@ -53,7 +53,7 @@ This starts the production server with a fresh file-backed run, one simulation
 thread and the static server's exact allowed Origin. It checks actual native
 binary frames through the packaged WASM decoder, per-channel credits, browser
 pause/step/resume controls against independent HTTP reads, durable command
-receipts, same-ID retry after a deliberately dropped receipt and cursor reconnect,
+receipts, read-only original-key recovery after a deliberately dropped receipt and cursor reconnect,
 Canvas/software-WebGPU remote PNG pixels/identity and saved
 local-owner freeze/return. Truncated/version-mismatched native frames and an
 unlisted browser Origin must fail. The test retains the database, native log,
@@ -63,6 +63,37 @@ saturation, long-run persistence or the complete remote/browser acceptance. The
 initial event subscription records how many native narrative records were
 observed and verifies their displayed text. An empty page qualifies only empty
 history/credit handling; nonempty narrative delivery requires observed records.
+
+### Recovering remote command outcomes
+
+The browser retains up to 32 mutating control requests with their original
+owner session and exact request identity. Admission and journal completion are
+separate observations: an admitted command or an uncertain error does not free
+its retention slot. A separate bounded lookup slot keeps outcome inspection
+available when all 32 commands are unresolved.
+
+**Recover Command Outcome** only reads existing owner evidence. If a receipt
+already identified the command, recovery requests its status. If the first
+receipt was lost, recovery uses the original request key and owner session:
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "a-new-lookup-correlation-id",
+  "command": "status_by_key",
+  "idempotency_key": "the-original-control-request-id",
+  "session_id": "the-original-owner-session"
+}
+```
+
+This operation derives the existing command identity and queries it without
+submitting a command. Reconnecting or recovering therefore cannot replay a Step
+after the owner's bounded command history has evicted its duplicate-detection
+entry. A missing record remains an unknown outcome; it does not prove that the
+original command was never admitted. An older server that does not recognize
+the lookup refuses it; the browser does not fall back to resubmission. Late
+admission receipts cannot replace a later terminal outcome, and observations
+from another owner cannot settle or recover the retained request.
 
 ### Controls & metrics
 

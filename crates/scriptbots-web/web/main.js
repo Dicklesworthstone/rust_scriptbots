@@ -1168,7 +1168,7 @@ function updateRemoteControls() {
   remoteReconnect.disabled = !remoteMode || !remoteClient || remoteConnected;
   for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteOwnerAllowsMutation() || !!reviewedCheckpoint;
   remoteRefresh.disabled = !remoteConnected || !lastRemoteCommandId;
-  remoteRetry.disabled = !remoteOwnerAllowsMutation() || !!reviewedCheckpoint || !lastRemoteRequestId;
+  remoteRetry.disabled = !remoteConnected || !lastRemoteRequestId;
   remoteStepBatch.syncAuthority();
   renderRemoteStepBatch();
   captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
@@ -1485,7 +1485,7 @@ function sendRemoteControl(command) {
   } catch (error) {
     if (error.requestId) {
       lastRemoteRequestId = error.requestId;
-      remoteReceipt.textContent = `Command delivery unconfirmed (${error.requestId}): ${error.message}. Reconnect and retry with the same ID.`;
+      remoteReceipt.textContent = `Command delivery unconfirmed (${error.requestId}): ${error.message}. Reconnect and recover its outcome; the command will not be resent.`;
     } else {
       remoteReceipt.textContent = `Command was not sent: ${error.message}`;
     }
@@ -1517,11 +1517,10 @@ remoteRefresh.addEventListener("click", () => {
 });
 remoteRetry.addEventListener("click", () => {
   try {
-    if (!remoteOwnerAllowsMutation()) throw new Error("Wait for a current running owner before retrying live-world commands");
-    if (reviewedCheckpoint) throw new Error("Return to live before retrying a server command");
-    remoteClient.retryControl(lastRemoteRequestId);
-    remoteReceipt.textContent = `Retried the same command identity (${lastRemoteRequestId}); awaiting the server's receipt.`;
-  } catch (error) { remoteReceipt.textContent = `Retry failed: ${error.message}`; }
+    if (!remoteConnected) throw new Error("Reconnect and subscribe before recovering a control outcome");
+    lastRemoteStatusRequestId = remoteClient.retryControl(lastRemoteRequestId);
+    remoteReceipt.textContent = `Recovering the outcome of ${lastRemoteRequestId}; the command will not be resent.`;
+  } catch (error) { remoteReceipt.textContent = `Outcome recovery failed: ${error.message}`; }
 });
 
 function resetPerformanceWindows(snapshot = null) {

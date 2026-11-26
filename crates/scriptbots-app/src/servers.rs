@@ -2598,6 +2598,8 @@ struct WsControlRequest {
     limit: Option<usize>,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 const fn ws_control_protocol_version() -> u16 {
@@ -2655,6 +2657,7 @@ fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
             offset: None,
             limit: None,
             idempotency_key: None,
+            session_id: None,
         }
     } else {
         if !text.starts_with('{') {
@@ -2677,6 +2680,32 @@ fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
         if request_id.is_empty() || request_id.len() > 1024 {
             return Err(AppError::bad_request(
                 "request_id must contain 1..=1024 bytes",
+            ));
+        }
+    }
+    if text.starts_with('{') {
+        // Recovery has an exact read-only shape. Check presence as well as the
+        // decoded Options so extra fields set to null cannot bypass the shape.
+        let fields: serde_json::Map<String, Value> = serde_json::from_str(text).map_err(|error| {
+            AppError::bad_request(format!("invalid WebSocket control request: {error}"))
+        })?;
+        let valid_fields = if request.command == "status_by_key" {
+            fields.len() == 5
+                && [
+                    "protocol_version",
+                    "request_id",
+                    "command",
+                    "idempotency_key",
+                    "session_id",
+                ]
+                .iter()
+                .all(|field| fields.contains_key(*field))
+        } else {
+            !fields.contains_key("session_id")
+        };
+        if !valid_fields {
+            return Err(AppError::bad_request(
+                "status_by_key requires only protocol_version, request_id, command, idempotency_key and session_id; session_id is not accepted by other controls",
             ));
         }
     }
@@ -2706,6 +2735,25 @@ fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
                     .command_id
                     .as_ref()
                     .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+        }
+        "status_by_key" => {
+            no_single_fields
+                && request.count.is_none()
+                && request.batch_id.is_none()
+                && request.offset.is_none()
+                && request.limit.is_none()
+                && request
+                    .request_id
+                    .as_ref()
+                    .zip(request.idempotency_key.as_ref())
+                    .is_some_and(|(request_id, key)| {
+                        request_id != key && !key.is_empty() && key.len() <= 1024
+                    })
+                && request.session_id.as_ref().is_some_and(|session| {
+                    session
+                        .parse::<u64>()
+                        .is_ok_and(|value| value.to_string() == session.as_str())
+                })
         }
         "step_batch_create" => {
             no_single_fields
@@ -2769,6 +2817,24 @@ async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsCont
                     })
                     .map(|receipt| WsControlOutcome::Receipt { receipt });
             }
+            "status_by_key" => {
+                let key = request
+                    .idempotency_key
+                    .as_deref()
+                    .expect("validated original command key");
+                return handle
+                    .command_status_by_key(
+                        key,
+                        request.session_id.as_deref().expect("validated owner session"),
+                    )?
+                    .ok_or_else(|| {
+                        ControlError::NotFound(
+                            "command receipt is not retained; absence does not authorize resubmission"
+                                .to_owned(),
+                        )
+                    })
+                    .map(|receipt| WsControlOutcome::Receipt { receipt });
+            }
             "step_batch_create" => {
                 return handle
                     .create_step_batch(
@@ -2793,8 +2859,8 @@ async fn apply_ws_control_message(handle: ControlHandle, text: String) -> WsCont
             }
             _ => unreachable!("validated WebSocket command"),
         };
-        // The host owns retry identity and conflicting-payload refusal. A reconnect
-        // must not create a second Step after the first receipt was lost.
+        // Mutations retain the original client key. Recovery uses the read-only
+        // status paths above: missing owner history must not execute another Step.
         handle
             .submit_command(command, request.request_id.as_deref())
             .map(|receipt| WsControlOutcome::Receipt { receipt })
@@ -14772,6 +14838,233 @@ mod tests {
     }
 
     #[test]
+    fn websocket_status_by_key_recovers_lost_reply_without_resubmission() {
+        let (handle, owner) = handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("WebSocket recovery runtime");
+        let key = "lost-first-step-reply";
+        let expected_id = handle
+            .prepare_control_command(scriptbots_core::ControlCommand::Step, Some(key))
+            .unwrap()
+            .command_id
+            .to_string();
+        let lost = runtime.block_on(apply_ws_control_message(
+            handle.clone(),
+            json!({"protocol_version": 1, "request_id": key, "command": "step"}).to_string(),
+        ));
+        drop(lost);
+        let applied = owner.wait_finished(&expected_id);
+        assert_eq!(applied.application_state, "applied");
+        assert_eq!(applied.applied_tick, Some(1));
+        let before = handle.read_snapshot().unwrap();
+        let session = handle.session_id().get().to_string();
+
+        for index in 0..3 {
+            let request_id = format!("recover-lost-step-{index}");
+            let reply = runtime.block_on(apply_ws_control_message(
+                owner.handle(),
+                json!({
+                    "protocol_version": 1,
+                    "request_id": request_id,
+                    "command": "status_by_key",
+                    "idempotency_key": key,
+                    "session_id": session
+                })
+                .to_string(),
+            ));
+            assert_eq!(reply.request_id.as_deref(), Some(request_id.as_str()));
+            assert_eq!(websocket_receipt(reply), applied);
+        }
+        for (lookup_key, lookup_session, expected_status) in [
+            ("never-admitted", session.clone(), 404),
+            (key, (handle.session_id().get() + 1).to_string(), 409),
+        ] {
+            let reply = runtime.block_on(apply_ws_control_message(
+                handle.clone(),
+                json!({
+                    "protocol_version": 1,
+                    "request_id": "refused-lookup",
+                    "command": "status_by_key",
+                    "idempotency_key": lookup_key,
+                    "session_id": lookup_session
+                })
+                .to_string(),
+            ));
+            let wire = serde_json::to_value(reply).unwrap();
+            assert_eq!(wire["request_id"], "refused-lookup");
+            assert_eq!(wire["type"], "error");
+            assert_eq!(wire["status"], expected_status);
+        }
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+        assert_eq!(after.command_queue_depth, 0);
+        let next = handle.pause(None).unwrap();
+        assert_eq!(
+            next.admission_sequence,
+            applied.admission_sequence.map(|sequence| sequence + 1)
+        );
+        owner.wait_applied(&next);
+        assert_eq!(handle.status().unwrap().tick, 1);
+    }
+
+    #[test]
+    fn websocket_status_by_key_never_reapplies_after_volatile_history_eviction() {
+        let world = WorldState::new(ScriptBotsConfig {
+            world_width: 64,
+            world_height: 64,
+            food_cell_size: 16,
+            rng_seed: Some(42),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            closed: true,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("bounded recovery world");
+        let owner = crate::control::tests::TestHost::spawn_with_command_history(world, 1);
+        let handle = owner.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bounded recovery runtime");
+        let key = "evicted-step-reply";
+        let expected_id = handle
+            .prepare_control_command(scriptbots_core::ControlCommand::Step, Some(key))
+            .unwrap()
+            .command_id
+            .to_string();
+        drop(runtime.block_on(apply_ws_control_message(
+            handle.clone(),
+            json!({"protocol_version": 1, "request_id": key, "command": "step"}).to_string(),
+        )));
+        owner.wait_finished(&expected_id);
+        let mut later = Vec::new();
+        for index in 0..3 {
+            let receipt = websocket_receipt(runtime.block_on(apply_ws_control_message(
+                handle.clone(),
+                json!({
+                    "protocol_version": 1,
+                    "request_id": format!("later-step-{index}"),
+                    "command": "step"
+                })
+                .to_string(),
+            )));
+            later.push(owner.wait_applied(&receipt));
+        }
+        assert!(
+            handle.command_status(&expected_id).unwrap().is_none(),
+            "both the actual owner history and its channel mirror must evict the original"
+        );
+        let before = handle.read_snapshot().unwrap();
+        assert_eq!(before.world.tick, 4);
+        for index in 0..3 {
+            let reply = runtime.block_on(apply_ws_control_message(
+                owner.handle(),
+                json!({
+                    "protocol_version": 1,
+                    "request_id": format!("recover-evicted-step-{index}"),
+                    "command": "status_by_key",
+                    "idempotency_key": key,
+                    "session_id": handle.session_id().get().to_string()
+                })
+                .to_string(),
+            ));
+            let wire = serde_json::to_value(reply).unwrap();
+            assert_eq!(wire["type"], "error");
+            assert_eq!(wire["status"], 404);
+        }
+        let after = handle.read_snapshot().unwrap();
+        assert_eq!(after.world, before.world);
+        assert_eq!(after.revisions, before.revisions);
+        assert_eq!(after.last_applied_command, before.last_applied_command);
+        assert_eq!(after.command_queue_depth, 0);
+        let next = handle.pause(None).unwrap();
+        assert_eq!(
+            next.admission_sequence,
+            later
+                .last()
+                .unwrap()
+                .admission_sequence
+                .map(|sequence| sequence + 1),
+            "absent lookups must not consume any admission order"
+        );
+        owner.wait_applied(&next);
+        assert_eq!(handle.status().unwrap().tick, 4);
+    }
+
+    #[test]
+    fn websocket_status_by_key_requires_an_exact_session_scoped_read_shape() {
+        let valid = json!({
+            "protocol_version": 1,
+            "request_id": "read-original",
+            "command": "status_by_key",
+            "idempotency_key": "original-step",
+            "session_id": u64::MAX.to_string()
+        });
+        assert!(parse_ws_control_message(&valid.to_string()).is_ok());
+        for missing in [
+            "protocol_version",
+            "request_id",
+            "idempotency_key",
+            "session_id",
+        ] {
+            let mut request = valid.clone();
+            request.as_object_mut().unwrap().remove(missing);
+            assert!(parse_ws_control_message(&request.to_string()).is_err());
+        }
+        for (field, value) in [
+            ("command_id", json!("00000000000000000000000000000001")),
+            ("speed", json!(1.0)),
+            ("count", json!(1)),
+            ("batch_id", json!("batch")),
+            ("offset", json!(0)),
+            ("limit", json!(1)),
+        ] {
+            for value in [value, Value::Null] {
+                let mut request = valid.clone();
+                request[field] = value;
+                assert!(parse_ws_control_message(&request.to_string()).is_err());
+            }
+        }
+        for session in [
+            Value::Null,
+            json!(1),
+            json!(""),
+            json!("01"),
+            json!("+1"),
+            json!("1 "),
+            json!("1.0"),
+            json!("18446744073709551616"),
+        ] {
+            let mut request = valid.clone();
+            request["session_id"] = session;
+            assert!(parse_ws_control_message(&request.to_string()).is_err());
+        }
+        for key in [json!(""), json!("k".repeat(1025)), json!("read-original")] {
+            let mut request = valid.clone();
+            request["idempotency_key"] = key;
+            assert!(parse_ws_control_message(&request.to_string()).is_err());
+        }
+        for command in [
+            json!({"command": "step"}),
+            json!({"command": "status", "command_id": "00000000000000000000000000000001"}),
+            json!({"command": "step_batch_create", "count": 1}),
+            json!({"command": "step_batch_advance", "batch_id": "retained"}),
+            json!({"command": "step_batch_status", "batch_id": "retained"}),
+        ] {
+            for session in [json!("1"), Value::Null] {
+                let mut request = command.clone();
+                request["session_id"] = session;
+                assert!(parse_ws_control_message(&request.to_string()).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn websocket_control_bounds_apply_before_parsing_or_dispatch() {
         let message = r#"{"command":"step","protocol_version":1,"request_id":"bounded"}"#;
         for len in [
@@ -16196,8 +16489,8 @@ mod tests {
         assert_eq!(handle.status().unwrap().tick, 1);
         drop(second);
 
-        // Discard the actual response before reading it, then retry only after
-        // independently observing that its scientific step really happened.
+        // Discard the actual response before reading it. Recover by the original
+        // key on a new socket without replaying a mutation or knowing its command ID.
         let lost_request =
             r#"{"protocol_version":1,"request_id":"lost-step-receipt","command":"step"}"#;
         let mut lost = connect_websocket(address);
@@ -16211,15 +16504,36 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         drop(lost);
+        let before_recovery = handle.read_snapshot().unwrap();
         let mut recovered = connect_websocket(address);
-        send_websocket_text(&mut recovered, lost_request);
+        send_websocket_text(
+            &mut recovered,
+            &json!({
+                "protocol_version": 1,
+                "request_id": "lost-receipt-lookup",
+                "command": "status_by_key",
+                "idempotency_key": "lost-step-receipt",
+                "session_id": handle.session_id().get().to_string()
+            })
+            .to_string(),
+        );
         let recovered_reply = read_websocket_reply(&mut recovered);
-        assert_eq!(recovered_reply["request_id"], "lost-step-receipt");
+        assert_eq!(recovered_reply["request_id"], "lost-receipt-lookup");
+        assert_eq!(recovered_reply["type"], "receipt", "{recovered_reply}");
         assert_eq!(recovered_reply["receipt"]["application_state"], "applied");
+        assert_eq!(recovered_reply["receipt"]["applied_tick"], 2);
+        let after_recovery = handle.read_snapshot().unwrap();
+        assert_eq!(after_recovery.world, before_recovery.world);
+        assert_eq!(after_recovery.revisions, before_recovery.revisions);
+        assert_eq!(
+            after_recovery.last_applied_command,
+            before_recovery.last_applied_command
+        );
+        assert_eq!(after_recovery.command_queue_depth, 0);
         assert_eq!(
             handle.status().unwrap().tick,
             2,
-            "lost receipt must not double-step"
+            "read-only recovery must not double-step"
         );
         drop(recovered);
         server.shutdown().expect("WebSocket server shutdown");

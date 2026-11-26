@@ -19,6 +19,29 @@ fall back to in-memory operation with a visible notice. Focused V8 controller
 probes exercised recovery with simulated storage and transport. The packaged
 browser, native service and DSR qualification remain open.
 
+**Remote command recovery under sustained control traffic (2026-11-26):**
+[Source implemented and independently reviewed; candidate validation pending —
+Codex; corrective contribution to `bd-ac4l` and `bd-2z0.12.2`;
+original complete acceptance retained]
+
+Retain unresolved remote mutation identities after admission, uncertain errors
+and subsequent status traffic. Outcome inspection has independent bounded
+capacity and reconciles application and journal evidence without downgrading
+terminal observations. Recovery queries a known command ID or derives that
+identity from the original request key and owner session; neither path
+resubmits a mutation. Missing owner history remains an unknown outcome.
+
+Regression source covers full retention, delayed receipts, lost initial replies,
+owner changes and actual native history eviction. The real browser journey
+must also observe an unchanged scientific tick and admission sequence, the
+original lookup key/session and no second Step on the wire.
+
+The clean starting revision `86543a7a` passed 389 browser module tests and 38
+JavaScript syntax checks through DSR 0.2.3. These are baseline results only.
+The executor disconnected again during implementation; candidate test,
+compiler, Clippy and packaged-browser execution remain pending. Original
+acceptance and scientific guarantees are unchanged.
+
 **Remote browser step plans and retained receipt inspection (2026-11-26):**
 [Source implemented and independently reviewed; browser module validation passed —
 Codex; functional contribution to `bd-2z0.12.2`;
