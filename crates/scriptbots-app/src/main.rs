@@ -3801,7 +3801,7 @@ pub struct ExperimentArgs {
     /// Retry failed runs from their verified saved cuts, retaining prior failure evidence.
     #[arg(long, conflicts_with = "example")]
     pub retry_failed: bool,
-    /// Compare one verified endpoint in two completed variants and print the paired result as JSON.
+    /// Compare one endpoint or a comma-separated family of endpoints in two completed variants.
     #[arg(long, num_args = 3, value_names = ["BASELINE", "CHALLENGER", "METRIC"], conflicts_with_all = ["example", "retry_failed"])]
     pub compare: Option<Vec<String>>,
     /// Print an editable matched MLP/DWRAON experiment plan without starting a run.
@@ -3904,15 +3904,24 @@ fn run_experiment_subcommand(args: &ExperimentArgs) -> Result<()> {
         let [baseline, challenger, metric] = comparison.as_slice() else {
             bail!("--compare requires BASELINE CHALLENGER METRIC");
         };
-        let report = scriptbots_app::control::compare_saved_experiment_variants(
+        // Bound the collected list before bundle verification even for a malformed
+        // argument containing thousands of separators. The verifier rejects overflow.
+        let metrics = metric
+            .split(',')
+            .take(scriptbots_app::experiment_runner::EXPERIMENT_ENDPOINT_METRICS.len() + 1)
+            .collect::<Vec<_>>();
+        let report = scriptbots_app::control::compare_saved_experiment_metrics(
             &runner,
             &status_path,
             baseline,
             challenger,
-            metric,
+            &metrics,
         )?;
         let mut stdout = io::stdout().lock();
-        serde_json::to_writer_pretty(&mut stdout, &report)?;
+        match report.comparisons.as_slice() {
+            [single] => serde_json::to_writer_pretty(&mut stdout, single)?,
+            _ => serde_json::to_writer_pretty(&mut stdout, &report)?,
+        }
         writeln!(stdout)?;
         return Ok(());
     }

@@ -2548,6 +2548,43 @@ fn real_process_experiment_cli_executes_matched_plan_and_reuses_verified_bundles
     assert_eq!(report.mean_difference, population_difference / 2.0);
     assert_eq!(report.plan_digest, status.plan_digest);
     assert_eq!(report.status_generation, status.generation);
+    let grouped = retained_experiment_cli(
+        &directory,
+        "endpoint-family",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--out")
+            .arg(&output_dir)
+            .args(["--compare", "mlp", "dwraon", "total_food,alive_agents"]),
+    )?;
+    assert!(
+        grouped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&grouped.stderr)
+    );
+    let family: scriptbots_app::control::ExperimentComparisonFamily =
+        serde_json::from_slice(&grouped.stdout)?;
+    let [food, population] = family.comparisons.as_slice() else {
+        bail!("incomplete endpoint family");
+    };
+    assert_eq!(food.metric, "total_food");
+    assert_eq!(population.metric, "alive_agents");
+    assert_eq!(population.mean_difference, report.mean_difference);
+    assert_eq!(food.matched_seeds, report.matched_seeds);
+    assert_eq!(population.plan_digest, report.plan_digest);
+    let duplicate = retained_experiment_cli(
+        &directory,
+        "duplicate-endpoint",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--out")
+            .arg(&output_dir)
+            .args(["--compare", "mlp", "dwraon", "total_food,total_food"]),
+    )?;
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("duplicate experiment endpoint"));
     assert_eq!(std::fs::read(&status_path)?, original_status);
 
     let repeated = retained_experiment_cli(

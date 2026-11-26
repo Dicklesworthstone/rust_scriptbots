@@ -2611,6 +2611,15 @@ matched seeds, the plan digest and the status generation. A single matched seed
 yields a descriptive difference. An incomplete cohort or a damaged bundle
 causes the command to fail without changing the experiment.
 
+To analyze several endpoints together, give `--compare` a comma-separated metric
+list, for example `--compare mlp dwraon alive_agents,total_food,total_energy`.
+Each bundle is verified once per comparison. The JSON contains the analysis
+parameters and one result per endpoint in the requested order. The default
+Benjamini–Hochberg adjustment uses all requested endpoints as one family.
+Define the endpoints before inspecting outcomes when using these results for
+inference. Duplicate names or an unavailable endpoint on any seed refuse the
+entire comparison. A single metric retains its original JSON format.
+
 The example is an editable MLP/DWRAON study. Its strict version-1 plan declares
 `experiment_id`, `cohort_id`, exact integer `seeds`, `variants`, `ticks_per_run`,
 and `max_concurrency`. Variants use the same configuration overrides and ordered
