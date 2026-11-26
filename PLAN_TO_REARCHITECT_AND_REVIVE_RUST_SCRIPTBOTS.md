@@ -2,6 +2,29 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Bounded browser continuation storage and recovery (2026-11-26):**
+[Source implemented and independently reviewed; browser module checks passed —
+Codex; corrective contribution to `bd-ywtv` and `bd-2z0.12.3`;
+packaged-browser and native qualification remain open]
+
+Manual and recovery storage operations now share a ten-second deadline across
+IndexedDB opening and transaction completion. A timeout releases the waiting
+UI/controller while retaining a fence around any native transaction that has
+not actually completed or aborted. Late callbacks cannot enqueue another write,
+resettle the caller or silently recover authority to replace a recovery record.
+A write that might have committed reports an unconfirmed outcome; recovery
+replacement requires an explicit reread of the slot before a new conditional
+write. The existing recovery action performs that reconciliation.
+
+Seven deterministic regressions cover stalled opens, the shared deadline,
+delayed abort delivery, late requests, both commit/deadline orderings and
+controller error recovery. DSR ran all 407 browser module tests successfully,
+with no failures/skips, plus syntax checks on all three changed JS files, after
+integration with `b9025410` and with identical before/after source fingerprints.
+The combined receipt also records an unavailable native formatter after an
+environment reset; it is not an all-green quality gate. Native compilation,
+native regression execution and packaged-browser durability remain unverified.
+
 **Communication MI samples the hearing source boundary (2026-11-26):**
 [Source implemented and independently reviewed — Codex; corrective contribution
 to `bd-16g.7.2`; native execution and the `bd-16g.7.3` study remain unqualified]

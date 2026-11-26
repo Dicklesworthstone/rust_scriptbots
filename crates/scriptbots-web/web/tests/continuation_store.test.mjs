@@ -99,13 +99,14 @@ class IndexedDbEvents {
             if (transaction.finished) throw new DOMException("Transaction is finished", "InvalidStateError");
             transaction.finished = true;
             transaction.error = error;
-            queueMicrotask(() => {
+            transaction.deliverAbort = () => {
               transaction.onerror?.();
               transaction.onabort();
               if (factory.active === transaction) factory.active = null;
               factory.queued = factory.queued.filter((pending) => pending !== transaction);
               factory.admit();
-            });
+            };
+            if (!factory.stallAbort) queueMicrotask(transaction.deliverAbort);
           },
         };
         factory.transactions.push(transaction);
@@ -758,4 +759,194 @@ test("capture must retain the same source and disabled recovery cannot acknowled
   assert.equal(await pending, false);
   assert.deepEqual(saved, []);
   assert.equal(controller.pending, false);
+});
+
+class StorageClock {
+  time = 0;
+  nextTimer = 0;
+  timers = new Map();
+
+  options(timeoutMs = 10) {
+    return { timeoutMs, now: () => this.time,
+      setTimer: (callback, delay) => {
+        const id = ++this.nextTimer;
+        this.timers.set(id, { callback, deadline: this.time + delay });
+        return id;
+      },
+      clearTimer: (id) => this.timers.delete(id) };
+  }
+
+  advance(milliseconds, dispatch = true) {
+    this.time += milliseconds;
+    if (dispatch) this.fire();
+  }
+
+  fire() {
+    for (const [id, timer] of [...this.timers]) {
+      if (timer.deadline <= this.time && this.timers.delete(id)) timer.callback();
+    }
+  }
+}
+
+const timeoutIs = (outcome) => (error) => codeIs("timeout")(error) && error.outcome === outcome;
+
+test("storage uses a finite ten-second default deadline and rejects invalid budgets", async () => {
+  const factory = new IndexedDbEvents(record());
+  factory.stallOpen = true;
+  for (const timeoutMs of [0, -1, 0.5, NaN, Infinity, 2_147_483_648]) {
+    assert.throws(() => new BrowserContinuationStore(8, factory, { timeoutMs }), codeIs("bounds"));
+  }
+  const clock = new StorageClock(), options = clock.options();
+  delete options.timeoutMs;
+  const store = new BrowserContinuationStore(8, factory, options);
+  const refused = assert.rejects(store.read(), timeoutIs("not_written"));
+  clock.advance(9_999);
+  assert.equal(clock.timers.size, 1);
+  assert.equal(factory.transactions.length, 0);
+  clock.advance(1);
+  await refused;
+  assert.equal(clock.timers.size, 0);
+});
+
+test("stalled manual reads and saves time out without accumulating native opens", async () => {
+  const previous = record(), factory = new IndexedDbEvents(previous), clock = new StorageClock();
+  factory.stallOpen = true;
+  const store = new BrowserContinuationStore(8, factory, clock.options());
+  for (const operation of [() => store.read(), () => store.save(new Blob(["new"]), "8", SAVED_AT)]) {
+    const refused = assert.rejects(operation(), timeoutIs("not_written"));
+    clock.advance(10);
+    await refused;
+    assert.equal(factory.opens, 1, "a retry shares the original uncancellable IndexedDB open");
+    assert.equal(factory.transactions.length, 0);
+    assert.equal(factory.stored, previous);
+    assert.equal(clock.timers.size, 0);
+  }
+  factory.lastOpen.onsuccess();
+  assert.equal(factory.closes, 1, "an unobserved late connection is closed");
+  factory.stallOpen = false;
+  assert.equal(await finishRead(store, factory), previous);
+  assert.equal(factory.opens, 2);
+});
+
+test("opening consumes the same operation deadline as the transaction", async () => {
+  const previous = record(), factory = new IndexedDbEvents(previous), clock = new StorageClock();
+  factory.stallOpen = true;
+  const store = new BrowserContinuationStore(8, factory, clock.options());
+  const refused = assert.rejects(store.save(new Blob(["new"]), "8", SAVED_AT), timeoutIs("unconfirmed"));
+  clock.advance(6);
+  factory.lastOpen.onsuccess();
+  const transaction = await factory.nextTransaction();
+  transaction.succeed();
+  assert.equal(factory.stored, previous, "request success has not committed the replacement");
+  clock.advance(4);
+  await refused;
+  assert.equal(factory.stored, previous);
+  assert.equal(clock.timers.size, 0, "transaction admission never starts a fresh budget");
+  factory.stallOpen = false;
+  assert.equal(await finishRead(store, factory), previous);
+});
+
+test("a timed-out transaction fences new work until its actual abort and ignores late requests", async () => {
+  const factory = new IndexedDbEvents(record()), clock = new StorageClock();
+  const store = new BrowserContinuationStore(16, factory, clock.options());
+  await finishRecoveryRead(store, factory);
+  factory.stallAbort = true;
+  const refused = assert.rejects(store.saveRecovery(new Blob(["expired"]), source(), { savedAt: SAVED_AT }),
+    (error) => timeoutIs("unconfirmed")(error) && error.recoveryObservationRequired);
+  const transaction = await factory.nextTransaction(), lateGet = transaction.request;
+  clock.advance(10);
+  await refused;
+  assert.equal(store.recoveryObserved, false);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await assert.rejects(store.read(), codeIs("busy"));
+    await assert.rejects(store.save(new Blob(["other"]), "9", SAVED_AT), codeIs("busy"));
+  }
+  assert.equal(factory.opens, 2);
+  assert.equal(factory.transactions.length, 2, "an unreported abort cannot leak more native work");
+  lateGet.result = undefined;
+  lateGet.onsuccess();
+  assert.equal(transaction.candidates.size, 0, "a late get cannot enqueue the recovery put");
+  assert.equal(factory.recovery, undefined);
+  transaction.deliverAbort();
+  factory.stallAbort = false;
+  assert.equal(await finishRecoveryRead(store, factory), null);
+  await finishRecoverySave(store, factory, new Blob(["reconciled"]));
+  assert.equal(await factory.recovery.blob.text(), "reconciled");
+});
+
+test("a recovery read arriving after its deadline cannot adopt legacy write authority", async () => {
+  const factory = new IndexedDbEvents(record()), clock = new StorageClock();
+  const legacy = { schema: "scriptbots.browser-recovery.v1", tick: source().tick,
+    savedAt: SAVED_AT, blob: new Blob(["legacy"]), source: source() };
+  factory.recovery = legacy;
+  const store = new BrowserContinuationStore(16, factory, clock.options());
+  const refused = assert.rejects(store.readRecovery(), timeoutIs("unconfirmed"));
+  const transaction = await factory.nextTransaction();
+  clock.advance(10, false); // Native request delivery wins the race with the timer callback.
+  transaction.succeed();
+  await refused;
+  assert.equal(factory.recovery, legacy);
+  assert.equal(Object.hasOwn(legacy, "writeToken"), false);
+  assert.equal(transaction.candidates.size, 0);
+  assert.equal(store.recoveryObserved, false);
+});
+
+test("a commit racing the deadline remains unconfirmed and requires explicit recovery reread", async () => {
+  for (const timerFirst of [false, true]) {
+    const factory = new IndexedDbEvents(record()), clock = new StorageClock();
+    const store = new BrowserContinuationStore(16, factory, clock.options());
+    await finishRecoveryRead(store, factory);
+    const refused = assert.rejects(store.saveRecovery(new Blob(["committed"]), source(), { savedAt: SAVED_AT }),
+      (error) => timeoutIs("unconfirmed")(error) && error.recoveryObservationRequired
+        && !error.message.includes("unchanged"));
+    const transaction = await factory.nextTransaction();
+    transaction.succeed();
+    // Model the commit boundary having passed before the completion event is delivered.
+    transaction.abort = () => { throw new DOMException("Already committing", "InvalidStateError"); };
+    clock.advance(10, false);
+    if (timerFirst) clock.fire();
+    transaction.complete();
+    await refused;
+    assert.equal(await factory.recovery.blob.text(), "committed", "timeout cannot promise the previous bytes survived");
+    assert.equal(store.recoveryObserved, false, "a late completion cannot grant replacement authority");
+    const opens = factory.opens;
+    await assert.rejects(store.saveRecovery(new Blob(["retry"]), source()), codeIs("unobserved"));
+    assert.equal(factory.opens, opens, "uncertain writes are not retried under a new identity");
+    assert.equal(await finishRecoveryRead(store, factory), factory.recovery);
+    assert.equal(store.recoveryObserved, true);
+    assert.equal(clock.timers.size, 0);
+  }
+});
+
+test("recovery deadlines release the controller and latch until explicit reconciliation", async () => {
+  const factory = new IndexedDbEvents(record()), clock = new StorageClock();
+  const store = new BrowserContinuationStore(16, factory, clock.options()), saved = [];
+  await finishRecoveryRead(store, factory);
+  let captures = 0;
+  const controller = new BrowserRecoveryController(store, { now: () => clock.time,
+    intervalMs: 20, onSaved: (value) => saved.push(value) });
+  controller.attach({});
+  controller.setEnabled(true);
+  const poll = () => controller.poll(source, () => { captures += 1; return new Blob(["world"]); });
+  const pending = poll();
+  await factory.nextTransaction();
+  clock.advance(10);
+  assert.equal(await pending, false);
+  assert.equal(controller.pending, false);
+  assert.equal(controller.error.code, "timeout");
+  assert.equal(controller.error.recoveryObservationRequired, true);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    clock.advance(100);
+    assert.equal(await poll(), false);
+  }
+  assert.equal(captures, 1);
+  assert.deepEqual(saved, []);
+  await finishRecoveryRead(store, factory);
+  controller.retry();
+  const resumed = poll(), transaction = await factory.nextTransaction();
+  transaction.succeed();
+  transaction.complete();
+  assert.equal(await resumed, true);
+  assert.equal(captures, 2);
+  assert.equal(saved.length, 1);
 });

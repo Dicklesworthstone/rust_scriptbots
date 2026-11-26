@@ -11,6 +11,7 @@ const RECOVERY_SLOT = "recovery";
 const RECOVERY_SCHEMA = "scriptbots.browser-recovery.v1";
 const SOURCE_FIELDS = ["sessionId", "scientificRevision", "controlRevision", "configRevision", "tick"];
 const WRITE_TOKEN = /^[0-9a-f]{32}$/;
+const OPERATION_TIMEOUT_MS = 10_000;
 
 function newWriteToken() {
   if (typeof globalThis.crypto?.getRandomValues !== "function") {
@@ -65,18 +66,35 @@ export class BrowserContinuationStore {
   #maxBytes;
   #factory;
   #busy = false;
+  // A deadline releases its caller, not an unsettled native transaction.
+  // Retain this fence until an actual complete/abort event retires its work.
+  #unsettledTransaction = null;
+  #timeoutMs;
+  #now;
+  #setTimer;
+  #clearTimer;
   #blockedOpen = false;
   #opening = null;
   // Undefined is unobserved, null is an observed empty slot. Only a completed
   // read or write establishes authority to replace the shared recovery slot.
   #recoveryToken;
 
-  constructor(maxBytes, factory) {
+  constructor(maxBytes, factory, { timeoutMs = OPERATION_TIMEOUT_MS,
+    now = () => performance.now(), setTimer = (callback, delay) => setTimeout(callback, delay),
+    clearTimer = (timer) => clearTimeout(timer) } = {}) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
       throw new ContinuationStoreError("bounds", "The owner checkpoint size limit is invalid.");
     }
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647
+        || typeof now !== "function" || typeof setTimer !== "function" || typeof clearTimer !== "function") {
+      throw new ContinuationStoreError("bounds", "The browser storage operation deadline is invalid.");
+    }
     this.#maxBytes = maxBytes;
     this.#factory = factory;
+    this.#timeoutMs = timeoutMs;
+    this.#now = now;
+    this.#setTimer = setTimer;
+    this.#clearTimer = clearTimer;
   }
 
   get recoveryObserved() { return this.#recoveryToken !== undefined; }
@@ -150,7 +168,7 @@ export class BrowserContinuationStore {
         request(store.put(adopted, RECOVERY_SLOT), () => adopted);
         return undefined;
       });
-    }, signal);
+    }, signal, true);
     this.#recoveryToken = record === null ? null : record.writeToken;
     return record;
   }
@@ -174,7 +192,7 @@ export class BrowserContinuationStore {
       }
       if (current !== undefined) this.#validateRecovery(current);
       request(store.put(record, RECOVERY_SLOT));
-    }), signal);
+    }), signal, true);
     this.#recoveryToken = record.writeToken;
     return { tick: record.tick, savedAt: record.savedAt, byteLength: record.blob.size, source };
   }
@@ -192,7 +210,8 @@ export class BrowserContinuationStore {
         signal?.removeEventListener("abort", cancel);
         callback(value);
       };
-      const cancel = () => finish(reject, storageError(new DOMException("Recovery cancelled while opening storage", "AbortError")));
+      const cancel = () => finish(reject, storageError(signal?.reason instanceof ContinuationStoreError
+        ? signal.reason : new DOMException("Recovery cancelled while opening storage", "AbortError")));
       const waiter = { resolve: (value) => finish(resolve, value), reject: (error) => finish(reject, error) };
       opening.waiters.add(waiter);
       signal?.addEventListener("abort", cancel, { once: true });
@@ -249,42 +268,104 @@ export class BrowserContinuationStore {
     });
   }
 
-  async #transaction(mode, operation, signal) {
+  async #transaction(mode, operation, signal, recoveryWrite = false) {
     if (signal?.aborted) throw storageError(new DOMException("Recovery cancelled", "AbortError"));
     if (this.#busy) throw new ContinuationStoreError("busy", "A browser continuation operation is already in progress.");
+    if (this.#unsettledTransaction) {
+      throw new ContinuationStoreError("busy", "A previous browser storage transaction is still settling; wait before retrying.");
+    }
     if (this.#blockedOpen) throw new ContinuationStoreError("blocked", "Browser storage is still blocked by another tab; close that tab and retry.");
+    const deadline = this.#now() + this.#timeoutMs;
+    if (!Number.isFinite(deadline)) throw new ContinuationStoreError("bounds", "The browser storage clock is unavailable.");
     this.#busy = true;
     let database;
+    let transaction;
+    let transactionOutcome = null;
+    let timer;
+    let failure;
+    let timeoutError;
+    let rejectActive;
+    const budgetAbort = new AbortController();
+    const abortTransaction = () => {
+      if (!transaction || transactionOutcome !== null) return;
+      // abort() can lose a race with commit. Its terminal event, not this call,
+      // releases the native-work fence and establishes whether a write finished.
+      try { transaction.abort(); } catch (_) { /* Await the actual outcome. */ }
+    };
+    const timeout = () => {
+      if (timeoutError) return timeoutError;
+      const uncertainWrite = transaction !== undefined && mode === "readwrite" && transactionOutcome !== "aborted";
+      timeoutError = new ContinuationStoreError("timeout", uncertainWrite
+        ? "Browser storage timed out; the write outcome is unconfirmed. Read the saved checkpoint before retrying."
+        : transaction === undefined
+          ? "Browser storage timed out before a transaction began; no checkpoint was changed."
+          : "Browser storage timed out; no checkpoint write completed.");
+      timeoutError.outcome = uncertainWrite ? "unconfirmed" : "not_written";
+      timeoutError.recoveryObservationRequired = recoveryWrite && uncertainWrite;
+      if (timeoutError.recoveryObservationRequired) this.#recoveryToken = undefined;
+      failure = timeoutError;
+      budgetAbort.abort(timeoutError);
+      abortTransaction();
+      // Do not wait indefinitely for an abort event. Further work remains
+      // fenced until IndexedDB reports that this transaction actually ended.
+      rejectActive?.(timeoutError);
+      return timeoutError;
+    };
+    const expired = () => {
+      if (timeoutError) return true;
+      if (this.#now() < deadline) return false;
+      timeout();
+      return true;
+    };
+    const cancel = () => {
+      if (timeoutError) return;
+      failure = new DOMException("Recovery cancelled because its owner or selection changed", "AbortError");
+      budgetAbort.abort(failure);
+      abortTransaction();
+    };
     try {
-      database = await this.#open(signal);
-      if (signal?.aborted) throw new DOMException("Recovery cancelled", "AbortError");
+      timer = this.#setTimer(timeout, Math.max(0, deadline - this.#now()));
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
+      if (expired()) throw timeoutError;
+      if (budgetAbort.signal.aborted) throw failure;
+      database = await this.#open(budgetAbort.signal);
+      if (expired()) throw timeoutError;
+      if (signal?.aborted) throw failure;
       return await new Promise((resolve, reject) => {
-        let transaction;
         let lastRequest;
         let result;
-        let failure;
-        const cancel = () => {
-          failure = new DOMException("Recovery cancelled because its owner or selection changed", "AbortError");
-          // Once commit completed, cancellation cannot undo it. The controller
-          // still suppresses an acknowledgement for a replaced owner.
-          try { transaction?.abort(); } catch (_) { /* Already committed or aborted. */ }
-        };
+        let settled = false;
         const settle = (callback, value) => {
-          signal?.removeEventListener("abort", cancel);
+          if (settled) return;
+          settled = true;
           callback(value);
+        };
+        rejectActive = (error) => settle(reject, error);
+        const finished = (outcome) => {
+          transactionOutcome = outcome;
+          if (this.#unsettledTransaction === transaction) this.#unsettledTransaction = null;
         };
         try {
           transaction = database.transaction(STORE, mode);
-          transaction.onabort = () => settle(reject, storageError(failure || transaction.error
-            || new DOMException("Transaction aborted", "AbortError")));
-          transaction.onerror = () => { failure ||= transaction.error || lastRequest?.error; };
+          this.#unsettledTransaction = transaction;
+          transaction.onabort = () => {
+            finished("aborted");
+            if (settled || expired()) return;
+            settle(reject, storageError(failure || transaction.error || new DOMException("Transaction aborted", "AbortError")));
+          };
+          transaction.onerror = () => { if (!settled) failure ||= transaction.error || lastRequest?.error; };
           // A request can succeed and its transaction still fail at commit.
-          // Only the transaction's complete event acknowledges a saved record.
-          transaction.oncomplete = () => settle(resolve, result);
-          signal?.addEventListener("abort", cancel, { once: true });
+          // Completion after the original deadline cannot acknowledge success.
+          transaction.oncomplete = () => {
+            finished("committed");
+            if (settled || expired()) return;
+            settle(resolve, result);
+          };
           const request = (next, observe = (value) => value) => {
             lastRequest = next;
             next.onsuccess = () => {
+              if (settled || transactionOutcome !== null || expired() || budgetAbort.signal.aborted) return;
               try {
                 result = observe(next.result);
               } catch (error) {
@@ -292,8 +373,9 @@ export class BrowserContinuationStore {
                 try { transaction.abort(); } catch (_) { settle(reject, storageError(error)); }
               }
             };
-            next.onerror = () => { failure = next.error; };
+            next.onerror = () => { if (!settled) failure = next.error; };
           };
+          if (expired()) return;
           operation(transaction.objectStore(STORE), request);
         } catch (error) {
           failure = error;
@@ -303,8 +385,10 @@ export class BrowserContinuationStore {
         }
       });
     } catch (error) {
-      throw storageError(error);
+      throw storageError(timeoutError || error);
     } finally {
+      this.#clearTimer(timer);
+      signal?.removeEventListener("abort", cancel);
       database?.close();
       this.#busy = false;
     }

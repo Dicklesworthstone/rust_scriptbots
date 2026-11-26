@@ -1258,7 +1258,8 @@ function updateCheckpointControls() {
 function renderRecoveryControls() {
   const busy = browserStorePending || checkpointLoadPending;
   const conflict = browserRecovery?.error?.code === "conflict";
-  const unobserved = browserRecovery?.error?.code === "unobserved";
+  const unobserved = browserRecovery?.error?.code === "unobserved"
+    || browserRecovery?.error?.recoveryObservationRequired === true;
   if (recoveryEnabled) {
     recoveryEnabled.checked = browserRecovery?.enabled === true;
     recoveryEnabled.disabled = !browserRecovery || remoteMode || !localOwnerAllowsCommands() || activeBrainPreset === "wander" || busy;
@@ -2513,7 +2514,8 @@ recoveryEnabled?.addEventListener("change", () => {
 recoveryRetryButton?.addEventListener("click", async () => {
   if (!browserRecovery?.enabled || !browserRecovery.error || remoteMode || browserStorePending
       || checkpointLoadPending || browserRecovery.pending) return;
-  if (!["conflict", "unobserved"].includes(browserRecovery.error.code)) {
+  if (!["conflict", "unobserved"].includes(browserRecovery.error.code)
+      && !browserRecovery.error.recoveryObservationRequired) {
     // A quota/abort retry retains its original comparison. It must not silently
     // authorize replacing a newer checkpoint saved by another tab meanwhile.
     recoveryReadStatus = "";
