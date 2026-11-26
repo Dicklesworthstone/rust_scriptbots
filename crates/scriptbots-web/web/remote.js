@@ -172,6 +172,262 @@ function labIdentifier(value) {
   return value;
 }
 
+export const STEP_BATCH_LIMITS = Object.freeze({ count: 100000, page: 16, bytes: 9 * 1024 });
+
+function stepBatchIdentifier(value) {
+  if (typeof value !== "string" || !value || encoder.encode(value).length > 64) {
+    throw new Error("Invalid bounded step batch identity");
+  }
+  return value;
+}
+
+function stepBatchCount(value) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > STEP_BATCH_LIMITS.count) {
+    throw new Error("Choose a whole number of steps from 1 to 100,000");
+  }
+  return value;
+}
+
+/** A bounded receipt page identifies one retained batch, never a replacement run. */
+export function validateRemoteStepBatch(value, { sessionId, batchId, count } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid step batch response");
+  stepBatchIdentifier(value.batch_id);
+  decimal(value.session_id);
+  if (value.session_id !== sessionId || (batchId !== undefined && value.batch_id !== batchId)) {
+    throw new Error("Step batch response belongs to another batch or owner");
+  }
+  stepBatchCount(value.requested_count);
+  if (count !== undefined && value.requested_count !== count) throw new Error("Step batch count changed");
+  for (const field of ["attempted_count", "admitted_count", "applied_count", "settled_count", "offset"]) {
+    if (!Number.isSafeInteger(value[field]) || value[field] < 0 || value[field] > value.requested_count) {
+      throw new Error("Invalid bounded step batch progress");
+    }
+  }
+  if ([value.admitted_count, value.applied_count, value.settled_count].some((n) => n > value.attempted_count)
+      || !["reserved", "ready", "waiting", "indeterminate", "stopped", "complete"].includes(value.phase)
+      || typeof value.advancing !== "boolean" || !Array.isArray(value.entries) || value.entries.length > STEP_BATCH_LIMITS.page) {
+    throw new Error("Invalid step batch outcome");
+  }
+  if (value.phase === "complete" && (value.applied_count !== value.requested_count
+      || value.settled_count !== value.requested_count)) throw new Error("Step batch completion lacks settled applied steps");
+  if (value.blocking_index != null && (!Number.isSafeInteger(value.blocking_index)
+      || value.blocking_index < 0 || value.blocking_index >= value.attempted_count)) {
+    throw new Error("Invalid step batch blocking entry");
+  }
+  if (value.next_offset != null && (!Number.isSafeInteger(value.next_offset)
+      || value.next_offset !== value.offset + value.entries.length || value.next_offset <= value.offset
+      || value.next_offset >= value.attempted_count)) throw new Error("Invalid step batch page cursor");
+  const failure = (detail) => {
+    if (detail != null && (typeof detail.code !== "string" || encoder.encode(detail.code).length > 128
+        || typeof detail.message !== "string" || encoder.encode(detail.message).length > 512
+        || typeof detail.diagnostic_truncated !== "boolean")) throw new Error("Invalid step batch diagnostic");
+  };
+  for (let i = 0; i < value.entries.length; i++) {
+    const entry = value.entries[i];
+    if (!entry || entry.index !== value.offset + i || entry.index >= value.attempted_count
+        || typeof entry.command_id !== "string" || !entry.command_id || encoder.encode(entry.command_id).length > 128
+        || !["in_flight", "not_admitted", "observed", "indeterminate"].includes(entry.submission_state)) {
+      throw new Error("Invalid step batch receipt entry");
+    }
+    failure(entry.observation_error);
+    if (entry.submission_state === "not_admitted" && (entry.receipt != null || entry.observation_error == null)) {
+      throw new Error("A refused step admission must preserve its reason without inventing a receipt");
+    }
+    if (entry.receipt != null) {
+      const receipt = entry.receipt;
+      if (receipt.command_id !== entry.command_id
+          || !["admitted", "applied", "rejected", "failed"].includes(receipt.application_state)
+          || !["not_required", "pending", "committed_volatile", "durable", "failed"].includes(receipt.journal_state)) {
+        throw new Error("Step batch receipt does not identify its attempted command");
+      }
+      failure(receipt.application_failure);
+      failure(receipt.journal_failure);
+    }
+  }
+  const page = structuredClone(value);
+  for (const entry of page.entries) {
+    if (entry.observation_error) Object.freeze(entry.observation_error);
+    if (entry.receipt) {
+      if (entry.receipt.application_failure) Object.freeze(entry.receipt.application_failure);
+      if (entry.receipt.journal_failure) Object.freeze(entry.receipt.journal_failure);
+      Object.freeze(entry.receipt);
+    }
+    Object.freeze(entry);
+  }
+  Object.freeze(page.entries);
+  return Object.freeze(page);
+}
+
+function waitForStepBatch(milliseconds, signal) {
+  return new Promise((resolve) => {
+    const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); };
+    const timer = setTimeout(finish, milliseconds);
+    signal.addEventListener("abort", finish, { once: true });
+    if (signal.aborted) finish();
+  });
+}
+
+/** Explicit continuation retains creation identity and never guesses a missing admission. */
+export class RemoteStepBatchController {
+  constructor({ getClient, canAdvance = () => true, onChange = () => {}, now = () => performance.now(), wait = waitForStepBatch }) {
+    this.getClient = getClient;
+    this.canAdvance = canAdvance;
+    this.onChange = onChange;
+    this.now = now;
+    this.wait = wait;
+    this.source = null;
+    this.creation = null;
+    this.batchId = null;
+    this.page = null;
+    this.pending = null;
+    this.missing = false;
+    this.notice = "Run a bounded number of steps on the connected server, or open a retained batch ID.";
+  }
+
+  get terminal() { return ["complete", "stopped"].includes(this.page?.phase); }
+  get canStart() { return !this.pending && (!this.source || this.terminal); }
+  get connected() {
+    const client = this.getClient();
+    return !!this.source && client?.state === "connected" && client.url === this.source.url
+      && client.tracker.sessionId === this.source.sessionId;
+  }
+
+  client() {
+    if (!this.connected) throw new Error("Reconnect to this batch's original server and session before continuing");
+    return this.getClient();
+  }
+
+  attach() {
+    const client = this.getClient();
+    if (client?.state !== "connected" || !client.tracker.sessionId) throw new Error("Connect to a server before selecting a batch");
+    this.source = Object.freeze({ url: client.url, sessionId: client.tracker.sessionId });
+  }
+
+  accept(value) {
+    const page = validateRemoteStepBatch(value, { sessionId: this.source.sessionId,
+      batchId: this.batchId ?? undefined, count: this.creation?.count });
+    this.batchId = page.batch_id;
+    this.page = page;
+    this.missing = false;
+    this.onChange(this); // Expose the retained ID before the first advance request.
+    return page;
+  }
+
+  async execute(operation, { continuation = false } = {}) {
+    if (this.pending) throw new Error("A batch request is already pending");
+    const pending = { abort: new AbortController(), reason: null, continuation };
+    this.pending = pending;
+    this.onChange(this);
+    try {
+      await operation(pending.abort.signal);
+      return true;
+    } catch (error) {
+      this.missing = error instanceof RemoteOwnerHttpError && error.status === 404 && !!this.batchId;
+      this.notice = pending.reason ?? (this.missing
+        ? "This server has no retained record for this batch ID. Its earlier outcome is unknown; no replacement batch was created."
+        : `Batch outcome could not be confirmed: ${error.message || error}. Refresh or resume the same request.`);
+      return false;
+    } finally {
+      this.pending = null;
+      this.onChange(this);
+    }
+  }
+
+  async start(count) {
+    stepBatchCount(count);
+    if (!this.canStart) throw new Error("Resolve the retained batch before starting another one");
+    if (!this.canAdvance()) throw new Error("Return to the live, healthy owner before running a batch");
+    const creation = Object.freeze({ count, idempotency_key: uniqueRequestId("step-batch") });
+    this.attach();
+    this.creation = creation;
+    this.batchId = null;
+    this.page = null;
+    this.missing = false;
+    return this.execute(async (signal) => {
+      this.notice = "Reserving the batch; no steps have been requested yet.";
+      this.accept(await this.client().createStepBatch(this.creation, { sessionId: this.source.sessionId, signal }));
+      await this.advance(signal);
+    }, { continuation: true });
+  }
+
+  async open(batchId) {
+    stepBatchIdentifier(batchId);
+    if (this.pending) throw new Error("Wait for the current batch request before opening another ID");
+    this.attach();
+    this.creation = null;
+    this.batchId = batchId;
+    this.page = null;
+    this.missing = false;
+    return this.refresh(0);
+  }
+
+  clearReference() {
+    if (this.pending) throw new Error("Wait for the pending batch request before clearing its reference");
+    const previousId = this.batchId;
+    this.source = null;
+    this.creation = null;
+    this.batchId = null;
+    this.page = null;
+    this.missing = false;
+    this.notice = `Cleared the local batch reference${previousId ? ` to ${previousId}` : ""}. Earlier server work is unchanged; no step was cancelled, submitted or retried.`;
+    this.onChange(this);
+  }
+
+  async refresh(offset = this.page?.offset ?? 0) {
+    if (!this.batchId) throw new Error("Resume the unchanged creation request to recover its batch ID");
+    return this.execute(async (signal) => {
+      this.accept(await this.client().stepBatchStatus(this.batchId, { sessionId: this.source.sessionId, offset, signal }));
+      this.notice = "Read the retained batch outcome. Reading never submits another step.";
+    });
+  }
+
+  async resume() {
+    if (!this.source) throw new Error("Choose a batch before resuming");
+    return this.execute(async (signal) => {
+      const client = this.client();
+      const options = { sessionId: this.source.sessionId, signal };
+      this.accept(this.batchId ? await client.stepBatchStatus(this.batchId, options)
+        : await client.createStepBatch(this.creation, options));
+      await this.advance(signal);
+    }, { continuation: true });
+  }
+
+  async advance(signal) {
+    const deadline = this.now() + 10000;
+    let calls = 0;
+    while (!signal.aborted && !this.terminal && this.page?.phase !== "indeterminate"
+        && this.now() < deadline && calls < 100) {
+      if (!this.canAdvance()) {
+        this.notice = "Batch continuation is paused. Return to the live, healthy owner, then resume explicitly.";
+        return;
+      }
+      this.notice = "Advancing the retained batch; each request admits a bounded number of steps.";
+      this.accept(await this.client().advanceStepBatch(this.batchId, { sessionId: this.source.sessionId, signal }));
+      calls += 1;
+      if (!this.terminal && this.page.phase !== "indeterminate") await this.wait(100, signal);
+    }
+    if (signal.aborted) return;
+    this.notice = this.page?.phase === "complete" ? "All requested steps applied and their journal outcomes settled. See each receipt for its durability."
+      : this.page?.phase === "stopped" ? "The batch stopped at a known command or journal failure. Earlier applied steps remain applied."
+        : this.page?.phase === "indeterminate" ? "An attempted step has an unconfirmed outcome. Refresh its receipt; no later steps will be submitted while it is unknown."
+          : "This continuation window finished. Resume the same batch to request further steps.";
+  }
+
+  syncAuthority() {
+    if (this.pending?.continuation && (!this.connected || !this.canAdvance())) {
+      this.pause("Batch continuation paused because its live owner is unavailable or the view changed. Refresh the retained outcome before resuming.");
+    }
+  }
+
+  pause(reason = "Batch continuation paused. Refresh any outstanding outcome before resuming.") {
+    if (!this.pending || this.pending.abort.signal.aborted) return;
+    this.pending.reason = reason;
+    this.pending.abort.abort();
+    this.notice = reason;
+    this.onChange(this);
+  }
+}
+
 function experimentIdentifier(value) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(value) || value === "." || value.includes("..")) {
     throw new Error("Invalid bounded experiment identity");
@@ -531,6 +787,42 @@ export class RemoteStreamClient {
     }
     return this.readInspection("genome", 65536, uid, { sessionId, epoch, signal,
       query: { locus_offset: String(locusOffset), delta_offset: String(deltaOffset) } });
+  }
+
+  /** Creation reserves identity only. An uncertain retry must keep this exact key/count. */
+  async createStepBatch(request, { sessionId, signal } = {}) {
+    stepBatchCount(request?.count);
+    if (request.idempotency_key !== undefined && (typeof request.idempotency_key !== "string"
+        || !request.idempotency_key.trim() || encoder.encode(request.idempotency_key).length > 1024)) {
+      throw new Error("Invalid step batch creation key");
+    }
+    const body = JSON.stringify({ count: request.count, ...(request.idempotency_key === undefined
+      ? {} : { idempotency_key: request.idempotency_key }) });
+    if (encoder.encode(body).length > 16384) throw new Error("Step batch creation exceeds its 16 KiB request bound");
+    const page = await this.labJson("/api/control/step-batches", sessionId, STEP_BATCH_LIMITS.bytes,
+      { signal, method: "POST", body, timeoutMs: 2000 });
+    return validateRemoteStepBatch(page, { sessionId, count: request.count });
+  }
+
+  async advanceStepBatch(batchId, { sessionId, signal } = {}) {
+    stepBatchIdentifier(batchId);
+    const page = await this.labJson(`/api/control/step-batches/${encodeURIComponent(batchId)}/advance`,
+      sessionId, STEP_BATCH_LIMITS.bytes, { signal, method: "POST", timeoutMs: 2000 });
+    return validateRemoteStepBatch(page, { sessionId, batchId });
+  }
+
+  async stepBatchStatus(batchId, { sessionId, offset = 0, limit = STEP_BATCH_LIMITS.page, signal } = {}) {
+    stepBatchIdentifier(batchId);
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > STEP_BATCH_LIMITS.count
+        || !Number.isSafeInteger(limit) || limit < 1 || limit > STEP_BATCH_LIMITS.page) {
+      throw new Error("Invalid bounded step batch receipt page");
+    }
+    const page = await this.labJson(`/api/control/step-batches/${encodeURIComponent(batchId)}`,
+      sessionId, STEP_BATCH_LIMITS.bytes,
+      { signal, query: { offset: String(offset), limit: String(limit) }, timeoutMs: 2000 });
+    const result = validateRemoteStepBatch(page, { sessionId, batchId });
+    if (result.offset !== offset || result.entries.length > limit) throw new Error("Step batch returned another receipt page");
+    return result;
   }
 
   /** Stage or explicitly retry the same source-bound request through the canonical owner. */
