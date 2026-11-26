@@ -26,6 +26,12 @@ use scriptbots_runtime::{
 };
 use smallvec::SmallVec;
 
+mod step_batches;
+pub use step_batches::{
+    MAX_STEP_BATCH_ID_BYTES, MAX_STEP_BATCH_PAGE_BYTES, MAX_STEP_BATCH_PAGE_SIZE, StepBatchDto,
+    StepBatchEntryDto, StepBatchPhase, StepBatchSubmissionState,
+};
+
 /// Snapshot of configuration state returned to external clients.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ConfigSnapshot {
@@ -314,6 +320,8 @@ pub struct KnobUpdate {
 /// Errors produced by the control domain when mutating configuration.
 #[derive(Debug, Error)]
 pub enum ControlError {
+    #[error("step batch reservation capacity exhausted: {0}")]
+    StepBatchCapacity(String),
     #[error("experiment execution capacity exhausted: {0}")]
     ExperimentCapacity(String),
     #[error("an experiment comparison is already running; retry after it completes")]
@@ -455,11 +463,15 @@ pub struct CommandFailureDto {
 }
 
 impl CommandFailureDto {
+    pub const MAX_CODE_BYTES: usize = 128;
+    pub const MAX_MESSAGE_BYTES: usize = 512;
+
     fn from_diagnostic(code: &str, message: &str) -> Self {
         // Two failures plus the WebSocket envelope and a 1024-byte request ID
         // fit its 16 KiB ceiling even under worst-case JSON escaping.
-        let (code, code_truncated) = bounded_owner_diagnostic(code, 128);
-        let (message, message_truncated) = bounded_owner_diagnostic(message, 512);
+        let (code, code_truncated) = bounded_owner_diagnostic(code, Self::MAX_CODE_BYTES);
+        let (message, message_truncated) =
+            bounded_owner_diagnostic(message, Self::MAX_MESSAGE_BYTES);
         Self {
             code,
             message,
@@ -576,7 +588,7 @@ pub struct MapApplyRequestBody {
     pub idempotency_key: Option<String>,
 }
 
-/// Largest step batch a single control request may submit.
+/// Largest step plan a control service may reserve without executing it.
 pub const MAX_STEP_BATCH: u64 = 100_000;
 /// Largest procedural map (in cells) a single generate request may build.
 pub const MAX_GENERATED_MAP_CELLS: u64 = 4096 * 4096;
@@ -5246,6 +5258,7 @@ pub struct ControlHandle {
     knobs_cache: KnobsCache,
     command_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     command_namespace: u64,
+    step_batches: Arc<step_batches::StepBatchRegistry>,
     database_path: Option<std::path::PathBuf>,
     checkpoint_writer: Option<scriptbots_storage::StorageCheckpointWriter>,
     data_services: std::sync::Arc<DataServices>,
@@ -5272,6 +5285,7 @@ impl ControlHandle {
             knobs_cache: std::sync::Arc::new(Mutex::new(None)),
             command_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             command_namespace: allocate_control_command_namespace(),
+            step_batches: Arc::new(step_batches::StepBatchRegistry::default()),
             database_path: None,
             checkpoint_writer: None,
             data_services: std::sync::Arc::new(DataServices::default()),
@@ -8616,19 +8630,16 @@ impl ControlHandle {
         )
     }
 
-    /// Enqueue step commands for the simulation driver to advance `count` ticks.
+    /// Submit one step with the owner's existing retry identity.
     ///
-    /// A single step shares the host's retry identity across transports. A batch
-    /// still contains independent commands and returns only the last receipt;
-    /// refuse a keyed batch rather than silently discard its retry guarantee.
+    /// Multi-step execution must reserve a retained batch and then advance its
+    /// exact identity. Returning only the final command receipt loses partial
+    /// admissions, so this entry point refuses larger counts before any science.
     pub fn step_count(
         &self,
         count: u64,
         idempotency_key: Option<&str>,
     ) -> Result<CommandStatusDto, ControlError> {
-        // Each step is a separately journalled command submitted in a loop, so an
-        // unbounded request count (e.g. u64::MAX) would pin a worker thread forever and
-        // grow the command journal without limit.
         if count > MAX_STEP_BATCH {
             return Err(ControlError::InvalidPatch(format!(
                 "step count {count} exceeds the per-request limit of {MAX_STEP_BATCH}"
@@ -8642,17 +8653,10 @@ impl ControlHandle {
         if count == 1 {
             return self.submit_control_command_with_key(ControlCommand::Step, idempotency_key);
         }
-        if idempotency_key.is_some() {
-            return Err(ControlError::InvalidPatch(
-                "idempotency keys require count=1; submit individually keyed steps for retryable batches"
-                    .to_owned(),
-            ));
-        }
-        let mut last_status = None;
-        for _ in 0..count {
-            last_status = Some(self.submit_control_command(ControlCommand::Step)?);
-        }
-        Ok(last_status.expect("at least one iteration"))
+        Err(ControlError::InvalidPatch(
+            "count > 1 requires a retained step batch: reserve with /api/control/step-batches, retain its batch_id, then advance that exact identity"
+                .to_owned(),
+        ))
     }
 
     /// Read current status without waiting for a busy world owner.
