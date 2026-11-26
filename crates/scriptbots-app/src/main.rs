@@ -722,6 +722,7 @@ fn main() -> Result<()> {
                 ticks,
                 cli.brain,
                 founder_recipe_of(&launch_scenario)?,
+                &launch_scenario.interventions,
             )?;
         }
         if let Some(ticks) = cli.profile_storage_steps {
@@ -6389,11 +6390,31 @@ fn run_headless_simulation_from_checkpoint(
     })
 }
 
+fn step_profile_world(
+    world: &mut WorldState,
+    persistence: &mut PersistenceAdmissionSession,
+    tick_limit: u64,
+    interventions: &[ScenarioInterventionV1],
+) -> Result<()> {
+    // apply_scenario_interventions resolves against the live world. The JSON
+    // output is updated only at a scheduled boundary.
+    let mut current_config = JsonValue::Null;
+    for _ in 0..tick_limit {
+        if !interventions.is_empty() {
+            let boundary = world.tick().0;
+            apply_scenario_interventions(world, &mut current_config, interventions, boundary)?;
+        }
+        persistence.step(world)?;
+    }
+    Ok(())
+}
+
 fn profile_world_steps(
     config: &ScriptBotsConfig,
     tick_limit: u64,
     brain_preset: BrainPreset,
     founders: FounderRecipe,
+    interventions: &[ScenarioInterventionV1],
 ) -> Result<()> {
     let (collector, _handle) = ReplayCollector::new();
     let (mut world, mut persistence) =
@@ -6403,12 +6424,7 @@ fn profile_world_steps(
 
     emit_sense_startup_contract();
     let start = Instant::now();
-    let result = (|| -> Result<()> {
-        for _ in 0..tick_limit {
-            persistence.step(&mut world)?;
-        }
-        Ok(())
-    })();
+    let result = step_profile_world(&mut world, &mut persistence, tick_limit, interventions);
     emit_sense_run_end(SenseRunSummary::capture(&world), result.is_ok());
     result?;
     let elapsed = start.elapsed();
@@ -6524,12 +6540,12 @@ fn profile_world_steps_with_storage(
     };
     emit_sense_startup_contract();
     let start = Instant::now();
-    let profile_result = (|| -> Result<()> {
-        for _ in 0..tick_limit {
-            persistence.step(&mut world)?;
-        }
-        Ok(())
-    })();
+    let profile_result = step_profile_world(
+        &mut world,
+        &mut persistence,
+        tick_limit,
+        &manifest.scenario.interventions,
+    );
     let result = finish_with_storage(profile_result, "storage profiling", || {
         let finalization = finalize_world_persistence(&mut world, &mut persistence);
         finalize_then_shutdown_storage(finalization, &mut pipeline)

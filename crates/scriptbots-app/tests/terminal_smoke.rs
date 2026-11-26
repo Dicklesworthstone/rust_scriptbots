@@ -233,6 +233,7 @@ fn schedule_reference(
             "epoch": world.epoch(),
             "agent_count": world.agents().len(),
             "spike_hits": world.last_spike_hits(),
+            "average_energy": f64::from(world.history().next_back().unwrap().average_energy),
         }));
         digests.push(world.world_digest_v1().expect("reference boundary digest"));
     }
@@ -470,6 +471,52 @@ fn headless_scenario_schedule_matches_manual_science_across_bootstrap() {
         );
     }
     assert_scheduled_patch_logs(&stderr);
+}
+
+#[test]
+fn storage_profile_records_the_science_in_its_scenario_manifest() {
+    let directory = tempdir().unwrap();
+    let scenario = directory.path().join("scheduled.scenario.toml");
+    write_unsorted_schedule(&scenario);
+    let database = directory.path().join("profile.sqlite");
+    let output = headless_command()
+        .env("SCRIPTBOTS_STORAGE_PATH", &database)
+        .arg("--scenario")
+        .arg(&scenario)
+        .args(["--brain", "mlp", "--profile-storage-steps", "5", "--storage", "file"])
+        .output()
+        .expect("run storage profile");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let reader = scriptbots_storage::StorageReader::open_finished(database.to_str().unwrap()).unwrap();
+    assert_eq!(reader.run_manifest().unwrap().scenario_id, "bootstrap-schedule-parity");
+    let rows = reader.recent_ticks(5).unwrap();
+    let (frames, _) = schedule_reference(SchedulePerturbation::None, 4242);
+    assert_eq!(rows.len(), frames.len());
+    for (row, expected) in rows.iter().zip(frames) {
+        assert_eq!(Some(row.tick), expected["tick"].as_u64());
+        assert_eq!(Some(row.average_energy), expected["average_energy"].as_f64());
+    }
+}
+
+#[test]
+fn direct_profile_modes_stop_at_an_invalid_scheduled_treatment() {
+    let directory = tempdir().unwrap();
+    let scenario = directory.path().join("invalid.scenario.toml");
+    write_unsorted_schedule(&scenario);
+    let mut contents = fs::read_to_string(&scenario).unwrap();
+    contents.push_str("\n[[interventions]]\ntick = 2\nset = { food_cell_size = 0 }\n");
+    fs::write(&scenario, contents).unwrap();
+    for mode in ["--profile-steps", "--profile-storage-steps"] {
+        let output = headless_command()
+            .arg("--scenario")
+            .arg(&scenario)
+            .args(["--brain", "mlp", "--storage", "memory", mode, "5"])
+            .output()
+            .expect("run profile with refused intervention");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{mode}");
+        assert!(message.contains("intervention at tick 2 failed"), "{mode}: {message}");
+    }
 }
 
 #[test]
