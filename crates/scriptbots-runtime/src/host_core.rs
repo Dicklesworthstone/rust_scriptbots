@@ -21,10 +21,10 @@ use super::{
 };
 use arc_swap::ArcSwap;
 use scriptbots_core::{
-    ACTIVATION_CAPTURE_BUDGET, AgentUid, AppliedInterventionRecord, BrainInspectionClientId,
-    BrainInspectionError, BrainInspectionRequest, BrainInspectionRevision, CharacterizationError,
-    CompletedStepFault, ConfigAuditEntry, ControlCommand, ControlDisposition, DynamicAgentSnapshot,
-    DynamicAgentVisuals, DynamicWorldSnapshot, MigratingAgent, NullPersistence,
+    ACTIVATION_CAPTURE_BUDGET, AgentDebugInfo, AgentDebugQuery, AgentUid, AppliedInterventionRecord,
+    BrainInspectionClientId, BrainInspectionError, BrainInspectionRequest, BrainInspectionRevision,
+    CharacterizationError, CompletedStepFault, ConfigAuditEntry, ControlCommand, ControlDisposition,
+    DynamicAgentSnapshot, DynamicAgentVisuals, DynamicWorldSnapshot, MigratingAgent, NullPersistence,
     PersistenceAdmissionSession, PersistenceBatch, PersistenceCommitAuthority,
     PersistenceSessionError, ScientificStateError, ScriptBotsConfig, SelectionState, Tick,
     TickSummary, WorldDigestV1, WorldState, WorldStepTrace, WorldStepTracer, apply_control_command,
@@ -4739,6 +4739,16 @@ impl HostCore {
         uid: AgentUid,
     ) -> Result<Option<crate::channel::AgentInspectorData>, HostAccessError> {
         self.inspect_agent_with_attribution(uid, None, 0, false)
+    }
+
+    /// Read filtered debug rows from a completed scientific boundary.
+    /// An incomplete sensing transition cannot supply any rows, even for an empty query.
+    pub fn debug_agents(
+        &self,
+        query: AgentDebugQuery,
+    ) -> Result<Vec<AgentDebugInfo>, HostAccessError> {
+        self.ensure_complete_inspection_boundary()?;
+        Ok(self.world.agent_debug_view(query))
     }
 
     fn validate_inspector_request(
@@ -10484,6 +10494,7 @@ mod tests {
             assert!(core.inspect_brains(&request).is_ok());
             assert!(core.inspect_brain_activity(uid).is_ok());
             assert!(core.inspect_genome_page(uid, 0, 0).is_ok());
+            assert_eq!(core.debug_agents(AgentDebugQuery::default()).unwrap().len(), 1);
 
             core.world
                 .enqueue_intervention(scriptbots_core::Intervention::SetClosedWorld {
@@ -10527,6 +10538,26 @@ mod tests {
                 core.inspect_genome_page(uid, 0, 0),
                 Err(HostAccessError::ScientificState(error)) if error == fault
             ));
+            for query in [
+                AgentDebugQuery::default(),
+                AgentDebugQuery {
+                    ids: Some(Vec::new()),
+                    ..AgentDebugQuery::default()
+                },
+                AgentDebugQuery {
+                    limit: Some(0),
+                    ..AgentDebugQuery::default()
+                },
+                AgentDebugQuery {
+                    ids: Some(vec![u64::MAX]),
+                    ..AgentDebugQuery::default()
+                },
+            ] {
+                assert!(matches!(
+                    core.debug_agents(query),
+                    Err(HostAccessError::ScientificState(error)) if error == fault
+                ));
+            }
         }
     }
 

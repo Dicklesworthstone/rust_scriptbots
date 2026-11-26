@@ -1656,7 +1656,7 @@ impl ChannelHostDriver {
                 let _ = reply.send(result);
             }
             IngressMessage::DebugAgents { query, reply } => {
-                let _ = reply.send(Ok(self.host.core().world().agent_debug_view(query)));
+                let _ = reply.send(self.host.core().debug_agents(query));
             }
             IngressMessage::RequestReplayDigest { reply } => {
                 self.host.request_replay_world_digest();
@@ -2418,6 +2418,101 @@ mod tests {
             uid,
         ))
         .expect("unbound brain remains an explicit inspection result")
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "real channel ingress refuses every debug query shape after partial sensing"
+    )]
+    fn debug_queries_refuse_partial_science_after_sensing_failure() {
+        struct FailingSenseProvider;
+        impl scriptbots_core::sense_fixed::SenseProvider for FailingSenseProvider {
+            fn compute_accumulators(
+                &mut self,
+                _world: &scriptbots_core::WorldState,
+                _handles: &[scriptbots_core::AgentId],
+            ) -> Result<
+                Vec<scriptbots_core::sense_fixed::SenseAccum>,
+                scriptbots_core::sense_fixed::SenseProviderError,
+            > {
+                Err(scriptbots_core::sense_fixed::SenseProviderError::Execution(
+                    "debug query sensing failure".to_owned(),
+                ))
+            }
+        }
+
+        let mut world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            rng_seed: Some(0x5e47),
+            persistence_interval: 0,
+            aging_tick_interval: 1,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        world.set_sense_provider(Box::new(FailingSenseProvider));
+        let core = HostCore::new(
+            HostSessionId::new(0x5e47),
+            world,
+            HostCoreOptions {
+                tick_period_nanos: 1,
+                initial_playback: PlaybackSnapshot {
+                    paused: false,
+                    ..PlaybackSnapshot::default()
+                },
+                ..HostCoreOptions::default()
+            },
+        )
+        .unwrap();
+        let (mut driver, port) =
+            ChannelHostDriver::new(FixedDeadlineHost::new(core), fast_options()).unwrap();
+        driver.step(ManualInstant::from_nanos(0)).unwrap();
+        let completed = port.snapshot_hub().latest();
+        driver.step(ManualInstant::from_nanos(1)).unwrap();
+        let core = driver.host().core();
+        let fault = core.world().scientific_fault().cloned().unwrap();
+        assert_eq!(core.latest_snapshot().world, completed.world);
+        assert_eq!(
+            core.world().agent_debug_view(AgentDebugQuery::default())[0].age,
+            completed.world.agents[0].age + 1,
+            "live debug rows really contain an incomplete aging stage"
+        );
+
+        for query in [
+            AgentDebugQuery::default(),
+            AgentDebugQuery {
+                ids: Some(Vec::new()),
+                ..AgentDebugQuery::default()
+            },
+            AgentDebugQuery {
+                limit: Some(0),
+                ..AgentDebugQuery::default()
+            },
+            AgentDebugQuery {
+                ids: Some(vec![u64::MAX]),
+                ..AgentDebugQuery::default()
+            },
+        ] {
+            let (reply, result) = std::sync::mpsc::channel();
+            assert!(
+                port.sender
+                    .try_send(IngressMessage::DebugAgents { query, reply })
+                    .is_ok()
+            );
+            driver.step(ManualInstant::from_nanos(2)).unwrap();
+            assert!(matches!(
+                result.try_recv().unwrap(),
+                Err(HostAccessError::ScientificState(error)) if error == fault
+            ));
+        }
+        assert_eq!(driver.host().core().latest_snapshot().world, completed.world);
     }
 
     #[test]

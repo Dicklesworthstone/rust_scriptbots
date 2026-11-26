@@ -2,6 +2,26 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Bulk debug inspection at incomplete scientific boundaries (2026-11-25):**
+[Source implemented and independently reviewed; execution validation pending —
+Codex; corrective contribution to `bd-16g.15.2` and `bd-2z0.12.2`;
+original complete acceptance retained]
+
+The bulk agent-debug channel now uses the same completed-boundary guard as
+focused creature, brain and genome inspection. A terminal sensing failure can
+leave aging or other earlier stages partially applied; those live rows cannot
+escape through REST/MCP debug reads as completed scientific observations.
+The retained published world remains available, and valid healthy queries keep
+their existing filters and ordering.
+
+Authored regressions cover provider execution and malformed-response faults,
+empty/zero-limit/absent-subject queries, and actual channel ingress after a
+failed sensing pass with an observed partial age change. Source review is
+complete. The baseline formatting check passed before these edits; dependency
+fetching exhausted the executor's storage before native compiler diagnostics,
+then the executor disconnected. Candidate formatting, compilation, Clippy and
+test execution remain unverified. No original qualification gate is closed.
+
 **Final experiment-service owner teardown (2026-11-25):**
 [Source implemented and independently reviewed; execution validation pending —
 Codex; corrective contribution to `bd-2z0.5.11`;
