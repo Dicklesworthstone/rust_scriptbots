@@ -2,6 +2,37 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Final experiment-service owner teardown (2026-11-25):**
+[Source implemented and independently reviewed; execution validation pending —
+Codex; corrective contribution to `bd-2z0.5.11`;
+original complete acceptance retained]
+
+Experiment batch workers now retain their artifact catalog instead of the
+`DataServices` that owns their join handles. Dropping the final external service
+owner can therefore reach the existing cooperative shutdown path: close
+admission, cancel all experiment and checkpoint-branch siblings, then join every
+worker even if a registry was poisoned or another worker panicked. Explicit
+runtime shutdown still returns errors; destructor cleanup logs them. Current
+scientific/checkpoint operations can finish, with no hard interruption deadline.
+
+A real two-seed regression observes nonzero scientific progress, releases the
+final standalone control handle, checks cancellation and capacity release, and
+requires cold reads to preserve saved status and checkpoint bytes. It resumes
+unfinished work when cancellation wins the race, compares final scientific
+digests against uninterrupted runs, and verifies portable bundles. A separate
+poison/panic regression deterministically requires every sibling cancellation
+before any join and checks that all execution reservations are released.
+
+A native owner-to-DTO regression also exercises a real sensing failure after a
+completed but undisplayed tick. It requires the older scientific publication and
+config revisions to remain intact while health reports the later fault tick,
+complementing the browser regressions below.
+
+The executor exhausted its disk and became unavailable. Regression execution,
+native compilation, Clippy and rustfmt remain unverified. Independent source
+reviews completed; no native, persistence, browser or experiment qualification
+gate is closed.
+
 **Remote scientific faults with sparse publications (2026-11-25):**
 [Source implemented and independently reviewed; execution validation pending —
 Codex; corrective contribution to `bd-2z0.12.2` and `bd-ac4l`;

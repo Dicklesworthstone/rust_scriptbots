@@ -2195,16 +2195,22 @@ impl ExperimentJob {
         self.runner
             .verify_completed_status(&self.state_file, &status)
             .map_err(|error| experiment_catalog_error(&self.state_file, error))?;
-        services.publish_experiment_artifacts(&status, &self.artifact_root)?;
+        DataServices::publish_experiment_artifacts(
+            &services.artifacts,
+            &status,
+            &self.artifact_root,
+        )?;
         *published = Some(status.generation);
         Ok(())
     }
 
     /// Start (or restart) the batch worker. `running` is raised before the
     /// thread exists so a status read can never observe a false idle gap.
+    /// Retain only the artifact catalog, not the service that owns this worker:
+    /// the final external owner must remain able to cancel and join the batch.
     fn start(
         &mut self,
-        services: std::sync::Arc<DataServices>,
+        artifacts: Arc<Mutex<BTreeMap<String, RetainedArtifact>>>,
         mut reservation: ExperimentExecutionReservation,
     ) {
         use std::sync::atomic::Ordering;
@@ -2222,9 +2228,12 @@ impl ExperimentJob {
             .spawn(move || {
                 let _reservation = reservation;
                 let outcome = match runner.execute_batch_until_cancelled(&state_file, &cancel) {
-                    Ok(status) => services
-                        .publish_experiment_artifacts(&status, &artifact_root)
-                        .map_err(|error| format!("artifact publication failed: {error}")),
+                    Ok(status) => DataServices::publish_experiment_artifacts(
+                        &artifacts,
+                        &status,
+                        &artifact_root,
+                    )
+                    .map_err(|error| format!("artifact publication failed: {error}")),
                     Err(error) => Err(error.to_string()),
                 };
                 if let Err(error) = outcome {
@@ -2338,6 +2347,8 @@ impl ExperimentJob {
 }
 
 /// Canonical in-process data services managing experiments, checkpoints, and artifacts.
+/// Releasing the final owner cancels and joins its workers at their existing safe
+/// boundaries. Use explicit shutdown to receive any worker errors directly.
 #[derive(Debug)]
 pub struct DataServices {
     experiments: Mutex<BTreeMap<String, ExperimentJob>>,
@@ -4614,11 +4625,12 @@ impl DataServices {
     /// Publish only completed, bounded, verified bundles. Stage the entire slice
     /// before taking the catalog lock so a failure cannot expose a partial slice.
     fn publish_experiment_artifacts(
-        &self,
+        artifacts: &Mutex<BTreeMap<String, RetainedArtifact>>,
         status: &crate::experiment_runner::ExperimentBatchStatus,
         root: &Path,
     ) -> Result<(), ControlError> {
-        self.publish_experiment_artifact_records(
+        Self::publish_experiment_artifact_records(
+            artifacts,
             &status.experiment_id,
             status
                 .runs
@@ -4632,7 +4644,7 @@ impl DataServices {
     /// Publish a selected, semantically verified run or the completed batch slice.
     /// Keep catalog identities immutable and expose no files from a failed slice.
     fn publish_experiment_artifact_records<'a>(
-        &self,
+        artifacts: &Mutex<BTreeMap<String, RetainedArtifact>>,
         experiment_id: &str,
         runs: impl IntoIterator<Item = &'a crate::experiment_runner::RunRecord>,
         root: &Path,
@@ -4769,7 +4781,7 @@ impl DataServices {
                 );
             }
         }
-        let mut catalog = self.artifacts.lock().map_err(|_| ControlError::Lock)?;
+        let mut catalog = artifacts.lock().map_err(|_| ControlError::Lock)?;
         for (id, observed) in &staged {
             if let Some(retained) = catalog.get(id)
                 && (retained.directory != observed.directory
@@ -4920,6 +4932,18 @@ impl Default for DataServices {
                 ))
             });
         Self::new(dir)
+    }
+}
+
+impl Drop for DataServices {
+    fn drop(&mut self) {
+        // Workers retain their catalog and reservation state, never this owner.
+        // Thus its final external release can signal every sibling before joining
+        // any of them, without a worker retaining itself or joining its own thread.
+        // Explicit runtime shutdown remains the fallible, caller-visible path.
+        if let Err(error) = self.shutdown_experiments() {
+            tracing::error!(%error, "experiment services failed during drop");
+        }
     }
 }
 
@@ -5400,7 +5424,7 @@ impl ControlHandle {
                 grid_cells,
             )?;
             definition.persist(&output_dir)?;
-            job.start(std::sync::Arc::clone(&self.data_services), reservation);
+            job.start(Arc::clone(&self.data_services.artifacts), reservation);
             lock.insert(experiment_id.clone(), job);
         }
         // Admission has happened even if the first status read fails. Publish
@@ -5494,7 +5518,8 @@ impl ControlHandle {
         let mut progress = runner
             .checkpoint_progress_snapshot(&state_file, &status, true)
             .map_err(|error| experiment_catalog_error(&state_file, error))?;
-        let artifacts = self.data_services.publish_experiment_artifact_records(
+        let artifacts = DataServices::publish_experiment_artifact_records(
+            &self.data_services.artifacts,
             experiment_id,
             std::iter::once(record),
             &root,
@@ -5862,7 +5887,7 @@ impl ControlHandle {
         if let Ok(mut error) = job.last_error.lock() {
             *error = None;
         }
-        job.start(std::sync::Arc::clone(&self.data_services), reservation);
+        job.start(Arc::clone(&self.data_services.artifacts), reservation);
         job.status_dto(true)
     }
 
@@ -10771,6 +10796,236 @@ pub(crate) mod tests {
         fs::write(&summary_path, original_summary).unwrap();
         fs::write(&manifest_path, original_manifest).unwrap();
         assert_eq!(compare().unwrap(), expected);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real owner teardown, cold recovery and uninterrupted comparison journey"
+    )]
+    fn final_control_handle_drop_joins_real_experiments_and_preserves_their_results() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let oracle_root = tempfile::tempdir().unwrap();
+        let (control, host) = handle();
+        let control = control
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let mut request = experiment_creation_request();
+        request.experiment_id = Some("drop-active".into());
+        request.idempotency_key = Some("drop-active-key".into());
+        request.seeds = vec![7, 9];
+        request.max_concurrency = Some(2);
+        request.ticks_per_run = Some(64);
+        control.create_experiment(request.clone()).unwrap();
+
+        let owner = Arc::downgrade(control.data_services());
+        let capacity = Arc::clone(&control.data_services.execution_capacity);
+        let (cancel, running) = {
+            let jobs = control.data_services.experiments.lock().unwrap();
+            let job = &jobs["drop-active"];
+            (Arc::clone(&job.cancel), Arc::clone(&job.running))
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = control.get_experiment("drop-active").unwrap();
+            assert!(
+                matches!(status.status.as_str(), "pending" | "running" | "completed"),
+                "{status:?}"
+            );
+            if status.runs.iter().any(|run| {
+                run.checkpoint_progress
+                    .observed_tick()
+                    .is_some_and(|tick| tick > 0)
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "a real owner must advance");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!cancel.load(Ordering::Acquire));
+
+        drop(control);
+        // Clean up the old implementation before failing its regression: a worker
+        // retaining DataServices otherwise keeps running after the assertion unwinds.
+        let retained_by_worker = if let Some(leaked) = owner.upgrade() {
+            leaked.shutdown_experiments().unwrap();
+            true
+        } else {
+            false
+        };
+        assert!(
+            !retained_by_worker,
+            "dropping the final external owner left the real experiment retaining its service"
+        );
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!running.load(Ordering::Acquire));
+        let released = *capacity.lock().unwrap();
+        assert_eq!(released.reserved_batches, 0);
+        assert_eq!(released.reserved_run_slots, 0);
+        assert_eq!(released.reserved_grid_cells, 0);
+
+        // A new service must acquire the same source root and discover the exact
+        // retained cuts. Reading their identities cannot restart scientific work.
+        let reopened = host
+            .handle()
+            .with_artifacts_dir(root.path().to_path_buf())
+            .unwrap();
+        let stopped = reopened.get_experiment("drop-active").unwrap();
+        assert!(matches!(stopped.status.as_str(), "stopped" | "completed"));
+        assert!(
+            stopped
+                .runs
+                .iter()
+                .all(|run| matches!(run.state.as_str(), "running" | "completed"))
+        );
+        let directory = root.path().join("experiments/drop-active");
+        let state_before_read = fs::read(directory.join("status.json")).unwrap();
+        let cuts = stopped
+            .runs
+            .iter()
+            .map(|run| {
+                let path = directory.join(format!("{}.checkpoint", run.run_id));
+                (path.clone(), fs::read(path).unwrap())
+            })
+            .collect::<Vec<_>>();
+        for _ in &stopped.runs {
+            reopened.get_experiment("drop-active").unwrap();
+        }
+        let observed = reopened.get_experiment("drop-active").unwrap();
+        assert!(observed.runs.iter().any(|run| {
+            run.checkpoint_progress
+                .observed_tick()
+                .is_some_and(|tick| tick > 0)
+        }));
+        for run in &observed.runs {
+            assert!(
+                run.checkpoint_progress
+                    .observed_tick()
+                    .is_some_and(|tick| tick <= run.target_ticks)
+            );
+        }
+        assert_eq!(
+            fs::read(directory.join("status.json")).unwrap(),
+            state_before_read
+        );
+        for (path, bytes) in cuts {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+
+        let wait_completed = |control: &ControlHandle| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let status = control.get_experiment("drop-active").unwrap();
+                if status.status == "completed" {
+                    break status;
+                }
+                assert!(
+                    matches!(status.status.as_str(), "pending" | "running"),
+                    "unexpected experiment result: {status:?}"
+                );
+                assert!(Instant::now() < deadline, "real experiment did not complete");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        if stopped.status == "stopped" {
+            reopened.resume_experiment("drop-active").unwrap();
+        }
+        let resumed = wait_completed(&reopened);
+        let oracle = host
+            .handle()
+            .with_artifacts_dir(oracle_root.path().to_path_buf())
+            .unwrap();
+        oracle.create_experiment(request).unwrap();
+        let uninterrupted = wait_completed(&oracle);
+        assert_eq!(resumed.completed_runs, 2);
+        assert_eq!(resumed.failed_runs, 0);
+        for (actual, expected) in resumed.runs.iter().zip(&uninterrupted.runs) {
+            assert_eq!(actual.run_id, expected.run_id);
+            assert_eq!(actual.seed, expected.seed);
+            assert_eq!(actual.total_ticks, 64);
+            assert_eq!(actual.final_digest, expected.final_digest);
+            assert!(actual.final_digest.is_some());
+            crate::experiment_runner::verify_portable_run_bundle(
+                Path::new(actual.bundle_path.as_ref().unwrap()),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn final_service_drop_cancels_all_workers_before_joining_despite_poison_or_panic() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let services = DataServices::new(root.path().to_path_buf());
+        for id in ["a-panic", "z-sibling"] {
+            pending_catalog_definition(root.path(), id);
+            services.recover_experiment(id).unwrap();
+        }
+        let capacity = Arc::clone(&services.execution_capacity);
+        let sibling_finished = Arc::new(AtomicBool::new(false));
+        let observed_all_cancellations = Arc::new(AtomicUsize::new(0));
+        let cancellations = {
+            let mut jobs = services.experiments.lock().unwrap();
+            let cancellations = jobs
+                .values()
+                .map(|job| Arc::clone(&job.cancel))
+                .collect::<Vec<_>>();
+            for (index, job) in jobs.values_mut().enumerate() {
+                let flags = cancellations.clone();
+                let finished = Arc::clone(&sibling_finished);
+                let observed = Arc::clone(&observed_all_cancellations);
+                let mut reservation = services
+                    .reserve_experiment_execution(&job.runner.experiment_id, 1, 1)
+                    .unwrap();
+                job.running.store(true, Ordering::Release);
+                reservation.running = Some(Arc::clone(&job.running));
+                job.worker = Some(std::thread::spawn(move || {
+                    let _reservation = reservation;
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !flags.iter().all(|flag| flag.load(Ordering::Acquire)) {
+                        assert!(Instant::now() < deadline, "all siblings must be cancelled");
+                        std::thread::yield_now();
+                    }
+                    observed.fetch_add(1, Ordering::AcqRel);
+                    assert_ne!(index, 0, "injected experiment worker panic during owner drop");
+                    finished.store(true, Ordering::Release);
+                }));
+            }
+            cancellations
+        };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _jobs = services.experiments.lock().unwrap();
+                panic!("injected registry poison before owner drop");
+            }))
+            .is_err()
+        );
+        drop(services);
+        let joined_all = sibling_finished.load(Ordering::Acquire)
+            && observed_all_cancellations.load(Ordering::Acquire) == 2
+            && capacity.lock().unwrap().reserved_batches == 0;
+        if !joined_all {
+            // The old owner drops its JoinHandles. Stop those regression workers
+            // before reporting the missing teardown, rather than leaking them.
+            for flag in cancellations {
+                flag.store(true, Ordering::Release);
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while capacity.lock().unwrap().reserved_batches != 0 {
+                assert!(Instant::now() < deadline, "regression workers did not stop");
+                std::thread::yield_now();
+            }
+        }
+        assert!(joined_all, "owner drop did not cancel and join every sibling");
+        let released = *capacity.lock().unwrap();
+        assert_eq!(released.reserved_batches, 0);
+        assert_eq!(released.reserved_run_slots, 0);
+        assert_eq!(released.reserved_grid_cells, 0);
     }
 
     #[test]
@@ -19949,6 +20204,106 @@ pub(crate) mod tests {
             format!("x{}", "🦋".repeat(511))
         );
         assert_eq!(protocol["fault"]["diagnostic_truncated"], true);
+    }
+
+    #[test]
+    fn remote_owner_status_retains_a_scientific_fault_after_its_displayed_tick() {
+        use scriptbots_runtime::{HostCore, HostCoreOptions, ManualHostDriver, ManualInstant};
+
+        struct FailSecondSense {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl scriptbots_core::SenseProvider for FailSecondSense {
+            fn compute_accumulators(
+                &mut self,
+                _world: &WorldState,
+                handles: &[scriptbots_core::AgentId],
+            ) -> Result<
+                Vec<scriptbots_core::sense_fixed::SenseAccum>,
+                scriptbots_core::SenseProviderError,
+            > {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(vec![
+                        scriptbots_core::sense_fixed::SenseAccum::default();
+                        handles.len()
+                    ])
+                } else {
+                    Err(scriptbots_core::SenseProviderError::Execution(
+                        "remote sparse-publication sensing failure".to_owned(),
+                    ))
+                }
+            }
+        }
+
+        let mut world = WorldState::new(ScriptBotsConfig {
+            world_width: 40,
+            world_height: 40,
+            food_cell_size: 10,
+            rng_seed: Some(77),
+            persistence_interval: 0,
+            population_minimum: 0,
+            population_spawn_interval: 0,
+            reproduction_energy_threshold: f32::MAX,
+            ..ScriptBotsConfig::default()
+        })
+        .unwrap();
+        world
+            .try_spawn_agent(scriptbots_core::AgentData::default())
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        world.set_sense_provider(Box::new(FailSecondSense {
+            calls: Arc::clone(&calls),
+        }));
+        let mut owner = HostCore::new(
+            scriptbots_runtime::HostSessionId::new(77),
+            world,
+            HostCoreOptions {
+                tick_period_nanos: 10,
+                snapshot_interval_ticks: 4,
+                ..HostCoreOptions::default()
+            },
+        )
+        .unwrap();
+        owner.drive(ManualInstant::from_nanos(0)).unwrap();
+        assert_eq!(
+            owner
+                .drive(ManualInstant::from_nanos(10))
+                .unwrap()
+                .scientific_steps,
+            1
+        );
+        let displayed = owner.latest_snapshot();
+        assert_eq!(
+            displayed.world.tick, 0,
+            "exercise a genuinely older publication"
+        );
+        assert_eq!(
+            owner
+                .drive(ManualInstant::from_nanos(20))
+                .unwrap()
+                .scientific_steps,
+            0
+        );
+        let faulted = owner.latest_snapshot();
+        let observed = serde_json::to_value(RemoteOwnerStatusDto::from_snapshot(&faulted)).unwrap();
+        assert_eq!(observed["identity"]["tick"], "0");
+        assert_eq!(observed["fault"]["tick"], "1");
+        assert_eq!(observed["fault"]["code"], "world_step");
+        assert_eq!(observed["health"], "faulted");
+        assert_eq!(observed["playback"]["paused"], true);
+        assert!(
+            observed["fault"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("remote sparse-publication sensing failure")
+        );
+        assert!(faulted.revision > displayed.revision);
+        assert_eq!(faulted.world, displayed.world);
+        assert_eq!(faulted.revisions.scientific, displayed.revisions.scientific);
+        assert_eq!(faulted.revisions.config, displayed.revisions.config);
+        assert!(Arc::ptr_eq(&faulted, &owner.latest_snapshot()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

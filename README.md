@@ -2387,6 +2387,14 @@ reports `cancelled`; its unfinished run records retain `running`, with actual
 progress in validated owner/journal cuts for resume. A batch that finishes before
 the request takes effect still reports `completed`.
 
+Dropping the final owner of shared `DataServices`, including standalone control
+handles, requests cancellation for all admitted experiment and checkpoint-branch
+workers before joining them. Cleanup waits for current cooperative work,
+including checkpoint and file publication, to finish; it has no hard
+interruption deadline. Retained cuts and completed bundles remain available for
+later discovery or resume. Explicit runtime shutdown reports worker errors to
+its caller; destruction logs cleanup errors.
+
 Read per-run checkpoint progress through `GET /api/v1/experiments/{id}`, MCP
 `experiment_status`, or `control_cli experiment status ID`. Each run includes
 `target_ticks`, the validated plan's requested horizon, and a separate typed
