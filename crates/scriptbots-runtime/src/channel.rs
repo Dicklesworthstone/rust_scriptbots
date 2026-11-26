@@ -1506,14 +1506,10 @@ impl ChannelHostDriver {
                     | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. }
             )
         );
-        let advancing = self.journal_retry_needed()
-            || matches!(
-                self.host.drive_interest(),
-                HostDriveInterest::ReadyNow
-                    | HostDriveInterest::Deadline
-                    | HostDriveInterest::Draining
-            );
-        if world_tail && !advancing && self.capture_flush != CaptureFlush::Admitted {
+        // Full-owner captures hold automatic time at the current boundary while the
+        // journal settles. Even a running host cannot reach its next periodic flush
+        // in this state. Seal its tail through the same ordered command as a paused host.
+        if world_tail && self.capture_flush != CaptureFlush::Admitted {
             match self.host.request_persistence_flush() {
                 Ok(_) => self.capture_flush = CaptureFlush::Admitted,
                 Err(HostAccessError::CommandAuthorityLookup {
@@ -1528,7 +1524,7 @@ impl ChannelHostDriver {
                     return;
                 }
             }
-        } else if world_tail && !advancing {
+        } else if world_tail {
             self.finish_host_capture(&request, Err(error));
             return;
         }
@@ -2064,7 +2060,15 @@ impl ChannelHostDriver {
         self.update_journal_retry_deadline(now)?;
         let mut interest = if self.handoff == HandoffState::Retired {
             HostDriveInterest::Terminated
-        } else if self.journal_retry_at.is_some() {
+        } else if self.journal_retry_at.is_some()
+            || (!self.parked_host_captures.is_empty()
+                && matches!(
+                    self.host.drive_interest(),
+                    HostDriveInterest::ReadyNow | HostDriveInterest::Deadline
+                ))
+        {
+            // Full captures deliberately hold the science clock. Its next deadline may
+            // already be in the past; wait for ingress or the next maintenance poll.
             HostDriveInterest::Draining
         } else {
             self.host.drive_interest()
@@ -3042,6 +3046,13 @@ mod tests {
             .expect("resume reply")
             .expect("resume admitted");
         assert_eq!(driver.host().drive_interest(), HostDriveInterest::Deadline);
+        assert_eq!(first.interest, HostDriveInterest::Draining);
+        assert_eq!(
+            driver
+                .timed_ingress_wait(first.interest, &mut || ManualInstant::from_nanos(1_000_000))
+                .expect("wait while automatic time is held"),
+            driver.maintenance_period
+        );
         assert!(!driver.host().core().latest_snapshot().playback.paused);
         assert!(matches!(
             driver.host().core().capture_host_checkpoint_v1(),
@@ -3193,6 +3204,72 @@ mod tests {
         );
         assert!(driver.host().core().shutdown_command_status().is_none());
         assert_ne!(driver.handoff, HandoffState::Retired);
+    }
+
+    #[test]
+    fn running_host_capture_and_handoff_share_one_flush_at_a_partial_persistence_tick() {
+        let world = scriptbots_core::WorldState::new(ScriptBotsConfig {
+            rng_seed: Some(0x5eed_cafe),
+            persistence_interval: 3,
+            ..ScriptBotsConfig::default()
+        })
+        .expect("partial-cadence world");
+        let core = HostCore::new(
+            HostSessionId::new(92),
+            world,
+            HostCoreOptions {
+                initial_playback: PlaybackSnapshot {
+                    paused: true,
+                    ..PlaybackSnapshot::default()
+                },
+                tick_period_nanos: 1,
+                ..HostCoreOptions::default()
+            },
+        )
+        .expect("owner");
+        let (mut driver, port) =
+            ChannelHostDriver::new(FixedDeadlineHost::new(core), fast_options()).expect("channel");
+        let step = queue_command(&port, 1, HostCommand::Step);
+        driver.step(ManualInstant::from_nanos(0)).unwrap();
+        step.try_recv().unwrap().unwrap();
+        driver.step(ManualInstant::from_nanos(1)).unwrap();
+        assert!(matches!(
+            driver.host().core().capture_host_checkpoint_v1(),
+            Err(HostCheckpointError::World(
+                scriptbots_core::WorldCheckpointError::DeferredHostOutput { .. }
+                    | scriptbots_core::WorldCheckpointError::PersistenceBoundary { .. }
+            ))
+        ));
+        let digest = driver.host().core().scientific_digest_v1().unwrap();
+        let before = driver.host().core().admission_cursor();
+        let resume = queue_command(&port, 2, HostCommand::Resume);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let read = queue_host_capture(&port, false, deadline);
+        let handoff = queue_host_capture(&port, true, deadline);
+        for now in [2, 100, 200, 300, 400] {
+            driver.step(ManualInstant::from_nanos(now)).unwrap();
+        }
+        resume.try_recv().unwrap().unwrap();
+        let captured = read.try_recv().expect("reader received the cut").unwrap();
+        let retired = handoff
+            .try_recv()
+            .expect("owner handoff completed")
+            .unwrap();
+        assert_eq!(captured.encode().unwrap(), retired.encode().unwrap());
+        assert_eq!(retired.tick(), scriptbots_core::Tick(1));
+        assert_eq!(
+            retired.persistence_last_admitted_tick(),
+            Some(retired.tick())
+        );
+        assert_eq!(retired.world_checkpoint().source_digest(), &digest);
+        assert!(!retired.playback().paused);
+        // Resume and the single shared flush are the only new admissions.
+        assert_eq!(
+            driver.host().core().admission_cursor().get(),
+            before.get() + 2
+        );
+        assert_eq!(driver.handoff, HandoffState::Retired);
+        assert!(driver.host().core().shutdown_command_status().is_none());
     }
 
     #[test]
