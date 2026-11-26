@@ -522,6 +522,116 @@ test("remote owner status preserves exact fault identities and refuses contradic
   assert.throws(() => validateRemoteOwnerStatus(inventedRecovery, OWNER_SESSION, stopped), /contradicts/);
 });
 
+test("scientific faults retain their exact owner tick beside an older coherent publication", () => {
+  const source = ownerStatusFixture(OWNER_SESSION, "1");
+  source.identity.tick = "0";
+  source.identity.scientificRevision = "0";
+  source.identity.controlRevision = "0";
+  source.identity.configRevision = "0";
+  const healthy = validateRemoteOwnerStatus(source, OWNER_SESSION);
+  for (const tick of ["0", "1", "9007199254740993", "18446744073709551615"]) {
+    const response = structuredClone(source);
+    response.identity.publicationRevision = "2";
+    response.health = "faulted";
+    response.fault = { kind: "scientific", tick, code: "world_step",
+      message: "sense provider failed during an incomplete transition", diagnostic_truncated: false };
+    const faulted = validateRemoteOwnerStatus(response, OWNER_SESSION, healthy);
+    assert.equal(faulted.fault.tick, tick, "the fault observation must not be clamped to the retained canvas");
+    assert.equal(faulted.identity.tick, "0", "fault reporting must not invent a completed scientific publication");
+    assert.equal(faulted.identity.scientificRevision, "0");
+
+    const contradiction = structuredClone(response);
+    contradiction.fault.tick = tick === "0" ? "1" : "0";
+    assert.throws(() => validateRemoteOwnerStatus(contradiction, OWNER_SESSION, faulted), /contradicts/,
+      "the same publication still cannot change its fault identity");
+    const recovery = structuredClone(source);
+    recovery.identity.publicationRevision = "3";
+    assert.throws(() => validateRemoteOwnerStatus(recovery, OWNER_SESSION, faulted), /contradicts/);
+    const stopped = structuredClone(response);
+    stopped.identity.publicationRevision = "3";
+    stopped.lifecycle = "stopped";
+    const terminal = validateRemoteOwnerStatus(stopped, OWNER_SESSION, faulted);
+    assert.equal(terminal.fault.tick, tick);
+    const restarted = structuredClone(response);
+    restarted.identity.publicationRevision = "4";
+    assert.throws(() => validateRemoteOwnerStatus(restarted, OWNER_SESSION, terminal), /contradicts/);
+
+    response.fault.tick = "malformed";
+    assert.equal(faulted.fault.tick, tick, "validated fault evidence is independent of the response object");
+  }
+  for (const tick of [undefined, null, 1, -1, "", "01", "-1", "1.5", "1e3", "18446744073709551616"]) {
+    const invalid = structuredClone(source);
+    invalid.identity.publicationRevision = "2";
+    invalid.health = "faulted";
+    invalid.fault = { kind: "scientific", tick, code: "world_step", message: "invalid tick", diagnostic_truncated: false };
+    assert.throws(() => validateRemoteOwnerStatus(invalid, OWNER_SESSION, healthy), /identity/,
+      "separate owner and canvas ticks must still be exact canonical u64 values");
+  }
+});
+
+test("remote polling exposes a sparse-publication fault and disables controls without losing the canvas", async () => {
+  const original = globalThis.fetch, requests = [], observations = [];
+  const { client, sessionId } = experimentTransport(OWNER_SESSION);
+  client.onOwnerStatus = (current) => observations.push({ available: current.ownerStatusAvailable,
+    mutation: current.ownerAllowsMutation, status: current.ownerStatus });
+  globalThis.fetch = (_url, options) => new Promise((resolve) => requests.push({ options, resolve }));
+  try {
+    const source = ownerStatusFixture(sessionId, "1");
+    source.identity.tick = "0";
+    source.identity.scientificRevision = "0";
+    source.identity.controlRevision = "0";
+    source.identity.configRevision = "0";
+    const consumed = [];
+    for (const channel of ["canvas", "telemetry"]) {
+      const publication = frame(channel, "1", { tick: 0 });
+      publication.identity = { ...source.identity };
+      assert.equal(client.tracker.accept(publication, (value) => { consumed.push(value.kind); }), true);
+    }
+    const narrative = eventPage(0, 1, 1, 1, 1, "1");
+    narrative.identity = { ...source.identity };
+    narrative.payload.events[0].record.tick = "0";
+    narrative.payload.events[0].record.window = ["0", "0"];
+    assert.equal(client.tracker.accept(narrative, (value) => { consumed.push(value.kind); }), true);
+    assert.deepEqual(consumed, ["canvas", "telemetry", "events"]);
+    const retained = new Map(client.tracker.observed);
+    const retainedMetadata = structuredClone([...client.tracker.observed]);
+    assert.equal(retained.size, 3);
+    assert.equal(client.tracker.afterEvent, 1n);
+    client.setOwnerStatusEnabled(true);
+    requests[0].resolve(new Response(JSON.stringify(source)));
+    await settleOwnerStatus();
+    assert.equal(client.ownerAllowsMutation, true);
+    const resume = structuredClone(client.resume);
+    assert.deepEqual(resume, { session_id: sessionId, after_event: "1", after_revision: "1" });
+
+    const pending = client.pollOwnerStatus(client.ownerStatusAttemptAt + 1000);
+    assert.equal(requests.length, 2);
+    const fault = structuredClone(source);
+    fault.identity.publicationRevision = "2";
+    fault.health = "faulted";
+    fault.fault = { kind: "scientific", tick: "1", code: "world_step",
+      message: "sense provider failed after the last published canvas", diagnostic_truncated: false };
+    requests[1].resolve(new Response(JSON.stringify(fault)));
+    assert.equal(await pending, true, "a genuine later fault is an available owner observation");
+    assert.equal(client.ownerStatusAvailable, true);
+    assert.equal(client.ownerStatusError, null);
+    assert.equal(client.ownerStatus.health, "faulted");
+    assert.equal(client.ownerStatus.fault.tick, "1");
+    assert.equal(client.ownerStatus.identity.tick, "0");
+    assert.equal(client.ownerAllowsMutation, false);
+    assert.equal(client.state, "connected", "the scientific fault is distinct from a transport failure");
+    assert.deepEqual(client.resume, resume, "health reads cannot advance the retained canvas or event cursors");
+    assert.equal(client.tracker.afterEvent, 1n);
+    for (const [channel, metadata] of retained) {
+      assert.equal(client.tracker.observed.get(channel), metadata,
+        "health polling cannot replace a consumed channel's publication metadata");
+    }
+    assert.deepEqual([...client.tracker.observed], retainedMetadata,
+      "the consumed scientific/event metadata remains unchanged");
+    assert.deepEqual(observations.at(-1), { available: true, mutation: false, status: client.ownerStatus });
+  } finally { client.setOwnerStatusEnabled(false); globalThis.fetch = original; }
+});
+
 test("remote health polling requires a fresh session-bound read and never overlaps requests", async () => {
   const original = globalThis.fetch, requests = [];
   const { client, sessionId } = experimentTransport(OWNER_SESSION);

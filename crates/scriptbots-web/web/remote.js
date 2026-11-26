@@ -45,7 +45,10 @@ export function validateRemoteOwnerStatus(value, sessionId, previous = null) {
     fault = { kind: detail.kind, code: detail.code, message: detail.message,
       diagnostic_truncated: detail.diagnostic_truncated };
     if (detail.kind === "scientific") {
-      if (decimal(detail.tick) > decimal(value.identity.tick)) throw new Error("Remote fault follows its owner publication");
+      // An incomplete step retains the last coherent scientific publication.
+      // With sparse snapshot cadence that canvas can precede the completed tick
+      // where the owner observed the fault; these are distinct observations.
+      decimal(detail.tick);
       fault.tick = detail.tick;
     } else if (detail.kind === "journal") {
       decimal(detail.session_id); decimal(detail.batch_sequence);

@@ -2,6 +2,23 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Remote scientific faults with sparse publications (2026-11-25):**
+[Source implemented and independently reviewed; execution validation pending —
+Codex; corrective contribution to `bd-2z0.12.2` and `bd-ac4l`;
+original complete acceptance retained]
+
+Browser owner-health reads retain the exact scientific fault tick independently
+of the last coherent displayed tick. Incomplete transitions can fault after a
+completed tick that snapshot cadence has not yet published; that observation no
+longer becomes an unavailable-status error. Exact integer validation, publication
+consistency, terminal lifecycle checks and mutation refusal remain in place.
+
+Two authored browser regressions cover full-width and malformed tick identities,
+contradictory publications, terminal health and polling after actual canvas,
+telemetry and nonempty event consumption. The executor exhausted its disk and
+disconnected before DSR execution; tests, syntax checks and packaged-browser
+acceptance remain unverified. No original qualification gate is closed.
+
 **Effective communication-scrambling seeds (2026-11-25):**
 [Source implemented and independently reviewed; execution validation pending —
 Codex; corrective contribution to `bd-16g.7.3`;
