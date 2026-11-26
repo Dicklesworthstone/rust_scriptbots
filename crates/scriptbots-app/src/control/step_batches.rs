@@ -87,7 +87,9 @@ pub struct StepBatchDto {
     pub admitted_count: u64,
     /// Constituents positively observed applied; unknown attempts are not counted.
     pub applied_count: u64,
-    /// Terminal application and non-pending journal, including rejected/failed.
+    /// Terminal application with the owner's required journal commitment or a final
+    /// journal outcome, including failure. Volatile-only acknowledgements remain
+    /// unsettled when the owner requires durability.
     pub settled_count: u64,
     pub phase: StepBatchPhase,
     pub advancing: bool,
@@ -153,12 +155,11 @@ struct ObservedProgress {
 }
 
 impl ObservedProgress {
-    fn from_status(status: &CommandStatus) -> Self {
+    fn from_status(status: &CommandStatus, settled: bool) -> Self {
         Self {
             admitted: status.admission_sequence().is_some(),
             applied: matches!(status.application(), ApplicationState::Applied(_)),
-            settled: !matches!(status.application(), ApplicationState::Admitted)
-                && !matches!(status.journal(), JournalState::Pending),
+            settled,
             failed: matches!(
                 status.application(),
                 ApplicationState::Rejected(_) | ApplicationState::Failed(_)
@@ -666,7 +667,13 @@ mod tests {
             ApplicationState::Rejected(_)
         ));
         assert!(rejected.admission_sequence().is_none());
-        let observed = ObservedProgress::from_status(&rejected);
+        let observed = ObservedProgress::from_status(
+            &rejected,
+            rig.handle
+                .host
+                .command_status_is_settled(&rejected)
+                .unwrap(),
+        );
         batch
             .progress()
             .unwrap()
@@ -783,6 +790,220 @@ mod tests {
         assert_eq!(rig.tick(), 1);
     }
 
+    #[derive(Default)]
+    struct DelayedCommitState {
+        batches: BTreeMap<CommandId, scriptbots_runtime::JournalBatchId>,
+        receipts: VecDeque<JournalReceipt>,
+    }
+
+    struct DelayedCommitJournal {
+        state: Arc<Mutex<DelayedCommitState>>,
+    }
+
+    impl JournalPort for DelayedCommitJournal {
+        fn try_admit(&mut self, batch: &Arc<JournalBatch>) -> JournalAdmission {
+            let mut state = self.state.lock().unwrap();
+            if let Some(command_id) = batch.command_id() {
+                state.batches.insert(command_id, batch.id());
+            }
+            state.receipts.push_back(JournalReceipt::new(
+                batch.id(),
+                JournalReceiptState::CommittedVolatile,
+            ));
+            JournalAdmission::Accepted {
+                batch_id: batch.id(),
+            }
+        }
+
+        fn poll_receipts(&mut self, limit: usize) -> Vec<JournalReceipt> {
+            let mut state = self.state.lock().unwrap();
+            let count = limit.min(state.receipts.len());
+            state.receipts.drain(..count).collect()
+        }
+
+        fn command_authority_mode(&self) -> CommandAuthorityMode {
+            CommandAuthorityMode::ProcessLocal
+        }
+
+        fn shutdown_commit_requirement(&self) -> ShutdownCommitRequirement {
+            ShutdownCommitRequirement::Durable
+        }
+    }
+
+    fn settle_delayed_command(
+        state: &Arc<Mutex<DelayedCommitState>>,
+        command_id: &str,
+        receipt: JournalReceiptState,
+    ) {
+        let command_id: CommandId = serde_json::from_value(serde_json::json!(command_id)).unwrap();
+        let mut state = state.lock().unwrap();
+        let batch_id = state.batches[&command_id];
+        state
+            .receipts
+            .push_back(JournalReceipt::new(batch_id, receipt));
+    }
+
+    #[test]
+    fn step_batch_waits_for_owner_required_durability_before_continuing() {
+        let state = Arc::new(Mutex::new(DelayedCommitState::default()));
+        let mut rig = Rig::new(
+            32,
+            Some(Box::new(DelayedCommitJournal {
+                state: Arc::clone(&state),
+            })),
+        );
+        let reserved = rig.handle.create_step_batch(2, None).unwrap();
+        let id = reserved.batch_id.clone();
+        let waiting = rig
+            .call(move |handle| handle.advance_step_batch(&id))
+            .unwrap();
+        assert_eq!(waiting.phase, StepBatchPhase::Waiting);
+        assert_eq!(waiting.attempted_count, 1);
+        assert_eq!(waiting.applied_count, 1);
+        assert_eq!(waiting.settled_count, 0);
+        assert_eq!(rig.tick(), 1);
+        let first = waiting.entries[0].receipt.as_ref().unwrap();
+        assert_eq!(first.application_state, "applied");
+        assert_eq!(first.journal_state, "committed_volatile");
+        assert!(!first.settled);
+        let first_id = first.command_id.clone();
+        let id = reserved.batch_id.clone();
+        let still_waiting = rig
+            .call(move |handle| handle.advance_step_batch(&id))
+            .unwrap();
+        assert_eq!(still_waiting.phase, StepBatchPhase::Waiting);
+        assert_eq!(still_waiting.attempted_count, 1);
+        assert_eq!(still_waiting.settled_count, 0);
+        assert_eq!(
+            rig.tick(),
+            1,
+            "an intermediate receipt cannot admit the next step"
+        );
+
+        settle_delayed_command(&state, &first_id, JournalReceiptState::Durable);
+        rig.pump();
+        rig.pump();
+        let id = reserved.batch_id.clone();
+        let ready = rig
+            .call(move |handle| handle.step_batch_status(&id, 0, 2))
+            .unwrap();
+        assert_eq!(ready.phase, StepBatchPhase::Ready);
+        assert_eq!(ready.settled_count, 1);
+        let first = ready.entries[0].receipt.as_ref().unwrap();
+        assert_eq!(first.command_id, first_id);
+        assert_eq!(first.journal_state, "durable");
+        assert!(first.settled);
+        assert_eq!(
+            rig.tick(),
+            1,
+            "observing commitment does not execute the next step"
+        );
+
+        let id = reserved.batch_id.clone();
+        let next = rig
+            .call(move |handle| handle.advance_step_batch(&id))
+            .unwrap();
+        assert_eq!(next.phase, StepBatchPhase::Waiting);
+        assert_eq!(next.attempted_count, 2);
+        assert_eq!(next.applied_count, 2);
+        assert_eq!(next.settled_count, 1);
+        assert_eq!(rig.tick(), 2);
+        let second = next.entries[0].receipt.as_ref().unwrap();
+        assert_eq!(second.journal_state, "committed_volatile");
+        assert!(!second.settled);
+        settle_delayed_command(&state, &second.command_id, JournalReceiptState::Durable);
+        rig.pump();
+        rig.pump();
+        let id = reserved.batch_id.clone();
+        let complete = rig
+            .call(move |handle| handle.step_batch_status(&id, 0, 2))
+            .unwrap();
+        assert_eq!(complete.phase, StepBatchPhase::Complete);
+        assert_eq!(complete.settled_count, 2);
+        assert!(
+            complete
+                .entries
+                .iter()
+                .all(|entry| entry.receipt.as_ref().unwrap().settled)
+        );
+        assert_eq!(rig.tick(), 2);
+    }
+
+    #[test]
+    fn delayed_journal_failure_settles_the_applied_step_and_stops_the_batch() {
+        let state = Arc::new(Mutex::new(DelayedCommitState::default()));
+        let mut rig = Rig::new(
+            32,
+            Some(Box::new(DelayedCommitJournal {
+                state: Arc::clone(&state),
+            })),
+        );
+        let reserved = rig.handle.create_step_batch(2, None).unwrap();
+        let id = reserved.batch_id.clone();
+        let waiting = rig
+            .call(move |handle| handle.advance_step_batch(&id))
+            .unwrap();
+        assert_eq!(waiting.phase, StepBatchPhase::Waiting);
+        assert_eq!(waiting.attempted_count, 1);
+        let first = waiting.entries[0].receipt.as_ref().unwrap();
+        assert_eq!(first.journal_state, "committed_volatile");
+        assert!(!first.settled);
+        let original = first.command_id.clone();
+        settle_delayed_command(
+            &state,
+            &original,
+            JournalReceiptState::Failed(JournalFailure {
+                code: "durability_failed_after_volatile_commit".into(),
+                message: "the applied step did not reach durable storage".into(),
+            }),
+        );
+        rig.pump();
+        rig.pump();
+        let id = reserved.batch_id.clone();
+        let stopped = rig
+            .call(move |handle| handle.step_batch_status(&id, 0, 2))
+            .unwrap();
+        assert_eq!(stopped.phase, StepBatchPhase::Stopped);
+        assert_eq!(stopped.attempted_count, 1);
+        assert_eq!(stopped.applied_count, 1);
+        assert_eq!(stopped.settled_count, 1);
+        let failed = stopped.entries[0].receipt.as_ref().unwrap();
+        assert_eq!(failed.command_id, original);
+        assert_eq!(failed.application_state, "applied");
+        assert_eq!(failed.journal_state, "failed");
+        assert!(
+            failed.settled,
+            "failure is terminal without claiming durability"
+        );
+        assert_eq!(
+            failed.journal_failure.as_ref().unwrap().code,
+            "durability_failed_after_volatile_commit"
+        );
+        let again = rig.handle.advance_step_batch(&reserved.batch_id).unwrap();
+        assert_eq!(again.attempted_count, 1);
+        assert_eq!(again.phase, StepBatchPhase::Stopped);
+        assert_eq!(rig.tick(), 1);
+    }
+
+    #[test]
+    fn volatile_owner_receipts_settle_explicitly_and_legacy_dtos_do_not_invent_settlement() {
+        let mut rig = Rig::new(32, None);
+        let reserved = rig.handle.create_step_batch(1, None).unwrap();
+        let complete = rig.finish(&reserved.batch_id);
+        assert_eq!(complete.phase, StepBatchPhase::Complete);
+        assert_eq!(complete.settled_count, 1);
+        let receipt = complete.entries[0].receipt.as_ref().unwrap();
+        assert_eq!(receipt.journal_state, "committed_volatile");
+        assert!(receipt.settled);
+        let mut legacy = serde_json::to_value(receipt).unwrap();
+        legacy.as_object_mut().unwrap().remove("settled");
+        let decoded: CommandStatusDto = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.settled);
+        assert_eq!(decoded.command_id, receipt.command_id);
+        assert_eq!(decoded.journal_state, receipt.journal_state);
+        assert_eq!(rig.tick(), 1);
+    }
+
     struct FailSecondStepJournal {
         receipts: VecDeque<JournalReceipt>,
     }
@@ -885,6 +1106,7 @@ mod tests {
                     rejection_reason: None,
                     application_failure: Some(failure.clone()),
                     journal_state: "failed".into(),
+                    settled: true,
                     journal_failure: Some(failure.clone()),
                     applied_tick: None,
                     control_revision: u64::MAX,
@@ -1127,7 +1349,10 @@ impl ControlHandle {
         };
         match self.host.command_status_before(command_id, deadline) {
             Ok(Some(status)) => {
-                let observed = ObservedProgress::from_status(&status);
+                let observed = ObservedProgress::from_status(
+                    &status,
+                    self.host.command_status_is_settled(&status)?,
+                );
                 let receipt = self.status_dto(status);
                 batch.progress()?.observe(index, observed, receipt);
                 Ok(true)
@@ -1210,7 +1435,10 @@ impl ControlHandle {
             admitted_this_turn += 1;
             match self.host.submit_before(envelope, deadline) {
                 Ok(status) => {
-                    let observed = ObservedProgress::from_status(&status);
+                    let observed = ObservedProgress::from_status(
+                        &status,
+                        self.host.command_status_is_settled(&status)?,
+                    );
                     let receipt = self.status_dto(status);
                     batch.progress()?.observe(index, observed, receipt);
                 }

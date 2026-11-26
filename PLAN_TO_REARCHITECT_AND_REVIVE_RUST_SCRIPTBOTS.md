@@ -82,6 +82,43 @@ Restricted storage and endpoints with query strings use in-memory operation
 with a visible notice. A local paired study can delay treatment to a selected
 tick, records matched observations at that boundary and checks its receipt.
 
+**Owner-defined command settlement across native and browser controls (2026-11-26):**
+[Source implemented and independently reviewed; native qualification pending —
+Codex; corrective contribution to `bd-ac4l`, `bd-k7nq`, `bd-2z0.4.9`
+and `bd-2z0.12.2`; original complete acceptance retained]
+
+Command receipts now expose whether application and journalling have settled
+under the actual owner's immutable journal commitment requirement. The channel
+port, DTO projection and step-batch progress reuse the same canonical predicate.
+A volatile acknowledgement on a durable owner remains unresolved: it cannot
+complete the batch or admit its next child. A final journal failure preserves
+the applied scientific prefix, records the failure and stops later steps.
+
+Browser retention obeys that owner decision. Volatile receipts from older
+servers without settlement metadata remain unresolved. Valid volatile-to-failed
+transitions are accepted, and delayed weaker receipts cannot hide the retained
+failure or completion. Batch pages reject contradictory explicit settlement
+metadata, and the UI keeps pending completion separate from application and
+journal state.
+
+Three new native regressions use the actual owner/channel with controlled journal
+receipts for delayed durability, a later journal failure and explicitly volatile
+completion; the existing channel transition test also checks the shared predicate.
+Browser regressions cover full retention, delayed metadata, failure diagnostics,
+legacy receipts and batch-page contradictions. The live browser journey waits
+for the native owner's explicit settlement decision before judging its outcome.
+
+The preceding recovery/history increments `17f453be` and `68158077` passed
+their exact-commit DSR browser suites (400 and 424 tests respectively), each
+with 38 JavaScript syntax checks and unchanged source fingerprints.
+Pinned-nightly formatting passed for the native control/server files on
+`68158077`. Native compilation, Clippy and execution remain unqualified:
+the recorded workspace attempts stopped at the unavailable pinned `rust-xcb`
+source before compilation. The settlement candidate additionally passed all
+429 browser module tests and 38 syntax checks through DSR with unchanged source
+fingerprints before the final native formatting corrections. Native and packaged
+browser execution remain unverified; no broad acceptance gate is closed.
+
 **Remote command recovery under sustained control traffic (2026-11-26):**
 [Source implemented and independently reviewed; native qualification pending —
 Codex; corrective contribution to `bd-ac4l` and `bd-2z0.12.2`;

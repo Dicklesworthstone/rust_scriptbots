@@ -12918,6 +12918,7 @@ mod tests {
             rejection_reason: None,
             application_failure: Some(failure.clone()),
             journal_state: "failed".into(),
+            settled: true,
             journal_failure: Some(failure),
             applied_tick: None,
             control_revision: u64::MAX,

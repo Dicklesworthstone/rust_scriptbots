@@ -72,6 +72,16 @@ separate observations: an admitted command or an uncertain error does not free
 its retention slot. A separate bounded lookup slot keeps outcome inspection
 available when all 32 commands are unresolved.
 
+Receipts expose an owner-derived `settled` flag. A `committed_volatile` journal
+receipt can settle an explicitly volatile owner, but remains unresolved when
+the owner requires durable storage. Both the retained-command list and native
+step batches wait for this actual requirement before releasing evidence or
+reporting completion. A later journal failure settles the outcome as a failure,
+preserving the already-applied scientific step and stopping further batch steps;
+it never becomes a durability or success claim. Older servers without the flag
+leave volatile commitment unconfirmed. A missing or delayed weaker observation
+cannot erase a previously observed final outcome.
+
 Use **Retained Command** to select any retained request, including an earlier
 command whose first receipt was lost. Each choice shows its operation and
 application/journal outcomes; the summary counts unresolved requests. A later

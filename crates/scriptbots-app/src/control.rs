@@ -440,6 +440,11 @@ pub struct CommandStatusDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub application_failure: Option<CommandFailureDto>,
     pub journal_state: String,
+    /// Both receipt axes have settled under this owner's journal commitment contract.
+    /// This does not imply durable success: terminal failures and explicitly volatile
+    /// owners can settle too. Legacy receipts without this field remain unconfirmed.
+    #[serde(default)]
+    pub settled: bool,
     /// Independent journal failure; an applied command can still carry this failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub journal_failure: Option<CommandFailureDto>,
@@ -9453,6 +9458,7 @@ impl ControlHandle {
         };
         Ok(CommandStatusDto {
             command_id: status.command_id().to_string(),
+            settled: self.host.command_status_is_settled(&status)?,
             admission_sequence: status.admission_sequence().map(|sequence| sequence.get()),
             application_state: match status.application() {
                 ApplicationState::Admitted => "admitted",
@@ -22193,6 +22199,10 @@ pub(crate) mod tests {
             .submit_command(ControlCommand::Step, Some(key))
             .expect("actual owner admission");
         let applied = owner.wait_applied(&original);
+        assert!(
+            applied.settled,
+            "the volatile owner's receipt is fully settled"
+        );
         let before = handle.read_snapshot().expect("completed original step");
         let session = handle.session_id().get().to_string();
 

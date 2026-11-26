@@ -431,13 +431,163 @@ test("a full mutation history preserves both pending axes while a separate statu
   assert.equal(sent.length, 33);
   assert.throws(() => value.retryControl("step-1"), /lookup is pending/);
   receiveControl(value, commandReceipt(lookup, "00000000000000000000000000000001",
-    { application_state: "applied", journal_state: "committed_volatile" }));
+    { application_state: "applied", journal_state: "committed_volatile", settled: true }));
   assert.equal(value.controlRequests()[0].settled, true);
   value.sendControl("step", { requestId: "step-32" });
   assert.equal(value.requests.size, 32);
   assert.equal(value.requests.has("step-0"), false);
   assert.ok(Array.from({ length: 31 }, (_, index) => value.requests.has(`step-${index + 1}`)).every(Boolean),
     "only the original whose two axes settled may be evicted");
+});
+
+test("a durable owner's full history retains intermediate volatile receipts until a failure or durable completion settles them", () => {
+  const { value, sent } = connectedControlClient();
+  for (let index = 0; index < 32; index += 1) {
+    const key = `durable-${index}`, id = BigInt(index + 1).toString(16).padStart(32, "0");
+    value.sendControl("step", { requestId: key });
+    receiveControl(value, commandReceipt(key, id,
+      { application_state: "applied", journal_state: "committed_volatile", applied_tick: index + 1, settled: false }));
+  }
+  assert.equal(remoteCommandHistoryView(value).unresolvedCount, 32);
+  assert.ok(value.controlRequests().every((entry) => !entry.settled && entry.receipt.settled === false));
+  assert.throws(() => value.sendControl("step", { requestId: "overflow" }), /32 control outcomes/);
+  assert.equal(sent.length, 32);
+  const failedLookup = value.retryControl("durable-0");
+  const failure = { code: "fsync_failed", message: "Required durable journal write failed", diagnostic_truncated: false };
+  const failed = commandReceipt(failedLookup, "00000000000000000000000000000001",
+    { application_state: "applied", journal_state: "failed", applied_tick: 1, journal_failure: failure, settled: true });
+  receiveControl(value, failed);
+  let original = value.controlRequests().find((entry) => entry.requestId === "durable-0");
+  assert.equal(original.settled, true);
+  assert.equal(original.receipt.application_state, "applied");
+  assert.equal(original.receipt.journal_state, "failed");
+  assert.equal(original.receipt.applied_tick, 1);
+  assert.ok(Object.isFrozen(original.receipt.journal_failure));
+  failure.message = "changed outside the client";
+  assert.equal(original.receipt.journal_failure.message, "Required durable journal write failed");
+  assert.match(describeRemoteCommandReceipt(original.receipt), /Journal failure \(fsync_failed\)/);
+  assert.equal(remoteCommandHistoryView(value).unresolvedCount, 31);
+
+  receiveControl(value, commandReceipt("durable-0", "00000000000000000000000000000001",
+    { application_state: "applied", journal_state: "committed_volatile", applied_tick: 1, settled: false }));
+  original = value.controlRequests().find((entry) => entry.requestId === "durable-0");
+  assert.equal(original.receipt.journal_state, "failed", "a delayed volatile observation cannot hide the later failure");
+  assert.equal(original.receipt.journal_failure.message, "Required durable journal write failed");
+  assert.equal(original.settled, true);
+  value.sendControl("step", { requestId: "after-failure" });
+  assert.equal(value.requests.has("durable-0"), false);
+  assert.equal(value.requests.size, 32);
+  assert.ok(Array.from({ length: 31 }, (_, index) => value.requests.has(`durable-${index + 1}`)).every(Boolean));
+
+  const durableLookup = value.retryControl("durable-1");
+  receiveControl(value, commandReceipt(durableLookup, "00000000000000000000000000000002",
+    { application_state: "applied", journal_state: "durable", applied_tick: 2, settled: true }));
+  value.sendControl("step", { requestId: "after-durability" });
+  assert.equal(value.requests.has("durable-1"), false);
+  assert.equal(value.requests.size, 32);
+  assert.ok(Array.from({ length: 30 }, (_, index) => value.requests.has(`durable-${index + 2}`)).every(Boolean),
+    "every other intermediate volatile receipt remains retained");
+  assert.equal(sent.filter((request) => request.command === "step").length, 34, "only new explicit mutations advance science");
+});
+
+test("explicit volatile completion settles and same-state metadata enrichment preserves independent failure diagnosis", () => {
+  const { value, sent } = connectedControlClient();
+  value.sendControl("step", { requestId: "volatile-owner" });
+  receiveControl(value, commandReceipt("volatile-owner", COMMAND,
+    { application_state: "applied", journal_state: "committed_volatile", applied_tick: 7, settled: true }));
+  assert.equal(value.controlRequests()[0].settled, true);
+  assert.equal(remoteCommandHistoryView(value).unresolvedCount, 0);
+  assert.doesNotMatch(describeRemoteCommandReceipt(value.controlRequests()[0].receipt), /completion.*pending|completion.*unconfirmed/);
+  receiveControl(value, commandReceipt("volatile-owner", COMMAND,
+    { application_state: "applied", journal_state: "durable", applied_tick: 7 }));
+  assert.equal(value.controlRequests()[0].receipt.settled, true, "known completion survives stronger evidence without metadata");
+  receiveControl(value, commandReceipt("volatile-owner", COMMAND, { settled: false }));
+  assert.equal(value.controlRequests()[0].receipt.journal_state, "durable");
+  assert.equal(value.controlRequests()[0].receipt.settled, true, "late admission cannot erase completion");
+
+  const failedId = "00000000000000000000000000000002";
+  value.sendControl("step", { requestId: "application-failed" });
+  const diagnosis = { code: "world_step", message: "Retained scientific failure", diagnostic_truncated: true };
+  const fields = { application_state: "failed", journal_state: "committed_volatile", application_failure: diagnosis };
+  receiveControl(value, commandReceipt("application-failed", failedId, fields));
+  assert.equal(value.controlRequests()[1].settled, false, "an old server's volatile outcome does not prove required completion");
+  receiveControl(value, commandReceipt("application-failed", failedId, { ...fields, settled: false }));
+  assert.equal(value.controlRequests()[1].receipt.settled, false);
+  receiveControl(value, commandReceipt("application-failed", failedId, fields));
+  assert.equal(value.controlRequests()[1].receipt.settled, false, "missing same-state metadata cannot erase known incompletion");
+  receiveControl(value, commandReceipt("application-failed", failedId, { ...fields, settled: true,
+    application_failure: { ...diagnosis, message: "A later payload must not replace the retained diagnosis" } }));
+  const completed = value.controlRequests()[1].receipt;
+  assert.equal(value.controlRequests()[1].settled, true);
+  assert.equal(completed.settled, true);
+  assert.deepEqual(completed.application_failure, diagnosis);
+  assert.ok(Object.isFrozen(completed.application_failure));
+  for (const receipt of [fields, { ...fields, settled: false }]) {
+    receiveControl(value, commandReceipt("application-failed", failedId, receipt));
+    assert.equal(value.controlRequests()[1].receipt, completed);
+    assert.equal(value.controlRequests()[1].settled, true);
+  }
+  assert.equal(sent.length, 2, "metadata reconciliation never submits another mutation");
+});
+
+test("legacy terminal journal outcomes settle conservatively while explicit incomplete metadata remains authoritative", () => {
+  const { value } = connectedControlClient();
+  value.sendControl("step", { requestId: "legacy-volatile" });
+  receiveControl(value, commandReceipt("legacy-volatile", COMMAND,
+    { application_state: "applied", journal_state: "committed_volatile" }));
+  assert.equal(value.controlRequests()[0].settled, false);
+  assert.match(describeRemoteCommandReceipt(value.controlRequests()[0].receipt), /Required journal completion is unconfirmed/);
+  const lookup = value.retryControl("legacy-volatile");
+  receiveControl(value, commandReceipt(lookup, COMMAND, { application_state: "applied", journal_state: "durable" }));
+  assert.equal(value.controlRequests()[0].settled, true);
+  for (const [index, journal] of ["not_required", "failed"].entries()) {
+    const key = `legacy-${journal}`, id = BigInt(index + 2).toString(16).padStart(32, "0");
+    value.sendControl("step", { requestId: key });
+    receiveControl(value, commandReceipt(key, id, { application_state: "applied", journal_state: journal,
+      ...(journal === "failed" ? { journal_failure: { code: "write_failed", message: "No committed write", diagnostic_truncated: false } } : {}) }));
+    assert.equal(value.controlRequests().find((entry) => entry.requestId === key).settled, true);
+  }
+  value.sendControl("step", { requestId: "explicit-incomplete" });
+  const explicitId = "00000000000000000000000000000004";
+  receiveControl(value, commandReceipt("explicit-incomplete", explicitId,
+    { application_state: "applied", journal_state: "durable", settled: false }));
+  let entry = value.controlRequests().find((item) => item.requestId === "explicit-incomplete");
+  assert.equal(entry.settled, false);
+  assert.match(describeRemoteCommandReceipt(entry.receipt), /Owner completion remains pending/);
+  receiveControl(value, commandReceipt("explicit-incomplete", explicitId,
+    { application_state: "applied", journal_state: "durable" }));
+  assert.equal(value.controlRequests().find((item) => item.requestId === "explicit-incomplete").settled, false);
+  receiveControl(value, commandReceipt("explicit-incomplete", explicitId,
+    { application_state: "applied", journal_state: "durable", settled: true }));
+  assert.equal(value.controlRequests().find((item) => item.requestId === "explicit-incomplete").settled, true);
+
+  value.sendControl("step", { requestId: "legacy-after-admission" });
+  const admittedId = "00000000000000000000000000000005";
+  receiveControl(value, commandReceipt("legacy-after-admission", admittedId, { settled: false }));
+  receiveControl(value, commandReceipt("legacy-after-admission", admittedId,
+    { application_state: "applied", journal_state: "durable" }));
+  assert.equal(value.controlRequests().find((item) => item.requestId === "legacy-after-admission").settled, true,
+    "an earlier admitted receipt's false flag cannot override a stronger terminal legacy observation");
+});
+
+test("invalid completion metadata cannot resolve a retained command or consume its pending lookup", () => {
+  const callbacks = [], { value } = connectedControlClient({ onReceipt: (reply) => callbacks.push(reply) });
+  value.sendControl("step", { requestId: "completion-checked" });
+  const lookup = value.retryControl("completion-checked");
+  for (const fields of [
+    ...[null, 0, 1, "true", {}, []].map((settled) => ({ application_state: "applied", journal_state: "durable", settled })),
+    { application_state: "admitted", journal_state: "pending", settled: true },
+    { application_state: "admitted", journal_state: "not_required", settled: true },
+    { application_state: "applied", journal_state: "pending", settled: true },
+  ]) assert.throws(() => receiveControl(value, commandReceipt(lookup, COMMAND, fields)), /Invalid remote command receipt outcome/);
+  assert.equal(callbacks.length, 0);
+  assert.equal(value.statusRequest.received, false);
+  assert.equal(value.controlRequests()[0].commandId, null);
+  assert.equal(value.controlRequests()[0].settled, false);
+  receiveControl(value, commandReceipt(lookup, COMMAND,
+    { application_state: "applied", journal_state: "committed_volatile", settled: false }));
+  assert.equal(value.statusRequest.received, true);
+  assert.equal(value.controlRequests()[0].settled, false);
 });
 
 test("lost admission recovery is read-only even after errors, full retention, and missing native history", () => {
@@ -974,6 +1124,33 @@ test("step batch pages retain independent outcomes and refuse foreign, oversized
     assert.throws(() => validateRemoteStepBatch({ ...rejected, ...invalid },
       { sessionId: OWNER_SESSION, batchId: rejected.batch_id, count: 3 }));
   }
+});
+
+test("step batch settlement metadata preserves pending durability and rejects contradictory completed pages", () => {
+  const waiting = stepBatchFixture({ requested_count: 1, attempted_count: 1, admitted_count: 1, applied_count: 1,
+    settled_count: 0, phase: "waiting", entries: [stepBatchEntry(0, { settled: false })] });
+  const pending = validateRemoteStepBatch(waiting, { sessionId: OWNER_SESSION });
+  assert.equal(pending.settled_count, 0);
+  assert.equal(pending.entries[0].receipt.journal_state, "committed_volatile");
+  assert.equal(pending.entries[0].receipt.settled, false);
+  assert.ok(Object.isFrozen(pending.entries[0].receipt));
+  assert.match(describeRemoteCommandReceipt(pending.entries[0].receipt), /Owner completion remains pending/);
+  for (const fields of [
+    ...[null, 0, 1, "true", {}, []].map((settled) => ({ settled })),
+    { application_state: "admitted", journal_state: "pending", settled: true },
+    { application_state: "admitted", journal_state: "not_required", settled: true },
+    { application_state: "applied", journal_state: "pending", settled: true },
+  ]) assert.throws(() => validateRemoteStepBatch({ ...waiting, entries: [stepBatchEntry(0, fields)] },
+    { sessionId: OWNER_SESSION }), /Step batch receipt/);
+
+  const completed = { ...waiting, phase: "complete", settled_count: 1, entries: [stepBatchEntry(0, { settled: true })] };
+  assert.equal(validateRemoteStepBatch(completed, { sessionId: OWNER_SESSION }).entries[0].receipt.settled, true,
+    "the native owner may explicitly finish at volatile commitment");
+  assert.throws(() => validateRemoteStepBatch({ ...completed, entries: [stepBatchEntry(0, { settled: false })] },
+    { sessionId: OWNER_SESSION }), /completion contradicts an unsettled/);
+  assert.equal(validateRemoteStepBatch({ ...completed, entries: [stepBatchEntry(0)] },
+    { sessionId: OWNER_SESSION }).phase, "complete", "older batch protocols retain their authoritative aggregate contract");
+  assert.equal(waiting.entries[0].receipt.settled, false, "validation does not rewrite source progress or receipts");
 });
 
 test("step batch HTTP uses exact creation identity, bodyless advance and bounded session-bound receipt pages", async () => {

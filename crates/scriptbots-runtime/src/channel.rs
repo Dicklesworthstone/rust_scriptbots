@@ -486,6 +486,23 @@ impl Clone for ChannelHostPort {
 }
 
 impl ChannelHostPort {
+    /// Whether both receipt axes have settled under this owner's journal contract.
+    ///
+    /// This uses the same immutable commitment threshold as the channel's status
+    /// retention. A volatile receipt remains unsettled when this owner requires
+    /// durability. The supplied status must belong to this owner; no lookup or
+    /// command submission is performed.
+    pub fn command_status_is_settled(
+        &self,
+        status: &CommandStatus,
+    ) -> Result<bool, HostAccessError> {
+        let board = self
+            .statuses
+            .read()
+            .map_err(|_| Self::protocol_violation("channel status board poisoned"))?;
+        Ok(status_is_finished(status, board.commitment))
+    }
+
     /// Observe only the locally published status, without owner ingress or waiting.
     ///
     /// `None` means no observation was available: the bounded mirror may not contain
@@ -4495,6 +4512,7 @@ mod tests {
 
         let (mut port, admitted) = client.join().expect("client thread");
         assert_eq!(admitted.journal(), &crate::JournalState::Pending);
+        assert!(!port.command_status_is_settled(&admitted).unwrap());
         assert_step_applied_with_pending_journal(&mut port, CommandId::new(82));
         assert!(
             !journal_dropped.get(),
@@ -4516,6 +4534,10 @@ mod tests {
             intermediate.journal(),
             &crate::JournalState::CommittedVolatile
         );
+        assert!(
+            !port.command_status_is_settled(&intermediate).unwrap(),
+            "volatile acknowledgement does not meet this owner's durable contract"
+        );
 
         {
             let mut state = journal_state.borrow_mut();
@@ -4533,6 +4555,7 @@ mod tests {
             .expect("status lookup")
             .expect("step status retained");
         assert_eq!(durable.journal(), &crate::JournalState::Durable);
+        assert!(port.command_status_is_settled(&durable).unwrap());
 
         drop(port);
         driver
@@ -5369,7 +5392,10 @@ mod tests {
             )])),
         });
         let (mut driver, port) = ChannelHostDriver::new(
-            authority_test_host(authority, HostCoreOptions::default().archived_command_capacity),
+            authority_test_host(
+                authority,
+                HostCoreOptions::default().archived_command_capacity,
+            ),
             fast_options(),
         )
         .expect("channel authority driver");

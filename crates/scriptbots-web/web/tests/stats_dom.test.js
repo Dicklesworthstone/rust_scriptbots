@@ -1585,7 +1585,7 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
         return wire.replies.slice(start).findLast((reply) => reply.type === "receipt" && reply.request_id === sent?.request_id)?.receipt;
       }, { start, command }), (receipt) => !!receipt, `${command} receipt`);
       const settled = await until(() => request(`/api/control/status/${receipt.command_id}`),
-        (status) => status.application_state !== "admitted" && status.journal_state !== "pending", `${command} outcome`);
+        (status) => status.settled === true, `${command} owner-settled outcome`);
       if (settled.application_state !== "applied" || settled.journal_state !== "durable") {
         throw new Error(`Remote ${command} did not apply and journal durably: ${JSON.stringify(settled)}`);
       }

@@ -92,6 +92,10 @@ export function describeRemoteOwnerFault(status) {
 /** Describe the owner's independent application and journal outcomes verbatim. */
 export function describeRemoteCommandReceipt(receipt) {
   let text = `Command ${receipt.command_id}: application ${receipt.application_state}; journal ${receipt.journal_state}.`;
+  if (receipt.settled === false) text += " Owner completion remains pending.";
+  else if (receipt.journal_state === "committed_volatile" && receipt.settled !== true) {
+    text += " Required journal completion is unconfirmed.";
+  }
   if (receipt.application_state === "applied") {
     // These legacy DTO fields are JSON numbers. Never present a rounded u64 as
     // an exact applied boundary, or borrow the currently displayed frame's tick.
@@ -237,8 +241,12 @@ export function validateRemoteStepBatch(value, { sessionId, batchId, count } = {
       const receipt = entry.receipt;
       if (receipt.command_id !== entry.command_id
           || !["admitted", "applied", "rejected", "failed"].includes(receipt.application_state)
-          || !["not_required", "pending", "committed_volatile", "durable", "failed"].includes(receipt.journal_state)) {
+          || !["not_required", "pending", "committed_volatile", "durable", "failed"].includes(receipt.journal_state)
+          || !validReceiptSettlement(receipt)) {
         throw new Error("Step batch receipt does not identify its attempted command");
+      }
+      if (value.phase === "complete" && receipt.settled === false) {
+        throw new Error("Step batch completion contradicts an unsettled command receipt");
       }
       failure(receipt.application_failure);
       failure(receipt.journal_failure);
@@ -771,13 +779,20 @@ function freezeControlEvidence(value) {
   return copy;
 }
 
+/** Optional owner completion metadata is shared by live and batch receipts. */
+function validReceiptSettlement(receipt) {
+  return !Object.hasOwn(receipt, "settled") || (typeof receipt.settled === "boolean"
+    && (!receipt.settled || (receipt.application_state !== "admitted" && receipt.journal_state !== "pending")));
+}
+
 /** A reply is not a settled outcome until both independent owner axes settle. */
 function controlReceipt(receipt) {
   if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
       || typeof receipt.command_id !== "string" || !/^[0-9a-f]{32}$/.test(receipt.command_id)
       || !["admitted", "applied", "rejected", "failed"].includes(receipt.application_state)
       || !["not_required", "pending", "committed_volatile", "durable", "failed"].includes(receipt.journal_state)
-      || (receipt.application_state === "admitted" && !["not_required", "pending"].includes(receipt.journal_state))) {
+      || (receipt.application_state === "admitted" && !["not_required", "pending"].includes(receipt.journal_state))
+      || !validReceiptSettlement(receipt)) {
     throw new Error("Invalid remote command receipt outcome");
   }
   for (const [axis, state] of [["application", receipt.application_state], ["journal", receipt.journal_state]]) {
@@ -790,12 +805,31 @@ function controlReceipt(receipt) {
   return freezeControlEvidence(receipt);
 }
 
+/** Legacy volatile receipts do not reveal the owner's required commitment. */
+function controlReceiptSettled(receipt) {
+  if (typeof receipt.settled === "boolean") return receipt.settled;
+  return receipt.application_state !== "admitted"
+    && ["not_required", "durable", "failed"].includes(receipt.journal_state);
+}
+
 /** Delayed replies cannot undo a previously observed application or commitment. */
 function retainControlReceipt(previous, next) {
   if (!previous) return next;
+  const retain = (receipt) => {
+    // Completion is monotonic. A same-state metadata upgrade must not replace
+    // the retained boundary or diagnosis with a later, less complete payload.
+    if ((previous.settled === true || next.settled === true) && receipt.settled !== true) {
+      return freezeControlEvidence({ ...receipt, settled: true });
+    }
+    if (receipt === previous && !Object.hasOwn(previous, "settled") && next.settled === false
+        && previous.application_state === next.application_state && previous.journal_state === next.journal_state) {
+      return freezeControlEvidence({ ...receipt, settled: false });
+    }
+    return receipt;
+  };
   if (previous.application_state !== next.application_state) {
-    if (previous.application_state === "admitted") return next;
-    if (next.application_state === "admitted") return previous;
+    if (previous.application_state === "admitted") return retain(next);
+    if (next.application_state === "admitted") return retain(previous);
     throw new Error("Remote receipt contradicts its retained terminal application state");
   }
   if (previous.application_state === "applied") {
@@ -805,11 +839,11 @@ function retainControlReceipt(previous, next) {
       }
     }
   }
-  if (previous.journal_state === next.journal_state) return previous;
-  if (previous.journal_state === "pending") return next;
-  if (next.journal_state === "pending") return previous;
-  if (previous.journal_state === "committed_volatile" && next.journal_state === "durable") return next;
-  if (previous.journal_state === "durable" && next.journal_state === "committed_volatile") return previous;
+  if (previous.journal_state === next.journal_state) return retain(previous);
+  if (previous.journal_state === "pending") return retain(next);
+  if (next.journal_state === "pending") return retain(previous);
+  if (previous.journal_state === "committed_volatile" && ["durable", "failed"].includes(next.journal_state)) return retain(next);
+  if (["durable", "failed"].includes(previous.journal_state) && next.journal_state === "committed_volatile") return retain(previous);
   throw new Error("Remote receipt contradicts its retained journal outcome");
 }
 
@@ -1467,7 +1501,7 @@ export class RemoteStreamClient {
         target.commandId = commandId;
         target.receipt = retained;
         target.error = null;
-        target.settled = retained.application_state !== "admitted" && retained.journal_state !== "pending";
+        target.settled = controlReceiptSettled(retained);
       }
       // The UI sees the strongest retained observation, not a delayed pending
       // response that would hide an already observed terminal outcome.
