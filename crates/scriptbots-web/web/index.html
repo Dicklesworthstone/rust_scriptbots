@@ -988,6 +988,17 @@
                     <button id="intervention-stage" type="submit" disabled>Stage intervention at paused boundary</button>
                     <p id="intervention-form-error" role="status"></p>
                 </form>
+                <fieldset id="local-study">
+                    <legend>Compare this intervention on copies of the local world</legend>
+                    <p>Pause the local world and choose an intervention above. Both copies start from that checkpoint. Only the treatment receives the chosen intervention.</p>
+                    <label for="local-study-ticks">Scientific ticks per arm</label>
+                    <input id="local-study-ticks" type="number" min="1" max="512" step="1" value="64" />
+                    <button id="local-study-run" type="button" disabled>Run local comparison</button>
+                    <button id="local-study-cancel" type="button" disabled>Cancel comparison</button>
+                    <p id="local-study-status" role="status" aria-live="polite"></p>
+                    <table id="local-study-metrics" aria-label="Local study endpoints"></table>
+                    <a id="local-study-export" hidden>Download study result (JSON)</a>
+                </fieldset>
                 <p id="intervention-request">No intervention request in this owner session.</p>
                 <p id="intervention-receipt" role="status" aria-live="polite"></p>
                 <div class="inspector-actions">

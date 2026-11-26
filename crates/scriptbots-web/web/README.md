@@ -154,6 +154,14 @@ history/credit handling; nonempty narrative delivery requires observed records.
   **Refresh history** explicitly retries an unavailable read. These observations
   come from retained memory or a saved continuation, and do not establish a
   durable event journal. Reading the timeline never ticks the simulation.
+- **Local paired study**: Pause a local world and choose an action in the
+  scientific intervention toolbox. **Run local comparison** restores two copies
+  of the same complete continuation, stages the action on the treatment, and
+  advances both copies by the chosen 1–512 scientific ticks. The table shows
+  endpoint population, mean energy and mean health. An extinct arm has no\n  population mean, and its mean differences are shown as unavailable. The JSON includes the
+  source identity, intervention receipt and both arms' starting and final
+  measurements, plus the checkpoint byte count and SHA-256 when Web Crypto is\n  available. A worker runs one arm at a time and can be cancelled. The live
+  world receives no study commands. The comparison describes one saved world.
 - **Saved continuations**: MLP, DWRAON, Assembly and Unbound worlds can be saved.
   Both save controls are visibly disabled for the legacy Wander demo.
   **Save Continuation File** downloads a portable full-owner checkpoint; **Load

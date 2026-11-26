@@ -7,6 +7,7 @@ import { BrowserContinuationStore, BrowserRecoveryController } from "./continuat
 import { InspectionController, pickAgent, renderInspector, renderInspectorSource,
   validateBrainInspection, renderBrainInspector, renderBrainSource } from "./inspector.js";
 import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource } from "./genome.js";
+import { attachLocalStudy } from "./local-study-view.js";
 import { InterventionController, renderInterventions, validateInterventionAction } from "./interventions.js";
 import { NarrativeController, renderNarrative, renderNarrativeSource } from "./narrative.js";
 import { validateContinuationBrains, validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
@@ -160,6 +161,7 @@ const perfWindow = {
 };
 
 let simHandle = null;
+let localStudyPaused = false;
 let wasmInitialized = false;
 let simulationGeneration = 0;
 let speedMultiplier = Number(stepsSlider.value);
@@ -721,27 +723,37 @@ interventionField("use-selected")?.addEventListener("click", () => {
   interventionField("y").value = String(creature.position[1]);
   interventionField("form-error").textContent = "";
 });
+function readInterventionAction(frame) {
+  const kind = interventionField("kind").value;
+  let action;
+  if (kind === "set_closed_world") action = { kind, closed: interventionField("closed").value === "true" };
+  else {
+    const region = interventionField("region").value === "all" ? { shape: "all" }
+      : { shape: "disc", x: interventionNumber("x"), y: interventionNumber("y"), radius: interventionNumber("radius") };
+    const world = frame?.snapshot.world;
+    if (region.shape === "disc" && region.radius > Math.min(world.width, world.height) / 2) {
+      throw new Error("Disc radius cannot exceed half the smaller world dimension");
+    }
+    action = { kind, region };
+    if (["drought", "embargo"].includes(kind)) action.ticks = interventionNumber("ticks");
+    if (kind === "drought") action.growth_scale = interventionNumber("growth-scale");
+    if (kind === "bloom") action.amount = interventionNumber("amount");
+    if (kind === "meteor") Object.assign(action, { lethality: interventionNumber("lethality"), scorch: interventionNumber("scorch") });
+  }
+  return validateInterventionAction(action);
+}
+const localStudyPanel = document.getElementById("local-study");
+const localStudy = localStudyPanel && attachLocalStudy(localStudyPanel, {
+  getOwner: () => simHandle,
+  getAction: readInterventionAction,
+  getLimit: () => wasm.checkpoint_byte_limit(),
+  createWorker: () => new Worker(new URL("./local-study-worker.js", import.meta.url), { type: "module" }),
+});
 interventionField("form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   interventionField("form-error").textContent = "";
   try {
-    const kind = interventionField("kind").value;
-    let action;
-    if (kind === "set_closed_world") action = { kind, closed: interventionField("closed").value === "true" };
-    else {
-      const region = interventionField("region").value === "all" ? { shape: "all" }
-        : { shape: "disc", x: interventionNumber("x"), y: interventionNumber("y"), radius: interventionNumber("radius") };
-      const world = interventions.frame?.snapshot.world;
-      if (region.shape === "disc" && region.radius > Math.min(world.width, world.height) / 2) {
-        throw new Error("Disc radius cannot exceed half the smaller world dimension");
-      }
-      action = { kind, region };
-      if (["drought", "embargo"].includes(kind)) action.ticks = interventionNumber("ticks");
-      if (kind === "drought") action.growth_scale = interventionNumber("growth-scale");
-      if (kind === "bloom") action.amount = interventionNumber("amount");
-      if (kind === "meteor") Object.assign(action, { lethality: interventionNumber("lethality"), scorch: interventionNumber("scorch") });
-    }
-    await interventions.stage(validateInterventionAction(action));
+    await interventions.stage(readInterventionAction(interventions.frame));
   } catch (error) { interventionField("form-error").textContent = `Action was not submitted: ${error.message || error}`; }
 });
 interventionField("retry")?.addEventListener("click", () => { void interventions.retry(); });
@@ -1151,6 +1163,9 @@ function updateCheckpointControls() {
   const supportsContinuation = activeBrainPreset !== "wander";
   const recoveryBusy = browserRecovery?.pending === true;
   const runningOwner = localOwnerAllowsCommands();
+  localStudy?.setAvailable(!remoteMode && localStudyPaused && runningOwner && localOwnerStatus.health === "healthy"
+    && supportsContinuation && !checkpointLoadPending && !browserStorePending && !recoveryBusy
+    && typeof wasm.checkpoint_byte_limit === "function" && typeof Worker === "function");
   stepsSlider.disabled = remoteMode || !runningOwner;
   if (brainPresetSelect) brainPresetSelect.disabled = remoteMode;
   resetButton.disabled = remoteMode || brainPresetSelect?.value === "mixed_continuation";
@@ -1318,6 +1333,7 @@ function connectRemote() {
     }
     remoteClient = nextClient;
     installedClient = true;
+    localStudy?.reset();
     remoteMode = true;
     recoveryReadStatus = "";
     browserRecovery?.attach(null);
@@ -1518,6 +1534,10 @@ function validateFrameIdentity(frame) {
 }
 
 function observePresentedLiveFrame(frame) {
+  if (!remoteMode && localStudyPaused !== frame.playback.paused) {
+    localStudyPaused = frame.playback.paused;
+    updateCheckpointControls();
+  }
   lastPaintedLiveFrame = { simulationGeneration, sessionId: frame.identity.sessionId };
   inspector.observe(frame, simulationGeneration);
   brainInspector.observe(frame, simulationGeneration);
@@ -1695,6 +1715,7 @@ function captureAdmittedFrame(frameIdentity) {
 }
 
 window.addEventListener("pagehide", () => {
+  localStudy?.reset();
   cancelWorldDrag();
   browserRecovery?.setEnabled(false);
   narrative.setEnabled(false);
@@ -1914,7 +1935,9 @@ function replaceSimulation(next, { continuation = false, permalink = null, expec
   }
 
   const previous = simHandle;
+  localStudy?.reset();
   simHandle = next;
+  localStudyPaused = frame.playback.paused;
   localOwnerStatus = ownerStatus;
   localClockFailure = null;
   recoveryReadStatus = "";

@@ -189,7 +189,7 @@ function createServer(packageInfo) {
     } else if (url.pathname === "/main.js") {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, "main.js")));
-    } else if (["/remote.js", "/experiments.js", "/experiment-protocol.js", "/experiment-view.js", "/checkpoint-lab.js", "/study-report.js", "/study-trajectories.js", "/continuation-store.js", "/inspector.js", "/genome.js", "/interventions.js", "/narrative.js", "/recipes.js", "/world-view.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
+    } else if (["/remote.js", "/local-study.js", "/local-study-view.js", "/local-study-worker.js", "/experiments.js", "/experiment-protocol.js", "/experiment-view.js", "/checkpoint-lab.js", "/study-report.js", "/study-trajectories.js", "/continuation-store.js", "/inspector.js", "/genome.js", "/interventions.js", "/narrative.js", "/recipes.js", "/world-view.js", "/renderers/canvas.js", "/renderers/webgpu.js", "/renderers/environment.js"].includes(url.pathname)) {
       res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
       res.end(fs.readFileSync(path.join(webDir, url.pathname.slice(1))));
     } else if (url.pathname.startsWith("/pkg/")
@@ -271,6 +271,37 @@ async function runCheckpointJourney(browser, baseUrl, moduleFile) {
       owner.tick(3);
       return { snapshot: JSON.stringify(owner.snapshot()), identity: owner.frame().identity };
     });
+    // Exercise the shipped module worker against the actual packaged WASM. The
+    // reference control runs in a separate restored handle on the page.
+    const expectedControl = await page.evaluate(async (file) => {
+      const wasm = await import(`/pkg/${file}`);
+      const copy = wasm.restore_checkpoint(window.__continuationOwner.checkpoint());
+      try {
+        copy.tick(2);
+        return copy.snapshot().summary;
+      } finally { copy.free(); }
+    }, moduleFile);
+    await page.evaluate(() => { document.querySelector("#intervention-toolbox").open = true; });
+    await page.selectOption("#intervention-kind", "meteor");
+    await page.fill("#local-study-ticks", "2");
+    await page.click("#local-study-run");
+    await page.waitForFunction(() => !document.querySelector("#local-study-export").hidden
+      || /failed|unavailable/i.test(document.querySelector("#local-study-status").textContent));
+    const paired = await page.evaluate(async () => {
+      const link = document.querySelector("#local-study-export");
+      if (link.hidden) throw new Error(document.querySelector("#local-study-status").textContent);
+      return (await fetch(link.href)).json();
+    });
+    if (paired.source.sessionId !== saved.identity.sessionId || paired.source.tick !== saved.identity.tick
+        || paired.control.end.population !== expectedControl.agentCount
+        || paired.control.end.averageEnergy !== (expectedControl.agentCount ? expectedControl.averageEnergy : null)
+        || paired.control.end.averageHealth !== (expectedControl.agentCount ? expectedControl.averageHealth : null)
+        || paired.action.kind !== "meteor" || paired.treatment.receipt.applicationState !== "applied"
+        || paired.treatment.finalTick !== String(BigInt(saved.identity.tick) + 2n)
+        || await snapshot() !== saved.snapshot) {
+      throw new Error("Local paired study disagreed with the reference control or changed its live source");
+    }
+    await page.evaluate(() => { document.querySelector("#intervention-toolbox").open = false; });
     const [download] = await Promise.all([page.waitForEvent("download"), page.click("#checkpoint-save")]);
     const artifact = path.join(proof, download.suggestedFilename());
     await download.saveAs(artifact);
