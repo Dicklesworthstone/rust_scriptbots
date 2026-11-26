@@ -2565,6 +2565,8 @@ fn real_process_experiment_cli_executes_matched_plan_and_reuses_verified_bundles
     );
     let family: scriptbots_app::control::ExperimentComparisonFamily =
         serde_json::from_slice(&grouped.stdout)?;
+    let inference = family.inference.context("missing paired-test procedure")?;
+    assert_eq!(inference.sign_assignments_evaluated, 4);
     let [food, population] = family.comparisons.as_slice() else {
         bail!("incomplete endpoint family");
     };

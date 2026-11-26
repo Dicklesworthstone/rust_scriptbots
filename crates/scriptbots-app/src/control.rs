@@ -900,11 +900,23 @@ pub struct ExperimentComparisonDto {
     pub status_generation: u64,
 }
 
+/// Procedures used for the reported intervals and p-values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperimentComparisonInference {
+    pub p_value_procedure: crate::lab::stats::PValueProcedure,
+    /// Actual number of paired sign assignments evaluated per endpoint.
+    pub sign_assignments_evaluated: usize,
+    pub confidence_interval_procedure: crate::lab::stats::ConfidenceIntervalProcedure,
+}
+
 /// Paired results in the requested metric order. The correction in `params`
 /// was applied once across all of these endpoints.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExperimentComparisonFamily {
     pub params: crate::lab::stats::AnalysisParams,
+    /// Absent for descriptive-only cohorts and reports written before procedure metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<ExperimentComparisonInference>,
     pub comparisons: Vec<ExperimentComparisonDto>,
 }
 
@@ -1148,6 +1160,11 @@ fn compare_verified_variant_endpoints(
     }
     Ok(ExperimentComparisonFamily {
         params: analysis.params,
+        inference: (matched_seeds.len() >= 2).then_some(ExperimentComparisonInference {
+            p_value_procedure: analysis.p_value_procedure,
+            sign_assignments_evaluated: analysis.sign_assignments_evaluated,
+            confidence_interval_procedure: analysis.confidence_interval_procedure,
+        }),
         comparisons,
     })
 }
@@ -10798,6 +10815,16 @@ pub(crate) mod tests {
             family.params.correction,
             crate::lab::stats::Correction::BenjaminiHochberg
         );
+        assert_eq!(family.params.permutation_iterations, 4_000);
+        assert_eq!(
+            family.inference,
+            Some(ExperimentComparisonInference {
+                p_value_procedure: crate::lab::stats::PValueProcedure::PairedSignFlipExact,
+                sign_assignments_evaluated: 8,
+                confidence_interval_procedure:
+                    crate::lab::stats::ConfidenceIntervalProcedure::PercentileBootstrap,
+            })
+        );
         let [abundance, food] = family.comparisons.as_slice() else {
             panic!("expected both endpoints");
         };
@@ -10833,6 +10860,15 @@ pub(crate) mod tests {
         single
             .execute_batch(&single.output_dir.join("status.json"))
             .unwrap();
+        let family = compare_saved_experiment_metrics(
+            &single,
+            &single.output_dir.join("status.json"),
+            "baseline",
+            "challenger",
+            &["alive_agents", "total_food"],
+        )
+        .unwrap();
+        assert!(family.inference.is_none());
         let descriptive = handle
             .compare_experiment_variants("single-pair", "baseline", "challenger", "total_food")
             .unwrap();
