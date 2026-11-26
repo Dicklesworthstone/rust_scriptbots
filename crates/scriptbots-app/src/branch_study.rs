@@ -395,10 +395,11 @@ impl StudyIntervention {
                         reason: "food_transfer_rate must be finite and >= 0.0".to_string(),
                     });
                 }
-                if !params.food_sharing_distance.is_finite() || params.food_sharing_distance < 0.0 {
+                if !params.food_sharing_distance.is_finite() || params.food_sharing_distance <= 0.0
+                {
                     return Err(BranchStudyError::InvalidIntervention {
                         branch_id: "cooperation".to_string(),
-                        reason: "food_sharing_distance must be finite and >= 0.0".to_string(),
+                        reason: "food_sharing_distance must be finite and > 0.0".to_string(),
                     });
                 }
                 if let Some(partner) = params.reproduction_partner_chance
@@ -531,8 +532,11 @@ impl BranchStudyPlan {
         checkpoint_digest: &WorldDigestV1,
         source: &BranchStudySource,
     ) -> Result<RunManifestRecord, BranchStudyError> {
-        let mut manifest =
-            RunManifestRecord::unattributed(self.bundle_run_id(branch, checkpoint_digest, source)?);
+        let mut manifest = RunManifestRecord::unattributed(self.bundle_run_id(
+            branch,
+            checkpoint_digest,
+            source,
+        )?);
         manifest.scenario_id = format!("branch_study_{}", branch.branch_id);
         manifest.experiment_id = Some(self.study_id.clone());
         manifest.variant_id = Some(branch.branch_id.clone());
@@ -3628,7 +3632,10 @@ mod tests {
                 Err(BranchStudyError::CapacityExceeded { resource, .. })
                     if resource == expected_resource
             ));
-            assert!(!output.exists(), "an invalid immediate cohort reserves no output");
+            assert!(
+                !output.exists(),
+                "an invalid immediate cohort reserves no output"
+            );
 
             let mut delayed = plan.clone();
             delayed.branches[1].intervention = Some(intervention);
@@ -4443,6 +4450,50 @@ mod tests {
             ));
         }
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn study_preflight_requires_positive_cooperation_distance() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("never-created");
+        let mut base = replicated_fixture().study;
+        base.branches[1].branch_id = "cooperation".to_owned();
+        let plan_for_distance = |distance, source_checkpoint| {
+            let mut plan = base.clone();
+            plan.source_checkpoint = source_checkpoint;
+            plan.branches[1].intervention =
+                Some(StudyIntervention::Cooperation(CooperationParams {
+                    food_sharing_rate: 0.5,
+                    food_transfer_rate: 0.01,
+                    food_sharing_distance: distance,
+                    reproduction_partner_chance: None,
+                }));
+            plan
+        };
+
+        // Refuse invalid plans before seeded warmup or reading a declared source.
+        for source_checkpoint in [None, Some(dir.path().join("missing-source.bin"))] {
+            for distance in [0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let plan = plan_for_distance(distance, source_checkpoint.clone());
+                assert!(matches!(
+                    BranchStudyOrchestrator::new(plan, output.clone()).execute_study(None),
+                    Err(BranchStudyError::InvalidIntervention { ref branch_id, ref reason })
+                        if branch_id == "cooperation"
+                            && reason == "food_sharing_distance must be finite and > 0.0"
+                ));
+                assert!(
+                    !output.exists(),
+                    "invalid sharing distance must not reserve study output"
+                );
+            }
+            for distance in [f32::from_bits(1), 20.0] {
+                let plan = plan_for_distance(distance, source_checkpoint.clone());
+                BranchStudyOrchestrator::new(plan, output.clone())
+                    .validate()
+                    .expect("finite positive sharing distance admitted before execution");
+                assert!(!output.exists());
+            }
+        }
     }
 
     fn study_intervention_codec_cases() -> Vec<(&'static str, StudyIntervention)> {
