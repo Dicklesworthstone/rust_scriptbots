@@ -3,7 +3,8 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import test from "node:test";
-import { RemoteFrameTracker, RemoteStreamClient, consumeRemoteFrame, validateRemoteOwnerStatus, describeRemoteCommandReceipt, describeRemoteOwnerFault } from "../remote.js";
+import { RemoteFrameTracker, RemoteStreamClient, RemoteStepBatchController, RemoteOwnerHttpError, STEP_BATCH_LIMITS,
+  consumeRemoteFrame, validateRemoteOwnerStatus, validateRemoteStepBatch, describeRemoteCommandReceipt, describeRemoteOwnerFault } from "../remote.js";
 import { EXPERIMENT_LIMITS, prepareExperimentRequest } from "../experiment-protocol.js";
 import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
 
@@ -525,6 +526,316 @@ function experimentTransport(sessionId = SESSION) {
 }
 
 const OWNER_SESSION = "18446744073709551615";
+function stepBatchFixture(overrides = {}) {
+  return { batch_id: "retained-batch-a", session_id: OWNER_SESSION, requested_count: 3,
+    attempted_count: 0, admitted_count: 0, applied_count: 0, settled_count: 0,
+    phase: "reserved", advancing: false, offset: 0, entries: [], ...overrides };
+}
+function stepBatchEntry(index, receipt = {}) {
+  const command_id = `exact-command-${index}`;
+  return { index, command_id, submission_state: "observed", receipt: {
+    command_id, application_state: "applied", journal_state: "committed_volatile", applied_tick: index + 1,
+    control_revision: index + 1, scientific_revision: index + 1, config_revision: 0, ...receipt,
+  } };
+}
+function stepBatchClient(methods = {}) {
+  return { url: "wss://batch.example/api/ws/stream", state: "connected", tracker: { sessionId: OWNER_SESSION }, ...methods };
+}
+function stepBatchCrypto(t) {
+  if (!globalThis.crypto) {
+    Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true });
+    t.after(() => { delete globalThis.crypto; });
+  }
+}
+
+test("step batch pages retain independent outcomes and refuse foreign, oversized or fabricated progress", () => {
+  const failure = { code: "disk_full", message: "retained journal write failed", diagnostic_truncated: false };
+  const stopped = stepBatchFixture({ attempted_count: 1, admitted_count: 1, applied_count: 1, settled_count: 1,
+    phase: "stopped", blocking_index: 0, entries: [stepBatchEntry(0, { journal_state: "failed", journal_failure: failure })] });
+  const page = validateRemoteStepBatch(stopped, { sessionId: OWNER_SESSION, batchId: stopped.batch_id, count: 3 });
+  assert.match(describeRemoteCommandReceipt(page.entries[0].receipt), /application applied; journal failed/);
+  assert.match(describeRemoteCommandReceipt(page.entries[0].receipt), /Journal failure \(disk_full\)/);
+  stopped.entries[0].receipt.journal_failure.message = "changed input";
+  assert.equal(page.entries[0].receipt.journal_failure.message, "retained journal write failed");
+  assert.equal(Object.isFrozen(page.entries[0].receipt.journal_failure), true);
+  const rejected = stepBatchFixture({ attempted_count: 1, admitted_count: 0, settled_count: 1, phase: "stopped",
+    entries: [stepBatchEntry(0, { application_state: "rejected", journal_state: "not_required" })] });
+  assert.equal(validateRemoteStepBatch(rejected, { sessionId: OWNER_SESSION }).settled_count, 1,
+    "a settled pre-admission rejection need not count as admitted");
+  const projectionLost = stepBatchFixture({ attempted_count: 1, admitted_count: 1, phase: "indeterminate",
+    entries: [{ index: 0, command_id: "kept-command", submission_state: "observed", observation_error: failure }] });
+  assert.equal(validateRemoteStepBatch(projectionLost, { sessionId: OWNER_SESSION }).entries[0].receipt, undefined);
+  for (const invalid of [
+    { session_id: "1" }, { batch_id: "other-batch" }, { requested_count: 100001 }, { attempted_count: 4 },
+    { admitted_count: 2 }, { settled_count: -1 }, { offset: 1.5 }, { phase: "complete" },
+    { next_offset: 0 }, { entries: Array(17).fill(stepBatchEntry(0)) },
+    { entries: [stepBatchEntry(0, { command_id: "different-command" })] },
+    { entries: [{ ...stepBatchEntry(0), submission_state: "not_admitted",
+      observation_error: { ...failure, code: "step_submission_not_admitted" } }] },
+    { entries: [{ index: 0, command_id: "exact-command-0", submission_state: "not_admitted" }] },
+    { entries: [{ ...stepBatchEntry(0), observation_error: { ...failure, message: "é".repeat(257) } }] },
+  ]) {
+    assert.throws(() => validateRemoteStepBatch({ ...rejected, ...invalid },
+      { sessionId: OWNER_SESSION, batchId: rejected.batch_id, count: 3 }));
+  }
+});
+
+test("step batch HTTP uses exact creation identity, bodyless advance and bounded session-bound receipt pages", async () => {
+  const original = globalThis.fetch, calls = [];
+  const { client } = experimentTransport(OWNER_SESSION);
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: new URL(url), options });
+    const offset = options.method === "GET" ? Number(new URL(url).searchParams.get("offset")) : 0;
+    return new Response(JSON.stringify(offset === 2 ? stepBatchFixture({ attempted_count: 3, admitted_count: 3,
+      applied_count: 3, settled_count: 3, phase: "complete", offset: 2, entries: [stepBatchEntry(2)] }) : stepBatchFixture()));
+  };
+  try {
+    const key = ` ${"\u0001".repeat(1022)} `;
+    await client.createStepBatch({ count: 3, idempotency_key: key }, { sessionId: OWNER_SESSION });
+    assert.equal(calls[0].url.pathname, "/prefix/api/control/step-batches");
+    assert.equal(calls[0].options.method, "POST");
+    assert.deepEqual(JSON.parse(calls[0].options.body), { count: 3, idempotency_key: key });
+    assert.ok(calls[0].options.body.length > 2048, "valid escaped keys are not silently narrowed to 2 KiB");
+    await client.advanceStepBatch("retained-batch-a", { sessionId: OWNER_SESSION });
+    assert.equal(calls[1].url.pathname, "/prefix/api/control/step-batches/retained-batch-a/advance");
+    assert.equal(calls[1].options.method, "POST");
+    assert.equal(calls[1].options.body, undefined);
+    const page = await client.stepBatchStatus("retained-batch-a", { sessionId: OWNER_SESSION, offset: 2, limit: 1 });
+    assert.equal(page.entries[0].index, 2);
+    assert.equal(calls[2].url.search, "?offset=2&limit=1");
+    for (const call of calls) assert.equal(call.options.headers["X-ScriptBots-Session"], OWNER_SESSION);
+    const count = calls.length;
+    for (const invalid of [0, -1, 1.5, 100001, Number.MAX_SAFE_INTEGER + 1, "3"]) {
+      await assert.rejects(client.createStepBatch({ count: invalid }, { sessionId: OWNER_SESSION }));
+    }
+    for (const limit of [0, 17, 1.5]) {
+      await assert.rejects(client.stepBatchStatus("retained-batch-a", { sessionId: OWNER_SESSION, limit }));
+    }
+    await assert.rejects(client.createStepBatch({ count: 3, idempotency_key: "é".repeat(513) }, { sessionId: OWNER_SESSION }));
+    assert.equal(calls.length, count, "malformed requests are refused before HTTP admission");
+  } finally { globalThis.fetch = original; }
+});
+
+test("step batch HTTP enforces actual response bytes and ignores a response from a replaced connection", async () => {
+  const original = globalThis.fetch;
+  const { client } = experimentTransport(OWNER_SESSION);
+  try {
+    globalThis.fetch = async () => new Response(" ".repeat(STEP_BATCH_LIMITS.bytes) + JSON.stringify(stepBatchFixture()));
+    await assert.rejects(client.stepBatchStatus("retained-batch-a", { sessionId: OWNER_SESSION }), /9 KiB/);
+    let resolve;
+    globalThis.fetch = () => new Promise((done) => { resolve = done; });
+    const pending = client.createStepBatch({ count: 3, idempotency_key: "retained-key" }, { sessionId: OWNER_SESSION });
+    client.generation += 1;
+    resolve(new Response(JSON.stringify(stepBatchFixture())));
+    await assert.rejects(pending, /connection changed/);
+  } finally { globalThis.fetch = original; }
+});
+
+test("batch creation and advancement uncertainty preserve the exact reservation and stop later science", async (t) => {
+  stepBatchCrypto(t);
+  const creations = [], snapshots = [];
+  let advances = 0, reads = 0, controller;
+  const client = stepBatchClient({
+    async createStepBatch(request) {
+      creations.push(request);
+      if (creations.length === 1) throw new Error("creation reply lost");
+      return stepBatchFixture();
+    },
+    async advanceStepBatch(id) {
+      assert.equal(id, "retained-batch-a");
+      assert.equal(controller.batchId, id, "the ID is retained before any advancing request");
+      assert.ok(snapshots.includes(id), "the ID has already been exposed to the UI");
+      if (++advances === 1) throw new Error("advancing reply lost");
+      return stepBatchFixture({ attempted_count: 3, admitted_count: 3, applied_count: 3, settled_count: 3,
+        phase: "complete", offset: 2, entries: [stepBatchEntry(2)] });
+    },
+    async stepBatchStatus() {
+      reads += 1;
+      return stepBatchFixture({ attempted_count: 1, admitted_count: 1, phase: reads === 1 ? "indeterminate" : "ready",
+        applied_count: reads === 1 ? 0 : 1, settled_count: reads === 1 ? 0 : 1,
+        entries: reads === 1 ? [{ index: 0, command_id: "exact-command-0", submission_state: "indeterminate" }] : [stepBatchEntry(0)] });
+    },
+  });
+  controller = new RemoteStepBatchController({ getClient: () => client, onChange: (state) => snapshots.push(state.batchId) });
+  assert.equal(await controller.start(3), false);
+  assert.equal(controller.batchId, null);
+  assert.equal(Object.isFrozen(controller.creation), true);
+  await assert.rejects(controller.start(2), /retained batch/);
+  assert.equal(await controller.resume(), false);
+  assert.equal(creations[0], creations[1], "creation retry reuses the identical frozen request");
+  assert.equal(controller.batchId, "retained-batch-a");
+  assert.equal(await controller.resume(), true);
+  assert.equal(controller.page.phase, "indeterminate");
+  assert.equal(advances, 1, "an unknown attempted outcome cannot cause another advance");
+  assert.equal(await controller.resume(), true);
+  assert.equal(controller.page.phase, "complete");
+  assert.equal(advances, 2);
+  assert.equal(creations.length, 2, "after the ID is known, recovery only addresses that ID");
+});
+
+test("an unknown retained batch and a different owner never create replacement science", async () => {
+  let creates = 0, advances = 0, reads = 0;
+  const client = stepBatchClient({
+    async createStepBatch() { creates += 1; throw new Error("unexpected create"); },
+    async advanceStepBatch() { advances += 1; throw new Error("unexpected advance"); },
+    async stepBatchStatus(id) { reads += 1; assert.equal(id, "old-process-batch"); throw new RemoteOwnerHttpError(404, "unknown batch"); },
+  });
+  const controller = new RemoteStepBatchController({ getClient: () => client });
+  assert.equal(await controller.open("old-process-batch"), false);
+  assert.equal(controller.missing, true);
+  assert.equal(controller.batchId, "old-process-batch");
+  assert.equal(await controller.resume(), false);
+  await assert.rejects(controller.start(3), /retained batch/);
+  client.tracker.sessionId = "1";
+  assert.equal(await controller.resume(), false);
+  assert.equal(reads, 2, "a different owner cannot answer for the retained source");
+  assert.equal(creates, 0);
+  assert.equal(advances, 0);
+  assert.equal(controller.batchId, "old-process-batch");
+});
+
+test("proven pre-admission backpressure continues the retained batch and observes the same command identity", async (t) => {
+  stepBatchCrypto(t);
+  let creates = 0, advances = 0;
+  const observations = [];
+  const client = stepBatchClient({
+    async createStepBatch() { creates += 1; return stepBatchFixture({ requested_count: 1 }); },
+    async advanceStepBatch(id) {
+      assert.equal(id, "retained-batch-a");
+      advances += 1;
+      return advances === 1 ? stepBatchFixture({ requested_count: 1, attempted_count: 1, phase: "ready",
+        entries: [{ index: 0, command_id: "exact-command-0", submission_state: "not_admitted",
+          observation_error: { code: "step_submission_not_admitted", message: "No command was admitted", diagnostic_truncated: false } }] })
+        : stepBatchFixture({ requested_count: 1, attempted_count: 1, admitted_count: 1, applied_count: 1,
+          settled_count: 1, phase: "complete", entries: [stepBatchEntry(0)] });
+    },
+  });
+  const controller = new RemoteStepBatchController({ getClient: () => client, wait: async () => {},
+    onChange: (state) => { if (state.page) observations.push(state.page); } });
+  assert.equal(await controller.start(1), true);
+  const refused = observations.find((page) => page.entries[0]?.submission_state === "not_admitted");
+  assert.ok(refused);
+  assert.equal(refused.entries[0].receipt, undefined);
+  assert.equal(refused.attempted_count, 1);
+  assert.equal(refused.admitted_count, 0);
+  assert.equal(controller.page.entries[0].command_id, refused.entries[0].command_id);
+  assert.equal(controller.page.attempted_count, 1);
+  assert.equal(controller.page.phase, "complete");
+  assert.equal(creates, 1);
+  assert.equal(advances, 2);
+});
+
+test("batch continuation yields at a finite budget and an aborted reservation never auto-advances", async (t) => {
+  stepBatchCrypto(t);
+  let clock = 0, advances = 0;
+  const waiting = stepBatchFixture({ requested_count: 100000, attempted_count: 1, admitted_count: 1,
+    phase: "waiting", blocking_index: 0, entries: [stepBatchEntry(0, { application_state: "admitted", journal_state: "pending" })] });
+  const client = stepBatchClient({
+    async createStepBatch() { return stepBatchFixture({ requested_count: 100000 }); },
+    async advanceStepBatch() { advances += 1; return waiting; },
+  });
+  const controller = new RemoteStepBatchController({ getClient: () => client,
+    now: () => clock, wait: async (milliseconds) => { clock += milliseconds; } });
+  assert.equal(await controller.start(100000), true);
+  assert.equal(advances, 100);
+  assert.equal(clock, 10000);
+  assert.equal(controller.page.phase, "waiting");
+  assert.match(controller.notice, /continuation window finished/);
+
+  let resolve, abort;
+  client.createStepBatch = (_request, options) => { abort = options.signal; return new Promise((done) => { resolve = done; }); };
+  const paused = new RemoteStepBatchController({ getClient: () => client });
+  const pending = paused.start(3);
+  paused.pause("Changed presentation source; retain this creation request.");
+  assert.equal(abort.aborted, true);
+  resolve(stepBatchFixture());
+  await pending;
+  assert.equal(paused.batchId, "retained-batch-a");
+  assert.equal(advances, 100, "a late creation response cannot start science after the view was paused");
+});
+
+test("batch authority changes preserve read-only outcome inspection while pausing continuation", async (t) => {
+  stepBatchCrypto(t);
+  let allowed = false, resolveRead, resolveCreate, readSignal, createSignal, advances = 0;
+  const client = stepBatchClient({
+    stepBatchStatus(_id, { signal }) {
+      readSignal = signal;
+      return new Promise((resolve) => { resolveRead = resolve; });
+    },
+    createStepBatch(_request, { signal }) {
+      createSignal = signal;
+      return new Promise((resolve) => { resolveCreate = resolve; });
+    },
+    async advanceStepBatch() { advances += 1; throw new Error("unexpected continuation"); },
+  });
+  const reader = new RemoteStepBatchController({ getClient: () => client, canAdvance: () => allowed });
+  const reading = reader.open("retained-batch-a");
+  assert.equal(reader.pending.continuation, false);
+  reader.syncAuthority(); // The same production hook called by canvas and owner-status updates.
+  assert.equal(readSignal.aborted, false, "a faulted owner or historical view must still allow receipt reads");
+  resolveRead(stepBatchFixture({ attempted_count: 1, admitted_count: 1, applied_count: 1, settled_count: 1,
+    phase: "stopped", entries: [stepBatchEntry(0, { journal_state: "failed",
+      journal_failure: { code: "disk_full", message: "retained fault evidence", diagnostic_truncated: false } })] }));
+  assert.equal(await reading, true);
+  assert.equal(reader.page.entries[0].receipt.journal_failure.code, "disk_full");
+
+  allowed = true;
+  const runner = new RemoteStepBatchController({ getClient: () => client, canAdvance: () => allowed });
+  const creating = runner.start(3);
+  assert.equal(runner.pending.continuation, true);
+  allowed = false;
+  runner.syncAuthority();
+  assert.equal(createSignal.aborted, true, "live continuation must pause when mutation authority is lost");
+  resolveCreate(stepBatchFixture());
+  await creating;
+  assert.equal(runner.batchId, "retained-batch-a");
+  assert.equal(advances, 0);
+});
+
+test("clearing a batch reference makes no native calls and cannot discard a pending request", async (t) => {
+  stepBatchCrypto(t);
+  let creates = 0, reads = 0, advances = 0, resolveRead;
+  const client = stepBatchClient({
+    async createStepBatch() { creates += 1; throw new Error("reservation reply lost"); },
+    async advanceStepBatch() { advances += 1; throw new Error("unexpected advance"); },
+    stepBatchStatus(id) {
+      reads += 1;
+      if (id === "missing-batch") return Promise.reject(new RemoteOwnerHttpError(404, "unknown batch"));
+      return new Promise((resolve) => { resolveRead = resolve; });
+    },
+  });
+  const controller = new RemoteStepBatchController({ getClient: () => client });
+  assert.equal(await controller.start(3), false);
+  assert.ok(controller.creation);
+  assert.equal(controller.canStart, false);
+  controller.clearReference();
+  assert.equal(controller.creation, null);
+  assert.equal(controller.source, null);
+  assert.equal(controller.canStart, true);
+  assert.deepEqual([creates, reads, advances], [1, 0, 0]);
+
+  assert.equal(await controller.open("missing-batch"), false);
+  assert.equal(controller.missing, true);
+  assert.equal(controller.canStart, false, "404 alone never permits a replacement run");
+  controller.clearReference();
+  assert.equal(controller.batchId, null);
+  assert.equal(controller.page, null);
+  assert.equal(controller.source, null);
+  assert.equal(controller.creation, null);
+  assert.equal(controller.missing, false);
+  assert.equal(controller.canStart, true, "only the explicit local clear releases the selection");
+  assert.match(controller.notice, /Earlier server work is unchanged/);
+  assert.deepEqual([creates, reads, advances], [1, 1, 0], "forgetting a reference is purely local");
+
+  const pending = controller.open("pending-batch");
+  assert.throws(() => controller.clearReference(), /pending batch request/);
+  assert.equal(controller.batchId, "pending-batch");
+  assert.ok(controller.pending);
+  resolveRead(stepBatchFixture({ batch_id: "pending-batch" }));
+  assert.equal(await pending, true);
+  assert.deepEqual([creates, reads, advances], [1, 2, 0]);
+});
+
 function ownerStatusFixture(sessionId = OWNER_SESSION, revision = "9007199254740993") {
   return { schema: "scriptbots.remote-owner-status.v1",
     identity: { sessionId, publicationRevision: revision, scientificRevision: "9007199254740993",
