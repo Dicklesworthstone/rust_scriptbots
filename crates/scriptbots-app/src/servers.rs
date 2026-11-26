@@ -46,7 +46,7 @@ use crate::control::{
     ExperimentSummaryDto, ExperimentVariantDto, HydrologySnapshot, InterveneRequestBody,
     InterventionsPollDto, KnobEntry, KnobUpdate, MAX_CHECKPOINT_BRANCH_ID_BYTES,
     MAX_CHECKPOINT_BRANCH_KEY_BYTES, MAX_CHECKPOINT_BRANCH_NAME_BYTES,
-    MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MAX_CHECKPOINT_BRANCH_TICKS, MAX_STEP_BATCH,
+    MAX_CHECKPOINT_BRANCH_REQUEST_BYTES, MAX_CHECKPOINT_BRANCH_TICKS,
     MapApplyAgentPolicy, MapApplyRequestBody, MapGenerateRequestBody, PaginatedArtifactsResponse,
     PaginatedCheckpointBranchesResponse, PaginatedCheckpointsResponse,
     PaginatedExperimentsResponse, RemoteOwnerStatusDto, Scoreboard, SelectionModeDto,
@@ -1581,8 +1581,11 @@ impl From<ConfigAuditEntry> for ConfigAuditEntryView {
 #[serde(deny_unknown_fields)]
 pub struct StepRequestBody {
     #[serde(default = "default_step_count")]
+    #[schema(minimum = 1, maximum = 1)]
     pub count: u64,
 }
+
+const SINGLE_STEP_REQUIRED_MESSAGE: &str = "count > 1 requires a retained step batch: reserve with /api/control/step-batches, retain its batch_id, then advance that exact identity";
 
 fn default_step_count() -> u64 {
     1
@@ -1602,6 +1605,9 @@ fn parse_step_count(bytes: &[u8]) -> Result<u64, AppError> {
     // Decode the original object so duplicate fields cannot collapse in Value.
     let body: StepRequestBody = serde_json::from_slice(bytes)
         .map_err(|error| AppError::bad_request(format!("invalid step request payload: {error}")))?;
+    if body.count > 1 {
+        return Err(AppError::bad_request(SINGLE_STEP_REQUIRED_MESSAGE));
+    }
     Ok(body.count)
 }
 
@@ -1935,8 +1941,6 @@ impl From<ControlError> for AppError {
                 Self::bad_request(format!("unknown knob path: {path}"))
             }
             ControlError::InvalidPatch(msg) => Self::bad_request(msg),
-            ControlError::Serialization(msg) => Self::internal(msg),
-            ControlError::Lock => Self::service_unavailable("world state is currently unavailable"),
             ControlError::Host(
                 error @ scriptbots_runtime::HostAccessError::CommandIdCollision { .. },
             ) => Self::conflict(error.to_string()),
@@ -1956,7 +1960,18 @@ impl From<ControlError> for AppError {
                 }
                 other => Self::bad_request(other.to_string()),
             },
+            other => remaining_rest_control_error(other),
         }
+    }
+}
+
+// Preserve existing failures while separately updated control adapters may
+// introduce a new error before its transport-specific classification arrives.
+fn remaining_rest_control_error(error: ControlError) -> AppError {
+    match error {
+        ControlError::Lock => AppError::service_unavailable("world state is currently unavailable"),
+        ControlError::Serialization(message) => AppError::internal(message),
+        other => AppError::internal(other.to_string()),
     }
 }
 
@@ -4328,10 +4343,8 @@ async fn post_step(
 ) -> Result<Json<CommandStatusDto>, AppError> {
     require_json_content_type(&headers, &bytes)?;
     let count = parse_step_count(&bytes)?;
-    // `step_count` submits `count` commands and returns the LAST receipt. The
-    // reported id therefore identifies the final step, not the batch; a caller
-    // polling it learns about that one command. Saying so beats implying the
-    // receipt covers all of them.
+    // Only one step can be represented by this command receipt. Refuse an
+    // untracked multi-step request before it reaches the owner.
     let key = idempotency_key(&headers);
     let status = run_control(ControlWorkLane::Command, move || {
         state.handle.step_count(count, key.as_deref())
@@ -5677,11 +5690,11 @@ fn register_control_tools(builder: ServerBuilder, handle: ControlHandle) -> Serv
     builder = register_tool(
         builder,
         "step",
-        "Step the simulation by N ticks; an idempotency key requires count=1",
+        "Submit one scientific step; multi-step execution requires a retained batch identity",
         json!({
             "type": "object",
             "properties": {
-                "count": {"type": "integer", "minimum": 1, "maximum": MAX_STEP_BATCH},
+                "count": {"type": "integer", "minimum": 1, "maximum": 1},
                 "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 1024}
             },
             "additionalProperties": false
@@ -6843,6 +6856,12 @@ impl ToolHandler for ControlTool {
                         )
                     })?,
                 };
+                if count > 1 {
+                    return Err(McpError::new(
+                        McpErrorCode::InvalidParams,
+                        SINGLE_STEP_REQUIRED_MESSAGE,
+                    ));
+                }
                 if let Some(value) = arguments.get("idempotency_key")
                     && !value.as_str().is_some_and(|key| {
                         let key = key.trim();
@@ -7359,14 +7378,10 @@ fn map_control_error(err: ControlError) -> McpError {
             format!("unknown knob path: {path}"),
         ),
         ControlError::InvalidPatch(msg) => McpError::new(McpErrorCode::InvalidParams, msg),
-        ControlError::Serialization(msg) => McpError::new(McpErrorCode::InternalError, msg),
         ControlError::Host(
             error @ scriptbots_runtime::HostAccessError::CommandIdCollision { .. },
         ) => McpError::new(McpErrorCode::InvalidParams, error.to_string()),
         ControlError::Host(error) => McpError::new(McpErrorCode::InternalError, error.to_string()),
-        ControlError::Lock => {
-            McpError::new(McpErrorCode::InternalError, "world state is unavailable")
-        }
         ControlError::CommandQueueFull => McpError::new(
             McpErrorCode::InternalError,
             "command queue is full; retry shortly",
@@ -7383,7 +7398,17 @@ fn map_control_error(err: ControlError) -> McpError {
             }
             other => McpError::new(McpErrorCode::InvalidParams, other.to_string()),
         },
+        other => remaining_mcp_control_error(other),
     }
+}
+
+fn remaining_mcp_control_error(error: ControlError) -> McpError {
+    let message = match error {
+        ControlError::Lock => "world state is unavailable".to_owned(),
+        ControlError::Serialization(message) => message,
+        other => other.to_string(),
+    };
+    McpError::new(McpErrorCode::InternalError, message)
 }
 
 #[cfg(test)]
@@ -12733,19 +12758,21 @@ mod tests {
 
         let mut unkeyed = HeaderMap::new();
         unkeyed.insert("Content-Type", "application/json".parse().unwrap());
-        let Json(batch) = post_step(
+        let refused = post_step(
             State(state),
             unkeyed,
             axum::body::Bytes::from_static(br#"{"count":2}"#),
         )
         .await
-        .expect("existing unkeyed batch");
-        host.wait_applied(&batch);
-        assert_eq!(handle.status().unwrap().tick, 3);
+        .err()
+        .expect("untracked multi-step submissions must be refused");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert!(refused.message.contains("/api/control/step-batches"));
+        assert_eq!(handle.status().unwrap().tick, 1);
     }
 
     #[tokio::test]
-    async fn rest_step_requires_object_without_changing_empty_or_batch_behavior() {
+    async fn rest_step_requires_object_and_refuses_untracked_batches() {
         let (handle, host) = handle();
         let state = ApiState {
             handle: handle.clone(),
@@ -12786,15 +12813,17 @@ mod tests {
         .await
         .unwrap_or_else(|error| panic!("empty-body step refused: {}", error.message));
         host.wait_applied(&single);
-        let Json(batch) = post_step(
+        let refused = post_step(
             State(state),
             headers,
             axum::body::Bytes::from_static(br#"{"count":2}"#),
         )
         .await
-        .unwrap_or_else(|error| panic!("unkeyed batch refused: {}", error.message));
-        host.wait_applied(&batch);
-        assert_eq!(handle.status().unwrap().tick, before.world.tick + 3);
+        .err()
+        .expect("a multi-step request must retain a batch identity before execution");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert!(refused.message.contains("/api/control/step-batches"));
+        assert_eq!(handle.status().unwrap().tick, before.world.tick + 1);
     }
 
     #[tokio::test]
@@ -12882,9 +12911,10 @@ mod tests {
             (json!({"count":null}), None),
             (json!({"count":true}), None),
             (json!({"count":u64::MAX}), None),
+            (json!({"count":2}), None),
             (
                 json!({"count":2, "idempotency_key":"refused-step"}),
-                Some("idempotency keys require count=1; submit individually keyed steps for retryable batches"),
+                None,
             ),
             (json!({"cout":2}), None),
             (json!({"idempotency_key":7}), None),
@@ -12912,6 +12942,9 @@ mod tests {
                 }),
             )
             .await;
+            if arguments.get("count") == Some(&json!(2)) {
+                assert_eq!(direct.message, SINGLE_STEP_REQUIRED_MESSAGE);
+            }
             if let Some(diagnostic) = handler_diagnostic {
                 assert_eq!(direct.message, diagnostic, "{arguments}");
                 assert_mcp_handler_refusal(&response, diagnostic);
