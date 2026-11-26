@@ -472,6 +472,50 @@ fn headless_scenario_schedule_matches_manual_science_across_bootstrap() {
 }
 
 #[test]
+fn explicit_zero_bootstrap_starts_a_scenario_at_tick_zero() {
+    let dir = tempdir().expect("scenario bootstrap fixture");
+    let scenario = dir.path().join("warmup.scenario.toml");
+    fs::write(
+        &scenario,
+        r#"schema = "scriptbots.scenario.v1"
+schema_version = 1
+id = "warmup"
+bootstrap_ticks = 3
+"#,
+    )
+    .unwrap();
+    for (case, env_ticks, cli_ticks, expected) in [
+        ("document", None, None, 3),
+        ("explicit-zero", None, Some("0"), 0),
+        ("env-zero", Some("0"), None, 0),
+        ("cli-over-env", Some("2"), Some("1"), 1),
+    ] {
+        let report_path = dir.path().join(format!("{case}.json"));
+        let mut cmd = headless_command();
+        cmd.args(["--storage", "memory", "--rng-seed", "42", "--threads", "1"])
+            .arg("--scenario")
+            .arg(&scenario)
+            .env("SCRIPTBOTS_TERMINAL_HEADLESS_FRAMES", "1")
+            .env("SCRIPTBOTS_TERMINAL_HEADLESS_REPORT", &report_path);
+        if let Some(value) = env_ticks {
+            cmd.env("SCRIPTBOTS_BOOTSTRAP_TICKS", value);
+        }
+        if let Some(value) = cli_ticks {
+            cmd.args(["--bootstrap-ticks", value]);
+        }
+        let output = cmd.output().expect("start headless scenario");
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(report_path).unwrap())
+            .expect("headless scenario report");
+        assert_eq!(report["initial"]["tick"], expected, "{case}");
+    }
+}
+
+#[test]
 fn occupied_rest_port_refuses_before_config_tuning_or_storage() {
     let occupied =
         TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("occupy REST control port");

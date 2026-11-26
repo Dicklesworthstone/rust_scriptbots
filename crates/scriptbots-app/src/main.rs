@@ -76,7 +76,6 @@ use tracing::{debug, info, warn};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const DEFAULT_BOOTSTRAP_TICKS: u64 = 0;
 const DEFAULT_CHECKPOINT_INTERVAL: u64 = 1_000;
 const LIVE_RUN_POLICY: &str = "operator-controlled-until-stop-v1";
 
@@ -550,11 +549,7 @@ fn main() -> Result<()> {
     // Resolve the effective bootstrap policy once: an explicit CLI/env value outranks
     // the scenario document's policy; the document outranks the built-in zero default.
     // The manifest, REST scenario view, and TUI header all read this same value.
-    let effective_bootstrap_ticks = if cli_bootstrap_explicit(&cli) {
-        cli.bootstrap_ticks
-    } else {
-        launch_scenario.bootstrap_ticks
-    };
+    let effective_bootstrap_ticks = cli.bootstrap_ticks.unwrap_or(launch_scenario.bootstrap_ticks);
     launch_scenario.bootstrap_ticks = effective_bootstrap_ticks;
     let launch_scenario_shared = Arc::new(launch_scenario.clone());
 
@@ -3157,14 +3152,6 @@ fn load_scenario_document(path: &std::path::Path) -> Result<(ScenarioDocumentV1,
     Ok((document, bytes))
 }
 
-/// Whether the operator explicitly named a bootstrap count on the CLI or in the
-/// environment. An explicit value outranks a scenario document's bootstrap policy;
-/// an unset flag lets the document (if any) speak.
-fn cli_bootstrap_explicit(cli: &AppCli) -> bool {
-    cli.bootstrap_ticks != DEFAULT_BOOTSTRAP_TICKS
-        || std::env::var_os("SCRIPTBOTS_BOOTSTRAP_TICKS").is_some()
-}
-
 /// Layer order, most general first: built-in defaults -> configuration files (in
 /// order) -> environment -> CLI. Statement GATHERING (file reads, environment reads,
 /// flag interpretation) happens here; the merge itself is the pure
@@ -4605,10 +4592,9 @@ struct AppCli {
     #[arg(
         long = "bootstrap-ticks",
         value_name = "TICKS",
-        env = "SCRIPTBOTS_BOOTSTRAP_TICKS",
-        default_value_t = DEFAULT_BOOTSTRAP_TICKS
+        env = "SCRIPTBOTS_BOOTSTRAP_TICKS"
     )]
-    bootstrap_ticks: u64,
+    bootstrap_ticks: Option<u64>,
     /// Path to a FrankenSQLite run to verify via headless deterministic replay.
     #[arg(long = "replay-db", value_name = "FILE", env = "SCRIPTBOTS_REPLAY_DB")]
     replay_db: Option<PathBuf>,
@@ -8175,8 +8161,7 @@ mod tests {
 
             let cli = default_cli();
             assert_eq!(cli.mode, RendererMode::Auto);
-            assert_eq!(DEFAULT_BOOTSTRAP_TICKS, 0);
-            assert_eq!(cli.bootstrap_ticks, DEFAULT_BOOTSTRAP_TICKS);
+            assert_eq!(cli.bootstrap_ticks, None);
 
             let cli = AppCli::parse_from([
                 "scriptbots-app",
@@ -8186,7 +8171,7 @@ mod tests {
                 "37",
             ]);
             assert_eq!(cli.mode, RendererMode::Terminal);
-            assert_eq!(cli.bootstrap_ticks, 37);
+            assert_eq!(cli.bootstrap_ticks, Some(37));
 
             restore_env("SCRIPTBOTS_MODE", previous_mode);
             restore_env("SCRIPTBOTS_BOOTSTRAP_TICKS", previous_bootstrap);
@@ -10554,7 +10539,7 @@ activation = "Sigmoid"
                     brain_preset: BrainPreset::Mixed,
                     storage_mode: StorageMode::File,
                     thresholds: ThresholdsOverride::default(),
-                    bootstrap_ticks: DEFAULT_BOOTSTRAP_TICKS,
+                    bootstrap_ticks: 0,
                     thread_policy: resolve_thread_policy(None, None, None, false),
                     scenario: ScenarioIdentityV0::caller_seeded("invalid-neuroflow-test"),
                     config_overrides: Vec::new(),
