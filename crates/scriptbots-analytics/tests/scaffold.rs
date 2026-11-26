@@ -1299,7 +1299,10 @@ fn narrative_verification_matches_three_real_scoped_runs_after_display_ring_wrap
     reason = "one immutable two-world recording proves selected reconstruction, complete comparison, CLI output, and cross-island negative controls"
 )]
 fn island_narrative_reconstruction_and_verification_follow_independent_real_worlds() {
-    use scriptbots_analytics::IslandNarrativeVerificationV1;
+    use scriptbots_analytics::{
+        ArchipelagoNarrativeVerificationV1, IslandNarrativeVerificationV1,
+        verify_archipelago_narrative,
+    };
     use scriptbots_core::rng_domains::IslandId;
     use scriptbots_storage::RunEventIdentity;
 
@@ -1314,6 +1317,12 @@ fn island_narrative_reconstruction_and_verification_follow_independent_real_worl
     ));
     let registry = Registry::builtin();
     assert!(registry.run("narrative-reconstruct", &cx, &ReportParams::default()).is_err());
+    let all = verify_archipelago_narrative(&cx.reader).expect("verify the full archipelago");
+    all.require_equivalent().expect("both independent detectors matched");
+    assert_eq!(
+        all.islands.iter().map(|i| i.input_binding.island_id).collect::<Vec<_>>(),
+        [IslandId(0), IslandId(7)]
+    );
     let mut input_digests = Vec::new();
     for id in [0, 7] {
         let expected = online.get_mut(&id).expect("online detector records");
@@ -1322,6 +1331,10 @@ fn island_narrative_reconstruction_and_verification_follow_independent_real_worl
         assert!(expected.iter().any(|event| event.kind == EventKind::Extinction));
         let report = verify_island_narrative(&cx.reader, IslandId(id))
             .expect("complete selected-island comparison");
+        let member = all.islands.iter().find(|i| i.input_binding.island_id == IslandId(id)).unwrap();
+        assert_eq!(member.verification.input_digest, report.verification.input_digest);
+        assert_eq!(member.verification.persisted_digest, report.verification.persisted_digest);
+        assert_eq!(member.verification.events_matched, report.verification.events_matched);
         report.require_equivalent().expect("independent reconstruction matches live output");
         assert_eq!(report.input_binding.island_id, IslandId(id));
         assert_eq!(report.input_binding.stream.terminal_tick, 320);
@@ -1410,6 +1423,23 @@ fn island_narrative_reconstruction_and_verification_follow_independent_real_worl
             .expect("retained scoped divergence");
     assert_eq!(retained, changed);
 
+    let all_path = dir.path().join("archipelago-diverged.json");
+    let cli = Command::new(executable)
+        .args([&path, "verify-narrative", "--all-islands", "--json"])
+        .arg(&all_path)
+        .output()
+        .expect("complete archipelago CLI");
+    assert_eq!(cli.status.code(), Some(1));
+    let all: ArchipelagoNarrativeVerificationV1 =
+        serde_json::from_slice(&std::fs::read(all_path).unwrap()).unwrap();
+    assert!(!all.equivalent);
+    all.islands[0].require_equivalent().expect("island zero still matches");
+    assert_eq!(all.islands[1].verification.first_difference, changed.verification.first_difference);
+    assert!(matches!(
+        all.require_equivalent(),
+        Err(NarrativeVerificationError::Diverged { identity, .. }) if identity.island() == IslandId(7)
+    ));
+
     let connection = Connection::open_existing(&path).expect("negative input control");
     assert_eq!(connection
         .execute("DELETE FROM replay_events WHERE island_id = 7 AND tick = 3 AND event_type = 'narrative_input_v1'")
@@ -1418,6 +1448,13 @@ fn island_narrative_reconstruction_and_verification_follow_independent_real_worl
     let cx = ReaderCtx::open(&path).expect("finished structurally valid source");
     verify_island_narrative(&cx.reader, IslandId(0)).expect("healthy independent stream").require_equivalent()
         .expect("unmodified island remains complete");
+    assert!(matches!(
+        verify_archipelago_narrative(&cx.reader),
+        Err(AnalyticsError::IslandEvidence { island: 7, source })
+            if matches!(*source, AnalyticsError::Storage(StorageError::NarrativeInputStream(
+                NarrativeInputStreamError::TickGap { expected: 3, actual: 4, .. }
+            )))
+    ));
     assert!(matches!(
         verify_island_narrative(&cx.reader, IslandId(7)),
         Err(AnalyticsError::Storage(StorageError::NarrativeInputStream(
@@ -1438,6 +1475,17 @@ fn island_narrative_reconstruction_and_verification_follow_independent_real_worl
         verify_island_narrative(&cx.reader, IslandId(0)),
         Err(AnalyticsError::Storage(StorageError::RunEvent(
             RunEventDecodeError::UnsupportedSchemaVersion { found: 999, .. }
+        )))
+    ));
+    drop(cx);
+    let connection = Connection::open_existing(&path).expect("orphan an island");
+    assert_eq!(connection.execute("DELETE FROM islands WHERE island_id = 7").unwrap(), 1);
+    connection.close().unwrap();
+    let cx = ReaderCtx::open(&path).unwrap();
+    assert!(matches!(
+        verify_archipelago_narrative(&cx.reader),
+        Err(AnalyticsError::Storage(StorageError::NarrativeInputStream(
+            NarrativeInputStreamError::IslandUnavailable { island: IslandId(7), .. }
         )))
     ));
 }

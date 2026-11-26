@@ -617,6 +617,15 @@ pub enum AnalyticsError {
     /// Complete narrative verification refused an unsupported or incoherent source.
     #[error("narrative verification error: {0}")]
     NarrativeVerification(#[from] NarrativeVerificationError),
+    /// Complete archipelago verification could not reconstruct one island's evidence.
+    #[error("narrative verification failed for island {island}: {source}")]
+    IslandEvidence {
+        /// Configured island under inspection.
+        island: u32,
+        /// Typed underlying source or replay failure.
+        #[source]
+        source: Box<AnalyticsError>,
+    },
 }
 
 /// Read-only context handed to every report.
@@ -3752,22 +3761,53 @@ impl<'a> NarrativeInputPages<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum NarrativeComparisonScope {
+    SingleWorld,
+    SelectedIsland(IslandId),
+    ArchipelagoMember(IslandId),
+}
+
+impl NarrativeComparisonScope {
+    const fn island(self) -> Option<IslandId> {
+        match self {
+            Self::SingleWorld => None,
+            Self::SelectedIsland(id) | Self::ArchipelagoMember(id) => Some(id),
+        }
+    }
+
+    fn event_page(
+        self,
+        reader: &StorageReader,
+        after: Option<&RunEventCursorV1>,
+    ) -> Result<scriptbots_storage::RunEventPageV1, StorageError> {
+        match self {
+            Self::ArchipelagoMember(id) => {
+                reader.island_run_event_page_v1(id, after, NARRATIVE_RECONSTRUCT_PAGE_SIZE)
+            }
+            Self::SingleWorld | Self::SelectedIsland(_) => {
+                reader.run_event_page_v1(after, NARRATIVE_RECONSTRUCT_PAGE_SIZE)
+            }
+        }
+    }
+}
+
 struct StoredNarrativeEvents<'a> {
     reader: &'a StorageReader,
     binding: RunEventBindingV1,
     events: std::vec::IntoIter<PersistedRunEvent>,
     next_after: Option<RunEventCursorV1>,
     pages: u64,
-    island: Option<IslandId>,
+    scope: NarrativeComparisonScope,
 }
 
 impl<'a> StoredNarrativeEvents<'a> {
     fn new(
         reader: &'a StorageReader,
         input_binding: &NarrativeInputBindingV1,
-        island: Option<IslandId>,
+        scope: NarrativeComparisonScope,
     ) -> Result<Self, AnalyticsError> {
-        let page = reader.run_event_page_v1(None, NARRATIVE_RECONSTRUCT_PAGE_SIZE)?;
+        let page = scope.event_page(reader, None)?;
         if page.binding.run_id != input_binding.run_id
             || page.binding.config_digest != input_binding.config_digest
             || page.binding.manifest_digest != input_binding.manifest_digest
@@ -3780,14 +3820,14 @@ impl<'a> StoredNarrativeEvents<'a> {
             events: page.events.into_iter(),
             next_after: page.next_after,
             pages: 1,
-            island,
+            scope,
         })
     }
 
     fn next(&mut self) -> Result<Option<PersistedRunEvent>, AnalyticsError> {
         loop {
             if let Some(event) = self.events.next() {
-                if let Some(island) = self.island {
+                if let Some(island) = self.scope.island() {
                     if event.identity().island() != island {
                         continue;
                     }
@@ -3802,9 +3842,7 @@ impl<'a> StoredNarrativeEvents<'a> {
             let Some(cursor) = self.next_after.take() else {
                 return Ok(None);
             };
-            let page = self
-                .reader
-                .run_event_page_v1(Some(&cursor), NARRATIVE_RECONSTRUCT_PAGE_SIZE)?;
+            let page = self.scope.event_page(self.reader, Some(&cursor))?;
             if page.binding != self.binding {
                 return Err(NarrativeVerificationError::SourceBinding.into());
             }
@@ -4017,7 +4055,8 @@ pub fn verify_narrative(reader: &StorageReader) -> Result<NarrativeVerificationV
             .into());
         }
     }
-    verify_narrative_inputs(reader, None).map(|(verification, _)| verification)
+    verify_narrative_inputs(reader, NarrativeComparisonScope::SingleWorld)
+        .map(|(verification, _)| verification)
 }
 
 /// Independently reconstruct and compare every narrative event from one configured island.
@@ -4030,12 +4069,100 @@ pub fn verify_island_narrative(
     reader: &StorageReader,
     island: IslandId,
 ) -> Result<IslandNarrativeVerificationV1, AnalyticsError> {
-    let (verification, binding) = verify_narrative_inputs(reader, Some(island))?;
+    compare_island_narrative(reader, NarrativeComparisonScope::SelectedIsland(island))
+}
+
+fn compare_island_narrative(
+    reader: &StorageReader,
+    scope: NarrativeComparisonScope,
+) -> Result<IslandNarrativeVerificationV1, AnalyticsError> {
+    let (verification, binding) = verify_narrative_inputs(reader, scope)?;
     let input_binding = binding.ok_or(NarrativeVerificationError::SourceBinding)?;
     Ok(IslandNarrativeVerificationV1 {
         schema_version: 1,
         input_binding,
         verification,
+    })
+}
+
+/// Independent comparisons for all configured islands, in ascending ID order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchipelagoNarrativeVerificationV1 {
+    /// Version of the aggregate result format.
+    pub schema_version: u32,
+    /// Selected durable run.
+    pub run_id: RunId,
+    /// True when every configured island matched its saved outputs.
+    pub equivalent: bool,
+    /// Complete per-island comparisons with independent source cuts.
+    pub islands: Vec<IslandNarrativeVerificationV1>,
+}
+
+impl ArchipelagoNarrativeVerificationV1 {
+    /// Require complete record equality for every island in the returned comparison.
+    pub fn require_equivalent(&self) -> Result<(), NarrativeVerificationError> {
+        let Some(first) = self.islands.first() else {
+            return Err(NarrativeVerificationError::IncoherentResult);
+        };
+        if self.schema_version != 1
+            || self.islands.len() > scriptbots_runtime::MAX_ISLANDS
+            || self.islands.windows(2).any(|pair| {
+                pair[0].input_binding.island_id >= pair[1].input_binding.island_id
+            })
+            || self.islands.iter().any(|result| {
+                let stream = &result.input_binding.stream;
+                stream.run_id != self.run_id
+                    || stream.manifest_digest != first.input_binding.stream.manifest_digest
+                    || stream.config_digest != first.input_binding.stream.config_digest
+            })
+            || self.equivalent != self.islands.iter().all(|result| result.verification.equivalent)
+        {
+            return Err(NarrativeVerificationError::IncoherentResult);
+        }
+        for result in &self.islands {
+            result.require_equivalent()?;
+        }
+        Ok(())
+    }
+
+    /// Render every island's source cut and any observed difference.
+    #[must_use]
+    pub fn markdown(&self) -> String {
+        let mut result = format!(
+            "# Archipelago narrative verification\n\nRun `{}` compared {} configured islands. Overall result: **{}**.\n",
+            self.run_id, self.islands.len(), if self.equivalent { "equivalent" } else { "diverged" }
+        );
+        for island in &self.islands {
+            let _ = write!(result, "\n{}", island.markdown());
+        }
+        result
+    }
+}
+
+/// Compare all configured island narratives on one immutable finished-run lease.
+///
+/// Membership is checked against inputs, tick summaries and saved events before
+/// replay. Each independent detector is released before the next island. A
+/// divergent output does not short-circuit comparison of subsequent islands.
+/// Unreadable evidence returns an error with the affected island and typed cause.
+pub fn verify_archipelago_narrative(
+    reader: &StorageReader,
+) -> Result<ArchipelagoNarrativeVerificationV1, AnalyticsError> {
+    let ids = reader.finished_narrative_island_ids()?;
+    let mut islands = Vec::with_capacity(ids.len());
+    for id in ids {
+        let comparison = compare_island_narrative(reader, NarrativeComparisonScope::ArchipelagoMember(id))
+            .map_err(|source| AnalyticsError::IslandEvidence {
+                island: id.0,
+                source: Box::new(source),
+            })?;
+        islands.push(comparison);
+    }
+    Ok(ArchipelagoNarrativeVerificationV1 {
+        schema_version: 1,
+        run_id: reader.run_id(),
+        equivalent: islands.iter().all(|result| result.verification.equivalent),
+        islands,
     })
 }
 
@@ -4045,8 +4172,9 @@ pub fn verify_island_narrative(
 )]
 fn verify_narrative_inputs(
     reader: &StorageReader,
-    island: Option<IslandId>,
+    scope: NarrativeComparisonScope,
 ) -> Result<(NarrativeVerificationV1, Option<IslandNarrativeInputBindingV1>), AnalyticsError> {
+    let island = scope.island();
     let mut inputs = NarrativeInputPages::new(reader, island)?;
     let mut page = inputs.next()?;
     let binding = page.binding.clone();
@@ -4061,7 +4189,7 @@ fn verify_narrative_inputs(
     verify_narrative_policy(*first)?;
     let mut replay = NarrativeReplay::new(first.replay_policy()?)?;
     let mut policy = NarrativeInputPolicyV1::from(*first);
-    let mut stored = StoredNarrativeEvents::new(reader, &binding, island)?;
+    let mut stored = StoredNarrativeEvents::new(reader, &binding, scope)?;
     let next_stored = stored.next()?;
     let mut comparison = NarrativeComparison {
         stored,

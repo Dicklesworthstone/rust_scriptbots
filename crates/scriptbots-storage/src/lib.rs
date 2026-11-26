@@ -14651,14 +14651,40 @@ impl StorageReader {
     /// a supported writer from changing the stream between pages. Cursors must repeat the
     /// selected run's configuration and manifest digests and identify an exact retained
     /// row with the same complete payload. Result bounds do not impose an execution deadline.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the complete event page boundary validates its immutable lease, provenance-bound exact cursor, and every typed row before returning a bounded page"
-    )]
     pub fn run_event_page_v1(
         &self,
         after: Option<&RunEventCursorV1>,
         record_limit: usize,
+    ) -> Result<RunEventPageV1, StorageError> {
+        self.run_event_page_for_scope(after, record_limit, None)
+    }
+
+    /// Read one island's saved events in canonical order on the finished-run lease.
+    /// A cursor must identify an exact retained event from that same island.
+    pub fn island_run_event_page_v1(
+        &self,
+        island: IslandId,
+        after: Option<&RunEventCursorV1>,
+        record_limit: usize,
+    ) -> Result<RunEventPageV1, StorageError> {
+        if after.is_some_and(|cursor| cursor.identity.island() != island) {
+            return Err(RunEventStreamError::InvalidCursor {
+                reason: format!("event cursor does not belong to selected island {}", island.0),
+            }
+            .into());
+        }
+        self.run_event_page_for_scope(after, record_limit, Some(island))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "both scopes share complete cursor validation and typed row decoding"
+    )]
+    fn run_event_page_for_scope(
+        &self,
+        after: Option<&RunEventCursorV1>,
+        record_limit: usize,
+        island_filter: Option<IslandId>,
     ) -> Result<RunEventPageV1, StorageError> {
         if record_limit == 0 || record_limit > MAX_STORAGE_QUERY_PAGE {
             return Err(RunEventStreamError::InvalidPageSize {
@@ -14679,6 +14705,9 @@ impl StorageReader {
             manifest_digest,
         };
         let bound = checked_i64("run_event_page_v1.lookahead_limit", record_limit + 1)?;
+        let island_clause = island_filter.map_or_else(String::new, |id| {
+            format!("AND island_id = {}", id.0)
+        });
         let rows = if let Some(cursor) = after {
             if cursor.binding.run_id != binding.run_id {
                 return Err(RunEventStreamError::CursorRunMismatch {
@@ -14750,11 +14779,11 @@ impl StorageReader {
                 .into());
             }
             connection.query_with_params(
-                "SELECT tick, kind, severity, magnitude, window_start, window_end,
+                &format!("SELECT tick, kind, severity, magnitude, window_start, window_end,
                         metric, before_value, after_value, score, subject_ref, human_text,
                         schema_version, island_id
                  FROM run_events
-                 WHERE run_id = ?1 AND (
+                 WHERE run_id = ?1 {island_clause} AND (
                      tick > ?2
                      OR (tick = ?2 AND kind COLLATE BINARY > ?3)
                      OR (tick = ?2 AND kind COLLATE BINARY = ?3
@@ -14763,7 +14792,7 @@ impl StorageReader {
                          AND metric COLLATE BINARY = ?4 AND island_id > ?5))
                  ORDER BY tick ASC, kind COLLATE BINARY ASC,
                           metric COLLATE BINARY ASC, island_id ASC
-                 LIMIT ?6",
+                 LIMIT ?6"),
                 &[
                     sqlite_run_id(self.run_id),
                     tick.into(),
@@ -14775,14 +14804,14 @@ impl StorageReader {
             )?
         } else {
             connection.query_with_params(
-                "SELECT tick, kind, severity, magnitude, window_start, window_end,
+                &format!("SELECT tick, kind, severity, magnitude, window_start, window_end,
                         metric, before_value, after_value, score, subject_ref, human_text,
                         schema_version, island_id
                  FROM run_events
-                 WHERE run_id = ?1
+                 WHERE run_id = ?1 {island_clause}
                  ORDER BY tick ASC, kind COLLATE BINARY ASC,
                           metric COLLATE BINARY ASC, island_id ASC
-                 LIMIT ?2",
+                 LIMIT ?2"),
                 &[sqlite_run_id(self.run_id), bound.into()],
             )?
         };
@@ -14868,6 +14897,47 @@ impl StorageReader {
             }
         }
         Ok(events)
+    }
+
+    /// Enumerate configured detectors and check that every persisted narrative
+    /// input, tick summary and event belongs to one of them. A missing construction
+    /// row must never silently remove its island's history from a comparison.
+    pub fn finished_narrative_island_ids(&self) -> Result<Vec<IslandId>, StorageError> {
+        let connection = self.finished_connection()?;
+        let limit = checked_query_limit(
+            "archipelago narrative island limit",
+            scriptbots_runtime::MAX_ISLANDS + 1,
+        )?;
+        let configured = connection.query_with_params(
+            "SELECT island_id FROM islands WHERE run_id = ?1 ORDER BY island_id LIMIT ?2",
+            &[sqlite_run_id(self.run_id), limit.into()],
+        )?;
+        if configured.is_empty() || configured.len() > scriptbots_runtime::MAX_ISLANDS {
+            return Err(StorageError::InvalidData {
+                context: "archipelago narrative membership",
+                reason: format!("expected between 1 and {} configured islands", scriptbots_runtime::MAX_ISLANDS),
+            });
+        }
+        let ids = configured.iter().map(|row| {
+            checked_u32("islands.island_id", decode(row, 0, "islands.island_id")?).map(IslandId)
+        }).collect::<Result<Vec<_>, StorageError>>()?;
+        let recorded = connection.query_with_params(
+            "SELECT island_id FROM tick_summaries WHERE run_id = ?1
+             UNION SELECT island_id FROM replay_events WHERE run_id = ?1 AND event_type = ?2
+             UNION SELECT island_id FROM run_events WHERE run_id = ?1
+             ORDER BY island_id LIMIT ?3",
+            &[sqlite_run_id(self.run_id), NARRATIVE_INPUT_EVENT_TYPE.into(), limit.into()],
+        )?;
+        for row in &recorded {
+            let island = IslandId(checked_u32("narrative island", decode(row, 0, "island_id")?)?);
+            if ids.binary_search(&island).is_err() {
+                return Err(NarrativeInputStreamError::IslandUnavailable {
+                    island,
+                    reason: "recorded narrative evidence has no island construction record".to_owned(),
+                }.into());
+            }
+        }
+        Ok(ids)
     }
 
     /// Read all configured archipelago islands recorded for this run.
