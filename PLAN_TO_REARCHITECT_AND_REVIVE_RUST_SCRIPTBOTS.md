@@ -2,6 +2,72 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Remote browser step plans and retained receipt inspection (2026-11-26):**
+[Source implemented and independently reviewed; browser module validation passed —
+Codex; functional contribution to `bd-2z0.12.2`;
+native browser end-to-end qualification remains open]
+
+The remote controls expose a bounded step count, reservation/run, exact-ID
+resume, explicit refresh and receipt paging, including direct access to the
+latest attempted constituent. Requested, attempted, admitted, applied and
+settled totals remain distinct. The controller retains reservation identity
+before advancing; an uncertain request stops automatic work and never creates
+a replacement for an already known batch ID.
+
+HTTP responses are bounded to the backend's 9 KiB page budget, validated against
+the negotiated owner and immutable batch count, and fenced across connection
+replacement. Automatic continuation has finite time/request bounds and backs
+off on proven non-admission. Historical views or unavailable live authority
+pause continuation while leaving explicit read-only receipt inspection usable.
+An explicit Clear Batch Reference action releases a missing or prior-session
+selection without making a server call; pending requests cannot be discarded,
+and a 404 alone never enables automatic replacement.
+
+DSR passed all 389 browser module tests plus main-module syntax on the exact
+four-file candidate rebased onto `db9da87a`, with unchanged source fingerprints.
+The suite exercises the production controller, validator, HTTP bounded reader
+and authority hook using controlled network/native fixtures. No real DOM clicks,
+WASM initialization, rendering or browser-to-native end-to-end execution is
+claimed. Concurrent local-study functionality and its tests are preserved.
+
+**Retained multi-step execution across native control surfaces (2026-11-26):**
+[Source implemented and independently reviewed; Rust parsing/format verified;
+native compilation and execution pending — Codex; functional contribution to
+the shared control contract in `bd-k7nq` and `bd-2z0.4.9`;
+original complete acceptance retained]
+
+Multi-step execution now reserves an immutable, process-scoped batch before
+submitting any science. REST, MCP and WebSocket adapters share create, advance
+and paged-status operations. Each advance has one 250 ms owner-call deadline
+and at most 32 new admissions. Every child command identity is retained before
+submission; admitted/applied/settled counts and both receipt axes remain
+separate. A later failure preserves the confirmed prefix and stops new steps.
+
+Missing acknowledgements and evicted owner history never authorize resubmission.
+The only retryable submission refusal is typed command-evidence backpressure,
+which proves non-admission and retries the exact retained envelope. Concurrent
+advance and status refresh share one lease. Retention is bounded to 128 batches
+and 100,000 reserved steps, with no silent eviction; pages contain at most 16
+receipts and 9 KiB of encoded data. Unknown identities from a previous service
+lifetime are refused, so this is neither durable execution recovery nor an
+atomic transaction.
+
+The CLI routes `step COUNT` through the two-phase workflow, flushes the batch ID
+and recovery commands before the first advance, observes one absolute wait
+budget, and supports `resume-step-batch` and `lookup-step-batch`. The old
+receipt-only multi-step endpoint refuses before submission and directs clients
+to the retained API; ordinary single-step receipts keep their existing contract.
+
+Eight authored backend regressions use real owner/channel/journal behavior for
+reservation, capacity, concurrent progress, lost replies, actual history
+eviction, proven non-admission, rejection, journal failure and bounded paging.
+Additional CLI and transport regressions cover HTTP continuation, strict input
+shapes, owner-session fencing, cross-transport identity and frame bounds.
+Independent reviews and DSR Rust parsing/format checks completed. A DSR locked,
+offline native check stopped before compilation at the unavailable pinned
+`rust-xcb` source. Native regression execution and full qualification remain
+unverified; no original acceptance gate is closed.
+
 **Expired owner reads preserve checkpoint availability (2026-11-26):**
 [Source implemented and independently reviewed; native execution pending —
 Codex; corrective contribution to `bd-2z0.4.11` and `bd-2z0.5.13`;
@@ -27,7 +93,7 @@ concurrent control-receipt test; this change corrects that difference along with
 the new runtime test formatting. Native execution claims remain unchanged.
 
 **Browser command diagnoses and fault/publication separation (2026-11-26):**
-[Source implemented and independently reviewed; browser execution validation pending —
+[Source implemented and independently reviewed; browser module validation passed —
 Codex; corrective contribution to `bd-2z0.12.2`;
 original complete acceptance retained]
 
@@ -43,11 +109,11 @@ world remain distinct in the fault panel, including after a new frame is painted
 Three authored module regressions cover both failure axes, exact numeric bounds,
 detached immutable observations and scientific/journal fault descriptions.
 
-DSR and an isolated current-source browser checkout were restored, but the
-executor disconnected before the candidate suite and syntax checks could start.
-Independent source review completed; no candidate execution result or packaged
-browser qualification is claimed. Existing sparse-publication validation and
-cooperation-study additions are preserved.
+DSR subsequently executed all 375 browser module tests and the main-module
+syntax check successfully against committed source `56ce1be9`, with unchanged
+source fingerprints. This verifies the module logic, not a packaged browser or
+native end-to-end workflow. Independent source review completed; existing
+sparse-publication validation and cooperation-study additions are preserved.
 
 **Actionable command failures and retained application boundaries (2026-11-26):**
 [Source implemented and independently reviewed; native execution validation pending —
@@ -70,9 +136,11 @@ journal diagnosis, rather than presenting an ordinary successful admission.
 Authored regressions cover a real owner failure, retained metadata after later
 progress, independent failure combinations, UTF-8 limits, CLI outcomes, the
 actual transport byte budget, OpenAPI and REST/MCP/WebSocket parity. Independent
-source review completed. Native formatting, compilation, Clippy and execution
-remain unverified after storage exhaustion and repeated executor disconnections.
-No original qualification gate is closed.
+source review completed. The subsequent retained-batch integration passed DSR
+Rust parsing and formatting for the changed native files. Compilation, Clippy
+and native execution remain unverified: the locked offline check stops before
+compilation at the unavailable pinned rust-xcb source, following earlier storage
+exhaustion and executor disconnections. No original qualification gate is closed.
 
 **Bulk debug inspection at incomplete scientific boundaries (2026-11-25):**
 [Source implemented and independently reviewed; execution validation pending —
