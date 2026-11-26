@@ -2445,9 +2445,26 @@ fn real_process_experiment_cli_executes_matched_plan_and_reuses_verified_bundles
         completed.stdout, original_status,
         "stdout is the canonical status document"
     );
+    let absent = directory.join("absent-comparison-output");
+    let missing = retained_experiment_cli(
+        &directory,
+        "comparison-before-execution",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--out")
+            .arg(&absent)
+            .args(["--compare", "mlp", "dwraon", "alive_agents"]),
+    )?;
+    assert!(!missing.status.success());
+    assert!(
+        !absent.exists(),
+        "inspection must never start an experiment"
+    );
     let mut cells = std::collections::BTreeSet::new();
     let mut digests = std::collections::BTreeSet::new();
     let mut original_artifacts = Vec::new();
+    let mut population_difference = 0.0;
     for run in &status.runs {
         assert_eq!(run.state, RunState::Completed);
         assert_eq!(run.total_ticks, 3);
@@ -2460,6 +2477,11 @@ fn real_process_experiment_cli_executes_matched_plan_and_reuses_verified_bundles
         assert_eq!(restored.tick, 3);
         assert_eq!(restored.run_id, run.run_id);
         assert_eq!(Some(&restored.scientific_digest), run.final_digest.as_ref());
+        match run.variant_id.as_str() {
+            "mlp" => population_difference -= f64::from(restored.summary.alive_agents),
+            "dwraon" => population_difference += f64::from(restored.summary.alive_agents),
+            other => bail!("unexpected experiment variant {other}"),
+        }
         digests.insert(restored.scientific_digest);
         let bundle: scriptbots_storage::RunBundleV1 =
             serde_json::from_slice(&std::fs::read(bundle_dir.join("bundle_manifest.json"))?)?;
@@ -2501,6 +2523,33 @@ fn real_process_experiment_cli_executes_matched_plan_and_reuses_verified_bundles
         4,
         "each admitted family/seed cell executes distinct state"
     );
+    let comparison = retained_experiment_cli(
+        &directory,
+        "comparison",
+        experiment_cli_command()
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--out")
+            .arg(&output_dir)
+            .args(["--compare", "mlp", "dwraon", "alive_agents"]),
+    )?;
+    assert!(
+        comparison.status.success(),
+        "{}",
+        String::from_utf8_lossy(&comparison.stderr)
+    );
+    let report: scriptbots_app::control::ExperimentComparisonDto =
+        serde_json::from_slice(&comparison.stdout)?;
+    assert_eq!(report.matched_seeds, [7, u64::MAX]);
+    assert_eq!(report.endpoint_tick, 3);
+    assert_eq!(report.baseline_variant, "mlp");
+    assert_eq!(report.challenger_variant, "dwraon");
+    assert_eq!(report.metric, "alive_agents");
+    assert_eq!(report.mean_difference, population_difference / 2.0);
+    assert_eq!(report.plan_digest, status.plan_digest);
+    assert_eq!(report.status_generation, status.generation);
+    assert_eq!(std::fs::read(&status_path)?, original_status);
+
     let repeated = retained_experiment_cli(
         &directory,
         "repeated",

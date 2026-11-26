@@ -3801,6 +3801,9 @@ pub struct ExperimentArgs {
     /// Retry failed runs from their verified saved cuts, retaining prior failure evidence.
     #[arg(long, conflicts_with = "example")]
     pub retry_failed: bool,
+    /// Compare one verified endpoint in two completed variants and print the paired result as JSON.
+    #[arg(long, num_args = 3, value_names = ["BASELINE", "CHALLENGER", "METRIC"], conflicts_with_all = ["example", "retry_failed"])]
+    pub compare: Option<Vec<String>>,
     /// Print an editable matched MLP/DWRAON experiment plan without starting a run.
     #[arg(long, conflicts_with_all = ["plan", "out", "retry_failed"])]
     pub example: bool,
@@ -3896,13 +3899,29 @@ fn run_experiment_subcommand(args: &ExperimentArgs) -> Result<()> {
         plan.max_concurrency,
         output_dir.join("bundles"),
     );
+    let status_path = output_dir.join("status.json");
+    if let Some(comparison) = &args.compare {
+        let [baseline, challenger, metric] = comparison.as_slice() else {
+            bail!("--compare requires BASELINE CHALLENGER METRIC");
+        };
+        let report = scriptbots_app::control::compare_saved_experiment_variants(
+            &runner,
+            &status_path,
+            baseline,
+            challenger,
+            metric,
+        )?;
+        let mut stdout = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut stdout, &report)?;
+        writeln!(stdout)?;
+        return Ok(());
+    }
     // Resolve families, typed config, schedules, and resource bounds before the
     // runner acquires its persistent writer lease or creates any output paths.
     runner
         .plan_batch()
         .context("experiment plan was refused before creating artifacts")?;
     admit_experiment_output(output_dir)?;
-    let status_path = output_dir.join("status.json");
     if args.retry_failed {
         let observed = runner
             .status_snapshot(&status_path)

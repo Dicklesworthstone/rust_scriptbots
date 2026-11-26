@@ -2597,6 +2597,20 @@ cargo run -p scriptbots-app --bin scriptbots-app -- experiment \
   --plan experiment-plan.json --out runs/matched-experiment
 ```
 
+After the two arms complete, compare an endpoint from their saved bundles:
+
+```bash
+cargo run -p scriptbots-app --bin scriptbots-app -- experiment \
+  --plan experiment-plan.json --out runs/matched-experiment \
+  --compare mlp dwraon alive_agents
+```
+
+The comparison reopens the bundles and verifies the final checkpoints for every
+declared seed in both arms. Its JSON reports challenger minus baseline, the
+matched seeds, the plan digest and the status generation. A single matched seed
+yields a descriptive difference. An incomplete cohort or a damaged bundle
+causes the command to fail without changing the experiment.
+
 The example is an editable MLP/DWRAON study. Its strict version-1 plan declares
 `experiment_id`, `cohort_id`, exact integer `seeds`, `variants`, `ticks_per_run`,
 and `max_concurrency`. Variants use the same configuration overrides and ordered

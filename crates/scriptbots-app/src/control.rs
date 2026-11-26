@@ -849,6 +849,193 @@ pub struct ExperimentComparisonDto {
     pub status_generation: u64,
 }
 
+fn validate_experiment_comparison(
+    experiment_id: &str,
+    baseline_variant: &str,
+    challenger_variant: &str,
+    metric: &str,
+) -> Result<(), ControlError> {
+    use crate::experiment_runner::{
+        EXPERIMENT_ENDPOINT_METRICS, MAX_RUN_COMPONENT_BYTES, validate_path_component,
+    };
+
+    for (label, value) in [
+        ("experiment_id", experiment_id),
+        ("baseline_variant", baseline_variant),
+        ("challenger_variant", challenger_variant),
+    ] {
+        if value.len() > MAX_RUN_COMPONENT_BYTES {
+            return Err(ControlError::BadRequest(format!(
+                "{label} exceeds the {MAX_RUN_COMPONENT_BYTES}-byte experiment identity bound"
+            )));
+        }
+        validate_path_component(label, value)
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+    }
+    if baseline_variant == challenger_variant {
+        return Err(ControlError::BadRequest(
+            "comparison requires two distinct variants".into(),
+        ));
+    }
+    if !EXPERIMENT_ENDPOINT_METRICS.contains(&metric) {
+        return Err(ControlError::BadRequest(format!(
+            "unsupported experiment endpoint metric; expected one of {}",
+            EXPERIMENT_ENDPOINT_METRICS.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Compare two arms of a standalone saved experiment using the same verified
+/// bundles, restored endpoints and paired statistics as the managed service.
+/// This path never starts workers, resumes runs, or writes experiment state.
+pub fn compare_saved_experiment_variants(
+    runner: &crate::experiment_runner::MatchedSeedExperimentRunner,
+    state_file: &Path,
+    baseline_variant: &str,
+    challenger_variant: &str,
+    metric: &str,
+) -> Result<ExperimentComparisonDto, ControlError> {
+    validate_experiment_comparison(
+        &runner.experiment_id,
+        baseline_variant,
+        challenger_variant,
+        metric,
+    )?;
+    compare_verified_variant_endpoints(
+        runner,
+        state_file,
+        baseline_variant,
+        challenger_variant,
+        metric,
+    )
+}
+
+fn compare_verified_variant_endpoints(
+    runner: &crate::experiment_runner::MatchedSeedExperimentRunner,
+    state_file: &Path,
+    baseline_variant: &str,
+    challenger_variant: &str,
+    metric: &str,
+) -> Result<ExperimentComparisonDto, ControlError> {
+    use crate::experiment_runner::RunState;
+    use crate::lab::stats::{
+        AnalysisParams, RunSummary, RunSummaryParts, analyze_matched_seed_runs,
+    };
+
+    let experiment_id = &runner.experiment_id;
+    let variants = [baseline_variant, challenger_variant]
+        .map(|id| {
+            runner
+                .variants
+                .iter()
+                .find(|variant| variant.variant_id == id)
+                .ok_or_else(|| {
+                    ControlError::NotFound(format!(
+                        "variant '{id}' is not in experiment '{experiment_id}'"
+                    ))
+                })
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let status = runner
+        .status_snapshot(state_file)
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+    if let Some(run) = status.runs.iter().find(|run| {
+        (run.variant_id == baseline_variant || run.variant_id == challenger_variant)
+            && run.state != RunState::Completed
+    }) {
+        return Err(ControlError::Conflict(format!(
+            "comparison run '{}' is {:?}; every declared seed must be completed",
+            run.run_id, run.state
+        )));
+    }
+    let endpoints = runner
+        .verified_comparison_endpoints(state_file, &status, baseline_variant, challenger_variant)
+        .map_err(|error| ControlError::Serialization(error.to_string()))?;
+    let matched_seeds = endpoints[0]
+        .iter()
+        .map(|state| state.summary.seed)
+        .collect::<Vec<_>>();
+    let mut summaries = Vec::with_capacity(matched_seeds.len().saturating_mul(2));
+    for (arm, states) in endpoints.into_iter().enumerate() {
+        let variant = variants[arm];
+        for state in states {
+            let metrics = state.summary.available_metrics();
+            if !metrics.get(metric).is_some_and(|value| value.is_finite()) {
+                return Err(ControlError::Conflict(format!(
+                    "endpoint '{metric}' is unavailable for run '{}' at tick {}; missing values are not replaced with zero",
+                    state.run_id, state.tick
+                )));
+            }
+            summaries.push(RunSummary::from_verified_parts(RunSummaryParts {
+                summary_path: Some(
+                    runner
+                        .output_dir
+                        .join(&state.run_id)
+                        .join("exports/summary.csv")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                run_id: state.run_id,
+                arm_id: u16::try_from(arm).expect("two comparison arms fit u16"),
+                seed: state.summary.seed,
+                config_digest: state.config_digest,
+                digest: state.scientific_digest,
+                ticks: state.tick,
+                metrics,
+                summary_artifact_digest: state.summary_artifact_digest,
+                variant_id: variant.variant_id.clone(),
+                config_overrides: variant.config_overrides.clone(),
+                interventions: variant.interventions.clone(),
+                brain_family: state.summary.brain_family,
+            }));
+        }
+    }
+    let mut analysis =
+        analyze_matched_seed_runs(&summaries, &[metric.to_owned()], AnalysisParams::default())
+            .map_err(|error| ControlError::Conflict(format!("comparison unavailable: {error}")))?;
+    let effect = analysis.effects.pop().ok_or_else(|| {
+        ControlError::Serialization("comparison produced no endpoint effect".into())
+    })?;
+    if !effect.mean_difference.is_finite()
+        || effect
+            .standardized_effect
+            .is_some_and(|value| !value.is_finite())
+        || effect
+            .ci_95
+            .is_some_and(|(low, high)| !low.is_finite() || !high.is_finite())
+        || !effect.raw_p_value.is_finite()
+        || !effect.adjusted.adjusted_p_value.is_finite()
+    {
+        return Err(ControlError::Serialization(
+            "comparison produced a non-finite endpoint estimate".into(),
+        ));
+    }
+    let descriptive_only = effect.n_pairs < 2;
+    Ok(ExperimentComparisonDto {
+        experiment_id: experiment_id.clone(),
+        baseline_variant: baseline_variant.to_owned(),
+        challenger_variant: challenger_variant.to_owned(),
+        metric: metric.to_owned(),
+        endpoint_tick: runner.max_ticks,
+        matched_seeds,
+        mean_difference: effect.mean_difference,
+        ci_95: effect.ci_95,
+        standardized_effect: effect.standardized_effect,
+        p_value: (!descriptive_only).then_some(effect.raw_p_value),
+        adjusted_p_value: (!descriptive_only).then_some(effect.adjusted.adjusted_p_value),
+        significant: (!descriptive_only).then_some(effect.adjusted.rejected),
+        descriptive_only,
+        underpowered_reason: effect
+            .underpowered_reason
+            .map(|reason| reason.description()),
+        undefined_effect_reason: effect.undefined_reason.map(|reason| reason.description()),
+        plan_digest: status.plan_digest,
+        status_generation: status.generation,
+    })
+}
+
 /// Summary of an experiment for paginated listings.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ExperimentSummaryDto {
@@ -5588,37 +5775,12 @@ impl ControlHandle {
         challenger_variant: &str,
         metric: &str,
     ) -> Result<ExperimentComparisonDto, ControlError> {
-        use crate::experiment_runner::{
-            EXPERIMENT_ENDPOINT_METRICS, MAX_RUN_COMPONENT_BYTES, RunState, validate_path_component,
-        };
-        use crate::lab::stats::{
-            AnalysisParams, RunSummary, RunSummaryParts, analyze_matched_seed_runs,
-        };
-
-        for (label, value) in [
-            ("experiment_id", experiment_id),
-            ("baseline_variant", baseline_variant),
-            ("challenger_variant", challenger_variant),
-        ] {
-            if value.len() > MAX_RUN_COMPONENT_BYTES {
-                return Err(ControlError::BadRequest(format!(
-                    "{label} exceeds the {MAX_RUN_COMPONENT_BYTES}-byte experiment identity bound"
-                )));
-            }
-            validate_path_component(label, value)
-                .map_err(|error| ControlError::BadRequest(error.to_string()))?;
-        }
-        if baseline_variant == challenger_variant {
-            return Err(ControlError::BadRequest(
-                "comparison requires two distinct variants".into(),
-            ));
-        }
-        if !EXPERIMENT_ENDPOINT_METRICS.contains(&metric) {
-            return Err(ControlError::BadRequest(format!(
-                "unsupported experiment endpoint metric; expected one of {}",
-                EXPERIMENT_ENDPOINT_METRICS.join(", ")
-            )));
-        }
+        validate_experiment_comparison(
+            experiment_id,
+            baseline_variant,
+            challenger_variant,
+            metric,
+        )?;
         // The slot protects only read/analysis capacity, not mutable science.
         // Recover its empty value after a panic; RAII releases it on every return.
         let _comparison = match self.data_services.experiment_comparison.try_lock() {
@@ -5640,123 +5802,13 @@ impl ControlHandle {
             })?;
             (Arc::clone(&job.runner), job.state_file.clone())
         };
-        let variants = [baseline_variant, challenger_variant]
-            .map(|id| {
-                runner
-                    .variants
-                    .iter()
-                    .find(|variant| variant.variant_id == id)
-                    .ok_or_else(|| {
-                        ControlError::NotFound(format!(
-                            "variant '{id}' is not in experiment '{experiment_id}'"
-                        ))
-                    })
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        let status = runner
-            .status_snapshot(&state_file)
-            .map_err(|error| ControlError::Serialization(error.to_string()))?;
-        if let Some(run) = status.runs.iter().find(|run| {
-            (run.variant_id == baseline_variant || run.variant_id == challenger_variant)
-                && run.state != RunState::Completed
-        }) {
-            return Err(ControlError::Conflict(format!(
-                "comparison run '{}' is {:?}; every declared seed must be completed",
-                run.run_id, run.state
-            )));
-        }
-        let endpoints = runner
-            .verified_comparison_endpoints(
-                &state_file,
-                &status,
-                baseline_variant,
-                challenger_variant,
-            )
-            .map_err(|error| ControlError::Serialization(error.to_string()))?;
-        let matched_seeds = endpoints[0]
-            .iter()
-            .map(|state| state.summary.seed)
-            .collect::<Vec<_>>();
-        let mut summaries = Vec::with_capacity(matched_seeds.len().saturating_mul(2));
-        for (arm, states) in endpoints.into_iter().enumerate() {
-            let variant = variants[arm];
-            for state in states {
-                let metrics = state.summary.available_metrics();
-                if !metrics.get(metric).is_some_and(|value| value.is_finite()) {
-                    return Err(ControlError::Conflict(format!(
-                        "endpoint '{metric}' is unavailable for run '{}' at tick {}; missing values are not replaced with zero",
-                        state.run_id, state.tick
-                    )));
-                }
-                summaries.push(RunSummary::from_verified_parts(RunSummaryParts {
-                    summary_path: Some(
-                        runner
-                            .output_dir
-                            .join(&state.run_id)
-                            .join("exports/summary.csv")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
-                    run_id: state.run_id,
-                    arm_id: u16::try_from(arm).expect("two comparison arms fit u16"),
-                    seed: state.summary.seed,
-                    config_digest: state.config_digest,
-                    digest: state.scientific_digest,
-                    ticks: state.tick,
-                    metrics,
-                    summary_artifact_digest: state.summary_artifact_digest,
-                    variant_id: variant.variant_id.clone(),
-                    config_overrides: variant.config_overrides.clone(),
-                    interventions: variant.interventions.clone(),
-                    brain_family: state.summary.brain_family,
-                }));
-            }
-        }
-        let mut analysis =
-            analyze_matched_seed_runs(&summaries, &[metric.to_owned()], AnalysisParams::default())
-                .map_err(|error| {
-                    ControlError::Conflict(format!("comparison unavailable: {error}"))
-                })?;
-        let effect = analysis.effects.pop().ok_or_else(|| {
-            ControlError::Serialization("comparison produced no endpoint effect".into())
-        })?;
-        if !effect.mean_difference.is_finite()
-            || effect
-                .standardized_effect
-                .is_some_and(|value| !value.is_finite())
-            || effect
-                .ci_95
-                .is_some_and(|(low, high)| !low.is_finite() || !high.is_finite())
-            || !effect.raw_p_value.is_finite()
-            || !effect.adjusted.adjusted_p_value.is_finite()
-        {
-            return Err(ControlError::Serialization(
-                "comparison produced a non-finite endpoint estimate".into(),
-            ));
-        }
-        let descriptive_only = effect.n_pairs < 2;
-        Ok(ExperimentComparisonDto {
-            experiment_id: experiment_id.to_owned(),
-            baseline_variant: baseline_variant.to_owned(),
-            challenger_variant: challenger_variant.to_owned(),
-            metric: metric.to_owned(),
-            endpoint_tick: runner.max_ticks,
-            matched_seeds,
-            mean_difference: effect.mean_difference,
-            ci_95: effect.ci_95,
-            standardized_effect: effect.standardized_effect,
-            p_value: (!descriptive_only).then_some(effect.raw_p_value),
-            adjusted_p_value: (!descriptive_only).then_some(effect.adjusted.adjusted_p_value),
-            significant: (!descriptive_only).then_some(effect.adjusted.rejected),
-            descriptive_only,
-            underpowered_reason: effect
-                .underpowered_reason
-                .map(|reason| reason.description()),
-            undefined_effect_reason: effect.undefined_reason.map(|reason| reason.description()),
-            plan_digest: status.plan_digest,
-            status_generation: status.generation,
-        })
+        compare_verified_variant_endpoints(
+            &runner,
+            &state_file,
+            baseline_variant,
+            challenger_variant,
+            metric,
+        )
     }
 
     /// Request cooperative cancellation at the next durable tick boundary.
