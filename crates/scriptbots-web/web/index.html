@@ -311,7 +311,7 @@
             transform: none;
         }
 
-        #remote-status, #remote-playback, #remote-receipt {
+        #remote-status, #remote-playback, #remote-receipt, #remote-batch-status, #remote-batch-progress, #remote-batch-receipts {
             font-size: 0.75rem;
             overflow-wrap: anywhere;
         }
@@ -328,6 +328,8 @@
         #narrative-timeline p { margin: 0; font-size: 0.75rem; overflow-wrap: anywhere; }
         #narrative-gap { color: #fbbf24; }
         #remote-events li { margin: 0.5rem 0; overflow-wrap: anywhere; }
+        #remote-batch-receipts { max-height: 16rem; overflow: auto; padding-left: 1.2rem; }
+        #remote-batch-receipts li { margin: 0.5rem 0; }
 
         #remote-overlay {
             position: absolute;
@@ -628,6 +630,29 @@
                 <button id="remote-refresh" type="button" disabled>Refresh Command Outcome</button>
                 <button id="remote-retry" type="button" disabled>Retry Last Command with Same ID</button>
                 <div id="remote-receipt" role="status" aria-live="polite"></div>
+                <details id="remote-step-batch">
+                    <summary>Run a batch of server steps</summary>
+                    <p>Each step keeps its own outcome. Run continues for up to 10 seconds; resume the same batch to continue. Pausing continuation stops new requests but cannot undo a submitted step.</p>
+                    <label>Number of steps
+                        <input id="remote-batch-count" type="number" min="1" max="100000" step="1" value="100" />
+                    </label>
+                    <button id="remote-batch-run" type="button" disabled>Run New Batch</button>
+                    <button id="remote-batch-resume" type="button" disabled>Resume Retained Batch</button>
+                    <button id="remote-batch-pause" type="button" disabled>Pause Batch Continuation</button>
+                    <label>Retained batch ID
+                        <input id="remote-batch-id" type="text" spellcheck="false" autocomplete="off" />
+                    </label>
+                    <button id="remote-batch-open" type="button" disabled>Open Batch ID</button>
+                    <button id="remote-batch-clear" type="button" disabled>Clear Batch Reference</button>
+                    <p>Copy this ID before clearing the reference. Clearing this panel does not cancel or undo server work. IDs belong to this server process; an unavailable ID never starts a replacement run.</p>
+                    <p id="remote-batch-status" role="status" aria-live="polite"></p>
+                    <p id="remote-batch-progress"></p>
+                    <button id="remote-batch-refresh" type="button" disabled>Refresh Batch Outcome</button>
+                    <button id="remote-batch-first" type="button" disabled>First Receipt Page</button>
+                    <button id="remote-batch-latest" type="button" disabled>Latest Receipt</button>
+                    <button id="remote-batch-next" type="button" disabled>Next Receipt Page</button>
+                    <ol id="remote-batch-receipts" aria-label="Step batch receipts"></ol>
+                </details>
             </div>
             <details id="experiment-lab" class="controls">
                 <summary>Matched-seed experiments</summary>
