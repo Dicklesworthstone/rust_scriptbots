@@ -2069,7 +2069,7 @@ impl MatchedSeedExperimentRunner {
                 });
             }
         };
-        let mut _retry_leases = Vec::new();
+        let mut run_leases = Vec::new();
         if let Some(bytes) = &committed_bytes {
             let committed = self.decode_status(state_file, bytes, plan)?;
             if committed.generation.checked_add(1) != Some(candidate.generation) {
@@ -2091,7 +2091,22 @@ impl MatchedSeedExperimentRunner {
                 // its exact retained failure witness and executable sources.
                 // Ordinary save_status remains strictly monotonic.
                 self.validate_failed_retry_transition(state_file, &committed, &candidate, bytes)?;
-                _retry_leases = self.validate_failed_retry_sources(&committed, plan)?;
+                run_leases = self.validate_failed_retry_sources(&committed, plan)?;
+            }
+            // A wave prepares every tick-zero owner before publishing admission.
+            // Without those owners the old Pending status could still start,
+            // but promoting Running would permanently refuse that same launch.
+            for (old, new) in committed.runs.iter().zip(&candidate.runs) {
+                if (old.state, new.state) == (RunState::Pending, RunState::Running) {
+                    let path = self.run_checkpoint_path(&new.run_id);
+                    if !experiment_path_exists(&path, "inspect interrupted run admission")? {
+                        return Err(interrupted());
+                    }
+                    run_leases.push(ExperimentStatusWriterLease::acquire(&path)?);
+                    if !self.verify_pending_recovery_source(state_file, temporary, new, plan)? {
+                        return Err(interrupted());
+                    }
+                }
             }
         } else if candidate != self.initial_status(plan) {
             return Err(interrupted());
@@ -2225,41 +2240,7 @@ impl MatchedSeedExperimentRunner {
                     )?);
                 }
                 RunState::Pending => {
-                    // A pending arm may have its prepared tick-zero cut, but it
-                    // must not hide prior scientific execution. Do not turn an
-                    // inconsistent pending status into a fresh-world restart.
-                    let path = self.run_checkpoint_path(&record.run_id);
-                    if experiment_path_exists(
-                        &self.output_dir.join(&record.run_id),
-                        "inspect pending run bundle during status recovery",
-                    )? || experiment_path_exists(
-                        &self.staged_bundle_path(&record.run_id),
-                        "inspect pending bundle staging during status recovery",
-                    )? || experiment_path_exists(
-                        &status_temporary_path(&path)?,
-                        "inspect pending checkpoint staging during status recovery",
-                    )? {
-                        return Err(interrupted());
-                    }
-                    if let Some(checkpoint) = read_optional_run_checkpoint(&path)? {
-                        self.validate_run_checkpoint(
-                            &path,
-                            &checkpoint,
-                            variant,
-                            record.seed,
-                            &record.run_id,
-                            &plan.digest,
-                        )?;
-                        if checkpoint.owner.host_checkpoint().tick().0 != 0 {
-                            return Err(interrupted());
-                        }
-                        drop(restore_run_owner(
-                            &checkpoint,
-                            *family,
-                            &record.run_id,
-                            &path,
-                        )?);
-                    }
+                    self.verify_pending_recovery_source(state_file, temporary, record, plan)?;
                 }
                 RunState::Failed => {}
             }
@@ -2325,6 +2306,56 @@ impl MatchedSeedExperimentRunner {
             "retained torn status prefix; validated committed generation remains authoritative"
         );
         Ok(committed)
+    }
+
+    /// Returns whether this pending arm has its executable, committed tick-zero
+    /// cut. A prior execution or an unresolved publication cannot witness admission.
+    fn verify_pending_recovery_source(
+        &self,
+        state_file: &Path,
+        temporary: &Path,
+        record: &RunRecord,
+        plan: &ValidatedPlan,
+    ) -> Result<bool, ExperimentRunnerError> {
+        let (variant, family) = &plan.variants[&record.variant_id];
+        let path = self.run_checkpoint_path(&record.run_id);
+        let interrupted = || ExperimentRunnerError::InterruptedStatusWrite {
+            temporary: temporary.to_path_buf(),
+            committed: state_file.to_path_buf(),
+        };
+        if experiment_path_exists(
+            &self.output_dir.join(&record.run_id),
+            "inspect pending run bundle during status recovery",
+        )? || experiment_path_exists(
+            &self.staged_bundle_path(&record.run_id),
+            "inspect pending bundle staging during status recovery",
+        )? || experiment_path_exists(
+            &status_temporary_path(&path)?,
+            "inspect pending checkpoint staging during status recovery",
+        )? {
+            return Err(interrupted());
+        }
+        let Some(checkpoint) = read_optional_run_checkpoint(&path)? else {
+            return Ok(false);
+        };
+        self.validate_run_checkpoint(
+            &path,
+            &checkpoint,
+            variant,
+            record.seed,
+            &record.run_id,
+            &plan.digest,
+        )?;
+        if checkpoint.owner.host_checkpoint().tick().0 != 0 {
+            return Err(interrupted());
+        }
+        drop(restore_run_owner(
+            &checkpoint,
+            *family,
+            &record.run_id,
+            &path,
+        )?);
+        Ok(true)
     }
 
     /// Atomically and durably flushes a validated status update to disk.
@@ -8240,6 +8271,63 @@ mod tests {
             .unwrap();
         assert_eq!(final_cut.owner.host_checkpoint().tick().0, runner.max_ticks);
         assert_ne!(fs::read(&checkpoint_path).unwrap(), initial_cut);
+    }
+
+    #[test]
+    fn interrupted_admission_requires_every_prepared_owner_before_publishing_the_wave() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = progress_runner(directory.path(), vec![7, 9]);
+        let state_file = directory.path().join("status.json");
+        let temporary = status_temporary_path(&state_file).unwrap();
+        let mut candidate = runner.load_or_create_status(&state_file).unwrap();
+        let committed = fs::read(&state_file).unwrap();
+        let plan = runner.validated_plan().unwrap();
+        for record in &mut candidate.runs {
+            record.state = RunState::Running;
+        }
+        candidate.generation += 1;
+        let staged = canonical_status_bytes(&candidate).unwrap();
+        fs::write(&temporary, &staged).unwrap();
+        let prepare = |record: &RunRecord| {
+            let (variant, family) = &plan.variants[&record.variant_id];
+            runner
+                .prepare_run_checkpoint(variant, *family, record.seed, &record.run_id, &plan.digest)
+                .unwrap();
+        };
+        prepare(&candidate.runs[0]);
+        let first = runner.run_checkpoint_path(&candidate.runs[0].run_id);
+        let first_bytes = fs::read(&first).unwrap();
+        let second = runner.run_checkpoint_path(&candidate.runs[1].run_id);
+        for corrupt in [false, true] {
+            if corrupt {
+                fs::write(&second, b"damaged checkpoint").unwrap();
+            }
+            assert!(runner.load_or_create_status(&state_file).is_err());
+            assert_eq!(fs::read(&state_file).unwrap(), committed);
+            assert_eq!(fs::read(&temporary).unwrap(), staged);
+            assert_eq!(fs::read(&first).unwrap(), first_bytes);
+            if corrupt {
+                assert_eq!(fs::read(&second).unwrap(), b"damaged checkpoint");
+                fs::rename(&second, directory.path().join("retained-damaged-cut")).unwrap();
+            } else {
+                assert!(!second.exists());
+            }
+        }
+        prepare(&candidate.runs[1]);
+        let busy = ExperimentStatusWriterLease::acquire(&second).unwrap();
+        assert!(matches!(
+            runner.load_or_create_status(&state_file),
+            Err(ExperimentRunnerError::StatusWriterLeaseHeld(_))
+        ));
+        assert_eq!(fs::read(&state_file).unwrap(), committed);
+        assert_eq!(fs::read(&temporary).unwrap(), staged);
+        drop(busy);
+        assert_eq!(
+            runner.load_or_create_status(&state_file).unwrap(),
+            candidate
+        );
+        assert_eq!(fs::read(&state_file).unwrap(), staged);
+        assert!(!temporary.exists());
     }
 
     #[test]
