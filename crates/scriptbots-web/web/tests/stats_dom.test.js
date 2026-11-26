@@ -1668,10 +1668,47 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
     const revisions = ["canvas", "telemetry"].map((kind) => BigInt(consumed.findLast((ack) => ack.channel === kind).publication_revision));
     if (cursor?.session_id !== expectedPng.sessionId || BigInt(cursor.after_revision) !== (revisions[0] < revisions[1] ? revisions[0] : revisions[1])
         || cursor.after_event !== consumed.findLast((ack) => ack.channel === "events").after_event) throw new Error("Reconnect did not use independently consumed channel cursors");
+    observations.laterPause = await control("#remote-pause", "pause");
+    const retainedCommands = await page.evaluate(() => {
+      const wire = window.__remoteWire;
+      const history = document.getElementById("remote-command-history");
+      return { lostStep: wire.sent.findLast((message) => message.command === "step").request_id,
+        newerPause: wire.sent.findLast((message) => message.command === "pause").request_id,
+        selected: history.value, options: [...history.options].map((option) => option.value) };
+    });
+    if (retainedCommands.selected !== retainedCommands.newerPause
+        || !retainedCommands.options.includes(retainedCommands.lostStep)
+        || !retainedCommands.options.includes(retainedCommands.newerPause)) {
+      throw new Error("A newer command hid the earlier unresolved Step from the retained command selector");
+    }
+    await page.selectOption("#remote-command-history", retainedCommands.lostStep);
+    if (!(await page.textContent("#remote-receipt")).includes("awaiting the server's receipt")) {
+      throw new Error("Selecting the earlier unresolved Step must show its own missing receipt");
+    }
+    observations.retainedCommands = retainedCommands;
     const beforeRecovery = await page.evaluate(() => ({
       steps: window.__remoteWire.sent.filter((message) => message.command === "step").length,
       request: window.__remoteWire.sent.findLast((message) => message.command === "step"),
     }));
+    await page.evaluate(() => { window.__remoteWire.dropNextReceipt = true; });
+    observations.lostRecoveryReply = await control("#remote-retry", "status_by_key");
+    observations.pendingRecovery = await page.evaluate(() => ({
+      state: document.getElementById("remote-status").dataset.state,
+      selected: document.getElementById("remote-command-history").value,
+      readsBlocked: ["remote-retry", "remote-refresh"].every((id) => document.getElementById(id).disabled),
+      reconnectAvailable: !document.getElementById("remote-reconnect").disabled,
+      dropped: window.__remoteWire.droppedReceipts.length,
+    }));
+    if (observations.pendingRecovery.state !== "connected"
+        || observations.pendingRecovery.selected !== retainedCommands.lostStep
+        || !observations.pendingRecovery.readsBlocked || !observations.pendingRecovery.reconnectAvailable
+        || observations.pendingRecovery.dropped !== 2) {
+      throw new Error("A lost outcome lookup must preserve selection and allow cursor reconnect while the socket remains connected");
+    }
+    await page.click("#remote-reconnect");
+    await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "connected"
+      && document.getElementById("remote-owner-state").dataset.state === "healthy"
+      && !document.getElementById("remote-retry").disabled);
     observations.retry = await control("#remote-retry", "status_by_key");
     observations.recoveryWire = await page.evaluate(() => ({
       steps: window.__remoteWire.sent.filter((message) => message.command === "step").length,
@@ -1687,6 +1724,22 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
       throw new Error("Lost-receipt recovery must query the original owner's key without submitting another native Step");
     }
     await control("#remote-refresh", "status");
+    observations.delayedOtherReceipt = await page.evaluate((newerPause) => {
+      const wire = window.__remoteWire, history = document.getElementById("remote-command-history");
+      const receipt = document.getElementById("remote-receipt");
+      const before = { selected: history.value, text: receipt.textContent };
+      const duplicate = wire.replies.find((reply) => reply.type === "receipt" && reply.request_id === newerPause);
+      if (!duplicate) throw new Error("No original native Pause receipt is available for delayed-delivery control");
+      // Repeat the genuine other-command response on the actual subscribed socket.
+      // This controls delivery order without fabricating an owner outcome.
+      wire.sockets.at(-1).dispatchEvent(new MessageEvent("message", { data: JSON.stringify(duplicate) }));
+      return { before, after: { selected: history.value, text: receipt.textContent },
+        requestId: duplicate.request_id, control: "repeated original native Pause receipt" };
+    }, retainedCommands.newerPause);
+    if (observations.delayedOtherReceipt.after.selected !== retainedCommands.lostStep
+        || observations.delayedOtherReceipt.after.text !== observations.delayedOtherReceipt.before.text) {
+      throw new Error("A delayed response for another command replaced the selected Step's recovered outcome");
+    }
     // A saved scientific view must remain frozen while the real subscription
     // consumes new frames, then return to the latest verified live publication.
     await page.evaluate(() => { document.getElementById("checkpoint-lab").open = true; });

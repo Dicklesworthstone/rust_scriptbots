@@ -311,10 +311,12 @@
             transform: none;
         }
 
-        #remote-status, #remote-playback, #remote-receipt, #remote-batch-status, #remote-batch-progress, #remote-batch-receipts {
+        #remote-status, #remote-playback, #remote-receipt, #remote-command-history-summary, #remote-batch-status, #remote-batch-progress, #remote-batch-receipts {
             font-size: 0.75rem;
             overflow-wrap: anywhere;
         }
+
+        #remote-command-history { width: 100%; min-width: 0; box-sizing: border-box; }
 
         #remote-events {
             max-height: 20rem;
@@ -627,6 +629,12 @@
                 <button id="remote-pause" type="button" disabled>Pause Server</button>
                 <button id="remote-resume" type="button" disabled>Resume Server</button>
                 <button id="remote-step" type="button" disabled>Step Server Once</button>
+                <label for="remote-command-history">Retained command
+                    <select id="remote-command-history" aria-describedby="remote-command-history-summary" disabled>
+                        <option value="">No retained remote commands</option>
+                    </select>
+                </label>
+                <p id="remote-command-history-summary" role="status" aria-live="polite">No remote commands retained. Reconnect with Cursor keeps this history; a new connection or returning to local clears it.</p>
                 <button id="remote-refresh" type="button" disabled>Refresh Command Outcome</button>
                 <button id="remote-retry" type="button" disabled>Recover Command Outcome</button>
                 <div id="remote-receipt" role="status" aria-live="polite"></div>

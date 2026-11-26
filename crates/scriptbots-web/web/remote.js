@@ -813,6 +813,27 @@ function retainControlReceipt(previous, next) {
   throw new Error("Remote receipt contradicts its retained journal outcome");
 }
 
+/** One stable selection over retained mutation evidence; selecting never performs I/O. */
+export function remoteCommandHistoryView(client, selectedRequestId = null) {
+  const entries = client?.controlRequests() ?? Object.freeze([]);
+  const selected = entries.find((entry) => entry.requestId === selectedRequestId)
+    ?? entries.find((entry) => !entry.settled) ?? entries.at(-1) ?? null;
+  const lookup = client?.statusRequest;
+  const lookupPending = client?.state === "connected" && !!lookup && !lookup.received
+    && lookup.generation === client.generation && lookup.sessionId === client.tracker.sessionId;
+  const lookupTargetRequestId = lookup?.command === "status_by_key" ? lookup.idempotencyKey
+    : lookup?.command === "status" ? entries.find((entry) =>
+      entry.sessionId === lookup.sessionId && entry.commandId === lookup.commandId)?.requestId ?? null : null;
+  const readable = client?.state === "connected" && !!selected && selected.sessionId === client.tracker.sessionId;
+  return Object.freeze({
+    entries, selectedRequestId: selected?.requestId ?? null, selected,
+    unresolvedCount: entries.filter((entry) => !entry.settled).length,
+    lookupPending, lookupRequestId: lookup?.requestId ?? null, lookupTargetRequestId,
+    canRecover: readable && !lookupPending,
+    canRefresh: readable && !lookupPending && !!selected.commandId,
+  });
+}
+
 /** Bounded browser WebSocket client. Reconnect and outcome recovery are explicit. */
 export class RemoteStreamClient {
   constructor({ url, decodeFrame, channels = CHANNELS, maxFps = 60,

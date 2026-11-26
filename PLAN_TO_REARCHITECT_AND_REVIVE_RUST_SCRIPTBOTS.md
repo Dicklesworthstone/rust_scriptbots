@@ -83,7 +83,7 @@ with a visible notice. A local paired study can delay treatment to a selected
 tick, records matched observations at that boundary and checks its receipt.
 
 **Remote command recovery under sustained control traffic (2026-11-26):**
-[Source implemented and independently reviewed; candidate validation pending —
+[Source implemented and independently reviewed; native qualification pending —
 Codex; corrective contribution to `bd-ac4l` and `bd-2z0.12.2`;
 original complete acceptance retained]
 
@@ -94,16 +94,35 @@ terminal observations. Recovery queries a known command ID or derives that
 identity from the original request key and owner session; neither path
 resubmits a mutation. Missing owner history remains an unknown outcome.
 
+The retained-command selector exposes earlier unresolved requests after newer
+commands have been sent. Selection reads immutable retained evidence and stays
+fixed when unrelated replies arrive. Outcome recovery remains available on a
+connected faulted owner and while viewing a saved world; mutation authority
+remains separate. A lost lookup reply leaves cursor reconnect available even
+on an open socket, releasing the read slot without discarding original commands.
+The current client preserves this history across explicit cursor reconnects,
+but does not persist single-command history across reloads.
+
 Regression source covers full retention, delayed receipts, lost initial replies,
 owner changes and actual native history eviction. The real browser journey
 must also observe an unchanged scientific tick and admission sequence, the
 original lookup key/session and no second Step on the wire.
 
-The clean starting revision `86543a7a` passed 389 browser module tests and 38
-JavaScript syntax checks through DSR 0.2.3. These are baseline results only.
-The executor disconnected again during implementation; candidate test,
-compiler, Clippy and packaged-browser execution remain pending. Original
-acceptance and scientific guarantees are unchanged.
+The recovery increment `17f453be` passed all 400 browser module tests and 38
+JavaScript syntax checks through DSR 0.2.3 on its exact clean commit, with
+unchanged source fingerprints. The starting revision `86543a7a` passed 389 tests;
+the increase also includes concurrent work preserved before that increment.
+Five additional module regressions cover retained-command selection, older
+outcome recovery, full history, source/health fences and a lost lookup reply
+followed by explicit cursor reconnect without resubmitting a mutation. The live browser
+journey additionally selects an earlier lost-receipt Step after a later Pause
+and repeats a genuine unrelated reply to require a stable selected outcome.
+
+The pinned nightly formatter parsed the native recovery files and requested
+three formatting-only changes, incorporated with the history UI. DSR's locked
+offline workspace check and Clippy stopped before compilation at the uncached
+pinned `rust-xcb` source. Native execution and the packaged browser journey
+remain unverified; original acceptance and scientific guarantees are unchanged.
 
 **Remote browser step plans and retained receipt inspection (2026-11-26):**
 [Source implemented and independently reviewed; browser module validation passed —

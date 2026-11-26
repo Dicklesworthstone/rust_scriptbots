@@ -2,7 +2,7 @@ import initWasm, * as wasm from "./pkg/scriptbots_web.js";
 import { CanvasRenderer } from "./renderers/canvas.js";
 import { WebGpuRenderer } from "./renderers/webgpu.js";
 import { environmentDescription } from "./renderers/environment.js";
-import { RemoteStreamClient, RemoteStepBatchController, describeRemoteOwnerFault, describeRemoteCommandReceipt } from "./remote.js";
+import { RemoteStreamClient, RemoteStepBatchController, remoteCommandHistoryView, describeRemoteOwnerFault, describeRemoteCommandReceipt } from "./remote.js";
 import { BrowserContinuationStore, BrowserRecoveryController } from "./continuation-store.js";
 import { InspectionController, pickAgent, renderInspector, renderInspectorSource,
   validateBrainInspection, renderBrainInspector, renderBrainSource } from "./inspector.js";
@@ -108,6 +108,8 @@ const remoteResume = document.getElementById("remote-resume");
 const remoteStep = document.getElementById("remote-step");
 const remoteRefresh = document.getElementById("remote-refresh");
 const remoteRetry = document.getElementById("remote-retry");
+const remoteCommandHistory = document.getElementById("remote-command-history");
+const remoteCommandHistorySummary = document.getElementById("remote-command-history-summary");
 const remoteBatchCount = document.getElementById("remote-batch-count");
 const remoteBatchRun = document.getElementById("remote-batch-run");
 const remoteBatchResume = document.getElementById("remote-batch-resume");
@@ -188,9 +190,8 @@ let remoteClient = null;
 let remoteFrame = null;
 let remoteConnected = false;
 const remoteOwnerState = document.getElementById("remote-owner-state");
-let lastRemoteRequestId = null;
-let lastRemoteCommandId = null;
-let lastRemoteStatusRequestId = null;
+let selectedRemoteRequestId = null;
+let remoteCommandNotice = null;
 const remoteStepBatch = new RemoteStepBatchController({
   getClient: () => remoteMode ? remoteClient : null,
   canAdvance: () => remoteOwnerAllowsMutation() && !reviewedCheckpoint,
@@ -1165,10 +1166,8 @@ function updateRemoteControls() {
     if (input) input.disabled = remoteMode;
   }
   remoteLocal.disabled = !remoteMode;
-  remoteReconnect.disabled = !remoteMode || !remoteClient || remoteConnected;
   for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteOwnerAllowsMutation() || !!reviewedCheckpoint;
-  remoteRefresh.disabled = !remoteConnected || !lastRemoteCommandId;
-  remoteRetry.disabled = !remoteConnected || !lastRemoteRequestId;
+  renderRemoteCommandHistory();
   remoteStepBatch.syncAuthority();
   renderRemoteStepBatch();
   captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
@@ -1178,6 +1177,62 @@ function updateRemoteControls() {
   renderRemoteOwnerStatus();
   updateCheckpointControls();
   updateWorldNavigation();
+}
+
+function renderRemoteCommandHistory() {
+  const view = remoteCommandHistoryView(remoteClient, selectedRemoteRequestId);
+  // A connected socket can lose a lookup reply. Cursor reconnect preserves
+  // the selected original and releases the old connection's pending read.
+  remoteReconnect.disabled = !remoteMode || !remoteClient || (remoteConnected && !view.lookupPending);
+  selectedRemoteRequestId = view.selectedRequestId;
+  const options = view.entries.length ? view.entries.map((entry) => ({
+    value: entry.requestId,
+    text: `${entry.command} · ${entry.receipt
+      ? `${entry.receipt.application_state} / ${entry.receipt.journal_state}`
+      : "outcome unconfirmed"}${entry.settled ? "" : " (unresolved)"} · ${entry.requestId}`,
+  })) : [{ value: "", text: "No retained remote commands" }];
+  // Keep an open selector stable while unrelated live frames arrive.
+  if (remoteCommandHistory.options.length !== options.length || options.some((option, index) =>
+    remoteCommandHistory.options[index].value !== option.value || remoteCommandHistory.options[index].text !== option.text)) {
+    const fragment = document.createDocumentFragment();
+    for (const item of options) {
+      const option = document.createElement("option");
+      option.value = item.value;
+      option.textContent = item.text;
+      fragment.append(option);
+    }
+    remoteCommandHistory.replaceChildren(fragment);
+  }
+  if (remoteCommandHistory.value !== (view.selectedRequestId ?? "")) remoteCommandHistory.value = view.selectedRequestId ?? "";
+  remoteCommandHistory.disabled = view.entries.length === 0;
+  remoteRefresh.disabled = !view.canRefresh;
+  remoteRetry.disabled = !view.canRecover;
+  remoteCommandHistorySummary.dataset.retainedCount = String(view.entries.length);
+  remoteCommandHistorySummary.dataset.unresolvedCount = String(view.unresolvedCount);
+  let summary = view.entries.length
+    ? `${view.entries.length}/32 retained commands; ${view.unresolvedCount} unresolved. Choose any retained command to inspect or recover its outcome.`
+    : "No remote commands retained. Reconnect with Cursor keeps this history; a new connection or returning to local clears it.";
+  if (view.lookupPending) summary += " An outcome lookup is pending; wait for its reply or reconnect before another lookup.";
+  else if (view.selected && !view.canRecover) summary += " Reconnect to the same owner to recover this command's outcome.";
+  if (remoteCommandHistorySummary.textContent !== summary) remoteCommandHistorySummary.textContent = summary;
+  const selected = view.selected;
+  remoteReceipt.dataset.requestId = selected?.requestId ?? "";
+  remoteReceipt.dataset.commandId = selected?.commandId ?? "";
+  let description = selected ? selected.receipt
+    ? `${selected.command} (${selected.requestId}), owner ${selected.sessionId}. ${describeRemoteCommandReceipt(selected.receipt)}`
+    : `Sent ${selected.command} (${selected.requestId}); awaiting the server's receipt. Owner ${selected.sessionId}. Outcome remains unconfirmed.`
+    : "";
+  if (selected?.error) {
+    description += ` Last ${selected.error.operation === "status" || selected.error.operation === "status_by_key" ? "outcome lookup" : "command response"} ${selected.error.status}: ${selected.error.message}.`;
+    description += selected.settled ? " The retained owner receipt above remains available."
+      : " Missing evidence does not authorize resending the mutation.";
+  }
+  if (view.lookupPending && view.lookupTargetRequestId === selected?.requestId) {
+    description += " Recovering this command's outcome; the command will not be resent.";
+  }
+  if (remoteCommandNotice?.requestId === view.selectedRequestId) description += ` ${remoteCommandNotice.message}`;
+  if (remoteReceipt.textContent !== description.trim()) remoteReceipt.textContent = description.trim();
+  return view;
 }
 
 function renderRemoteStepBatch() {
@@ -1338,20 +1393,13 @@ function receiveRemoteState(state) {
 
 function receiveRemoteReceipt(reply) {
   if (!remoteMode) return;
-  if (reply.request_id !== lastRemoteRequestId && reply.request_id !== lastRemoteStatusRequestId) {
-    appendLog(`Earlier remote request ${reply.request_id}: ${reply.type === "receipt"
-      ? describeRemoteCommandReceipt(reply.receipt)
-      : `${reply.status}: ${reply.message}`}`);
-    return;
-  }
-  if (reply.type === "receipt") {
-    const receipt = reply.receipt;
-    lastRemoteCommandId = receipt.command_id;
-    remoteReceipt.textContent = describeRemoteCommandReceipt(receipt);
-  } else {
-    remoteReceipt.textContent = `Command response ${reply.status}: ${reply.message}`;
-  }
-  appendLog(remoteReceipt.textContent);
+  const view = remoteCommandHistoryView(remoteClient, selectedRemoteRequestId);
+  const target = reply.request_id === view.lookupRequestId ? view.lookupTargetRequestId : reply.request_id;
+  if (remoteCommandNotice?.requestId === target) remoteCommandNotice = null;
+  appendLog(`Remote request ${reply.request_id}: ${reply.type === "receipt"
+    ? describeRemoteCommandReceipt(reply.receipt) : `${reply.status}: ${reply.message}`}`);
+  // Every reply updates its own retained entry. Rendering reads only the
+  // explicitly selected original, including when another request replies late.
   updateRemoteControls();
 }
 
@@ -1402,9 +1450,8 @@ function connectRemote() {
     browserRecovery?.attach(null);
     remoteConnected = false;
     remoteFrame = null;
-    lastRemoteRequestId = null;
-    lastRemoteCommandId = null;
-    lastRemoteStatusRequestId = null;
+    selectedRemoteRequestId = null;
+    remoteCommandNotice = null;
     simulationGeneration += 1;
     presentationGeneration += 1;
     lastPaintedLiveFrame = null;
@@ -1480,20 +1527,15 @@ function sendRemoteControl(command) {
   try {
     if (!remoteOwnerAllowsMutation()) throw new Error("Wait for a current running owner before sending live-world commands");
     if (reviewedCheckpoint) throw new Error("Return to live before controlling the server");
-    lastRemoteCommandId = null;
-    lastRemoteStatusRequestId = null;
-    lastRemoteRequestId = remoteClient.sendControl(command);
-    remoteReceipt.textContent = `Sent ${command} (${lastRemoteRequestId}); awaiting the server's receipt.`;
-    updateRemoteControls();
+    remoteCommandNotice = null;
+    selectedRemoteRequestId = remoteClient.sendControl(command);
   } catch (error) {
-    if (error.requestId) {
-      lastRemoteRequestId = error.requestId;
-      remoteReceipt.textContent = `Command delivery unconfirmed (${error.requestId}): ${error.message}. Reconnect and recover its outcome; the command will not be resent.`;
-    } else {
-      remoteReceipt.textContent = `Command was not sent: ${error.message}`;
-    }
-    updateRemoteControls();
+    if (error.requestId) selectedRemoteRequestId = error.requestId;
+    remoteCommandNotice = { requestId: selectedRemoteRequestId, message: error.requestId
+      ? `Command delivery unconfirmed: ${error.message}. Reconnect and recover its outcome; the command will not be resent.`
+      : `Command was not sent: ${error.message}` };
   }
+  updateRemoteControls();
 }
 
 remotePause.addEventListener("click", () => sendRemoteControl("pause"));
@@ -1514,17 +1556,29 @@ remoteBatchFirst.addEventListener("click", () => performRemoteBatch(() => remote
 remoteBatchLatest.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.refresh(Math.max(0, remoteStepBatch.page.attempted_count - 1))));
 remoteBatchNext.addEventListener("click", () => performRemoteBatch(() => remoteStepBatch.refresh(remoteStepBatch.page.next_offset)));
 remoteBatchId.addEventListener("input", renderRemoteStepBatch);
-remoteRefresh.addEventListener("click", () => {
-  try { lastRemoteStatusRequestId = remoteClient.sendControl("status", { commandId: lastRemoteCommandId }); }
-  catch (error) { remoteReceipt.textContent = `Outcome lookup failed: ${error.message}`; }
+remoteCommandHistory.addEventListener("change", () => {
+  selectedRemoteRequestId = remoteCommandHistory.value || null;
+  remoteCommandNotice = null;
+  renderRemoteCommandHistory();
 });
-remoteRetry.addEventListener("click", () => {
+
+function recoverSelectedRemoteCommand(refreshOnly = false) {
+  const view = remoteCommandHistoryView(remoteClient, selectedRemoteRequestId);
   try {
-    if (!remoteConnected) throw new Error("Reconnect and subscribe before recovering a control outcome");
-    lastRemoteStatusRequestId = remoteClient.retryControl(lastRemoteRequestId);
-    remoteReceipt.textContent = `Recovering the outcome of ${lastRemoteRequestId}; the command will not be resent.`;
-  } catch (error) { remoteReceipt.textContent = `Outcome recovery failed: ${error.message}`; }
-});
+    if (!view.canRecover || (refreshOnly && !view.canRefresh)) {
+      throw new Error(view.lookupPending ? "An outcome lookup is already pending; wait or reconnect"
+        : "Select a retained command and connect to its original owner");
+    }
+    remoteCommandNotice = null;
+    if (refreshOnly) remoteClient.sendControl("status", { commandId: view.selected.commandId });
+    else remoteClient.retryControl(view.selectedRequestId);
+  } catch (error) {
+    remoteCommandNotice = { requestId: view.selectedRequestId, message: `Outcome recovery failed: ${error.message}` };
+  }
+  renderRemoteCommandHistory();
+}
+remoteRefresh.addEventListener("click", () => recoverSelectedRemoteCommand(true));
+remoteRetry.addEventListener("click", () => recoverSelectedRemoteCommand());
 
 function resetPerformanceWindows(snapshot = null) {
   const now = performance.now();

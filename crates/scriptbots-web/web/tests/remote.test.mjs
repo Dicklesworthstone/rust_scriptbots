@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import test from "node:test";
 import { RemoteFrameTracker, RemoteStreamClient, RemoteStepBatchController, RemoteOwnerHttpError, STEP_BATCH_LIMITS,
-  consumeRemoteFrame, validateRemoteOwnerStatus, validateRemoteStepBatch, describeRemoteCommandReceipt, describeRemoteOwnerFault } from "../remote.js";
+  consumeRemoteFrame, validateRemoteOwnerStatus, validateRemoteStepBatch, remoteCommandHistoryView, describeRemoteCommandReceipt, describeRemoteOwnerFault } from "../remote.js";
 import { EXPERIMENT_LIMITS, prepareExperimentRequest } from "../experiment-protocol.js";
 import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
 
@@ -577,6 +577,213 @@ test("malformed or miscorrelated receipts cannot resolve or evict a retained mut
   assert.throws(() => value.sendControl("status_by_key", {
     requestId: "same-key", idempotencyKey: "same-key", sessionId: CONTROL_SESSION,
   }), /Invalid remote recovery key/);
+});
+
+test("command history selects an existing original, otherwise the oldest unresolved or latest settled command", () => {
+  const empty = remoteCommandHistoryView(null, "missing");
+  assert.deepEqual(empty.entries, []);
+  assert.equal(empty.selected, null);
+  assert.equal(empty.selectedRequestId, null);
+  assert.equal(empty.unresolvedCount, 0);
+  assert.equal(empty.canRecover, false);
+  assert.equal(empty.canRefresh, false);
+  assert.ok(Object.isFrozen(empty) && Object.isFrozen(empty.entries));
+  const { value, sent } = connectedControlClient();
+  value.sendControl("step", { requestId: "earliest" });
+  value.sendControl("pause", { requestId: "middle" });
+  value.sendControl("step", { requestId: "latest" });
+  receiveControl(value, commandReceipt("middle", "00000000000000000000000000000002",
+    { application_state: "applied", journal_state: "not_required" }));
+  let view = remoteCommandHistoryView(value);
+  assert.equal(view.selectedRequestId, "earliest");
+  assert.equal(view.unresolvedCount, 2);
+  assert.equal(view.canRecover, true);
+  assert.equal(view.canRefresh, false, "a lost first receipt recovers by key, not an invented command ID");
+  view = remoteCommandHistoryView(value, "middle");
+  assert.equal(view.selectedRequestId, "middle", "an explicitly selected settled outcome remains selected");
+  assert.equal(view.canRefresh, true);
+  assert.ok(Object.isFrozen(view) && Object.isFrozen(view.entries) && Object.isFrozen(view.selected));
+  assert.throws(() => { view.selected.commandId = null; }, TypeError);
+  assert.throws(() => { view.entries.push(null); }, TypeError);
+  receiveControl(value, commandReceipt("earliest", "00000000000000000000000000000001",
+    { application_state: "applied", journal_state: "not_required" }));
+  assert.equal(remoteCommandHistoryView(value, "missing").selectedRequestId, "latest");
+  receiveControl(value, commandReceipt("latest", "00000000000000000000000000000003",
+    { application_state: "applied", journal_state: "not_required" }));
+  view = remoteCommandHistoryView(value, "missing");
+  assert.equal(view.selectedRequestId, "latest");
+  assert.equal(view.unresolvedCount, 0);
+  assert.equal(sent.length, 3, "selection and fallback must never query or mutate the owner");
+});
+
+test("selecting older outcomes and receiving unrelated replies never replaces the selected command's evidence", () => {
+  const { value, sent } = connectedControlClient();
+  value.sendControl("step", { requestId: "lost-step" });
+  value.sendControl("pause", { requestId: "later-pause" });
+  const pauseId = "00000000000000000000000000000002";
+  receiveControl(value, commandReceipt("later-pause", pauseId,
+    { application_state: "applied", journal_state: "not_required", applied_tick: 12 }));
+  const pause = remoteCommandHistoryView(value, "later-pause").selected.receipt;
+  let view = remoteCommandHistoryView(value, "lost-step");
+  assert.equal(view.selected.receipt, null);
+  assert.equal(sent.length, 2, "selecting an earlier unresolved command is read-only local navigation");
+  const lookup = value.retryControl(view.selectedRequestId);
+  view = remoteCommandHistoryView(value, "lost-step");
+  assert.equal(view.lookupPending, true);
+  assert.equal(view.lookupRequestId, lookup);
+  assert.equal(view.lookupTargetRequestId, "lost-step");
+  assert.equal(view.canRecover, false);
+  assert.equal(view.canRefresh, false);
+  view = remoteCommandHistoryView(value, "later-pause");
+  assert.equal(view.selected.receipt, pause);
+  assert.equal(view.canRecover, false, "another selected command cannot consume a second concurrent lookup slot");
+  receiveControl(value, commandReceipt(lookup, COMMAND,
+    { application_state: "applied", journal_state: "not_required", applied_tick: 11 }));
+  view = remoteCommandHistoryView(value, "later-pause");
+  assert.equal(view.selected.receipt, pause, "the older lookup's result must not replace the selected pause");
+  assert.equal(view.lookupPending, false);
+  assert.equal(view.canRefresh, true);
+  const step = remoteCommandHistoryView(value, "lost-step").selected.receipt;
+  receiveControl(value, commandReceipt("later-pause", pauseId));
+  view = remoteCommandHistoryView(value, "lost-step");
+  assert.equal(view.selectedRequestId, "lost-step");
+  assert.equal(view.selected.receipt, step, "an unrelated delayed receipt must not alter the selected original");
+  assert.equal(view.selected.receipt.applied_tick, 11);
+  assert.equal(sent.length, 3);
+  assert.equal(sent.at(-1).command, "status_by_key");
+  assert.equal(sent.at(-1).idempotency_key, "lost-step");
+});
+
+test("full history keeps older unresolved commands selectable and falls back safely when a settled selection is evicted", () => {
+  const { value, sent } = connectedControlClient();
+  for (let index = 0; index < 32; index += 1) value.sendControl("step", { requestId: `history-${index}` });
+  let view = remoteCommandHistoryView(value, "history-0");
+  assert.equal(view.entries.length, 32);
+  assert.equal(view.unresolvedCount, 32);
+  assert.equal(view.canRecover, true);
+  const lookup = value.retryControl(view.selectedRequestId);
+  receiveControl(value, { protocol_version: 1, request_id: lookup, type: "error",
+    status: 404, message: "No retained receipt" });
+  view = remoteCommandHistoryView(value, view.selectedRequestId);
+  assert.equal(view.selectedRequestId, "history-0");
+  assert.equal(view.unresolvedCount, 32);
+  assert.equal(view.selected.error.status, 404);
+  assert.equal(view.canRecover, true);
+  const second = value.retryControl(view.selectedRequestId);
+  receiveControl(value, commandReceipt(second, COMMAND, { application_state: "applied", journal_state: "durable" }));
+  view = remoteCommandHistoryView(value, "history-0");
+  assert.equal(view.unresolvedCount, 31);
+  assert.equal(view.selected.settled, true);
+  value.sendControl("step", { requestId: "history-32" });
+  view = remoteCommandHistoryView(value, "history-0");
+  assert.equal(view.entries.length, 32);
+  assert.equal(view.unresolvedCount, 32);
+  assert.equal(view.selectedRequestId, "history-1", "eviction of one settled entry must select an available unresolved original");
+  assert.equal(view.entries.some((entry) => entry.requestId === "history-0"), false);
+  assert.equal(sent.filter((request) => request.command === "step").length, 33);
+});
+
+test("a connected pending outcome lookup can reconnect and recover the same original through a fresh read only", () => {
+  const originalSocket = globalThis.WebSocket, sockets = [];
+  class ControlledSocket {
+    constructor() {
+      this.readyState = 0; this.bufferedAmount = 0;
+      this.listeners = new Map(); this.sent = []; sockets.push(this);
+    }
+    addEventListener(kind, listener) { this.listeners.set(kind, listener); }
+    send(text) { this.sent.push(JSON.parse(text)); }
+    close() { this.readyState = 3; }
+    open() { this.readyState = 1; this.listeners.get("open")(); }
+    message(reply) { this.listeners.get("message")({ data: JSON.stringify(reply) }); }
+  }
+  globalThis.WebSocket = ControlledSocket;
+  const value = client();
+  const subscribe = () => {
+    const socket = sockets.at(-1);
+    socket.open();
+    const request = socket.sent.find((message) => message.command === "subscribe");
+    socket.message({ protocol_version: 1, stream_protocol_version: 2, type: "subscribed",
+      request_id: request.request_id, session_id: CONTROL_SESSION, channels: request.channels, max_fps: request.max_fps });
+    return socket;
+  };
+  try {
+    value.connect();
+    const first = subscribe();
+    value.sendControl("step", { requestId: "lost-step-before-reconnect" });
+    const selectedRequestId = remoteCommandHistoryView(value).selectedRequestId;
+    const retained = value.requests.get(selectedRequestId).text;
+    const lostLookup = value.retryControl(selectedRequestId);
+    let view = remoteCommandHistoryView(value, selectedRequestId);
+    assert.equal(value.state, "connected");
+    assert.equal(view.lookupPending, true, "a lost lookup reply can leave a healthy socket connected");
+    assert.equal(view.canRecover, false);
+    assert.equal(view.lookupTargetRequestId, selectedRequestId);
+
+    value.reconnect();
+    assert.equal(first.readyState, 3);
+    view = remoteCommandHistoryView(value, selectedRequestId);
+    assert.equal(view.selectedRequestId, selectedRequestId);
+    assert.equal(view.lookupPending, false, "the old connection no longer owns the read slot");
+    assert.equal(view.canRecover, false, "reads wait for the new subscription");
+    const second = subscribe();
+    view = remoteCommandHistoryView(value, selectedRequestId);
+    assert.equal(view.canRecover, true);
+    assert.equal(view.selected.sessionId, CONTROL_SESSION);
+    assert.equal(value.requests.get(selectedRequestId).text, retained);
+    assert.deepEqual(second.sent.map((request) => request.command), ["subscribe"],
+      "reconnect never automatically resends a mutation or lookup");
+    assert.deepEqual(second.sent[0].resume, { session_id: CONTROL_SESSION, after_event: "0" });
+
+    const freshLookup = value.retryControl(selectedRequestId);
+    assert.notEqual(freshLookup, lostLookup);
+    assert.deepEqual(second.sent.at(-1), { protocol_version: 1, request_id: freshLookup, command: "status_by_key",
+      idempotency_key: selectedRequestId, session_id: CONTROL_SESSION });
+    first.message(commandReceipt(lostLookup, COMMAND, { application_state: "applied", journal_state: "durable" }));
+    assert.equal(remoteCommandHistoryView(value, selectedRequestId).selected.receipt, null,
+      "a late reply from the replaced socket cannot consume the new lookup");
+    second.message(commandReceipt(freshLookup, COMMAND, { application_state: "applied", journal_state: "durable" }));
+    view = remoteCommandHistoryView(value, selectedRequestId);
+    assert.equal(view.selectedRequestId, selectedRequestId);
+    assert.equal(view.selected.commandId, COMMAND);
+    assert.equal(view.selected.settled, true);
+    assert.equal(view.lookupPending, false);
+    assert.deepEqual(sockets.flatMap((socket) => socket.sent).map((request) => request.command),
+      ["subscribe", "step", "status_by_key", "subscribe", "status_by_key"]);
+  } finally {
+    value.disconnect();
+    globalThis.WebSocket = originalSocket;
+  }
+});
+
+test("retained command reads remain available on faulted owners and preserve selection across disconnect and source fences", () => {
+  const { value } = connectedControlClient();
+  value.sendControl("step", { requestId: "retained" });
+  receiveControl(value, commandReceipt("retained", COMMAND,
+    { application_state: "applied", journal_state: "pending", applied_tick: 12 }));
+  value.ownerStatusEnabled = true;
+  value.ownerStatusAvailable = true;
+  value.ownerStatus = { identity: { sessionId: CONTROL_SESSION }, lifecycle: "stopping", health: "faulted" };
+  assert.equal(value.ownerAllowsMutation, false);
+  let view = remoteCommandHistoryView(value, "retained");
+  assert.equal(view.canRecover, true, "outcome reads do not require mutation authority");
+  assert.equal(view.canRefresh, true);
+  const receipt = view.selected.receipt;
+  value.disconnect();
+  view = remoteCommandHistoryView(value, "retained");
+  assert.equal(view.selectedRequestId, "retained");
+  assert.equal(view.selected.receipt, receipt);
+  assert.equal(view.canRecover, false);
+  assert.equal(view.canRefresh, false);
+  value.state = "connected";
+  value.tracker.sessionId = "72";
+  view = remoteCommandHistoryView(value, "retained");
+  assert.equal(view.selected.receipt, receipt);
+  assert.equal(view.canRecover, false);
+  assert.equal(view.canRefresh, false);
+  value.tracker.sessionId = CONTROL_SESSION;
+  view = remoteCommandHistoryView(value, "retained");
+  assert.equal(view.canRecover, true);
+  assert.equal(view.canRefresh, true);
 });
 
 test("subscription acknowledgement gates all binary decoding and refuses unrelated acknowledgements", () => {

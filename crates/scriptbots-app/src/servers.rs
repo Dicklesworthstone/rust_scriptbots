@@ -2686,9 +2686,10 @@ fn parse_ws_control_message(text: &str) -> Result<WsControlRequest, AppError> {
     if text.starts_with('{') {
         // Recovery has an exact read-only shape. Check presence as well as the
         // decoded Options so extra fields set to null cannot bypass the shape.
-        let fields: serde_json::Map<String, Value> = serde_json::from_str(text).map_err(|error| {
-            AppError::bad_request(format!("invalid WebSocket control request: {error}"))
-        })?;
+        let fields: serde_json::Map<String, Value> =
+            serde_json::from_str(text).map_err(|error| {
+                AppError::bad_request(format!("invalid WebSocket control request: {error}"))
+            })?;
         let valid_fields = if request.command == "status_by_key" {
             fields.len() == 5
                 && [
@@ -14944,15 +14945,17 @@ mod tests {
         owner.wait_finished(&expected_id);
         let mut later = Vec::new();
         for index in 0..3 {
-            let receipt = websocket_receipt(runtime.block_on(apply_ws_control_message(
-                handle.clone(),
-                json!({
-                    "protocol_version": 1,
-                    "request_id": format!("later-step-{index}"),
-                    "command": "step"
-                })
-                .to_string(),
-            )));
+            let receipt = websocket_receipt(
+                runtime.block_on(apply_ws_control_message(
+                    handle.clone(),
+                    json!({
+                        "protocol_version": 1,
+                        "request_id": format!("later-step-{index}"),
+                        "command": "step"
+                    })
+                    .to_string(),
+                )),
+            );
             later.push(owner.wait_applied(&receipt));
         }
         assert!(

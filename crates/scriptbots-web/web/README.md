@@ -72,6 +72,21 @@ separate observations: an admitted command or an uncertain error does not free
 its retention slot. A separate bounded lookup slot keeps outcome inspection
 available when all 32 commands are unresolved.
 
+Use **Retained Command** to select any retained request, including an earlier
+command whose first receipt was lost. Each choice shows its operation and
+application/journal outcomes; the summary counts unresolved requests. A later
+response for a different request updates that request's evidence without
+changing the selection or replacing the displayed outcome. Explicit recovery
+and status refresh remain available while reviewing a saved world or inspecting
+a faulted owner, provided the selected command belongs to the connected owner.
+
+The command list is retained in the current page's client across **Reconnect**.
+Starting a fresh connection or reloading the page starts a new single-command
+history; this list is not a durable command journal. Only one outcome lookup
+runs at a time. If its reply is lost while the socket remains connected,
+**Reconnect with Cursor** releases the pending read while preserving the
+original commands; select **Recover Command Outcome** to read the outcome again.
+
 **Recover Command Outcome** only reads existing owner evidence. If a receipt
 already identified the command, recovery requests its status. If the first
 receipt was lost, recovery uses the original request key and owner session:
