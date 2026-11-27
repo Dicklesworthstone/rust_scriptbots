@@ -353,15 +353,19 @@ Connect to the existing remote host, wait for its canvas frame, then open
 experiment runner. Each arm starts from the runner's defaults plus its own
 initial overrides; it does not start from the current canvas or a checkpoint.
 
-1. Enter distinct baseline and challenger arm IDs and choose their brain
-   families. Keep the initial overrides identical when comparing only families.
+1. Compose two to eight arms with distinct IDs and choose their brain families.
+   **Add arm** creates another editor; **Duplicate arm** preserves the source
+   family's overrides and intervention schedule for editing. Remove or move an
+   arm with its own controls. At least two arms remain. Keep the initial
+   overrides identical when comparing only families; identical declared arms
+   are refused because they do not define a comparison.
 2. Enter exact decimal seeds, separated by commas or whitespace. Every arm uses
    the same seed set. The form accepts 1–32 distinct unsigned 64-bit seeds;
    values above JavaScript's safe integer range remain exact.
 3. Choose the horizon and concurrency. The initial form uses seeds 11, 42 and
    137, 200 ticks, one simultaneous run, and a population minimum of 20 in
    each arm. These are editable experiment inputs, not changes to world defaults.
-4. Expand either arm to edit its initial JSON overrides or ordered numeric
+4. Expand any arm to edit its initial JSON overrides or ordered numeric
    intervention schedule. For example,
    `[{"tick":100,"set":{"food_growth_rate":0.001}}]` changes that arm's growth
    rate at tick 100. Schedule ticks must be inside the horizon; same-tick
@@ -387,6 +391,12 @@ rows report the host's configured reservations, including zero-slot admission
 shutdown. A server bundle path identifies a retained host file; it is not a
 browser download link.
 
+Each arm runs every declared seed, so eight arms and 32 seeds request 256 runs.
+The shared concurrency controls how many of those runs can execute at once,
+subject to the host's capacity. Reordering arm editors changes their declared
+order and preserves their complete settings. Each arm executes in independent
+worlds.
+
 When both chosen cohorts have completed every declared seed, select baseline,
 challenger and a terminal metric, then choose **Compare completed arms**.
 Results report challenger minus baseline across the independent matched seeds,
@@ -404,10 +414,11 @@ identifies its browser-observation scope and is separate from server run bundles
 
 Requests and responses have explicit browser bounds (64 KiB creation and
 1 MiB response). The backend remains responsible for scientific execution,
-configuration validation, durable records and paired inference. Source-level
-regressions were added for this workflow, but the execution environment was
-unavailable before DSR could run them; browser and native qualification remain
-open under the existing acceptance work.
+configuration validation, durable records and paired inference. Browser module
+regressions and JavaScript syntax checks pass through DSR, including the full
+eight-arm, 32-seed authoring boundary. These use controlled observations;
+real-package browser and native qualification remain open under the existing
+acceptance work.
 
 ### Remote checkpoint studies
 

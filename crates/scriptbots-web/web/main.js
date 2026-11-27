@@ -13,7 +13,8 @@ import { NarrativeController, renderNarrative, renderNarrativeSource } from "./n
 import { validateContinuationBrains, validateLaunchInfo, launchInfoText, renderBuildComparison } from "./recipes.js";
 import { CheckpointLabController, renderCheckpointLab, archiveStudyTreatment } from "./checkpoint-lab.js";
 import { ExperimentController } from "./experiments.js";
-import { readExperimentForm, renderExperimentLab, experimentObservationExport } from "./experiment-view.js";
+import { initializeExperimentArmEditor, readExperimentForm, renderExperimentLab,
+  experimentObservationExport } from "./experiment-view.js";
 import { renderStudyReport, renderStudyTrajectories } from "./study-report.js";
 import { WorldViewport, WorldDrag, MIN_WORLD_ZOOM, MAX_WORLD_ZOOM } from "./world-view.js";
 
@@ -209,6 +210,7 @@ const remoteStepBatch = new RemoteStepBatchController({
 const experimentPanel = document.getElementById("experiment-lab");
 const experimentForm = document.getElementById("experiment-form");
 const experimentFormError = document.getElementById("experiment-form-error");
+if (experimentForm) initializeExperimentArmEditor(experimentForm);
 let experimentExportUrl = null;
 let experimentDownloadUrl = null;
 const experiments = new ExperimentController({

@@ -681,9 +681,10 @@
                 <button id="experiment-catalog-next" type="button" disabled>Next catalog page</button>
                 <p id="experiment-catalog-detail"></p>
                 <p id="experiment-capacity"></p>
-                <h3>Create a two-arm experiment</h3>
+                <h3>Create a matched-seed experiment</h3>
                 <p>Each arm starts fresh worlds from the runner's defaults plus its overrides, using the same seed set. These runs do not start from the current canvas or a saved checkpoint. The current world stays separate.</p>
                 <form id="experiment-form">
+                    <div id="experiment-plan-tools"></div>
                     <label>Experiment ID (optional)
                         <input id="experiment-id" type="text" maxlength="128" pattern="[A-Za-z0-9_-]+" placeholder="Host assigns an ID when blank" />
                     </label>
@@ -700,54 +701,11 @@
                     <label>Maximum simultaneous runs
                         <input id="experiment-concurrency" type="number" min="1" max="8" step="1" value="1" required />
                     </label>
-                    <fieldset>
-                        <legend>Baseline arm</legend>
-                        <label>Arm ID
-                            <input id="experiment-baseline-id" type="text" pattern="[A-Za-z0-9_-]+" maxlength="64" value="baseline" required />
-                        </label>
-                        <label>Brain family
-                            <select id="experiment-baseline-family">
-                                <option value="mlp" selected>MLP baseline</option>
-                                <option value="dwraon">DWRAON baseline</option>
-                                <option value="neuroflow">NeuroFlow (requires host support)</option>
-                                <option value="assembly">Assembly (experimental)</option>
-                                <option value="ft">Ft</option>
-                            </select>
-                        </label>
-                        <details>
-                            <summary>Baseline configuration and schedule</summary>
-                            <label>Initial overrides (JSON object)
-                                <textarea id="experiment-baseline-config" rows="3" maxlength="16384" spellcheck="false">{"population_minimum":20}</textarea>
-                            </label>
-                            <label>Scheduled changes (JSON array)
-                                <textarea id="experiment-baseline-schedule" rows="3" maxlength="16384" spellcheck="false">[]</textarea>
-                            </label>
-                        </details>
-                    </fieldset>
-                    <fieldset>
-                        <legend>Challenger arm</legend>
-                        <label>Arm ID
-                            <input id="experiment-challenger-id" type="text" pattern="[A-Za-z0-9_-]+" maxlength="64" value="challenger" required />
-                        </label>
-                        <label>Brain family
-                            <select id="experiment-challenger-family">
-                                <option value="mlp">MLP baseline</option>
-                                <option value="dwraon" selected>DWRAON baseline</option>
-                                <option value="neuroflow">NeuroFlow (requires host support)</option>
-                                <option value="assembly">Assembly (experimental)</option>
-                                <option value="ft">Ft</option>
-                            </select>
-                        </label>
-                        <details>
-                            <summary>Challenger configuration and schedule</summary>
-                            <label>Initial overrides (JSON object)
-                                <textarea id="experiment-challenger-config" rows="3" maxlength="16384" spellcheck="false">{"population_minimum":20}</textarea>
-                            </label>
-                            <label>Scheduled changes (JSON array)
-                                <textarea id="experiment-challenger-schedule" rows="3" maxlength="16384" spellcheck="false">[]</textarea>
-                            </label>
-                        </details>
-                    </fieldset>
+                    <h4>Experiment arms</h4>
+                    <p>Compare 2–8 brain families or treatments. Every arm receives every shared seed. Add an arm, or duplicate an existing arm before changing one setting. Arm order is preserved in the submitted plan.</p>
+                    <p id="experiment-arm-summary" role="status" aria-live="polite"></p>
+                    <div id="experiment-arms"></div>
+                    <button id="experiment-arm-add" type="button">Add arm</button>
                     <p>Keep initial overrides identical to compare only brain families. NeuroFlow uses the experiment defaults for architecture and activation; this form does not sweep those settings. The host must include NeuroFlow support. Configuration keys may use dotted paths. The host validates supported configuration and refuses seed or recording-policy changes in overrides.</p>
                     <p>Schedule example: <code>[{"tick":100,"set":{"food_growth_rate":0.001}}]</code>. Use ordered ticks within the horizon and numeric live settings; changes at the same tick keep their order.</p>
                     <button id="experiment-launch" type="submit" disabled>Create matched-seed experiment</button>

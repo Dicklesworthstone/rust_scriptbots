@@ -1,6 +1,25 @@
-import { EXPERIMENT_ENDPOINT_METRICS, experimentRunArtifactPath } from "./experiment-protocol.js";
+import { EXPERIMENT_ENDPOINT_METRICS, EXPERIMENT_LIMITS, experimentRunArtifactPath, prepareExperimentRequest } from "./experiment-protocol.js";
 
 const MAX_SEED = 18446744073709551615n;
+const EDITOR_VALIDATION_KEY = "browser-experiment-draft-validation";
+const armEditors = new WeakMap();
+const ARM_FAMILIES = Object.freeze([
+  ["mlp", "MLP baseline"], ["dwraon", "DWRAON baseline"],
+  ["neuroflow", "NeuroFlow (requires host support)"], ["assembly", "Assembly (experimental)"],
+  ["ft", "Ft (requires host support)"],
+]);
+const FORM_FAMILIES = Object.freeze({
+  "mlp.baseline": "mlp", "dwraon.baseline": "dwraon", "assembly.experimental": "assembly",
+  "ml.neuroflow": "neuroflow", ft: "ft",
+});
+
+function immutable(value) {
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value)) immutable(child);
+    Object.freeze(value);
+  }
+  return value;
+}
 
 function field(form, name) {
   const input = form.querySelector("#experiment-" + name);
@@ -29,18 +48,23 @@ function jsonInput(value, label, array = false) {
   return parsed;
 }
 
-function arm(form, prefix) {
-  const variantId = field(form, prefix + "-id").trim();
+function arm(card) {
+  const value = (name) => {
+    const input = card.querySelector('[data-experiment-field="' + name + '"]');
+    if (!input) throw new Error("Experiment arm is missing " + name + ".");
+    return input.value;
+  };
+  const variantId = value("id").trim();
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(variantId)) {
     throw new Error("Each arm ID must contain 1–64 letters, digits, underscores, or hyphens.");
   }
-  const family = field(form, prefix + "-family");
-  if (!["mlp", "dwraon", "assembly", "neuroflow", "ft"].includes(family)) throw new Error("Choose an available brain family.");
+  const family = value("family");
+  if (!ARM_FAMILIES.some(([id]) => id === family)) throw new Error("Choose an available brain family.");
   return {
     variant_id: variantId,
     brain_family: family,
-    config_overrides: jsonInput(field(form, prefix + "-config"), prefix + " overrides"),
-    interventions: jsonInput(field(form, prefix + "-schedule"), prefix + " schedule", true),
+    config_overrides: jsonInput(value("config"), variantId + " overrides"),
+    interventions: jsonInput(value("schedule"), variantId + " schedule", true),
   };
 }
 
@@ -62,9 +86,11 @@ export function readExperimentForm(form) {
   }
   const description = field(form, "description").trim();
   if (description.length > 1024) throw new Error("Description must not exceed 1024 characters.");
-  const variants = [arm(form, "baseline"), arm(form, "challenger")];
-  if (variants[0].variant_id === variants[1].variant_id) throw new Error("The two arm IDs must differ.");
-  return {
+  const cards = [...form.querySelectorAll("[data-experiment-arm]")];
+  if (cards.length < 2 || cards.length > EXPERIMENT_LIMITS.maxVariants) throw new Error("Create between 2 and 8 experiment arms.");
+  const variants = cards.map(arm);
+  if (new Set(variants.map((entry) => entry.variant_id)).size !== variants.length) throw new Error("All arm IDs must differ.");
+  const request = {
     experiment_id: experimentId || null,
     description: description || null,
     seeds,
@@ -72,6 +98,191 @@ export function readExperimentForm(form) {
     max_concurrency: integer(field(form, "concurrency"), "Concurrency", 8),
     variants,
   };
+  // Use the same bounds and semantic duplicate checks as submission, without
+  // allocating a mutation identity or retaining any authority for this draft.
+  prepareExperimentRequest({ ...request, idempotency_key: EDITOR_VALIDATION_KEY });
+  return immutable(request);
+}
+
+function armDraft(variant) {
+  const editorJson = (value) => {
+    const pretty = JSON.stringify(value, null, 2);
+    return pretty.length <= 16384 ? pretty : JSON.stringify(value);
+  };
+  return {
+    id: variant.variant_id,
+    family: FORM_FAMILIES[variant.brain_family] ?? variant.brain_family,
+    config: editorJson(variant.config_overrides),
+    schedule: editorJson(variant.interventions),
+  };
+}
+
+/** Install one bounded editor; subsequent calls reuse its listeners and cards. */
+export function initializeExperimentArmEditor(form, { onChange = () => {} } = {}) {
+  if (armEditors.has(form)) return armEditors.get(form).api;
+  const container = form.querySelector("#experiment-arms");
+  const addButton = form.querySelector("#experiment-arm-add");
+  const summary = form.querySelector("#experiment-arm-summary");
+  if (!container || !addButton || !summary) throw new Error("Experiment arm editor controls are missing.");
+  const document = form.ownerDocument;
+  let cards = [], serial = 0;
+  const draft = (card) => Object.fromEntries(Object.entries(card.fields).map(([key, input]) => [key, input.value]));
+  const refresh = (changed = true) => {
+    cards.forEach((card, index) => {
+      card.legend.textContent = "Arm " + (index + 1);
+      card.buttons.up.disabled = index === 0;
+      card.buttons.down.disabled = index === cards.length - 1;
+      card.buttons.remove.disabled = cards.length <= 2;
+      card.buttons.duplicate.disabled = cards.length >= EXPERIMENT_LIMITS.maxVariants;
+    });
+    addButton.disabled = cards.length >= EXPERIMENT_LIMITS.maxVariants;
+    const seeds = field(form, "seeds").trim().split(/[\s,]+/).filter(Boolean);
+    const count = new Set(seeds).size;
+    summary.textContent = cards.length + " of " + EXPERIMENT_LIMITS.maxVariants + " arms · "
+      + (count ? cards.length * count + " planned runs across " + count + " entered seeds." : "Enter the shared seed set.")
+      + " Copied arms must differ in family, settings, or schedule before launch.";
+    if (changed) onChange();
+  };
+  const nextId = (base = "arm") => {
+    const used = new Set(cards.map((card) => card.fields.id.value.trim()));
+    const prefix = /^[A-Za-z0-9_-]+$/.test(base) ? base.slice(0, 55) : "arm";
+    for (let suffix = 1; ; suffix += 1) {
+      const candidate = prefix + "_" + suffix;
+      if (!used.has(candidate)) return candidate;
+    }
+  };
+  const makeCard = (values) => {
+    const prefix = serial === 0 ? "baseline" : serial === 1 ? "challenger" : "arm-" + serial;
+    serial += 1;
+    const element = node(document, "fieldset");
+    element.dataset.experimentArm = "";
+    const legend = node(document, "legend");
+    element.append(legend);
+    const fields = {};
+    const control = (parent, name, labelText, tag) => {
+      const label = node(document, "label", labelText);
+      const input = node(document, tag);
+      input.id = "experiment-" + prefix + "-" + name;
+      input.dataset.experimentField = name;
+      label.htmlFor = input.id;
+      label.append(input);
+      parent.append(label);
+      fields[name] = input;
+      return input;
+    };
+    const identifier = control(element, "id", "Arm ID", "input");
+    Object.assign(identifier, { type: "text", pattern: "[A-Za-z0-9_-]+", maxLength: 64, required: true });
+    const family = control(element, "family", "Brain family", "select");
+    family.append(...ARM_FAMILIES.map(([value, label]) => {
+      const option = node(document, "option", label);
+      option.value = value;
+      return option;
+    }));
+    const details = node(document, "details");
+    details.append(node(document, "summary", "Initial configuration and timed changes"));
+    for (const [name, label] of [["config", "Initial overrides (JSON object)"], ["schedule", "Scheduled changes (JSON array)"]]) {
+      const input = control(details, name, label, "textarea");
+      Object.assign(input, { rows: 3, maxLength: 16384, spellcheck: false });
+    }
+    element.append(details);
+    const actions = node(document, "div");
+    const buttons = {};
+    const card = { element, legend, fields, buttons };
+    for (const [action, label] of [["duplicate", "Duplicate arm"], ["remove", "Remove arm"], ["up", "Move up"], ["down", "Move down"]]) {
+      const button = node(document, "button", label);
+      button.type = "button";
+      button.dataset.experimentArmAction = action;
+      button.addEventListener("click", () => {
+        const index = cards.indexOf(card);
+        if (action === "duplicate") api.duplicateArm(index);
+        else if (action === "remove") api.removeArm(index);
+        else api.moveArm(index, action === "up" ? -1 : 1);
+      });
+      actions.append(button);
+      buttons[action] = button;
+    }
+    element.append(actions);
+    for (const [name, value] of Object.entries(values)) fields[name].value = value;
+    return card;
+  };
+  const validIndex = (index) => Number.isInteger(index) && index >= 0 && index < cards.length;
+  const commitCards = (next, changed = true) => {
+    cards = next;
+    container.replaceChildren(...cards.map((card) => card.element));
+    refresh(changed);
+  };
+  const api = Object.freeze({
+    get count() { return cards.length; },
+    addArm() {
+      if (cards.length >= EXPERIMENT_LIMITS.maxVariants) return false;
+      const card = makeCard({ id: nextId(), family: "mlp", config: "{}", schedule: "[]" });
+      commitCards([...cards, card]);
+      card.fields.id.focus();
+      return true;
+    },
+    duplicateArm(index) {
+      if (!validIndex(index) || cards.length >= EXPERIMENT_LIMITS.maxVariants) return false;
+      // Copy editor text, including an unfinished JSON edit, without sharing any
+      // mutable arm state. Validation happens when the user previews or submits.
+      const values = draft(cards[index]);
+      values.id = nextId(values.id + "_copy");
+      const card = makeCard(values);
+      commitCards([...cards.slice(0, index + 1), card, ...cards.slice(index + 1)]);
+      card.fields.id.focus();
+      return true;
+    },
+    removeArm(index) {
+      if (!validIndex(index) || cards.length <= 2) return false;
+      commitCards(cards.filter((_, at) => at !== index));
+      return true;
+    },
+    moveArm(index, offset) {
+      if (!validIndex(index) || ![-1, 1].includes(offset) || !validIndex(index + offset)) return false;
+      const next = [...cards];
+      [next[index], next[index + offset]] = [next[index + offset], next[index]];
+      commitCards(next);
+      return true;
+    },
+  });
+  armEditors.set(form, { api, makeCard, commitCards });
+  addButton.addEventListener("click", () => api.addArm());
+  const edited = () => refresh();
+  form.addEventListener("input", edited);
+  form.addEventListener("change", edited);
+  commitCards([
+    makeCard({ id: "baseline", family: "mlp", config: '{"population_minimum":20}', schedule: "[]" }),
+    makeCard({ id: "challenger", family: "dwraon", config: '{"population_minimum":20}', schedule: "[]" }),
+  ], false);
+  return api;
+}
+
+/** Validate an entire draft before replacing any controls; this never submits it. */
+export function replaceExperimentForm(form, plan) {
+  const prepared = prepareExperimentRequest({ ...plan, idempotency_key: EDITOR_VALIDATION_KEY });
+  const request = prepared.request;
+  if ((request.description?.length ?? 0) > 1024) throw new Error("Description must not exceed 1024 characters.");
+  if (request.experiment_id && !/^[A-Za-z0-9_-]{1,128}$/.test(request.experiment_id)) {
+    throw new Error("Experiment ID must contain 1–128 letters, digits, underscores, or hyphens.");
+  }
+  const values = {
+    id: request.experiment_id ?? "", description: request.description ?? "", seeds: request.seeds.join(", "),
+    ticks: String(request.ticks_per_run), concurrency: String(request.max_concurrency),
+  };
+  const controls = Object.fromEntries(Object.keys(values).map((name) => {
+    const control = form.querySelector("#experiment-" + name);
+    if (!control) throw new Error("Experiment form is missing " + name + ".");
+    return [name, control];
+  }));
+  const drafts = request.variants.map(armDraft);
+  if (drafts.some((entry) => entry.config.length > 16384 || entry.schedule.length > 16384)) {
+    throw new Error("An imported arm exceeds the 16 KiB editor limit.");
+  }
+  initializeExperimentArmEditor(form);
+  const editor = armEditors.get(form);
+  const cards = drafts.map(editor.makeCard);
+  for (const [name, value] of Object.entries(values)) controls[name].value = value;
+  editor.commitCards(cards);
+  return readExperimentForm(form);
 }
 
 function node(document, tag, text) {

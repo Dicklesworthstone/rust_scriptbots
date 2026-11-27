@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readExperimentForm, renderExperimentLab, experimentObservationExport } from "../experiment-view.js";
+import { readExperimentForm, renderExperimentLab, experimentObservationExport, initializeExperimentArmEditor, replaceExperimentForm } from "../experiment-view.js";
 import { prepareExperimentRequest } from "../experiment-protocol.js";
 
 class Element {
@@ -13,12 +13,43 @@ class Element {
     this.disabled = false;
     this.hidden = false;
     this._text = "";
+    this.parentNode = null;
+    this.listeners = new Map();
   }
   set textContent(value) { this._text = String(value); this.children = []; }
   get textContent() { return this._text + this.children.map((child) => child.textContent).join(" "); }
   set innerHTML(_) { throw new Error("Untrusted experiment data must use textContent."); }
-  append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this._text = ""; this.children = children; }
+  append(...children) {
+    for (const child of children) {
+      if (child.parentNode) child.parentNode.children = child.parentNode.children.filter((entry) => entry !== child);
+      child.parentNode = this;
+      this.children.push(child);
+    }
+  }
+  replaceChildren(...children) {
+    this._text = "";
+    for (const child of this.children) child.parentNode = null;
+    this.children = [];
+    this.append(...children);
+  }
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  }
+  fire(type) {
+    for (const listener of this.listeners.get(type) ?? []) listener({ type, target: this });
+    this.parentNode?.fire(type);
+  }
+  click() { if (!this.disabled) this.fire("click"); }
+  focus() { this.ownerDocument.activeElement = this; }
+  querySelectorAll(selector) {
+    const attribute = selector.match(/^\[data-([a-z-]+)(?:="([^"]*)")?\]$/);
+    const property = attribute?.[1].replace(/-([a-z])/g, (_, char) => char.toUpperCase());
+    const matches = (node) => selector.startsWith("#") ? node.id === selector.slice(1)
+      : attribute && Object.hasOwn(node.dataset, property) && (attribute[2] === undefined || node.dataset[property] === attribute[2]);
+    return this.children.flatMap((child) => [...(matches(child) ? [child] : []), ...child.querySelectorAll(selector)]);
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
 }
 
 function panel() {
@@ -33,18 +64,32 @@ function panel() {
   return root;
 }
 
-function form(changes = {}) {
+function form(changes = {}, options = {}) {
   const values = {
     id: "", description: "",
     seeds: "11, 42, 137", ticks: "200", concurrency: "1",
-    "baseline-id": "baseline", "baseline-family": "mlp",
-    "baseline-config": '{"population_minimum":20}', "baseline-schedule": "[]",
-    "challenger-id": "challenger", "challenger-family": "dwraon",
-    "challenger-config": '{"population_minimum":20}', "challenger-schedule": "[]",
-    ...changes,
   };
-  return { querySelector: (selector) => ({ value: values[selector.replace("#experiment-", "")] }) };
+  const document = { createElement: (tag) => new Element(document, tag) };
+  const root = new Element(document, "form");
+  for (const [name, value] of Object.entries(values)) {
+    const input = new Element(document, "input");
+    input.id = "experiment-" + name;
+    input.value = value;
+    root.append(input);
+  }
+  for (const name of ["arms", "arm-add", "arm-summary"]) {
+    const element = new Element(document);
+    element.id = "experiment-" + name;
+    root.append(element);
+  }
+  root.editor = initializeExperimentArmEditor(root, options);
+  for (const [name, value] of Object.entries(changes)) root.querySelector("#experiment-" + name).value = value;
+  return root;
 }
+
+function cards(form) { return form.querySelectorAll("[data-experiment-arm]"); }
+function armField(card, name) { return card.querySelector('[data-experiment-field="' + name + '"]'); }
+function action(card, name) { return card.querySelector('[data-experiment-arm-action="' + name + '"]'); }
 
 function run(variant = "baseline", seed = "11", changes = {}) {
   return {
@@ -183,6 +228,175 @@ test("optional request metadata and blank editors produce explicit empty values"
   assert.deepEqual(request.variants[0].interventions, []);
   assert.equal(request.variants[1].brain_family, "ft");
   assert.deepEqual(request.seeds, ["42"]);
+});
+
+test("arm editor preserves defaults and binds each action once with two-to-eight bounds", () => {
+  let changes = 0;
+  const root = form({}, { onChange: () => { changes += 1; } });
+  const editor = root.editor;
+  assert.equal(initializeExperimentArmEditor(root), editor);
+  assert.deepEqual(cards(root).map((card) => armField(card, "id").value), ["baseline", "challenger"]);
+  assert.equal(root.querySelector("#experiment-baseline-id"), armField(cards(root)[0], "id"));
+  assert.equal(editor.removeArm(0), false);
+  assert.equal(action(cards(root)[0], "remove").disabled, true);
+  assert.equal(editor.moveArm(0, -1), false);
+  root.querySelector("#experiment-arm-add").click();
+  assert.equal(editor.count, 3);
+  assert.equal(changes, 1);
+  for (let index = 3; index < 8; index += 1) assert.equal(editor.addArm(), true);
+  assert.equal(editor.count, 8);
+  assert.equal(editor.addArm(), false);
+  assert.equal(editor.duplicateArm(0), false);
+  assert.equal(root.querySelector("#experiment-arm-add").disabled, true);
+  assert.ok(cards(root).every((card) => action(card, "duplicate").disabled));
+  assert.match(root.querySelector("#experiment-arm-summary").textContent, /8 of 8 arms · 24 planned runs/);
+  assert.equal(new Set(cards(root).map((card) => armField(card, "id").value)).size, 8);
+  assert.equal(editor.removeArm(7), true);
+  assert.equal(root.querySelector("#experiment-arm-add").disabled, false);
+  assert.equal(editor.moveArm(0, 2), false);
+  assert.equal(editor.removeArm(-1), false);
+  assert.equal(editor.duplicateArm(99), false);
+});
+
+test("duplicate and reordered card actions retain their own independent draft values", () => {
+  let changes = 0;
+  const root = form({}, { onChange: () => { changes += 1; } });
+  const original = cards(root)[0];
+  armField(original, "id").value = "x".repeat(64);
+  armField(original, "config").value = '{"unfinished":';
+  armField(original, "schedule").value = '[{"tick":10,"set":{"food_growth_rate":0.001}}]';
+  action(original, "duplicate").click();
+  const copy = cards(root)[1];
+  assert.equal(armField(copy, "config").value, '{"unfinished":');
+  assert.notEqual(armField(copy, "id").value, armField(original, "id").value);
+  assert.match(armField(copy, "id").value, /^[A-Za-z0-9_-]{1,64}$/);
+  armField(copy, "config").value = '{"population_minimum":30}';
+  armField(copy, "config").fire("input");
+  assert.equal(armField(original, "config").value, '{"unfinished":');
+  assert.equal(changes, 2);
+  action(copy, "down").click();
+  assert.equal(cards(root)[2], copy);
+  action(copy, "up").click();
+  assert.equal(cards(root)[1], copy);
+  action(original, "down").click();
+  assert.equal(cards(root)[0], copy);
+  action(original, "remove").click();
+  assert.deepEqual(cards(root), [copy, cards(root)[1]]);
+  assert.ok(!cards(root).includes(original));
+  assert.equal(action(copy, "up").disabled, true);
+  assert.equal(action(copy, "remove").disabled, true);
+  assert.equal(changes, 6);
+});
+
+test("eight-arm plans preserve exact seeds, independent settings, and intervention order", () => {
+  const root = form();
+  const base = readExperimentForm(root);
+  const plan = {
+    ...base, seeds: Array.from({ length: 31 }, (_, index) => String(index)).concat("18446744073709551615"),
+    variants: Array.from({ length: 8 }, (_, index) => ({
+      variant_id: "treatment_" + index, brain_family: "mlp.baseline",
+      config_overrides: { population_minimum: 20, food_growth_rate: 0.001 * (index + 1) },
+      interventions: [
+        { tick: 100, set: { food_growth_rate: 0.002 } },
+        { tick: 100, set: { food_growth_rate: 0.003 } },
+      ],
+    })),
+  };
+  const restored = replaceExperimentForm(root, plan);
+  const prepared = prepareExperimentRequest({ ...restored, idempotency_key: "real-captured-request" });
+  assert.equal(restored.variants.length * restored.seeds.length, 256);
+  assert.deepEqual(restored.seeds, plan.seeds);
+  assert.deepEqual(restored.variants.map((entry) => entry.variant_id), plan.variants.map((entry) => entry.variant_id));
+  assert.deepEqual(restored.variants[7].interventions.map((entry) => entry.set.food_growth_rate), [0.002, 0.003]);
+  assert.match(prepared.body, /18446744073709551615/);
+  const capturedBody = prepared.body;
+  plan.variants[0].config_overrides.food_growth_rate = 999;
+  assert.equal(readExperimentForm(root).variants[0].config_overrides.food_growth_rate, 0.001);
+  armField(cards(root)[0], "config").value = '{"food_growth_rate":0.04}';
+  root.editor.moveArm(0, 1);
+  root.editor.removeArm(0);
+  assert.equal(prepared.body, capturedBody);
+  assert.equal(prepared.request.variants[0].config_overrides.food_growth_rate, 0.001);
+  assert.equal(restored.variants[0].config_overrides.food_growth_rate, 0.001);
+  assert.ok(Object.isFrozen(restored) && Object.isFrozen(restored.variants) && Object.isFrozen(restored.variants[0].interventions[0].set));
+  assert.throws(() => { restored.variants[0].config_overrides.food_growth_rate = 5; }, TypeError);
+});
+
+test("validated form replacement maps every canonical family and clears stale metadata and arms", () => {
+  const root = form({ id: "previous", description: "old question" });
+  const original = readExperimentForm(root);
+  const families = ["mlp.baseline", "dwraon.baseline", "assembly.experimental", "ml.neuroflow", "ft"];
+  replaceExperimentForm(root, {
+    ...original, variants: families.map((brain_family, index) => ({
+      variant_id: "family_" + index, brain_family, config_overrides: {}, interventions: [],
+    })),
+  });
+  assert.deepEqual(cards(root).map((card) => armField(card, "family").value), ["mlp", "dwraon", "assembly", "neuroflow", "ft"]);
+  const next = { ...original, experiment_id: null, description: null, seeds: ["9007199254740993"], ticks_per_run: 12, max_concurrency: 2 };
+  const restored = replaceExperimentForm(root, next);
+  assert.equal(root.editor.count, 2);
+  assert.equal(root.querySelector("#experiment-id").value, "");
+  assert.equal(root.querySelector("#experiment-description").value, "");
+  assert.deepEqual(restored, next);
+  assert.equal(restored.ticks_per_run, 12);
+});
+
+test("invalid replacement leaves every existing form control and edit callback untouched", () => {
+  let changes = 0;
+  const root = form({}, { onChange: () => { changes += 1; } });
+  const original = readExperimentForm(root);
+  const originalCards = [...cards(root)];
+  const invalid = [
+    { ...original, seeds: ["18446744073709551616"] },
+    { ...original, description: "x".repeat(1025) },
+    { ...original, variants: [original.variants[0]] },
+    { ...original, variants: Array.from({ length: 9 }, (_, index) => ({ ...original.variants[0], variant_id: "arm_" + index })) },
+    { ...original, variants: [original.variants[0], { ...original.variants[1], variant_id: "baseline" }] },
+    { ...original, variants: [original.variants[0], { ...original.variants[0], variant_id: "same_science" }] },
+    { ...original, variants: [original.variants[0], { ...original.variants[1], brain_family: "unknown" }] },
+  ];
+  for (const input of invalid) {
+    assert.throws(() => replaceExperimentForm(root, input));
+    assert.deepEqual(readExperimentForm(root), original);
+    assert.deepEqual(cards(root), originalCards);
+    assert.equal(changes, 0);
+  }
+  replaceExperimentForm(root, original);
+  assert.equal(changes, 1);
+});
+
+test("duplicated science is refused until the user changes a setting; IDs and total bounds remain enforced", () => {
+  const root = form();
+  root.editor.duplicateArm(0);
+  assert.throws(() => readExperimentForm(root), /identical declared arms/);
+  const copy = cards(root)[1];
+  armField(copy, "config").value = '{"population_minimum":21}';
+  assert.equal(readExperimentForm(root).variants.length, 3);
+  armField(copy, "id").value = "challenger";
+  assert.throws(() => readExperimentForm(root), /IDs must differ/);
+  armField(copy, "id").value = "valid_copy";
+  armField(copy, "schedule").value = '[{"tick":200,"set":{"food_growth_rate":0.01}}]';
+  assert.throws(() => readExperimentForm(root), /intervention tick/);
+  armField(copy, "schedule").value = "[]";
+  root.querySelector("#experiment-id").value = "x".repeat(128);
+  assert.throws(() => readExperimentForm(root), /derived run identity/);
+});
+
+test("imported metadata and JSON content stay literal, and callbacks observe the complete replacement", () => {
+  let observed = null;
+  const root = form({}, { onChange: () => { observed = readExperimentForm(root); } });
+  const plan = {
+    ...readExperimentForm(root), description: '<img src=x onerror="not executed">', seeds: ["18446744073709551615"],
+    variants: [
+      { variant_id: "literal", brain_family: "mlp", config_overrides: { label: "<script>text only</script>" }, interventions: [] },
+      { variant_id: "other", brain_family: "dwraon", config_overrides: {}, interventions: [] },
+    ],
+  };
+  const result = replaceExperimentForm(root, plan);
+  assert.deepEqual(observed, result);
+  assert.equal(root.querySelector("#experiment-description").value, plan.description);
+  assert.match(armField(cards(root)[0], "config").value, /<script>text only<\/script>/);
+  assert.equal(result.variants[0].config_overrides.label, "<script>text only</script>");
 });
 
 test("running progress is a saved observation rather than the zero terminal tick field", () => {

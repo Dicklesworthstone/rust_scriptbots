@@ -9352,6 +9352,17 @@ parity fixtures and pinned tooling; no Vite integration or fresh browser pass is
 
 #### 5.2 agent-friendly API/MCP
 
+[Currently In Progress — Codex, 2026-11-27; `bd-2z0.12.2`, `bd-2z0.12.3`]
+The browser now authors the existing bounded experiment runner's full
+two-to-eight-arm matrix, with independent family/configuration/schedule editors,
+duplication, removal and reordering. Full-draft validation preserves exact seed
+identities and immutable admitted requests. DSR executed 453 browser module
+tests and all JavaScript syntax checks successfully with an unchanged source
+fingerprint. Numeric parameter sweeps and portable initial-condition plans are
+the next implementation slice. Authoring, loading or exporting a plan must not
+launch, resume or replace scientific work. Native and real-package browser
+acceptance remain separate and unexecuted on this host.
+
 - status/health/read snapshots;
 - command receipts;
 - scenario/experiment tools;
