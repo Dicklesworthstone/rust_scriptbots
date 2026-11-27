@@ -13,6 +13,9 @@ const MAX_CHECKPOINT_CANVAS_BYTES = 12 * 1024 * 1024;
 const MAX_CONTROL_BYTES = 16 * 1024;
 const MAX_SEND_BUFFER_BYTES = 64 * 1024;
 const MAX_REQUESTS = 32;
+/** Recovery stores bounded identities, never saved authority or owner receipts. */
+export const REMOTE_CONTROL_RECOVERY_LIMITS = Object.freeze({ entries: MAX_REQUESTS, bytes: 256 * 1024 });
+const CONTROL_RECOVERY_SCHEMA = "scriptbots.remote-command-recovery.v1";
 const MAX_INSPECTION_BYTES = 16 * 1024;
 const MAX_BRAIN_ACTIVITY_BYTES = 512 * 1024;
 const MAX_OWNER_STATUS_BYTES = 16 * 1024;
@@ -768,6 +771,62 @@ function controlText(command, options) {
     idempotencyKey: command === "status_by_key" ? idempotencyKey : null };
 }
 
+function controlRecoveryFields(value, fields) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== fields.length || fields.some((field) => !Object.hasOwn(value, field))) {
+    throw new Error("Saved command recovery has missing or unsupported fields");
+  }
+}
+
+function controlRecoveryUrl(value) {
+  if (typeof value !== "string" || value.length > 2048) throw new Error("Invalid saved command endpoint");
+  const url = new URL(value);
+  if (!["ws:", "wss:"].includes(url.protocol) || value !== url.href || url.username || url.password
+      || url.search || url.hash) throw new Error("Command endpoints with credentials or private parameters cannot be saved");
+  return value;
+}
+
+/** Parse untrusted tab storage before exposing any retained identity or changing a client. */
+export function parseRemoteControlRecovery(raw) {
+  if (typeof raw !== "string" || raw.length > REMOTE_CONTROL_RECOVERY_LIMITS.bytes
+      || encoder.encode(raw).length > REMOTE_CONTROL_RECOVERY_LIMITS.bytes) {
+    throw new Error("Saved command recovery exceeds its byte bound");
+  }
+  const record = JSON.parse(raw);
+  controlRecoveryFields(record, ["schema", "url", "commands"]);
+  if (record.schema !== CONTROL_RECOVERY_SCHEMA) throw new Error("Unsupported saved command recovery schema");
+  controlRecoveryUrl(record.url);
+  if (!Array.isArray(record.commands) || record.commands.length > REMOTE_CONTROL_RECOVERY_LIMITS.entries) {
+    throw new Error("Saved command recovery exceeds its command bound");
+  }
+  const requestIds = new Set(), commandIds = new Set();
+  const commands = record.commands.map((entry) => {
+    controlRecoveryFields(entry, ["requestId", "sessionId", "command", "speed", "commandId"]);
+    decimal(entry.sessionId);
+    if (!["pause", "resume", "step", "speed"].includes(entry.command)
+        || (entry.command !== "speed" && entry.speed !== null)) {
+      throw new Error("Saved recovery must identify an original mutation");
+    }
+    if (typeof entry.requestId !== "string" || !entry.requestId) {
+      throw new Error("Invalid saved request identity");
+    }
+    controlText(entry.command, { requestId: entry.requestId,
+      ...(entry.command === "speed" ? { speed: entry.speed } : {}) });
+    if (entry.commandId !== null && (typeof entry.commandId !== "string" || !/^[0-9a-f]{32}$/.test(entry.commandId))) {
+      throw new Error("Invalid saved canonical command identity");
+    }
+    const identity = `${entry.sessionId}/${entry.commandId}`;
+    if (requestIds.has(entry.requestId) || (entry.commandId !== null && commandIds.has(identity))) {
+      throw new Error("Saved command recovery contains duplicate identities");
+    }
+    requestIds.add(entry.requestId);
+    if (entry.commandId !== null) commandIds.add(identity);
+    return Object.freeze({ requestId: entry.requestId, sessionId: entry.sessionId, command: entry.command,
+      speed: entry.speed, commandId: entry.commandId });
+  });
+  return Object.freeze({ schema: record.schema, url: record.url, commands: Object.freeze(commands) });
+}
+
 function freezeControlEvidence(value) {
   const copy = structuredClone(value), pending = [copy];
   while (pending.length) {
@@ -871,7 +930,7 @@ export function remoteCommandHistoryView(client, selectedRequestId = null) {
 /** Bounded browser WebSocket client. Reconnect and outcome recovery are explicit. */
 export class RemoteStreamClient {
   constructor({ url, decodeFrame, channels = CHANNELS, maxFps = 60,
-    onFrame = () => {}, onState = () => {}, onReceipt = () => {}, onOwnerStatus = () => {} }) {
+    onFrame = () => {}, onState = () => {}, onReceipt = () => {}, onOwnerStatus = () => {}, onControlHistoryChange = () => {} }) {
     const parsed = new URL(url, globalThis.location?.href);
     if (!["ws:", "wss:"].includes(parsed.protocol) || parsed.username || parsed.password) {
       throw new Error("Use a ws:// or wss:// endpoint without URL credentials");
@@ -885,6 +944,7 @@ export class RemoteStreamClient {
     this.onState = onState;
     this.onReceipt = onReceipt;
     this.onOwnerStatus = onOwnerStatus;
+    this.onControlHistoryChange = onControlHistoryChange;
     this.ownerStatus = null;
     this.ownerStatusError = null;
     this.ownerStatusAvailable = false;
@@ -909,8 +969,51 @@ export class RemoteStreamClient {
   controlRequests() {
     return Object.freeze([...this.requests.values()].map((request) => Object.freeze({
       requestId: request.requestId, command: request.command, sessionId: request.sessionId,
+      speed: request.command === "speed" ? JSON.parse(request.text).speed : null,
       commandId: request.commandId, receipt: request.receipt, error: request.error, settled: request.settled,
     })));
+  }
+
+  /** Save unresolved keys before sending; only a current owner receipt can settle one. */
+  exportControlRecovery() {
+    const url = controlRecoveryUrl(this.url);
+    const commands = [...this.requests.values()].filter((request) => !request.settled).map((request) => ({
+      requestId: request.requestId, sessionId: request.sessionId, command: request.command,
+      speed: request.command === "speed" ? JSON.parse(request.text).speed : null, commandId: request.commandId,
+    }));
+    const raw = JSON.stringify({ schema: CONTROL_RECOVERY_SCHEMA, url, commands });
+    parseRemoteControlRecovery(raw);
+    return raw;
+  }
+
+  /** Restore lookup references only; reconnecting and reading outcomes remain explicit. */
+  restoreControlRecovery(raw) {
+    if (this.state !== "disconnected" || this.socket || this.tracker.sessionId !== null
+        || this.requests.size || this.statusRequest) throw new Error("Restore command recovery into a fresh disconnected client");
+    const record = parseRemoteControlRecovery(raw);
+    if (record.url !== this.url) throw new Error("Saved command recovery belongs to another endpoint");
+    const requests = new Map(record.commands.map((entry) => {
+      const request = controlText(entry.command, { requestId: entry.requestId,
+        ...(entry.command === "speed" ? { speed: entry.speed } : {}) });
+      return [entry.requestId, { ...request, sessionId: entry.sessionId, commandId: entry.commandId,
+        received: false, receipt: null, error: null, settled: false }];
+    }));
+    this.requests = requests;
+    return requests.size;
+  }
+
+  /** Preserve trusted observations across an explicit same-endpoint connection replacement. */
+  inheritControlHistory(previous) {
+    if (this.state !== "disconnected" || this.socket || this.tracker.sessionId !== null
+        || this.requests.size || this.statusRequest) throw new Error("Inherit command history into a fresh disconnected client");
+    if (!(previous instanceof RemoteStreamClient) || previous === this || previous.url !== this.url) {
+      throw new Error("Command history must come from another client at the same endpoint");
+    }
+    // Receipts/errors are immutable observations. Copy the mutable envelopes so
+    // a late reply on the old connection cannot alter the replacement's history.
+    // No socket, subscription, lookup, resume cursor or owner health is inherited.
+    this.requests = new Map([...previous.requests].map(([key, request]) => [key, { ...request }]));
+    return this.requests.size;
   }
 
   get ownerAllowsMutation() {
@@ -1403,6 +1506,7 @@ export class RemoteStreamClient {
     // Preserve the original key even when send throws. Recovery only queries
     // that key or its observed command ID; it never resubmits a mutation.
     try {
+      if (!isLookup) this.onControlHistoryChange(this);
       this.sendText(retained.text);
     } catch (error) {
       // A failed read may be repeated safely; it must not occupy the only
@@ -1514,6 +1618,7 @@ export class RemoteStreamClient {
       if (target) target.error = Object.freeze({ status: reply.status, message: reply.message, operation: request.command });
     }
     request.received = true;
+    if (target) this.onControlHistoryChange(this);
     this.onReceipt(observedReply);
   }
 

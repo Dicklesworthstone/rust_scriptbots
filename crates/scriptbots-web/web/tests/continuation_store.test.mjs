@@ -4,12 +4,222 @@
 // exercises reload and checkpoint validation through actual browser storage.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BrowserContinuationStore, BrowserRecoveryController, ContinuationStoreError } from "../continuation-store.js";
+import { BrowserContinuationStore, BrowserRecoveryController, ContinuationStoreError, RemoteCommandRecoveryStore } from "../continuation-store.js";
+import { RemoteStreamClient, REMOTE_CONTROL_RECOVERY_LIMITS } from "../remote.js";
 
 const SAVED_AT = "2026-11-06T00:00:00.000Z";
 const record = (overrides = {}) => ({ schema: "scriptbots.browser-continuation.v1",
   tick: "7", savedAt: SAVED_AT, blob: new Blob([new Uint8Array([1, 2, 3])]), ...overrides });
 const codeIs = (code) => (error) => error instanceof ContinuationStoreError && error.code === code;
+
+const REMOTE_RECOVERY_KEY = "scriptbots.remote-command-recovery.v1";
+const REMOTE_ENDPOINT = "wss://lab.example/nested/api/ws/stream";
+const remoteRecovery = (overrides = {}) => JSON.stringify({ schema: "scriptbots.remote-command-recovery.v1",
+  url: REMOTE_ENDPOINT, commands: [{ requestId: "store-step", sessionId: "7", command: "step", speed: null, commandId: null }], ...overrides });
+
+class TabRecoveryStorage {
+  constructor(raw = null) { this.raw = raw; this.reads = 0; this.writes = 0; this.removals = 0; }
+  getItem(key) {
+    assert.equal(key, REMOTE_RECOVERY_KEY); this.reads += 1;
+    if (this.readError) throw this.readError;
+    return this.raw;
+  }
+  setItem(key, raw) {
+    assert.equal(key, REMOTE_RECOVERY_KEY);
+    if (this.writeError) throw this.writeError;
+    this.writes += 1; this.raw = raw;
+  }
+  removeItem(key) {
+    assert.equal(key, REMOTE_RECOVERY_KEY);
+    if (this.removeError) throw this.removeError;
+    this.removals += 1; this.raw = null;
+  }
+}
+
+function recoveryClient(store, url = REMOTE_ENDPOINT) {
+  return new RemoteStreamClient({ url, decodeFrame() { throw new Error("Recovery must not decode or request a frame"); },
+    onControlHistoryChange: (client) => store.save(client) });
+}
+
+test("remote recovery storage is lazy, bounded and read-only until an explicit operation", () => {
+  const storage = new TabRecoveryStorage(remoteRecovery());
+  let accesses = 0;
+  const store = new RemoteCommandRecoveryStore(() => { accesses += 1; return storage; });
+  assert.equal(accesses, 0);
+  const state = store.read();
+  assert.equal(state, store.state);
+  assert.equal(state.status, "saved");
+  assert.equal(state.endpoint, REMOTE_ENDPOINT);
+  assert.equal(state.count, 1);
+  assert.equal(state.raw, storage.raw);
+  assert.ok(Object.isFrozen(state) && Object.isFrozen(state.record.commands[0]));
+  const restored = recoveryClient(store);
+  assert.equal(restored.restoreControlRecovery(state.raw), 1);
+  assert.equal(restored.state, "disconnected");
+  assert.equal(restored.tracker.sessionId, null);
+  assert.equal(restored.controlRequests()[0].receipt, null);
+  assert.equal(restored.controlRequests()[0].settled, false);
+  assert.equal(storage.writes, 0);
+  assert.equal(storage.removals, 0);
+});
+
+test("remote originals reach tab storage before send and settled owner evidence clears their reference", () => {
+  const storage = new TabRecoveryStorage(), store = new RemoteCommandRecoveryStore(() => storage);
+  assert.equal(store.read().status, "empty");
+  const client = recoveryClient(store), sent = [];
+  client.state = "connected"; client.tracker.acknowledge("7");
+  client.sendText = (text) => {
+    assert.equal(store.state.status, "saved", "the original must be retained before socket delivery");
+    assert.equal(JSON.parse(storage.raw).commands[0].requestId, "store-step");
+    sent.push(JSON.parse(text));
+  };
+  client.sendControl("step", { requestId: "store-step" });
+  assert.deepEqual(sent.map((request) => request.command), ["step"]);
+  client.receive(JSON.stringify({ protocol_version: 1, type: "receipt", request_id: "store-step",
+    receipt: { command_id: "1".repeat(32), application_state: "applied", journal_state: "pending", settled: false } }));
+  assert.equal(JSON.parse(storage.raw).commands[0].commandId, "1".repeat(32));
+  assert.equal(store.state.count, 1, "application alone does not authorize forgetting an original");
+  client.receive(JSON.stringify({ protocol_version: 1, type: "receipt", request_id: "store-step",
+    receipt: { command_id: "1".repeat(32), application_state: "applied", journal_state: "durable", settled: true } }));
+  assert.equal(storage.raw, null);
+  assert.equal(store.state.status, "empty");
+  assert.equal(storage.removals, 1);
+  assert.equal(sent.length, 1, "saving and clearing cannot send another mutation");
+});
+
+test("remote recovery preserves another endpoint even when the new client exports no commands", () => {
+  const original = remoteRecovery(), storage = new TabRecoveryStorage(original);
+  const store = new RemoteCommandRecoveryStore(() => storage); store.read();
+  const other = recoveryClient(store, "wss://other.example/api/ws/stream");
+  assert.equal(store.save(other).status, "conflict");
+  assert.equal(storage.raw, original);
+  assert.equal(storage.removals, 0);
+  assert.equal(storage.writes, 0);
+  assert.equal(store.state.endpoint, REMOTE_ENDPOINT);
+  assert.equal(store.clear().status, "empty");
+  assert.equal(store.save(other).status, "empty");
+});
+
+test("an empty or stale same-endpoint client cannot erase originals it has not restored", () => {
+  const original = remoteRecovery(), storage = new TabRecoveryStorage(original);
+  const store = new RemoteCommandRecoveryStore(() => storage); store.read();
+  const fresh = recoveryClient(store);
+  assert.equal(store.save(fresh).status, "conflict");
+  assert.equal(storage.raw, original);
+  assert.equal(storage.removals, 0);
+  fresh.restoreControlRecovery(original);
+  assert.equal(store.save(fresh).status, "saved");
+  const changed = remoteRecovery({ commands: [JSON.parse(original).commands[0],
+    { requestId: "second-original", sessionId: "8", command: "pause", speed: null, commandId: null }] });
+  storage.raw = changed;
+  store.read();
+  assert.equal(store.save(fresh).status, "conflict", "rereading a changed record does not give a stale client its missing originals");
+  assert.equal(storage.raw, changed);
+  assert.equal(store.state.count, 2);
+  const restored = recoveryClient(store);
+  restored.restoreControlRecovery(changed);
+  assert.equal(store.save(restored).status, "saved");
+  assert.equal(store.state.count, 2);
+});
+
+test("same-endpoint recovery refuses changed original arguments, sessions and learned command identities", () => {
+  const command = { requestId: "original-speed", sessionId: "7", command: "speed", speed: 0.25, commandId: "1".repeat(32) };
+  const original = remoteRecovery({ commands: [command] });
+  for (const mutation of [{ speed: 0.5 }, { sessionId: "8" }, { commandId: null }, { commandId: "2".repeat(32) },
+    { command: "step", speed: null }]) {
+    const storage = new TabRecoveryStorage(original), store = new RemoteCommandRecoveryStore(() => storage);
+    store.read();
+    const client = recoveryClient(store);
+    client.restoreControlRecovery(remoteRecovery({ commands: [{ ...command, ...mutation }] }));
+    assert.equal(store.save(client).status, "conflict");
+    assert.equal(storage.raw, original);
+    assert.equal(storage.writes + storage.removals, 0);
+  }
+});
+
+test("remote recovery refuses malformed and oversized records until explicitly cleared", () => {
+  for (const raw of ["{", remoteRecovery({ schema: "unknown" }), "x".repeat(REMOTE_CONTROL_RECOVERY_LIMITS.bytes + 1)]) {
+    const storage = new TabRecoveryStorage(raw), store = new RemoteCommandRecoveryStore(() => storage);
+    assert.equal(store.read().status, "invalid");
+    assert.equal(store.state.raw, null, "untrusted oversized input must not remain in application state");
+    const client = recoveryClient(store);
+    assert.equal(store.save(client).status, "invalid");
+    assert.equal(storage.raw, raw);
+    assert.equal(storage.writes + storage.removals, 0);
+    assert.equal(store.clear().status, "empty");
+    assert.equal(storage.raw, null);
+    assert.equal(store.save(client).status, "empty");
+  }
+});
+
+test("remote recovery detects replacement after observation and does not overwrite or clear it", () => {
+  const storage = new TabRecoveryStorage(remoteRecovery()), store = new RemoteCommandRecoveryStore(() => storage);
+  const initial = store.read(), client = recoveryClient(store);
+  client.restoreControlRecovery(initial.raw);
+  const changed = remoteRecovery({ commands: [{ requestId: "other-step", sessionId: "7", command: "step", speed: null, commandId: null }] });
+  storage.raw = changed;
+  assert.equal(store.save(client).status, "conflict");
+  assert.equal(storage.raw, changed);
+  assert.equal(store.save(client).status, "unavailable", "a conflict requires a new explicit observation");
+  assert.equal(store.read().raw, changed);
+  storage.raw = remoteRecovery({ url: "wss://changed.example/api/ws/stream" });
+  assert.equal(store.clear().status, "conflict");
+  assert.equal(store.state.endpoint, "wss://changed.example/api/ws/stream");
+  assert.equal(storage.removals, 0);
+  assert.equal(store.clear().status, "empty", "the user can explicitly clear the newly displayed reference");
+});
+
+test("remote storage refusal leaves the exact original in memory and requires readback before another write", () => {
+  const storage = new TabRecoveryStorage(), store = new RemoteCommandRecoveryStore(() => storage);
+  store.read();
+  storage.writeError = new DOMException("Controlled quota", "QuotaExceededError");
+  const client = recoveryClient(store), sent = [];
+  client.state = "connected"; client.tracker.acknowledge("7");
+  client.sendText = (text) => sent.push(JSON.parse(text));
+  client.sendControl("step", { requestId: "store-step" });
+  assert.equal(store.state.status, "unavailable");
+  assert.match(store.state.warning, /memory/);
+  assert.equal(client.controlRequests()[0].requestId, "store-step");
+  assert.equal(sent.length, 1, "an explicit memory-only fallback retains the original before sending");
+  storage.writeError = null;
+  assert.equal(store.save(client).status, "unavailable");
+  assert.equal(storage.writes, 0);
+  store.read();
+  assert.equal(store.save(client).status, "saved");
+  assert.equal(JSON.parse(storage.raw).commands[0].requestId, "store-step");
+});
+
+test("restricted storage access and failed explicit clearing remain visible without losing observed references", () => {
+  let denied = true;
+  const storage = new TabRecoveryStorage(remoteRecovery());
+  const store = new RemoteCommandRecoveryStore(() => {
+    if (denied) throw new DOMException("Controlled access refusal", "SecurityError");
+    return storage;
+  });
+  assert.equal(store.read().status, "unavailable");
+  denied = false;
+  const observed = store.read();
+  storage.removeError = new DOMException("Controlled removal refusal", "SecurityError");
+  assert.equal(store.clear().status, "unavailable");
+  assert.equal(store.state.record, observed.record);
+  assert.equal(storage.raw, observed.raw);
+  assert.match(store.state.warning, /may reappear/);
+  storage.removeError = null;
+  assert.equal(store.clear().status, "empty");
+  assert.equal(storage.raw, null);
+});
+
+test("private endpoint parameters stay memory-only without modifying a previously saved endpoint", () => {
+  for (const suffix of ["?token=private", "#private"]) {
+    const storage = new TabRecoveryStorage(remoteRecovery()), store = new RemoteCommandRecoveryStore(() => storage);
+    const original = store.read().raw;
+    const client = recoveryClient(store, `${REMOTE_ENDPOINT}${suffix}`);
+    assert.equal(store.save(client).status, "unavailable");
+    assert.equal(storage.raw, original);
+    assert.equal(storage.writes + storage.removals, 0);
+    assert.match(store.state.warning, /query strings or fragments/);
+  }
+});
 
 class IndexedDbEvents {
   constructor(stored) {

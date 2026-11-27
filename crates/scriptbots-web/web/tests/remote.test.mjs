@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import test from "node:test";
 import { RemoteFrameTracker, RemoteStreamClient, RemoteStepBatchController, RemoteOwnerHttpError, STEP_BATCH_LIMITS,
-  consumeRemoteFrame, validateRemoteOwnerStatus, validateRemoteStepBatch, remoteCommandHistoryView, describeRemoteCommandReceipt, describeRemoteOwnerFault } from "../remote.js";
+  REMOTE_CONTROL_RECOVERY_LIMITS, parseRemoteControlRecovery, consumeRemoteFrame, validateRemoteOwnerStatus,
+  validateRemoteStepBatch, remoteCommandHistoryView, describeRemoteCommandReceipt, describeRemoteOwnerFault } from "../remote.js";
 import { EXPERIMENT_LIMITS, prepareExperimentRequest } from "../experiment-protocol.js";
 import { EnvironmentRaster, environmentDescription } from "../renderers/environment.js";
 
@@ -370,6 +371,270 @@ function commandReceipt(requestId, commandId = COMMAND, fields = {}) {
 
 function receiveControl(value, reply) { value.receive(JSON.stringify(reply)); }
 
+test("command recovery captures the original before send and follows only observed owner settlement", () => {
+  const saved = [], onWire = [];
+  const { value } = connectedControlClient({ onControlHistoryChange: (owner) => saved.push(owner.exportControlRecovery()) });
+  value.socket.send = (text) => onWire.push({ message: JSON.parse(text), saved: JSON.parse(saved.at(-1)) });
+  value.sendControl("step", { requestId: "lost-first-reply" });
+  assert.deepEqual(onWire[0].saved.commands, [{ requestId: "lost-first-reply", sessionId: CONTROL_SESSION,
+    command: "step", speed: null, commandId: null }], "the reference is available before WebSocket.send can deliver the mutation");
+  receiveControl(value, commandReceipt("lost-first-reply", COMMAND,
+    { application_state: "applied", journal_state: "committed_volatile", settled: false }));
+  assert.equal(JSON.parse(saved.at(-1)).commands[0].commandId, COMMAND);
+  assert.equal(JSON.parse(saved.at(-1)).commands.length, 1, "a volatile intermediate observation remains recoverable");
+  assert.ok(!saved.at(-1).includes("receipt") && !saved.at(-1).includes("settled"), "stored references are not owner evidence");
+  const beforeLookup = saved.length;
+  const lookup = value.retryControl("lost-first-reply");
+  assert.equal(saved.length, beforeLookup, "read correlation slots never become saved mutations");
+  receiveControl(value, { protocol_version: 1, request_id: lookup, type: "error", status: 404, message: "No retained receipt" });
+  assert.equal(JSON.parse(saved.at(-1)).commands.length, 1, "a missing receipt cannot erase uncertain work");
+  const secondLookup = value.retryControl("lost-first-reply");
+  receiveControl(value, commandReceipt(secondLookup, COMMAND,
+    { application_state: "applied", journal_state: "durable", settled: true }));
+  assert.deepEqual(JSON.parse(saved.at(-1)).commands, [], "only observed completion releases a saved reference");
+  assert.equal(onWire.filter((entry) => entry.message.command === "step").length, 1);
+
+  value.socket.send = () => { throw new Error("socket write failed"); };
+  assert.throws(() => value.sendControl("resume", { requestId: "uncertain-send" }), (error) =>
+    error.requestId === "uncertain-send" && /socket write failed/.test(error.message));
+  assert.equal(JSON.parse(saved.at(-1)).commands[0].requestId, "uncertain-send");
+});
+
+test("reloaded command recovery preserves exact requests and performs only explicit same-owner reads", () => {
+  const { value: original } = connectedControlClient();
+  original.sendControl("step", { requestId: "unknown-step" });
+  original.sendControl("pause", { requestId: "known-pause" });
+  receiveControl(original, commandReceipt("known-pause", COMMAND,
+    { application_state: "applied", journal_state: "committed_volatile", settled: false }));
+  original.sendControl("speed", { requestId: "known-speed", speed: 0.375 });
+  const raw = original.exportControlRecovery(), parsed = parseRemoteControlRecovery(raw);
+  assert.ok(Object.isFrozen(parsed) && Object.isFrozen(parsed.commands) && parsed.commands.every(Object.isFrozen));
+  assert.throws(() => { parsed.commands[0].command = "resume"; }, TypeError);
+  let changes = 0;
+  const restored = client({ onControlHistoryChange: () => { changes += 1; } });
+  assert.equal(restored.restoreControlRecovery(raw), 3);
+  assert.equal(changes, 0);
+  assert.equal(restored.socket, null);
+  assert.equal(restored.statusRequest, null);
+  assert.equal(restored.tracker.sessionId, null);
+  assert.equal(restored.resume, undefined);
+  assert.equal(restored.ownerAllowsMutation, false);
+  for (const [key, request] of restored.requests) {
+    assert.equal(request.text, original.requests.get(key).text);
+    assert.equal(request.received, false);
+  }
+  assert.ok(restored.controlRequests().every((entry) => !entry.settled && entry.receipt === null && entry.error === null));
+  assert.equal(restored.controlRequests()[1].commandId, COMMAND);
+  assert.equal(remoteCommandHistoryView(restored).canRecover, false);
+  assert.throws(() => restored.retryControl("unknown-step"), /Reconnect and subscribe/);
+
+  const sent = [];
+  restored.state = "connected";
+  restored.generation = 1;
+  restored.tracker.acknowledge(CONTROL_SESSION);
+  restored.socket = { readyState: 1, bufferedAmount: 0, send: (text) => sent.push(JSON.parse(text)), close() {} };
+  const byKey = restored.retryControl("unknown-step");
+  assert.deepEqual(sent[0], { protocol_version: 1, request_id: byKey, command: "status_by_key",
+    idempotency_key: "unknown-step", session_id: CONTROL_SESSION });
+  receiveControl(restored, { protocol_version: 1, request_id: byKey, type: "error", status: 404, message: "History evicted" });
+  assert.equal(restored.controlRequests()[0].settled, false);
+  const byId = restored.retryControl("known-pause");
+  assert.deepEqual(sent[1], { protocol_version: 1, request_id: byId, command: "status", command_id: COMMAND });
+  receiveControl(restored, commandReceipt(byId, COMMAND,
+    { application_state: "applied", journal_state: "durable", settled: true }));
+  assert.equal(restored.controlRequests()[1].settled, true);
+  const repeated = restored.sendControl("step", { requestId: "unknown-step" });
+  assert.equal(sent[2].command, "status_by_key", "an explicit duplicate mutation request is still a read after reload");
+  receiveControl(restored, { protocol_version: 1, request_id: repeated, type: "error", status: 404, message: "History evicted" });
+  assert.throws(() => restored.sendControl("speed", { requestId: "known-speed", speed: 0.5 }), /different command/);
+  assert.ok(sent.every((message) => ["status", "status_by_key"].includes(message.command)));
+  restored.tracker.sessionId = "72";
+  assert.throws(() => restored.retryControl("known-pause"), /another owner session/);
+  assert.equal(sent.length, 3);
+});
+
+test("restored full command histories retain old sessions and preserve independent lookup capacity", () => {
+  const { value: original } = connectedControlClient();
+  original.sendControl("step", { requestId: "previous-owner" });
+  original.tracker.sessionId = "9007199254740993";
+  for (let index = 1; index < REMOTE_CONTROL_RECOVERY_LIMITS.entries; index += 1) {
+    original.sendControl("step", { requestId: `retained-${index}` });
+  }
+  const raw = original.exportControlRecovery(), restored = client(), sent = [];
+  assert.equal(restored.restoreControlRecovery(raw), 32);
+  restored.state = "connected";
+  restored.tracker.acknowledge("9007199254740993");
+  restored.socket = { readyState: 1, bufferedAmount: 0, send: (text) => sent.push(JSON.parse(text)), close() {} };
+  assert.throws(() => restored.sendControl("step", { requestId: "overflow" }), /32 control outcomes/);
+  assert.throws(() => restored.retryControl("previous-owner"), /another owner session/);
+  assert.deepEqual(sent, []);
+  const lookup = restored.retryControl("retained-1");
+  assert.equal(sent[0].session_id, "9007199254740993");
+  receiveControl(restored, commandReceipt(lookup, COMMAND,
+    { application_state: "applied", journal_state: "committed_volatile", settled: false }));
+  assert.throws(() => restored.sendControl("step", { requestId: "overflow" }), /32 control outcomes/);
+  assert.equal(JSON.parse(restored.exportControlRecovery()).commands.length, 32);
+  const settledLookup = restored.retryControl("retained-1");
+  receiveControl(restored, commandReceipt(settledLookup, COMMAND,
+    { application_state: "applied", journal_state: "committed_volatile", settled: true }));
+  assert.equal(JSON.parse(restored.exportControlRecovery()).commands.length, 31);
+  restored.sendControl("step", { requestId: "next-original" });
+  assert.equal(restored.requests.size, 32);
+  assert.equal(restored.requests.has("retained-1"), false);
+  assert.equal(restored.requests.get("previous-owner").sessionId, CONTROL_SESSION);
+});
+
+test("saved command references reject hostile state and duplicate identities atomically", () => {
+  const { value: original } = connectedControlClient();
+  original.sendControl("step", { requestId: "original" });
+  const source = JSON.parse(original.exportControlRecovery());
+  const invalid = (change, pattern = /saved|Saved|Invalid|Unsupported|original mutation|exact|bound/) => {
+    const record = structuredClone(source);
+    change(record);
+    const fresh = client();
+    assert.throws(() => fresh.restoreControlRecovery(JSON.stringify(record)), pattern);
+    assert.equal(fresh.requests.size, 0, "a malformed tail cannot install a valid prefix");
+    assert.equal(fresh.tracker.sessionId, null);
+    assert.equal(fresh.socket, null);
+  };
+  invalid((record) => { record.schema = "scriptbots.remote-command-recovery.v2"; });
+  invalid((record) => { record.ownerAllowsMutation = true; });
+  invalid((record) => { record.commands[0].settled = true; });
+  invalid((record) => { record.commands[0].receipt = { application_state: "applied", journal_state: "durable" }; });
+  invalid((record) => { record.commands[0].sessionId = "18446744073709551616"; }, /integer range/);
+  invalid((record) => { record.commands[0].sessionId = "01"; }, /canonical decimal/);
+  for (const requestId of [null, "", 0, false, {}, []]) {
+    invalid((record) => { record.commands[0].requestId = requestId; });
+  }
+  invalid((record) => { delete record.commands[0].requestId; });
+  invalid((record) => { record.commands[0].requestId = " "; });
+  invalid((record) => { record.commands[0].requestId = "x".repeat(1025); });
+  invalid((record) => { record.commands[0].command = "status_by_key"; });
+  invalid((record) => { record.commands[0].speed = 1; });
+  invalid((record) => { record.commands[0].command = "speed"; record.commands[0].speed = -1; });
+  invalid((record) => { record.commands[0].commandId = COMMAND.toUpperCase(); });
+  invalid((record) => { record.commands.push({ ...record.commands[0], command: "pause" }); }, /duplicate/);
+  invalid((record) => {
+    record.commands[0].commandId = COMMAND;
+    record.commands.push({ ...record.commands[0], requestId: "another-key" });
+  }, /duplicate/);
+  invalid((record) => { record.commands.push({ ...record.commands[0], requestId: "another-key", commandId: "invalid" }); });
+  invalid((record) => { record.commands = [null]; });
+  invalid((record) => { record.commands = Array.from({ length: 33 }, (_, index) => ({ ...source.commands[0], requestId: `key-${index}` })); });
+  assert.throws(() => parseRemoteControlRecovery("{"), SyntaxError);
+  for (const value of [null, [], {}, 1]) assert.throws(() => parseRemoteControlRecovery(value), /byte bound/);
+  const limit = REMOTE_CONTROL_RECOVERY_LIMITS.bytes, raw = JSON.stringify(source);
+  assert.deepEqual(parseRemoteControlRecovery(raw.padEnd(limit)), source);
+  assert.throws(() => parseRemoteControlRecovery(raw.padEnd(limit + 1)), /byte bound/);
+  assert.throws(() => parseRemoteControlRecovery(JSON.stringify({ value: "é".repeat(limit / 2) })), /byte bound/);
+  const unicode = structuredClone(source);
+  unicode.commands[0].requestId = "é".repeat(512);
+  assert.equal(parseRemoteControlRecovery(JSON.stringify(unicode)).commands[0].requestId, unicode.commands[0].requestId);
+  unicode.commands[0].requestId += "é";
+  assert.throws(() => parseRemoteControlRecovery(JSON.stringify(unicode)), /Invalid remote request/);
+});
+
+test("command recovery is endpoint-bound and cannot replace an active or populated client", () => {
+  const { value: original } = connectedControlClient();
+  original.sendControl("step", { requestId: "endpoint-command" });
+  const raw = original.exportControlRecovery();
+  const another = client({ url: "wss://another.example/api/ws/stream" });
+  assert.throws(() => another.restoreControlRecovery(raw), /another endpoint/);
+  assert.equal(another.requests.size, 0);
+  const populated = client();
+  populated.restoreControlRecovery(raw);
+  assert.throws(() => populated.restoreControlRecovery(raw), /fresh disconnected client/);
+  assert.equal(populated.requests.size, 1);
+  assert.throws(() => original.restoreControlRecovery(raw), /fresh disconnected client/);
+  const previouslyConnected = client();
+  previouslyConnected.tracker.acknowledge(CONTROL_SESSION);
+  assert.throws(() => previouslyConnected.restoreControlRecovery(raw), /fresh disconnected client/);
+  for (const url of ["ws://127.0.0.1:8787/api/ws/stream?token=private", "ws://127.0.0.1:8787/api/ws/stream#private"]) {
+    const privateClient = client({ url });
+    assert.throws(() => privateClient.exportControlRecovery(), /private parameters/);
+    const record = JSON.parse(raw);
+    record.url = url;
+    assert.throws(() => parseRemoteControlRecovery(JSON.stringify(record)), /private parameters/);
+  }
+  for (const url of ["ws://user:secret@127.0.0.1:8787/api/ws/stream", "https://example.com/api/ws/stream", "ws://EXAMPLE.com/api/ws/stream"]) {
+    const record = JSON.parse(raw);
+    record.url = url;
+    assert.throws(() => parseRemoteControlRecovery(JSON.stringify(record)), /cannot be saved/);
+  }
+});
+
+test("same-endpoint replacement keeps trusted private-URL history without inheriting live authority", () => {
+  const url = "wss://lab.example/api/ws/stream?token=not-persisted";
+  const { value: previous, sent: previousSent } = connectedControlClient({ url });
+  previous.sendControl("step", { requestId: "known-original" });
+  receiveControl(previous, commandReceipt("known-original", COMMAND,
+    { application_state: "applied", journal_state: "pending", settled: false, applied_tick: 8 }));
+  previous.sendControl("pause", { requestId: "unknown-original" });
+  const oldLookup = previous.retryControl("unknown-original");
+  const observations = previous.controlRequests(), sentBefore = previousSent.length;
+  let changes = 0;
+  const next = client({ url, onControlHistoryChange: () => { changes += 1; } });
+  assert.equal(next.inheritControlHistory(previous), 2);
+  assert.deepEqual(next.controlRequests(), observations);
+  assert.equal(next.controlRequests()[0].receipt, observations[0].receipt, "immutable observations retain their exact known boundary");
+  assert.notEqual(next.requests.get("known-original"), previous.requests.get("known-original"));
+  assert.equal(next.requests.get("unknown-original").text, previous.requests.get("unknown-original").text);
+  assert.equal(next.socket, null);
+  assert.equal(next.tracker.sessionId, null);
+  assert.equal(next.ownerStatus, null);
+  assert.equal(next.ownerStatusAvailable, false);
+  assert.equal(next.ownerAllowsMutation, false);
+  assert.equal(next.statusRequest, null, "an old pending read never occupies the new connection's lookup slot");
+  assert.equal(next.resume, undefined);
+  assert.equal(next.generation, 0);
+  assert.equal(changes, 0);
+  assert.equal(previousSent.length, sentBefore);
+  assert.throws(() => next.exportControlRecovery(), /private parameters/, "memory inheritance cannot enable storage of a private URL");
+  assert.throws(() => next.retryControl("unknown-original"), /Reconnect and subscribe/);
+
+  receiveControl(previous, commandReceipt("known-original", COMMAND,
+    { application_state: "applied", journal_state: "durable", settled: true, applied_tick: 8 }));
+  receiveControl(previous, { protocol_version: 1, request_id: oldLookup, type: "error", status: 404, message: "old read failed" });
+  assert.equal(previous.controlRequests()[0].settled, true);
+  assert.deepEqual(next.controlRequests(), observations, "late old-connection updates cannot mutate copied observations");
+  const sent = [];
+  next.state = "connected";
+  next.tracker.acknowledge(CONTROL_SESSION);
+  next.socket = { readyState: 1, bufferedAmount: 0, send: (text) => sent.push(JSON.parse(text)), close() {} };
+  const lookup = next.retryControl("unknown-original");
+  assert.equal(sent[0].command, "status_by_key");
+  receiveControl(next, commandReceipt(lookup, "2".repeat(32), { application_state: "rejected", journal_state: "not_required" }));
+  const knownLookup = next.retryControl("known-original");
+  assert.equal(sent[1].command, "status");
+  receiveControl(next, commandReceipt(knownLookup, COMMAND,
+    { application_state: "applied", journal_state: "durable", settled: true, applied_tick: 8 }));
+  assert.ok(next.controlRequests().every((entry) => entry.settled));
+  assert.ok(sent.every((request) => ["status", "status_by_key"].includes(request.command)));
+  next.tracker.sessionId = "72";
+  assert.throws(() => next.retryControl("known-original"), /another owner session/);
+  assert.equal(sent.length, 2);
+});
+
+test("memory inheritance refuses wrong endpoints, active clients and replacement of retained history", () => {
+  const { value: previous } = connectedControlClient();
+  previous.sendControl("step", { requestId: "keep-original" });
+  const fresh = client();
+  assert.throws(() => fresh.inheritControlHistory({ url: previous.url, requests: previous.requests }), /another client/);
+  assert.throws(() => fresh.inheritControlHistory(fresh), /another client/);
+  assert.equal(fresh.requests.size, 0);
+  const different = client({ url: "wss://other.example/api/ws/stream" });
+  assert.throws(() => different.inheritControlHistory(previous), /same endpoint/);
+  assert.equal(different.requests.size, 0);
+  assert.throws(() => previous.inheritControlHistory(fresh), /fresh disconnected client/);
+  const negotiated = client();
+  negotiated.tracker.acknowledge(CONTROL_SESSION);
+  assert.throws(() => negotiated.inheritControlHistory(previous), /fresh disconnected client/);
+  fresh.inheritControlHistory(previous);
+  const original = fresh.requests.get("keep-original");
+  assert.throws(() => fresh.inheritControlHistory(previous), /fresh disconnected client/);
+  assert.equal(fresh.requests.get("keep-original"), original);
+});
+
 test("failed send retains one recovery identity, refuses conflicting reuse, and bounds history", () => {
   const value = client();
   retainUnconfirmed(value, "step-1");
@@ -651,7 +916,7 @@ test("terminal application and journal failures settle independently without bec
   reply.receipt.journal_failure.message = "changed outside the client";
   assert.equal(value.controlRequests()[0].receipt.journal_failure.message, "Journal could not commit");
   assert.deepEqual(Object.keys(saved).sort(),
-    ["requestId", "command", "sessionId", "commandId", "receipt", "error", "settled"].sort());
+    ["requestId", "command", "sessionId", "speed", "commandId", "receipt", "error", "settled"].sort());
 });
 
 test("delayed admission cannot regress settled receipt evidence or callbacks and contradictory outcomes are rejected atomically", () => {

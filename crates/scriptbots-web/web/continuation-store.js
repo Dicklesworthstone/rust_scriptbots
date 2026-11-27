@@ -1,5 +1,7 @@
 // Manual and recovery copies of the canonical owner checkpoint. This does not
 // turn the checkpoint's volatile journal into a durable SQL/batch journal.
+import { parseRemoteControlRecovery } from "./remote.js";
+
 const DATABASE = "scriptbots-continuations";
 // Older pages open version 1 and write recovery unconditionally. Advancing the
 // database version fences those writers without replacing any retained record.
@@ -12,6 +14,132 @@ const RECOVERY_SCHEMA = "scriptbots.browser-recovery.v1";
 const SOURCE_FIELDS = ["sessionId", "scientificRevision", "controlRevision", "configRevision", "tick"];
 const WRITE_TOKEN = /^[0-9a-f]{32}$/;
 const OPERATION_TIMEOUT_MS = 10_000;
+const REMOTE_COMMAND_SLOT = "scriptbots.remote-command-recovery.v1";
+
+/** One tab-local record of original remote command identities, never outcomes or authority. */
+export class RemoteCommandRecoveryStore {
+  #storage;
+  #observed = false;
+  #observedRaw = null;
+  #invalid = false;
+  #state = Object.freeze({ status: "empty", record: null, raw: null, endpoint: null, count: 0, warning: "" });
+
+  // Access the browser getter only inside an explicit operation: restricted
+  // storage must not prevent the application from constructing its controls.
+  constructor(storage = () => globalThis.sessionStorage) { this.#storage = storage; }
+
+  get state() { return this.#state; }
+
+  #publish(status, record, raw, warning = "") {
+    this.#state = Object.freeze({ status, record, raw, endpoint: record?.url ?? null,
+      count: record?.commands.length ?? 0, warning });
+    return this.#state;
+  }
+
+  #warning(status, message) {
+    return this.#publish(status, this.#state.record, this.#state.raw, message);
+  }
+
+  read() {
+    let raw;
+    try {
+      raw = this.#storage().getItem(REMOTE_COMMAND_SLOT);
+    } catch {
+      this.#observed = false;
+      return this.#warning("unavailable", "This tab could not read saved remote command recovery. Original commands remain in memory; read or explicitly clear the saved record before saving again.");
+    }
+    let record = null;
+    if (raw !== null) {
+      try { record = parseRemoteControlRecovery(raw); }
+      catch {
+        this.#observed = false;
+        this.#observedRaw = null;
+        this.#invalid = true;
+        // Do not retain an unbounded or malformed raw value in application state.
+        return this.#publish("invalid", null, null, "This tab's saved remote command recovery is invalid or exceeds its bounds. It was left unchanged; explicitly clear it before saving a new reference.");
+      }
+    }
+    this.#observed = true;
+    this.#observedRaw = raw;
+    this.#invalid = false;
+    return this.#publish(record ? "saved" : "empty", record, raw);
+  }
+
+  /** Called synchronously after retaining an original request and before its socket send. */
+  save(client) {
+    if (this.#invalid) return this.#warning("invalid", "Invalid saved remote command recovery was left unchanged. Explicitly clear it before saving; new originals are held in memory only.");
+    if (!this.#observed) return this.#warning("unavailable", "Read or explicitly clear this tab's saved remote command recovery before saving again. Original commands are held in memory only.");
+    let raw, record;
+    try {
+      raw = client.exportControlRecovery();
+      record = parseRemoteControlRecovery(raw);
+    } catch {
+      return this.#warning("unavailable", "Remote command recovery is held in memory only. This endpoint or command reference cannot be saved; endpoints containing query strings or fragments are never stored.");
+    }
+    if (this.#state.record && this.#state.endpoint !== record.url) {
+      return this.#warning("conflict", "Saved remote commands belong to another endpoint and were left unchanged. Reconnect to their original endpoint or explicitly clear the saved reference before replacing it.");
+    }
+    // Restoring the endpoint alone is insufficient: a fresh or stale client
+    // must not erase originals it never loaded, including after a slot reread.
+    const sameOriginal = (previous, next) => next && previous.requestId === next.requestId
+      && previous.sessionId === next.sessionId && previous.command === next.command && previous.speed === next.speed
+      && (previous.commandId === null || previous.commandId === next.commandId);
+    const pending = new Map(record.commands.map((entry) => [entry.requestId, entry]));
+    const observed = client.controlRequests();
+    for (const previous of this.#state.record?.commands ?? []) {
+      const next = pending.get(previous.requestId);
+      const live = observed.find((entry) => entry.requestId === previous.requestId);
+      if (next ? !sameOriginal(previous, next) : !sameOriginal(previous, live)
+          || live.settled !== true || !live.receipt || live.receipt.command_id !== live.commandId) {
+        return this.#warning("conflict", "This client has not retained or observed completion of every saved original command. The saved recovery was left unchanged; restore it into a fresh client or explicitly clear it before replacement.");
+      }
+    }
+    try {
+      const storage = this.#storage();
+      if (storage.getItem(REMOTE_COMMAND_SLOT) !== this.#observedRaw) {
+        this.#observed = false;
+        return this.#warning("conflict", "Saved remote command recovery changed after it was read. It was left unchanged; read the current reference before saving again.");
+      }
+      if (record.commands.length === 0) {
+        // An empty export cannot erase another endpoint's outstanding originals.
+        if (this.#observedRaw !== null) storage.removeItem(REMOTE_COMMAND_SLOT);
+        raw = null;
+        record = null;
+      } else storage.setItem(REMOTE_COMMAND_SLOT, raw);
+      this.#observedRaw = raw;
+      return this.#publish(record ? "saved" : "empty", record, raw);
+    } catch {
+      // A failed write must not discard the original retained by the client or
+      // claim that the older record was replaced. A fresh read reconciles it.
+      this.#observed = false;
+      return this.#warning("unavailable", "This tab could not confirm saving remote command recovery. Original commands remain in memory; read the saved reference before retrying or reloading.");
+    }
+  }
+
+  /** Explicit user action only; clearing references neither queries nor cancels a command. */
+  clear() {
+    try {
+      const storage = this.#storage();
+      if ((this.#observed || this.#state.raw !== null) && storage.getItem(REMOTE_COMMAND_SLOT) !== this.#observedRaw) {
+        this.read();
+        this.#observed = false;
+        return this.#warning("conflict", "Saved remote command recovery changed before clearing. Review the current reference and explicitly clear it again if intended.");
+      }
+      storage.removeItem(REMOTE_COMMAND_SLOT);
+      if (storage.getItem(REMOTE_COMMAND_SLOT) !== null) {
+        this.#observed = false;
+        return this.#warning("conflict", "This tab could not confirm that saved remote command recovery was cleared. Read the current reference before continuing.");
+      }
+      this.#observed = true;
+      this.#observedRaw = null;
+      this.#invalid = false;
+      return this.#publish("empty", null, null);
+    } catch {
+      this.#observed = false;
+      return this.#warning("unavailable", "This tab could not clear saved remote command recovery. The reference may reappear after reload; no remote command was cancelled or changed.");
+    }
+  }
+}
 
 function newWriteToken() {
   if (typeof globalThis.crypto?.getRandomValues !== "function") {
