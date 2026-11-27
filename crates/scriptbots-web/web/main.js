@@ -3,7 +3,7 @@ import { CanvasRenderer } from "./renderers/canvas.js";
 import { WebGpuRenderer } from "./renderers/webgpu.js";
 import { environmentDescription } from "./renderers/environment.js";
 import { RemoteStreamClient, RemoteStepBatchController, remoteCommandHistoryView, describeRemoteOwnerFault, describeRemoteCommandReceipt } from "./remote.js";
-import { BrowserContinuationStore, BrowserRecoveryController } from "./continuation-store.js";
+import { BrowserContinuationStore, BrowserRecoveryController, RemoteCommandRecoveryStore } from "./continuation-store.js";
 import { InspectionController, pickAgent, renderInspector, renderInspectorSource,
   validateBrainInspection, renderBrainInspector, renderBrainSource } from "./inspector.js";
 import { GenomeInspectionController, renderGenomeInspector, renderGenomeSource } from "./genome.js";
@@ -110,6 +110,10 @@ const remoteRefresh = document.getElementById("remote-refresh");
 const remoteRetry = document.getElementById("remote-retry");
 const remoteCommandHistory = document.getElementById("remote-command-history");
 const remoteCommandHistorySummary = document.getElementById("remote-command-history-summary");
+const remoteCommandRecoveryStatus = document.getElementById("remote-command-recovery-status");
+const remoteCommandRecoveryConnect = document.getElementById("remote-command-recovery-connect");
+const remoteCommandRecoverySave = document.getElementById("remote-command-recovery-save");
+const remoteCommandRecoveryClear = document.getElementById("remote-command-recovery-clear");
 const remoteBatchCount = document.getElementById("remote-batch-count");
 const remoteBatchRun = document.getElementById("remote-batch-run");
 const remoteBatchResume = document.getElementById("remote-batch-resume");
@@ -192,6 +196,9 @@ let remoteConnected = false;
 const remoteOwnerState = document.getElementById("remote-owner-state");
 let selectedRemoteRequestId = null;
 let remoteCommandNotice = null;
+const remoteCommandRecovery = new RemoteCommandRecoveryStore(() => window.sessionStorage);
+const initialRemoteRecovery = remoteCommandRecovery.read();
+if (initialRemoteRecovery.record?.commands.length) remoteUrl.value = initialRemoteRecovery.endpoint;
 const remoteStepBatch = new RemoteStepBatchController({
   getClient: () => remoteMode ? remoteClient : null,
   canAdvance: () => remoteOwnerAllowsMutation() && !reviewedCheckpoint,
@@ -1168,6 +1175,7 @@ function updateRemoteControls() {
   remoteLocal.disabled = !remoteMode;
   for (const button of [remotePause, remoteResume, remoteStep]) button.disabled = !remoteOwnerAllowsMutation() || !!reviewedCheckpoint;
   renderRemoteCommandHistory();
+  renderRemoteCommandRecovery();
   remoteStepBatch.syncAuthority();
   renderRemoteStepBatch();
   captureButton.disabled = !hasPresentationFrame() || !!captureRequest || !!encodingRequest;
@@ -1211,7 +1219,7 @@ function renderRemoteCommandHistory() {
   remoteCommandHistorySummary.dataset.unresolvedCount = String(view.unresolvedCount);
   let summary = view.entries.length
     ? `${view.entries.length}/32 retained commands; ${view.unresolvedCount} unresolved. Choose any retained command to inspect or recover its outcome.`
-    : "No remote commands retained. Reconnect with Cursor keeps this history; a new connection or returning to local clears it.";
+    : "No remote commands in this page. Saved unresolved references can be reopened below; no commands are repeated.";
   if (view.lookupPending) summary += " An outcome lookup is pending; wait for its reply or reconnect before another lookup.";
   else if (view.selected && !view.canRecover) summary += " Reconnect to the same owner to recover this command's outcome.";
   if (remoteCommandHistorySummary.textContent !== summary) remoteCommandHistorySummary.textContent = summary;
@@ -1233,6 +1241,31 @@ function renderRemoteCommandHistory() {
   if (remoteCommandNotice?.requestId === view.selectedRequestId) description += ` ${remoteCommandNotice.message}`;
   if (remoteReceipt.textContent !== description.trim()) remoteReceipt.textContent = description.trim();
   return view;
+}
+
+function retainRemoteCommandRecovery(client) {
+  // This callback runs before WebSocket.send and after each owner observation.
+  // Storage failure leaves the exact original in the client for read-only recovery.
+  remoteCommandRecovery.save(client);
+  renderRemoteCommandRecovery();
+}
+
+function renderRemoteCommandRecovery() {
+  const state = remoteCommandRecovery.state;
+  const unresolved = remoteClient?.controlRequests().filter((entry) => !entry.settled).length ?? 0;
+  remoteCommandRecoveryStatus.dataset.state = state.status;
+  remoteCommandRecoveryStatus.dataset.count = String(state.count);
+  remoteCommandRecoveryStatus.dataset.endpoint = state.endpoint ?? "";
+  let message = state.count > 0
+    ? `${state.status === "saved" ? "Saved in this tab" : "Last observed saved reference"}: ${state.count} unresolved command${state.count === 1 ? "" : "s"} for ${state.endpoint}. Reloading does not reconnect or repeat commands. Reconnect explicitly, then select a command and recover its outcome.`
+    : "Unresolved Pause, Resume, Step and Speed references are saved in this tab before sending. Reload restores lookup keys only; server outcomes must be read again. Closing the tab or clearing browser storage can remove these references.";
+  if (state.warning) message += ` ${state.warning}`;
+  if (unresolved && state.status !== "saved") message += ` ${unresolved} unresolved reference${unresolved === 1 ? " remains" : "s remain"} in this page.`;
+  if (remoteCommandRecoveryStatus.textContent !== message) remoteCommandRecoveryStatus.textContent = message;
+  remoteCommandRecoveryConnect.disabled = !wasmInitialized || !(state.count > 0 || unresolved > 0);
+  remoteCommandRecoverySave.hidden = !state.warning;
+  remoteCommandRecoverySave.disabled = !remoteClient?.controlRequests().length;
+  remoteCommandRecoveryClear.disabled = !remoteClient?.controlRequests().length && state.status === "empty";
 }
 
 function renderRemoteStepBatch() {
@@ -1416,7 +1449,21 @@ function connectRemote() {
       onState: receiveRemoteState,
       onReceipt: receiveRemoteReceipt,
       onOwnerStatus: (client) => { if (remoteMode && remoteClient === client) updateRemoteControls(); },
+      onControlHistoryChange: retainRemoteCommandRecovery,
     });
+    const saved = remoteCommandRecovery.state;
+    const unresolved = remoteClient?.controlRequests().some((entry) => !entry.settled);
+    if ((unresolved && remoteClient.url !== nextClient.url)
+        || (saved.count > 0 && saved.endpoint !== nextClient.url)) {
+      throw new Error("Unresolved commands belong to another server. Reconnect to their original endpoint or explicitly forget their references before switching servers.");
+    }
+    if (remoteClient?.url === nextClient.url) {
+      // Preserve trusted in-memory observations across fresh subscriptions,
+      // including endpoints whose private parameters must never enter storage.
+      nextClient.inheritControlHistory(remoteClient);
+    } else if (saved.count > 0) {
+      nextClient.restoreControlRecovery(saved.raw);
+    }
     // Freeze local science before changing the active source. The saved local
     // owner is resumed only by the user's explicit Return to Local action.
     if (!remoteMode && simHandle) {
@@ -1444,6 +1491,7 @@ function connectRemote() {
     }
     remoteClient = nextClient;
     installedClient = true;
+    retainRemoteCommandRecovery(nextClient);
     localStudy?.reset();
     remoteMode = true;
     recoveryReadStatus = "";
@@ -1493,7 +1541,8 @@ function returnToLocalSimulation() {
   remoteMode = false;
   browserRecovery?.attach(simHandle);
   remoteConnected = false;
-  remoteClient = null;
+  // Keep disconnected command evidence available even when tab storage is
+  // unavailable. Returning to local never discards an uncertain server action.
   remoteFrame = null;
   simulationGeneration += 1;
   presentationGeneration += 1;
@@ -1522,6 +1571,35 @@ function returnToLocalSimulation() {
   scheduleSimulation();
 }
 remoteLocal.addEventListener("click", returnToLocalSimulation);
+
+remoteCommandRecoveryConnect.addEventListener("click", () => {
+  const endpoint = remoteClient?.controlRequests().some((entry) => !entry.settled)
+    ? remoteClient.url : remoteCommandRecovery.state.endpoint;
+  if (!endpoint) return;
+  remoteUrl.value = endpoint;
+  connectRemote();
+});
+remoteCommandRecoverySave.addEventListener("click", () => {
+  remoteCommandRecovery.read();
+  if (remoteClient) retainRemoteCommandRecovery(remoteClient);
+  else renderRemoteCommandRecovery();
+});
+remoteCommandRecoveryClear.addEventListener("click", () => {
+  // Explicit forgetting disconnects first-class command recovery too, so a
+  // late receipt cannot silently recreate references the user just discarded.
+  const state = remoteCommandRecovery.clear();
+  if (state.status !== "empty") { renderRemoteCommandRecovery(); return; }
+  remoteClient?.disconnect();
+  remoteClient = null;
+  remoteConnected = false;
+  selectedRemoteRequestId = null;
+  remoteCommandNotice = null;
+  if (remoteMode) {
+    remoteStatus.dataset.state = "disconnected";
+    remoteStatus.textContent = "Command references forgotten. No server command was cancelled or repeated. Connect explicitly to continue.";
+  }
+  updateRemoteControls();
+});
 
 function sendRemoteControl(command) {
   try {

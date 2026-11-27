@@ -90,12 +90,42 @@ changing the selection or replacing the displayed outcome. Explicit recovery
 and status refresh remain available while reviewing a saved world or inspecting
 a faulted owner, provided the selected command belongs to the connected owner.
 
-The command list is retained in the current page's client across **Reconnect**.
-Starting a fresh connection or reloading the page starts a new single-command
-history; this list is not a durable command journal. Only one outcome lookup
-runs at a time. If its reply is lost while the socket remains connected,
-**Reconnect with Cursor** releases the pending read while preserving the
-original commands; select **Recover Command Outcome** to read the outcome again.
+The command list survives **Reconnect with Cursor**, a fresh connection to the
+same endpoint, and **Return to Local Simulation**. The disconnected client keeps
+its observed receipts in memory. An unresolved Pause, Resume, Step or Speed also
+saves its original lookup reference to this tab's `sessionStorage` synchronously
+before socket delivery. The one-record format is bounded to 32 references and
+256 KiB, with exact endpoint, owner session, request key, command arguments and
+any already observed canonical command ID. Only observed owner settlement
+removes a reference automatically; an admission, volatile intermediate receipt,
+missing history or failed lookup does not.
+
+After reloading, **Reconnect Saved Commands** explicitly connects to the original
+endpoint and restores the unresolved list. Select **Retained command**, then
+**Recover Command Outcome**. Reloading itself never opens a socket or repeats a
+mutation. Saved references contain no receipts, health, connection authority,
+stream cursors or completion flags: outcome inspection waits for a newly
+negotiated matching owner session. A replacement owner cannot recover the prior
+session's commands or make their outcome appear known.
+
+Storage restrictions, quota failures, invalid records and conflicting saved
+references produce a visible recovery notice. In-memory evidence remains
+available. Endpoints containing query strings or fragments are never persisted;
+their histories survive same-page connection replacement and returning to local,
+but not a page reload. **Retry Saving References** explicitly rereads storage
+before retrying, and a stale client cannot replace saved originals it has not
+retained or observed settling. Switching servers refuses to discard unresolved
+references silently. **Forget Command References** explicitly clears the saved
+record and disconnects/discards the retained command client; it does not cancel
+or repeat any server action. A failed clear keeps the references available.
+
+Tab storage can disappear when the tab closes or browser data is cleared; it is
+not the owner's durable command journal. Only one outcome lookup runs at a time.
+If its reply is lost while the socket remains connected, **Reconnect with
+Cursor** releases the pending read while preserving the originals; select
+**Recover Command Outcome** to read the outcome again. These single-command
+references are separate from the batch, intervention, checkpoint and experiment
+controllers' own recovery contracts.
 
 **Recover Command Outcome** only reads existing owner evidence. If a receipt
 already identified the command, recovery requests its status. If the first

@@ -1413,6 +1413,191 @@ async function runRendererTests(browser, baseUrl) {
   return true;
 }
 
+async function runRemoteReloadRecovery(context, baseUrl, endpoint, request, until, observation) {
+  // A separate real page preserves the original journey's frozen local owner.
+  // This observer is installed before app startup on every navigation so an
+  // automatic reconnect cannot escape observation during a reload.
+  const page = await context.newPage();
+  const errors = [];
+  Object.assign(observation, { status: "running", errors });
+  page.on("pageerror", (error) => errors.push(error.message));
+  const slot = "scriptbots.remote-command-recovery.v1";
+  const url = endpoint.replace("http:", "ws:") + "/api/ws/stream";
+  const observeStatus = (before, after) => {
+    for (const field of ["tick", "scientific_revision", "config_revision", "paused", "last_applied_command", "command_queue_depth"]) {
+      if (before[field] !== after[field]) throw new Error(`Reload recovery changed native ${field}`);
+    }
+  };
+  try {
+    await page.addInitScript((slot) => {
+      const wire = window.__reloadRemoteWire = { sent: [], replies: [], dropped: [], sockets: 0,
+        beforeSend: [], dropNextStep: false, dropRequest: null };
+      const NativeSocket = WebSocket;
+      window.WebSocket = class extends NativeSocket {
+        constructor(...args) {
+          super(...args);
+          wire.sockets += 1;
+          this.addEventListener("message", (event) => {
+            if (typeof event.data !== "string") return;
+            const reply = JSON.parse(event.data);
+            wire.replies.push(reply);
+            if (reply.type === "receipt" && reply.request_id === wire.dropRequest) {
+              wire.dropped.push(reply);
+              event.stopImmediatePropagation();
+            }
+          });
+        }
+        send(text) {
+          const message = JSON.parse(text);
+          wire.sent.push(message);
+          if (["pause", "resume", "step", "speed"].includes(message.command)) {
+            wire.beforeSend.push({ message, saved: sessionStorage.getItem(slot) });
+          }
+          if (message.command === "step" && wire.dropNextStep) {
+            wire.dropNextStep = false;
+            wire.dropRequest = message.request_id;
+          }
+          return super.send(text);
+        }
+      };
+    }, slot);
+    await page.goto(baseUrl);
+    await page.waitForFunction(() => !document.getElementById("remote-connect").disabled);
+    const beforeStep = await request("/api/status");
+    if (!beforeStep.paused) throw new Error("Reload recovery requires the original native owner to remain paused");
+    await page.fill("#remote-url", url);
+    await page.click("#remote-connect");
+    await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "connected"
+      && document.getElementById("remote-owner-state").dataset.state === "healthy"
+      && !document.getElementById("remote-step").disabled);
+    const sessionId = await page.getAttribute("#remote-owner-state", "data-session-id");
+    await page.evaluate(() => { window.__reloadRemoteWire.dropNextStep = true; });
+    await page.click("#remote-step");
+    const dropped = await until(() => page.evaluate(() => window.__reloadRemoteWire.dropped.at(-1)),
+      (reply) => !!reply, "genuine lost Step receipt before reload");
+    const originalReceipt = await until(() => request(`/api/control/status/${dropped.receipt.command_id}`),
+      (receipt) => receipt.settled === true, "reload Step durable outcome");
+    if (originalReceipt.application_state !== "applied" || originalReceipt.journal_state !== "durable"
+        || !Number.isSafeInteger(originalReceipt.admission_sequence)) {
+      throw new Error("Reload Step lacks independently observed durable admission evidence");
+    }
+    const afterStep = await request("/api/status");
+    Object.assign(observation, { beforeStep, afterStep, originalReceipt });
+    if (!afterStep.paused || afterStep.tick !== beforeStep.tick + 1
+        || afterStep.scientific_revision !== beforeStep.scientific_revision + 1
+        || afterStep.last_applied_command !== originalReceipt.command_id) {
+      throw new Error("Lost-receipt reload Step did not apply exactly once before navigation");
+    }
+    const original = await page.evaluate((slot) => ({
+      request: window.__reloadRemoteWire.sent.findLast((message) => message.command === "step"),
+      beforeSend: window.__reloadRemoteWire.beforeSend,
+      raw: sessionStorage.getItem(slot), receiptText: document.getElementById("remote-receipt").textContent,
+    }), slot);
+    const saved = JSON.parse(original.raw);
+    observation.original = original;
+    if (saved.url !== url || saved.commands.length !== 1 || saved.commands[0].requestId !== original.request.request_id
+        || saved.commands[0].sessionId !== sessionId || saved.commands[0].command !== "step"
+        || saved.commands[0].commandId !== null || original.beforeSend.length !== 1
+        || original.beforeSend[0].saved !== original.raw
+        || !original.receiptText.includes("awaiting the server's receipt")) {
+      throw new Error("The lost Step's exact lookup reference was not saved before its real socket send");
+    }
+    const recoverAfterReload = async (raw, command, commandId) => {
+      await page.reload();
+      await page.waitForFunction(() => document.getElementById("remote-command-recovery-status").dataset.count === "1"
+        && !document.getElementById("remote-command-recovery-connect").disabled
+        && document.getElementById("metric-tick").textContent !== "–");
+      const firstTick = await page.textContent("#metric-tick");
+      await page.waitForFunction((tick) => document.getElementById("metric-tick").textContent !== tick, firstTick);
+      const loaded = await page.evaluate((slot) => ({
+        wire: window.__reloadRemoteWire, raw: sessionStorage.getItem(slot),
+        recovery: { ...document.getElementById("remote-command-recovery-status").dataset },
+        lookupDisabled: document.getElementById("remote-retry").disabled,
+        receipt: document.getElementById("remote-receipt").textContent,
+      }), slot);
+      if (loaded.wire.sockets !== 0 || loaded.wire.sent.length !== 0 || loaded.wire.replies.length !== 0
+          || loaded.raw !== raw || !loaded.lookupDisabled || loaded.receipt !== ""
+          || loaded.recovery.state !== "saved" || loaded.recovery.endpoint !== url) {
+        throw new Error("Reload automatically connected, trusted an outcome, or changed the saved original");
+      }
+      observeStatus(afterStep, await request("/api/status"));
+      await page.click("#remote-command-recovery-connect");
+      await page.waitForFunction(() => document.getElementById("remote-status").dataset.state === "connected"
+        && document.getElementById("remote-owner-state").dataset.state === "healthy"
+        && !document.getElementById("remote-retry").disabled);
+      const connected = await page.evaluate(() => ({
+        owner: document.getElementById("remote-owner-state").dataset.sessionId,
+        selected: document.getElementById("remote-command-history").value,
+        commandId: document.getElementById("remote-receipt").dataset.commandId,
+        sent: [...window.__reloadRemoteWire.sent],
+      }));
+      if (connected.owner !== sessionId || connected.selected !== original.request.request_id
+          || connected.commandId !== (commandId ?? "")
+          || connected.sent.some((message) => ["pause", "resume", "step", "speed", "status", "status_by_key"].includes(message.command))) {
+        throw new Error("Explicit saved reconnect submitted a mutation or performed an unrequested outcome lookup");
+      }
+      observeStatus(afterStep, await request("/api/status"));
+      await page.click("#remote-retry");
+      await page.waitForFunction(() => document.getElementById("remote-command-history-summary").dataset.unresolvedCount === "0"
+        && document.getElementById("remote-command-recovery-status").dataset.count === "0");
+      const recovered = await page.evaluate((slot) => ({ wire: window.__reloadRemoteWire,
+        raw: sessionStorage.getItem(slot), selected: document.getElementById("remote-command-history").value,
+        commandId: document.getElementById("remote-receipt").dataset.commandId,
+      }), slot);
+      const reads = recovered.wire.sent.filter((message) => ["status", "status_by_key"].includes(message.command));
+      const lookup = reads[0];
+      const reply = recovered.wire.replies.findLast((message) => message.type === "receipt" && message.request_id === lookup?.request_id);
+      if (reads.length !== 1 || lookup.command !== command || lookup.request_id === original.request.request_id
+          || (commandId === null ? lookup.idempotency_key !== original.request.request_id || lookup.session_id !== sessionId
+            : lookup.command_id !== commandId)
+          || recovered.wire.sent.some((message) => ["pause", "resume", "step", "speed"].includes(message.command))
+          || reply?.receipt.command_id !== originalReceipt.command_id
+          || reply?.receipt.admission_sequence !== originalReceipt.admission_sequence || reply?.receipt.settled !== true
+          || recovered.raw !== null || recovered.selected !== original.request.request_id
+          || recovered.commandId !== originalReceipt.command_id) {
+        throw new Error("Reload recovery did not settle the exact original through one read-only lookup");
+      }
+      const afterRecovery = await request("/api/status");
+      observeStatus(afterStep, afterRecovery);
+      return { loaded, connected, recovered, afterRecovery };
+    };
+    observation.byKey = await recoverAfterReload(original.raw, "status_by_key", null);
+    // Seed only a truthful lookup reference using the canonical ID observed in
+    // the genuine dropped native receipt. No receipt, settlement or authority
+    // is fabricated; this controls the known-ID branch independently of how
+    // quickly the native journal happened to settle its initial response.
+    const known = JSON.stringify({ ...saved, commands: [{ ...saved.commands[0], commandId: originalReceipt.command_id }] });
+    await page.evaluate(({ slot, raw }) => sessionStorage.setItem(slot, raw), { slot, raw: known });
+    observation.knownIdControl = "Saved original reference seeded only with the canonical command ID from the genuine dropped native receipt";
+    observation.byId = await recoverAfterReload(known, "status", originalReceipt.command_id);
+    // The next admitted real command is an independent check that neither
+    // reconnect nor either lookup silently re-admitted the original Step.
+    const sentinel = await request("/api/control/pause", { method: "POST" });
+    const nextReceipt = await until(() => request(`/api/control/status/${sentinel.command_id}`),
+      (receipt) => receipt.settled === true, "post-reload admission sentinel");
+    observation.nextReceipt = nextReceipt;
+    if (nextReceipt.application_state !== "applied" || nextReceipt.journal_state !== "durable"
+        || nextReceipt.admission_sequence !== originalReceipt.admission_sequence + 1
+        || (await request("/api/status")).tick !== afterStep.tick) {
+      throw new Error("Reload or outcome recovery inserted an unobserved native command admission");
+    }
+    if (errors.length) throw new Error(`Reload recovery browser errors: ${JSON.stringify(errors)}`);
+    observation.status = "pass";
+  } catch (error) {
+    observation.status = "fail";
+    observation.failure = String(error.stack ?? error);
+    observation.failureDom = await page.evaluate((slot) => ({
+      status: document.getElementById("remote-status")?.textContent,
+      recovery: document.getElementById("remote-command-recovery-status")?.textContent,
+      receipt: document.getElementById("remote-receipt")?.textContent,
+      wire: window.__reloadRemoteWire, raw: sessionStorage.getItem(slot),
+    }), slot).catch(() => null);
+    throw error;
+  } finally {
+    await page.close();
+  }
+}
+
 async function runRemoteTests(browser, baseUrl, packageInfo) {
   const binary = process.env.SCRIPTBOTS_APP_BINARY;
   if (!binary || !fs.statSync(binary).isFile()) throw new Error("A source-bound production SCRIPTBOTS_APP_BINARY is required");
@@ -2069,6 +2254,8 @@ async function runRemoteTests(browser, baseUrl, packageInfo) {
       treatmentDigest: treatmentBranch.final_digest, originalRemoteOwnerUnchanged: true,
       scope: "Exact native cut imported by packaged WASM; browser advanced cut consumed by isolated native study. Cross-target future equivalence is not asserted.",
     };
+    observations.reloadCommandRecovery = {};
+    await runRemoteReloadRecovery(context, baseUrl, endpoint, request, until, observations.reloadCommandRecovery);
     const wire = await page.evaluate(() => ({ sent: window.__remoteWire.sent, replies: window.__remoteWire.replies,
       frames: window.__remoteWire.frames, decodeErrors: window.__remoteWire.decodeErrors, binaries: window.__remoteWire.binaries }));
     for (const [index, bytes] of wire.binaries.entries()) fs.writeFileSync(path.join(proof, `native-frame-${index}.bin`), new Uint8Array(bytes), { flag: "wx" });

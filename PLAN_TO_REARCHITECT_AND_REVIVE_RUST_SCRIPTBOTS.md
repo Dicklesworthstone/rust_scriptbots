@@ -2,6 +2,28 @@
 
 **Status:** [Currently In Progress — Codex, 2026-07-11]
 
+**Remote command recovery across page reloads (2026-11-27):**
+[Source implemented and independently reviewed; DSR browser module/syntax checks
+passed — Codex; functional contribution to `bd-ac4l` and `bd-2z0.12.2`;
+original native/browser acceptance remains open]
+
+Unresolved Pause, Resume, Step and Speed references are bounded and saved before
+socket delivery, tied to the original endpoint and owner session. Explicit
+reconnection after reload restores only lookup identities, never command replay,
+saved success or live authority. Same-page reconnection and returning to local
+retain observed evidence, including when storage is unavailable. Invalid,
+conflicting or incomplete saved originals cannot be silently replaced. Recovery,
+storage retry and explicit forgetting are wired into the production controls.
+
+DSR passed all 446 browser module tests and 38 JavaScript syntax checks with
+unchanged source fingerprints; 17 new regressions exercise the recovery client
+and tab store. The real native/WASM browser journey now includes lost-receipt
+reload, original-key and canonical-ID recovery, plus an independent admission
+sequence check. That journey has not run. A separate controlled DOM probe could
+not launch the missing Chromium executable and ran no DOM assertions. Native
+checks remain blocked by the pinned dependency/toolchain environment. No broad
+native, packaged-browser or durability acceptance is closed.
+
 **Bounded browser continuation storage and recovery (2026-11-26):**
 [Source implemented and independently reviewed; browser module checks passed —
 Codex; corrective contribution to `bd-ywtv` and `bd-2z0.12.3`;

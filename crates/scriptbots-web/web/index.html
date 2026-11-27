@@ -311,7 +311,7 @@
             transform: none;
         }
 
-        #remote-status, #remote-playback, #remote-receipt, #remote-command-history-summary, #remote-batch-status, #remote-batch-progress, #remote-batch-receipts {
+        #remote-status, #remote-playback, #remote-receipt, #remote-command-history-summary, #remote-command-recovery-status, #remote-command-recovery-help, #remote-batch-status, #remote-batch-progress, #remote-batch-receipts {
             font-size: 0.75rem;
             overflow-wrap: anywhere;
         }
@@ -634,10 +634,15 @@
                         <option value="">No retained remote commands</option>
                     </select>
                 </label>
-                <p id="remote-command-history-summary" role="status" aria-live="polite">No remote commands retained. Reconnect with Cursor keeps this history; a new connection or returning to local clears it.</p>
+                <p id="remote-command-history-summary" role="status" aria-live="polite">No remote commands in this page. Saved unresolved references can be reopened below; no commands are repeated.</p>
                 <button id="remote-refresh" type="button" disabled>Refresh Command Outcome</button>
                 <button id="remote-retry" type="button" disabled>Recover Command Outcome</button>
                 <div id="remote-receipt" role="status" aria-live="polite"></div>
+                <p id="remote-command-recovery-status" role="status" aria-live="polite">Checking this tab for unresolved command references…</p>
+                <button id="remote-command-recovery-connect" type="button" disabled>Reconnect Saved Commands</button>
+                <button id="remote-command-recovery-save" type="button" hidden disabled>Retry Saving References</button>
+                <button id="remote-command-recovery-clear" type="button" aria-describedby="remote-command-recovery-help" disabled>Forget Command References</button>
+                <p id="remote-command-recovery-help">Forgetting disconnects the command client and discards its lookup keys. It does not cancel or repeat any server action. Resolve uncertain commands before forgetting them.</p>
                 <details id="remote-step-batch">
                     <summary>Run a batch of server steps</summary>
                     <p>Each step keeps its own outcome. Run continues for up to 10 seconds; resume the same batch to continue. Pausing continuation stops new requests but cannot undo a submitted step.</p>
